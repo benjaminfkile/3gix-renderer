@@ -237,8 +237,7 @@ impl WebApp {
                 volumes_drawn: scene.volumes.len(),
                 sprites_drawn: scene.sprites.len(),
                 lights_active: scene.lights.len(),
-                bytes_fetched: self.fetcher.bytes_fetched(),
-                last_round_trip: self.fetcher.last_round_trip().map(|d| d.as_secs_f64()),
+                ..MatterStats::from_tally(self.fetcher.tally())
             },
         }
         .text()

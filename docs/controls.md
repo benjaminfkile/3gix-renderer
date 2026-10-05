@@ -24,9 +24,11 @@ flying in deep space is fast. The wheel multiplier applies on top.
 
 The number keys index the frames in registry order: frame ids sorted
 ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.
-A jump places the camera at `3 * root_extent / 8` from the frame origin, on
-the side away from the root, looking back at the frame origin. A key past the
-last frame does nothing.
+A jump places the camera at `3 * root_extent / 8` from the frame origin,
+above it the way `Home` sees the root: along root `+z`, looking along root
+`-z` with root `+y` up. Because that direction is fixed in root axes, the
+frame shows a lit side and a dark side, and the lit side turns as the light
+moves over simulation time. A key past the last frame does nothing.
 
 ## Simulation time
 

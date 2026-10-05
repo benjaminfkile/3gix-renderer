@@ -206,13 +206,25 @@ impl World {
             && self.cache.pinned().all(resolved)
     }
 
+    /// Returns `true` when every selected and every pinned cell can be
+    /// drawn (`Ready` with its mesh, or `Empty`) and nothing is being
+    /// extracted. Stricter than [`World::settled`]: a `Gone` cell is not
+    /// ready.
+    pub fn ready(&self) -> bool {
+        self.extracting.is_empty()
+            && self.cache.selection().iter().all(|s| self.drawable(&s.key))
+            && self.cache.pinned().all(|k| self.drawable(k))
+    }
+
     /// The draw set (see [`CellCache::draw_set`]), its meshes and volumes,
     /// the lights its hot matter makes, and the sprites of far frames, for
     /// a view of `view_px` pixels. Marks the drawn cells as used.
     ///
-    /// Lights come from the hot matter of the drawn cells and, for frames
-    /// drawn as a sprite only, of their depth-0 cells, so a far hot frame
-    /// still lights the rest. Cold far frames reflect those lights.
+    /// Lights come from the hot matter of the drawn cells and, for far
+    /// frames none of whose drawn cells is hot (frames drawn as a sprite
+    /// only, and frames in the transition whose cells are beyond the
+    /// selection range), of their depth-0 cells, so a far hot frame still
+    /// lights the rest. Cold far frames reflect those lights.
     pub fn draw_list(
         &mut self,
         system: &FrameSystem,
@@ -247,7 +259,11 @@ impl World {
                 }
             }
         }
-        for f in far.iter().filter(|f| f.sprite_only()) {
+        // A far frame whose drawn cells carry no hot matter (a sprite only,
+        // or in the transition with its cells out of the selection range)
+        // still lights the rest through its depth-0 cell.
+        let lit: BTreeSet<u64> = emitters.iter().map(|(f, _)| *f).collect();
+        for f in far.iter().filter(|f| !lit.contains(&f.frame_id)) {
             if let Some(CellState::Ready(cell)) = self.cache.state(&depth_zero_key(f.frame_id)) {
                 if let Some(e) = &cell.emitter {
                     emitters.push((f.frame_id, e));

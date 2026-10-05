@@ -54,6 +54,19 @@ Flags: `--time-scale <f64>` (default 1), `--start-offset-seconds <f64>`
 `--hub-url`, `--space-id`, `--build-id` to override the environment. See
 `--help`.
 
+Headless runs also take `--view <home|0-9>` (the `Home` view, the default,
+or the view a number key jumps to), `--view-distance-scale <f64>` (a factor
+on that view's distance from its frame origin), `--wait-ready-seconds <f64>`
+(wait until every selected cell is ready and exit non-zero if that takes
+longer), `--stats-json <path.json>` (the overlay statistics: cells selected
+and fetched, bytes, the first and last round trip), and `--no-overlay`
+(matter only: no overlay text, frame markers, or lines):
+
+```sh
+cargo run --release --bin gx-renderer -- --screenshot frame-3.png --view 3 \
+    --wait-ready-seconds 300 --stats-json frame-3.json --no-overlay
+```
+
 Without a hub, `gx-mock-hub` serves a registry the way the hub does and prints
 the variables to use. `--cell <key>=<file>` adds a matter cell from a hub
 chunk container file:
@@ -95,6 +108,17 @@ matter render tests save their images as `target/tmp/matter-render.png` and
 `target/tmp/full-scene.png` with pixel statistics beside them in `.txt`
 files. The browser build is not run in CI; it is verified by hand
 (`docs/web.md`).
+
+## End to end
+
+```sh
+sh scripts/e2e.sh
+```
+
+Starts the hub with its own container harness, clones and serves the system
+compiler, takes four headless screenshots against them, and checks the
+images with `tools/png-stats`. The recorded run, the screenshots, and their
+statistics are in `docs/e2e/`.
 
 ## Specification
 

@@ -1,0 +1,17 @@
+[package]
+name = "png-stats"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pixel statistics and assertions on rendered PNG screenshots, for the end to end run."
+
+[lib]
+name = "png_stats"
+path = "src/lib.rs"
+
+[[bin]]
+name = "png-stats"
+path = "src/main.rs"
+
+[dependencies]
+png = "0.18"

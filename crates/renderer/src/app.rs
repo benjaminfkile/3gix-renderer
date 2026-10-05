@@ -16,7 +16,7 @@
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
 use crate::camera::Camera;
-use crate::config::Config;
+use crate::config::{Config, View};
 use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
@@ -87,10 +87,7 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         volumes_drawn: scene.volumes.len(),
         sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),
-        bytes_fetched: fetcher.map_or(0, Fetcher::bytes_fetched),
-        last_round_trip: fetcher
-            .and_then(Fetcher::last_round_trip)
-            .map(|d| d.as_secs_f64()),
+        ..MatterStats::from_tally(fetcher.map(Fetcher::tally).unwrap_or_default())
     }
 }
 
@@ -121,53 +118,214 @@ pub fn overlay_info(
     }
 }
 
-/// Renders one headless frame of `sim` from the `Home` view: integrates
-/// toward the launch offset (at most [`HEADLESS_CATCH_UP_ROUNDS`] clamped
-/// rounds), places the camera, streams the selected cells through
-/// `fetcher` until every one is resolved (at most
-/// [`HEADLESS_STREAM_SECONDS`]), and reads the image back.
+/// What a headless run renders and how long it waits for matter.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HeadlessRun {
+    /// Image width, pixels.
+    pub width: u32,
+    /// Image height, pixels.
+    pub height: u32,
+    /// The camera view.
+    pub view: View,
+    /// Factor on the view's distance from its frame origin.
+    pub view_distance_scale: f64,
+    /// Wait at most this long, seconds, for every selected and pinned cell
+    /// to be ready ([`World::ready`]). `None` waits at most
+    /// [`HEADLESS_STREAM_SECONDS`] for them to settle ([`World::settled`]).
+    pub wait_ready_seconds: Option<f64>,
+    /// Draw the overlay text, the frame markers, and the lines between
+    /// them into the image. Without them only matter is drawn.
+    pub overlay: bool,
+}
+
+impl HeadlessRun {
+    /// The `Home` view with the overlay, waiting as long as
+    /// [`HEADLESS_STREAM_SECONDS`].
+    pub fn home(width: u32, height: u32) -> HeadlessRun {
+        HeadlessRun {
+            width,
+            height,
+            view: View::Home,
+            view_distance_scale: 1.0,
+            wait_ready_seconds: None,
+            overlay: true,
+        }
+    }
+
+    /// The run a configuration asks for.
+    pub fn from_config(config: &Config) -> HeadlessRun {
+        HeadlessRun {
+            width: config.width,
+            height: config.height,
+            view: config.view,
+            view_distance_scale: config.view_distance_scale,
+            wait_ready_seconds: config.wait_ready_seconds,
+            overlay: config.overlay,
+        }
+    }
+}
+
+/// What a headless run saw: the overlay values and how the wait for
+/// matter ended. Written by `--stats-json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeadlessStats {
+    /// The view rendered.
+    pub view: View,
+    /// The overlay values at the rendered frame.
+    pub overlay: OverlayInfo,
+    /// Pinned far field cells, besides the selection.
+    pub cells_pinned: usize,
+    /// Every selected and pinned cell was ready when the frame was drawn.
+    pub ready: bool,
+    /// Wall-clock seconds spent streaming before drawing.
+    pub stream_seconds: f64,
+}
+
+impl HeadlessStats {
+    /// The statistics as a JSON object, keys in a fixed order.
+    pub fn to_json(&self) -> serde_json::Value {
+        let o = &self.overlay;
+        let m = &o.matter;
+        serde_json::json!({
+            "view": self.view.to_string(),
+            "sim_time_seconds_since_j2000": o.sim_time.value(),
+            "camera_frame": o.camera_frame,
+            "camera_distance_m": o.camera_distance,
+            "frames": o.frame_count,
+            "sim_lag": o.sim_lag,
+            "cells_selected": m.cells_selected,
+            "cells_pinned": self.cells_pinned,
+            "cells_ready": m.cells_ready,
+            "cells_pending": m.cells_pending,
+            "requests": m.requests,
+            "cells_fetched": m.cells_fetched,
+            "bytes_fetched": m.bytes_fetched,
+            "first_round_trip_seconds": m.first_round_trip,
+            "last_round_trip_seconds": m.last_round_trip,
+            "meshes_drawn": m.meshes_drawn,
+            "triangles_drawn": m.triangles_drawn,
+            "volumes_drawn": m.volumes_drawn,
+            "sprites_drawn": m.sprites_drawn,
+            "lights_active": m.lights_active,
+            "ready": self.ready,
+            "stream_seconds": self.stream_seconds,
+        })
+    }
+}
+
+/// One headless frame and its statistics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeadlessFrame {
+    /// The image read back.
+    pub image: Image,
+    /// What the run saw.
+    pub stats: HeadlessStats,
+}
+
+/// The camera of a view, at the view's distance scale. Fails when no frame
+/// has the number key the view names.
+pub fn view_camera(system: &FrameSystem, view: View, distance_scale: f64) -> Result<Camera> {
+    let camera = match view {
+        View::Home => Camera::home(system),
+        View::Key(index) => Camera::view_of_index(system, index)
+            .ok_or_else(|| anyhow!("no frame is bound to the number key of view {view}"))?,
+    };
+    Ok(camera.with_distance_scale(distance_scale))
+}
+
+/// Renders one headless frame of `sim` from the `Home` view (see
+/// [`render_headless_view`] and [`HeadlessRun::home`]).
 pub fn render_headless_frame(
     sim: &mut Simulation,
-    mut fetcher: Option<&mut Fetcher>,
+    fetcher: Option<&mut Fetcher>,
     width: u32,
     height: u32,
 ) -> Result<Image> {
+    Ok(render_headless_view(sim, fetcher, &HeadlessRun::home(width, height))?.image)
+}
+
+/// Renders one headless frame of `sim`: integrates toward the launch
+/// offset (at most [`HEADLESS_CATCH_UP_ROUNDS`] clamped rounds), places the
+/// camera for the run's view, streams the selected cells through
+/// `fetcher` until they are ready (or the wait ends), and reads the image
+/// back.
+pub fn render_headless_view(
+    sim: &mut Simulation,
+    mut fetcher: Option<&mut Fetcher>,
+    run: &HeadlessRun,
+) -> Result<HeadlessFrame> {
     for _ in 0..HEADLESS_CATCH_UP_ROUNDS {
         if !sim.integrate_toward_target().lagging {
             break;
         }
     }
-    let mut camera = Camera::home(&sim.system);
+    let (width, height) = (run.width, run.height);
+    let mut camera = view_camera(&sim.system, run.view, run.view_distance_scale)?;
     camera.update_parent(&sim.system);
     let mut world = World::new(default_threads());
     let start = Instant::now();
     world.select(&sim.system, &camera, (width, height), 0.0, true);
+    let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
+    let done = |world: &World| match run.wait_ready_seconds {
+        Some(_) => world.ready(),
+        None => world.settled(),
+    };
     if let Some(f) = fetcher.as_deref_mut() {
         loop {
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
             stream_step(&mut world, f, &sim.system, events, now);
-            if world.settled() {
+            if done(&world) {
                 break;
             }
-            if now > HEADLESS_STREAM_SECONDS {
-                tracing::warn!("not every cell arrived in time, rendering what did");
+            if now > limit {
+                tracing::warn!(seconds = limit, "not every cell arrived in time");
                 break;
             }
         }
     }
     world.finish_extraction();
-    let now = start.elapsed().as_secs_f64();
-    let scene = matter_scene(&mut world, &sim.system, &camera, (width, height), now);
+    let stream_seconds = start.elapsed().as_secs_f64();
+    let mut scene = matter_scene(
+        &mut world,
+        &sim.system,
+        &camera,
+        (width, height),
+        stream_seconds,
+    );
+    if !run.overlay {
+        // The markers and lines are visual aids like the text: only matter
+        // remains.
+        scene.markers.clear();
+        scene.lines.clear();
+    }
     let mut headless = Headless::new(width, height)?;
     tracing::info!(adapter = headless.adapter_name(), "headless rendering");
-    let stats = matter_stats(&world, fetcher.as_deref(), &scene);
-    let overlay = overlay_info(sim, &camera, None, stats).text();
-    headless.render(&scene, Some(&overlay))
+    let info = overlay_info(
+        sim,
+        &camera,
+        None,
+        matter_stats(&world, fetcher.as_deref(), &scene),
+    );
+    let text = info.text();
+    let image = headless.render(&scene, run.overlay.then_some(text.as_str()))?;
+    Ok(HeadlessFrame {
+        image,
+        stats: HeadlessStats {
+            view: run.view,
+            overlay: info,
+            cells_pinned: world.counts().cache.pinned,
+            ready: world.ready(),
+            stream_seconds,
+        },
+    })
 }
 
 /// The `--headless` run: one frame offscreen, written to the screenshot path
-/// if one was given. Cells are fetched through `client` on `runtime`.
+/// if one was given, with its statistics written to the `--stats-json`
+/// path. Cells are fetched through `client` on `runtime`. With
+/// `--wait-ready-seconds`, fails after writing both when the selection was
+/// not ready in time.
 pub fn run_headless(
     config: &Config,
     system: FrameSystem,
@@ -176,13 +334,30 @@ pub fn run_headless(
 ) -> Result<()> {
     let mut sim = launch_simulation(system, config);
     let mut fetcher = Fetcher::new(runtime, client);
-    let image = render_headless_frame(&mut sim, Some(&mut fetcher), config.width, config.height)?;
+    let run = HeadlessRun::from_config(config);
+    let frame = render_headless_view(&mut sim, Some(&mut fetcher), &run)?;
     match &config.screenshot {
         Some(path) => {
-            image.write_png(path)?;
+            frame.image.write_png(path)?;
             tracing::info!(path = %path.display(), "screenshot written");
         }
         None => tracing::info!("headless frame rendered"),
+    }
+    if let Some(path) = &config.stats_json {
+        let json = serde_json::to_string_pretty(&frame.stats.to_json())?;
+        std::fs::write(path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
+        tracing::info!(path = %path.display(), "statistics written");
+    }
+    if let Some(limit) = config.wait_ready_seconds {
+        if !frame.stats.ready {
+            let m = &frame.stats.overlay.matter;
+            return Err(anyhow!(
+                "the selection was not ready after {limit} s: {} of {} selected cells ready, {} pending",
+                m.cells_ready,
+                m.cells_selected,
+                m.cells_pending
+            ));
+        }
     }
     Ok(())
 }

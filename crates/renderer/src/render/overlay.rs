@@ -10,6 +10,7 @@
 //! section 6).
 
 use crate::sim::SECONDS_PER_DAY;
+use crate::stream::FetchTally;
 use gx_core::units::Seconds;
 
 /// Left and top margin of the overlay, pixels.
@@ -40,10 +41,30 @@ pub struct MatterStats {
     pub sprites_drawn: usize,
     /// Point lights in use.
     pub lights_active: usize,
+    /// Chunk requests finished this session, whatever the hub answered.
+    pub requests: u64,
+    /// Chunk requests answered with a body (`200`) this session.
+    pub cells_fetched: u64,
     /// Chunk body bytes received this session.
     pub bytes_fetched: u64,
+    /// Round-trip time of the first chunk request, seconds.
+    pub first_round_trip: Option<f64>,
     /// Round-trip time of the latest chunk request, seconds.
     pub last_round_trip: Option<f64>,
+}
+
+impl MatterStats {
+    /// The fetch values from a fetcher's totals, every other value zero.
+    pub fn from_tally(t: FetchTally) -> MatterStats {
+        MatterStats {
+            requests: t.requests,
+            cells_fetched: t.bodies,
+            bytes_fetched: t.bytes,
+            first_round_trip: t.first_round_trip.map(|d| d.as_secs_f64()),
+            last_round_trip: t.last_round_trip.map(|d| d.as_secs_f64()),
+            ..MatterStats::default()
+        }
+    }
 }
 
 /// The values the overlay reports.
@@ -103,13 +124,18 @@ impl OverlayInfo {
             "volumes {}  sprites {}",
             m.volumes_drawn, m.sprites_drawn
         ));
+        let rtt = |t: Option<f64>| match t {
+            Some(s) => format!("{s:.3} s"),
+            None => "-".to_string(),
+        };
         lines.push(format!(
-            "fetched {} B  rtt {}",
-            m.bytes_fetched,
-            match m.last_round_trip {
-                Some(s) => format!("{s:.3} s"),
-                None => "-".to_string(),
-            }
+            "requests {}  fetched {} cells {} B",
+            m.requests, m.cells_fetched, m.bytes_fetched
+        ));
+        lines.push(format!(
+            "rtt first {}  last {}",
+            rtt(m.first_round_trip),
+            rtt(m.last_round_trip)
         ));
         if self.sim_lag {
             lines.push("sim lag".to_string());
@@ -157,7 +183,10 @@ mod tests {
                 volumes_drawn: 2,
                 sprites_drawn: 7,
                 lights_active: 1,
+                requests: 20,
+                cells_fetched: 11,
                 bytes_fetched: 1_048_576,
+                first_round_trip: Some(0.25),
                 last_round_trip: Some(0.0425),
             },
         }
@@ -174,8 +203,9 @@ mod tests {
         assert_eq!(l[5], "cells selected 12  ready 9  pending 3");
         assert_eq!(l[6], "meshes 4  triangles 5120  lights 1");
         assert_eq!(l[7], "volumes 2  sprites 7");
-        assert_eq!(l[8], "fetched 1048576 B  rtt 0.043 s");
-        assert_eq!(l.len(), 9);
+        assert_eq!(l[8], "requests 20  fetched 11 cells 1048576 B");
+        assert_eq!(l[9], "rtt first 0.250 s  last 0.043 s");
+        assert_eq!(l.len(), 10);
     }
 
     #[test]
@@ -191,7 +221,8 @@ mod tests {
         .lines();
         assert_eq!(l[1], "time scale 0.25x (paused)");
         assert_eq!(l[4], "fps -");
-        assert_eq!(l[8], "fetched 0 B  rtt -");
-        assert_eq!(l[9], "sim lag");
+        assert_eq!(l[8], "requests 0  fetched 0 cells 0 B");
+        assert_eq!(l[9], "rtt first -  last -");
+        assert_eq!(l[10], "sim lag");
     }
 }
