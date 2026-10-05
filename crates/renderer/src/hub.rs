@@ -251,6 +251,20 @@ impl HubClient {
         if let Some(bytes) = self.ready.lock().expect("cache lock").get(key) {
             return ChunkFetch::Ready(bytes.clone());
         }
+        let outcome = self.fetch_chunk_uncached(key).await;
+        if let ChunkFetch::Ready(bytes) = &outcome {
+            self.ready
+                .lock()
+                .expect("cache lock")
+                .insert(key.to_string(), bytes.clone());
+        }
+        outcome
+    }
+
+    /// Fetches one chunk without the session cache: the request always goes
+    /// out and a `200` body is not kept. For callers with their own cache,
+    /// such as [`crate::stream::CellCache`], which evicts.
+    pub async fn fetch_chunk_uncached(&self, key: &str) -> ChunkFetch {
         let resp = match self
             .http
             .get(self.chunk_url(key))
@@ -265,14 +279,7 @@ impl HubClient {
             return outcome;
         }
         match resp.bytes().await {
-            Ok(body) => {
-                let bytes: Arc<[u8]> = Arc::from(body.as_ref());
-                self.ready
-                    .lock()
-                    .expect("cache lock")
-                    .insert(key.to_string(), bytes.clone());
-                ChunkFetch::Ready(bytes)
-            }
+            Ok(body) => ChunkFetch::Ready(Arc::from(body.as_ref())),
             Err(e) => ChunkFetch::Error(format!("reading body failed: {}", e.without_url())),
         }
     }

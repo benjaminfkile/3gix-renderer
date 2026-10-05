@@ -18,6 +18,13 @@
 //!   simulation time (`space-model.md` section 6).
 //! - [`camera`]: the free camera parented to its nearest frame, the floating
 //!   origin of `space-model.md` section 5.
+//! - [`stream`]: cell selection, the cell cache, decoding and compositing,
+//!   and the depth transition rule (`space-model.md` sections 2, 5, 7, 8).
+//! - [`extract`]: surface extraction by marching cubes on a worker pool.
+//! - [`light`]: lights and emission from hot matter (`matter-format.md`
+//!   section 3.3).
+//! - [`world`]: the matter pipeline from selection to drawable meshes and
+//!   lights.
 //! - [`render`]: camera-relative scene data, the wgpu renderer, the overlay,
 //!   and the headless offscreen target.
 //! - [`app`]: the desktop window loop and the headless screenshot run
@@ -31,8 +38,12 @@
 
 pub mod camera;
 pub mod config;
+pub mod extract;
+pub mod light;
 pub mod render;
 pub mod sim;
+pub mod stream;
+pub mod world;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod app;

@@ -2,7 +2,8 @@
 //!
 //! Loads the configuration ([`renderer::config`]), connects to the hub and
 //! loads the frame registry ([`renderer::hub`]), then opens a window or
-//! renders one headless frame ([`renderer::app`]). Exits with a clear error
+//! renders one headless frame ([`renderer::app`]), streaming matter cells
+//! from the hub on the same runtime. Exits with a clear error
 //! and a non-zero status when the configuration is incomplete or the
 //! registry is invalid or never becomes ready.
 
@@ -10,6 +11,7 @@ use anyhow::Result;
 use renderer::config::{load_env, parse_flags, Config, USAGE};
 use renderer::hub::{load_registry, HubClient, ReadyPolicy};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -38,13 +40,15 @@ fn run() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let system = runtime.block_on(async {
+    let (client, system) = runtime.block_on(async {
         let client = HubClient::connect(&config).await?;
-        load_registry(&client, ReadyPolicy::default()).await
+        let system = load_registry(&client, ReadyPolicy::default()).await?;
+        anyhow::Ok((Arc::new(client), system))
     })?;
+    let handle = runtime.handle().clone();
     if config.headless {
-        renderer::app::run_headless(&config, system)
+        renderer::app::run_headless(&config, system, client, handle)
     } else {
-        renderer::app::run_windowed(&config, system)
+        renderer::app::run_windowed(&config, system, client, handle)
     }
 }

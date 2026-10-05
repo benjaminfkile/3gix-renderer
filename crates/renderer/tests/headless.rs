@@ -49,6 +49,7 @@ fn home_view_renders_markers_and_overlay_deterministically() {
         frame_count: system.tree().frames().len(),
         fps: None,
         sim_lag: false,
+        matter: Default::default(),
     }
     .text();
 

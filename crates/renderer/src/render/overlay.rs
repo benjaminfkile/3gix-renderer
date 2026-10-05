@@ -21,6 +21,27 @@ pub const TEXT_PX: f32 = 16.0;
 /// Text color, linear RGBA.
 pub const TEXT_COLOR: [f32; 4] = [0.9, 0.92, 0.95, 1.0];
 
+/// The matter pipeline values the overlay reports.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct MatterStats {
+    /// Cells in the latest selection.
+    pub cells_selected: usize,
+    /// Selected cells fetched and composited (or known empty).
+    pub cells_ready: usize,
+    /// Selected cells requested or waiting for the hub.
+    pub cells_pending: usize,
+    /// Meshes drawn this frame.
+    pub meshes_drawn: usize,
+    /// Triangles drawn this frame.
+    pub triangles_drawn: usize,
+    /// Point lights in use.
+    pub lights_active: usize,
+    /// Chunk body bytes received this session.
+    pub bytes_fetched: u64,
+    /// Round-trip time of the latest chunk request, seconds.
+    pub last_round_trip: Option<f64>,
+}
+
 /// The values the overlay reports.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct OverlayInfo {
@@ -40,6 +61,8 @@ pub struct OverlayInfo {
     pub fps: Option<f64>,
     /// `true` when the integrator was clamped this frame.
     pub sim_lag: bool,
+    /// The matter pipeline.
+    pub matter: MatterStats,
 }
 
 impl OverlayInfo {
@@ -63,6 +86,23 @@ impl OverlayInfo {
                 None => "fps -".to_string(),
             },
         ];
+        let m = &self.matter;
+        lines.push(format!(
+            "cells selected {}  ready {}  pending {}",
+            m.cells_selected, m.cells_ready, m.cells_pending
+        ));
+        lines.push(format!(
+            "meshes {}  triangles {}  lights {}",
+            m.meshes_drawn, m.triangles_drawn, m.lights_active
+        ));
+        lines.push(format!(
+            "fetched {} B  rtt {}",
+            m.bytes_fetched,
+            match m.last_round_trip {
+                Some(s) => format!("{s:.3} s"),
+                None => "-".to_string(),
+            }
+        ));
         if self.sim_lag {
             lines.push("sim lag".to_string());
         }
@@ -100,6 +140,16 @@ mod tests {
             frame_count: 6,
             fps: Some(59.94),
             sim_lag: false,
+            matter: MatterStats {
+                cells_selected: 12,
+                cells_ready: 9,
+                cells_pending: 3,
+                meshes_drawn: 4,
+                triangles_drawn: 5120,
+                lights_active: 1,
+                bytes_fetched: 1_048_576,
+                last_round_trip: Some(0.0425),
+            },
         }
     }
 
@@ -111,7 +161,10 @@ mod tests {
         assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m");
         assert_eq!(l[3], "frames 6");
         assert_eq!(l[4], "fps 59.9");
-        assert_eq!(l.len(), 5);
+        assert_eq!(l[5], "cells selected 12  ready 9  pending 3");
+        assert_eq!(l[6], "meshes 4  triangles 5120  lights 1");
+        assert_eq!(l[7], "fetched 1048576 B  rtt 0.043 s");
+        assert_eq!(l.len(), 8);
     }
 
     #[test]
@@ -121,11 +174,13 @@ mod tests {
             paused: true,
             fps: None,
             sim_lag: true,
+            matter: MatterStats::default(),
             ..info()
         }
         .lines();
         assert_eq!(l[1], "time scale 0.25x (paused)");
         assert_eq!(l[4], "fps -");
-        assert_eq!(l[5], "sim lag");
+        assert_eq!(l[7], "fetched 0 B  rtt -");
+        assert_eq!(l[8], "sim lag");
     }
 }

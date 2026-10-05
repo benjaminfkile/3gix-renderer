@@ -42,6 +42,17 @@ asks for more than 20000 integration steps of 600 s in one rendered frame,
 the overlay shows `sim lag` and the frames catch up over the following
 rendered frames; the integrator is never skipped.
 
+## Exposure
+
+| Input | Action |
+|---|---|
+| `=` / numpad `+` | Brighten: exposure bias up half a stop |
+| `-` / numpad `-` | Darken: exposure bias down half a stop |
+
+Exposure follows the log-average luminance of the lit pixels on screen with
+a 0.5 s adaptation; the bias, between -16 and +16 stops, applies on top. See
+`docs/shading.md`.
+
 ## Window
 
 | Input | Action |

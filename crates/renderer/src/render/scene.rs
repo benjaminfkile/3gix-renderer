@@ -18,11 +18,16 @@
 //! infinity, the depth buffer clears to 0, and the depth test keeps the
 //! greater value. With the infinite far plane the only plane to choose is the
 //! near one, which is set per frame from the nearest visible marker (see
-//! [`near_plane`]), so precision is spent where the nearest matter is.
+//! [`near_plane`]) and pulled in to the nearest drawn mesh (see
+//! [`add_matter`]), so precision is spent where the nearest matter is.
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::extract::SurfaceMesh;
+use crate::light::PointLight;
+use crate::world::DrawList;
 use gx_core::frames::FrameSystem;
 use gx_core::units::Vec3;
+use std::sync::Arc;
 
 /// The near plane never moves closer than this, meters.
 pub const MIN_NEAR: f64 = 1.0e-3;
@@ -55,6 +60,22 @@ pub struct LineVertex {
     pub color: [f32; 4],
 }
 
+/// One cell's surface mesh placed for drawing.
+///
+/// The mesh is uploaded once with positions relative to its cell origin
+/// (`f32`, cell-sized values). Each frame the cell origin is made relative
+/// to the camera in `f64` with [`FrameSystem::relative`] and only that
+/// offset is cast to `f32`: the model transform of the draw.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceDraw {
+    /// The mesh, positions in its frame's coordinates.
+    pub mesh: Arc<SurfaceMesh>,
+    /// Cell origin relative to the camera, root axes, meters.
+    pub offset: [f32; 3],
+    /// Columns of the rotation from the frame axes into root axes.
+    pub rotation: [[f32; 3]; 3],
+}
+
 /// Everything one render pass draws, in camera-relative `f32`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
@@ -62,6 +83,10 @@ pub struct Scene {
     pub markers: Vec<Marker>,
     /// Pairs of vertices: each frame origin to its parent origin.
     pub lines: Vec<LineVertex>,
+    /// Surfaces of the drawn cells, in key order.
+    pub surfaces: Vec<SurfaceDraw>,
+    /// Point lights from hot matter, strongest first.
+    pub lights: Vec<PointLight>,
     /// Rotation from root axes into camera axes, column major.
     pub view_rotation: [[f32; 4]; 4],
     /// Near plane distance, meters.
@@ -167,9 +192,58 @@ pub fn build_scene(system: &FrameSystem, camera: &Camera, aspect: f64) -> Scene 
     Scene {
         markers,
         lines,
+        surfaces: Vec::new(),
+        lights: Vec::new(),
         view_rotation,
         near: near_plane(in_camera_axes, aspect) as f32,
         fov_y: FIELD_OF_VIEW_Y as f32,
+    }
+}
+
+/// Distance from a point to an axis aligned box, 0 inside.
+fn box_distance(p: Vec3, lo: [f64; 3], hi: [f64; 3]) -> f64 {
+    let gap = |c: f64, l: f64, h: f64| (l - c).max(c - h).max(0.0);
+    Vec3::new(
+        gap(p.x, lo[0], hi[0]),
+        gap(p.y, lo[1], hi[1]),
+        gap(p.z, lo[2], hi[2]),
+    )
+    .length()
+}
+
+/// Adds the matter of a [`DrawList`] to a scene built by [`build_scene`]:
+/// every mesh placed relative to the camera, the lights, and a near plane
+/// pulled in to [`NEAR_FRACTION`] of the distance to the nearest mesh
+/// bounds (at least [`MIN_NEAR`]) when that is closer than the markers.
+pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw: &DrawList) {
+    let mut nearest = f64::INFINITY;
+    for mesh in &draw.meshes {
+        let frame = mesh.key.frame_id;
+        let offset = camera.relative(system, mesh.origin, frame);
+        let q = system.root_orientation(frame);
+        let col = |v: Vec3| {
+            let r = q.rotate(v);
+            [r.x as f32, r.y as f32, r.z as f32]
+        };
+        let cam = system
+            .root_orientation(frame)
+            .conjugate()
+            .rotate(system.relative(camera.position, camera.frame_id, Vec3::zero(), frame));
+        nearest = nearest.min(box_distance(cam, mesh.bounds_min, mesh.bounds_max));
+        scene.surfaces.push(SurfaceDraw {
+            mesh: mesh.clone(),
+            offset: to_f32(offset),
+            rotation: [
+                col(Vec3::new(1.0, 0.0, 0.0)),
+                col(Vec3::new(0.0, 1.0, 0.0)),
+                col(Vec3::new(0.0, 0.0, 1.0)),
+            ],
+        });
+    }
+    scene.lights = draw.lights.clone();
+    if nearest.is_finite() {
+        let near = (nearest * NEAR_FRACTION).max(MIN_NEAR) as f32;
+        scene.near = scene.near.min(near);
     }
 }
 
