@@ -60,7 +60,10 @@ on that view's distance from its frame origin), `--wait-ready-seconds <f64>`
 (wait until every selected cell is ready and exit non-zero if that takes
 longer), `--stats-json <path.json>` (the overlay statistics: cells selected
 and fetched, bytes, the first and last round trip), and `--no-overlay`
-(matter only: no overlay text, frame markers, or lines):
+(matter only: no overlay text, frame markers, or lines).
+`--exposure-stops <f64>`, in the window too, fixes the exposure instead of
+adapting it, in stops relative to the automatic exposure of a scene whose
+log-average luminance is 1 W m^-2 sr^-1 (`docs/shading.md`):
 
 ```sh
 cargo run --release --bin gx-renderer -- --screenshot frame-3.png --view 3 \

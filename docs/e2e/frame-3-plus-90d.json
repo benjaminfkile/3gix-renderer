@@ -7,18 +7,84 @@
   "cells_pinned": 9,
   "cells_ready": 513,
   "cells_selected": 513,
-  "first_round_trip_seconds": 0.006176666,
+  "exposure_fixed_stops": null,
+  "first_round_trip_seconds": 0.005721542,
   "frames": 11,
-  "last_round_trip_seconds": 0.003890209,
+  "last_round_trip_seconds": 0.005200875,
   "lights_active": 1,
   "meshes_drawn": 8,
   "ready": true,
   "requests": 942,
   "sim_lag": false,
   "sim_time_seconds_since_j2000": 7776000.0,
+  "sprites": [
+    {
+      "frame_id": 1,
+      "irradiance_w_m2": 1221.0784013307439,
+      "position_px": null,
+      "size_px": 6.0
+    },
+    {
+      "frame_id": 2,
+      "irradiance_w_m2": 7.205253252380859e-8,
+      "position_px": [
+        -20480.66015625,
+        1713.823974609375
+      ],
+      "size_px": 2.857649326324463
+    },
+    {
+      "frame_id": 4,
+      "irradiance_w_m2": 1.2198137667448273e-7,
+      "position_px": null,
+      "size_px": 3.0862934589385986
+    },
+    {
+      "frame_id": 5,
+      "irradiance_w_m2": 5.896373970582813e-9,
+      "position_px": null,
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 6,
+      "irradiance_w_m2": 8.613301437480327e-8,
+      "position_px": null,
+      "size_px": 2.9351696968078613
+    },
+    {
+      "frame_id": 7,
+      "irradiance_w_m2": 4.808128758708738e-9,
+      "position_px": null,
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 8,
+      "irradiance_w_m2": 4.195240031214465e-11,
+      "position_px": [
+        1133.983154296875,
+        869.9940795898438
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 9,
+      "irradiance_w_m2": 6.297988418764959e-12,
+      "position_px": [
+        855.6387329101562,
+        912.1082763671875
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 10,
+      "irradiance_w_m2": 2.6441400228783218e-9,
+      "position_px": null,
+      "size_px": 2.0
+    }
+  ],
   "sprites_drawn": 9,
-  "stream_seconds": 10.373431963,
-  "triangles_drawn": 41008,
+  "stream_seconds": 10.389767046,
+  "triangles_drawn": 21494,
   "view": "key 3",
   "volumes_drawn": 0
 }

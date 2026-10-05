@@ -67,6 +67,9 @@ FLAGS:
     --stats-json <path.json>       headless: write the overlay statistics as JSON
     --no-overlay                   headless: leave the overlay text, frame markers, and lines
                                    out of the image, drawing matter only
+    --exposure-stops <f64>         fixed exposure, stops relative to the automatic exposure of a
+                                   scene whose log-average luminance is 1 W m^-2 sr^-1; turns
+                                   adaptation off, + and - change it (default: automatic)
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
@@ -173,6 +176,10 @@ pub struct Config {
     /// Draw the overlay text, the frame markers, and the lines between them
     /// (headless; the window always draws them).
     pub overlay: bool,
+    /// A fixed exposure, stops relative to the automatic exposure of the
+    /// reference scene ([`crate::render::gpu::fixed_exposure`]); `None`
+    /// adapts to the scene.
+    pub exposure_stops: Option<f64>,
 }
 
 /// The command line flags, each `None` when not given.
@@ -200,6 +207,8 @@ pub struct Flags {
     pub stats_json: Option<PathBuf>,
     /// `--no-overlay`.
     pub no_overlay: bool,
+    /// `--exposure-stops`.
+    pub exposure_stops: Option<f64>,
     /// `--hub-url`.
     pub hub_url: Option<String>,
     /// `--space-id`.
@@ -280,6 +289,7 @@ where
             }
             "--stats-json" => flags.stats_json = Some(PathBuf::from(value(&name)?)),
             "--no-overlay" => flags.no_overlay = true,
+            "--exposure-stops" => flags.exposure_stops = Some(parse_f64(&name, &value(&name)?)?),
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
             "--build-id" => flags.build_id = Some(value(&name)?),
@@ -385,6 +395,7 @@ impl Config {
             wait_ready_seconds: flags.wait_ready_seconds,
             stats_json: flags.stats_json.clone(),
             overlay: !flags.no_overlay,
+            exposure_stops: flags.exposure_stops,
         })
     }
 }
@@ -463,6 +474,7 @@ mod tests {
         assert_eq!(c.wait_ready_seconds, None);
         assert_eq!(c.stats_json, None);
         assert!(c.overlay);
+        assert_eq!(c.exposure_stops, None);
     }
 
     #[test]
@@ -476,9 +488,18 @@ mod tests {
             "--stats-json",
             "s.json",
             "--no-overlay",
+            "--exposure-stops=12.75",
         ])
         .unwrap();
         let c = Config::resolve(&base_env(), &flags).unwrap();
+        assert_eq!(c.exposure_stops, Some(12.75));
+        assert!(parse_flags(["--exposure-stops", "bright"]).is_err());
+        assert_eq!(
+            parse_flags(["--exposure-stops", "-3"])
+                .unwrap()
+                .exposure_stops,
+            Some(-3.0)
+        );
         assert_eq!(c.view, View::Key(2));
         assert_eq!(c.view_distance_scale, 0.25);
         assert_eq!(c.wait_ready_seconds, Some(120.0));

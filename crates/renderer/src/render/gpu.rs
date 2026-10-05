@@ -62,8 +62,27 @@ pub const OVERLAY_FONT: &[u8] = epaint_default_fonts::HACK_REGULAR;
 /// Time constant of the exposure adaptation, seconds.
 pub const ADAPTATION_SECONDS: f64 = 0.5;
 
-/// Exposure bias change per `+` or `-` key press, stops.
+/// Exposure bias change per `+` or `-` key press, stops. The same step
+/// changes a fixed exposure.
 pub const EXPOSURE_STEP_STOPS: f64 = 0.5;
+
+/// Middle grey: the luminance the exposure maps the log-average (automatic)
+/// or the reference luminance (fixed) to, before the tone curve.
+pub const EXPOSURE_KEY: f64 = 0.18;
+
+/// The luminance of the reference scene a fixed exposure is relative to,
+/// W m^-2 sr^-1: a scene whose log-average luminance is exactly this has
+/// the automatic exposure `EXPOSURE_KEY / REFERENCE_LUMINANCE` at bias 0,
+/// and a fixed exposure of `s` stops is that value times `2^s`.
+pub const REFERENCE_LUMINANCE: f64 = 1.0;
+
+/// The multiplier a fixed exposure of `stops` applies to the radiance
+/// before the tone curve: `EXPOSURE_KEY * 2^stops / REFERENCE_LUMINANCE`,
+/// in m^2 sr W^-1. At 0 stops a radiance of 1 W m^-2 sr^-1 lands on middle
+/// grey (0.18 before the curve); each stop doubles the multiplier.
+pub fn fixed_exposure(stops: f64) -> f64 {
+    EXPOSURE_KEY * stops.exp2() / REFERENCE_LUMINANCE
+}
 
 /// Pixels per side of one block of the luminance reduction.
 const LUMINANCE_BLOCK: u32 = 16;
@@ -85,8 +104,12 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
 /// How one frame is exposed.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Exposure {
-    /// User exposure bias, stops (`+` and `-` keys).
+    /// User exposure bias, stops (`+` and `-` keys). Ignored when the
+    /// exposure is fixed.
     pub bias_stops: f64,
+    /// A fixed exposure, stops relative to [`REFERENCE_LUMINANCE`] (see
+    /// [`fixed_exposure`]); `None` adapts to the scene.
+    pub fixed_stops: Option<f64>,
     /// Wall-clock seconds since the previous frame, for the adaptation; or
     /// `None` to jump straight to this frame's luminance (headless renders,
     /// so one render of one state is always the same image).
@@ -173,10 +196,11 @@ struct SpriteInstance {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct ExposureParams {
-    bias_stops: f32,
+    /// The bias, or the fixed exposure in stops when `fixed` is 1.
+    stops: f32,
     alpha: f32,
     partial_count: u32,
-    pad: u32,
+    fixed: u32,
 }
 
 #[repr(C)]
@@ -1347,10 +1371,10 @@ impl Renderer {
             self.queue.write_buffer(&self.models, 0, &model_bytes);
         }
         let params = ExposureParams {
-            bias_stops: exposure.bias_stops as f32,
+            stops: exposure.fixed_stops.unwrap_or(exposure.bias_stops) as f32,
             alpha: exposure.alpha(),
             partial_count: self.targets.partial_count,
-            pad: 0,
+            fixed: u32::from(exposure.fixed_stops.is_some()),
         };
         self.queue
             .write_buffer(&self.exposure_params, 0, bytemuck::bytes_of(&params));

@@ -13,7 +13,7 @@ use super::hub::{now_seconds, WebFetcher};
 use crate::camera::Camera;
 use crate::controls::Controls;
 use crate::extract::default_threads;
-use crate::render::gpu::{wanted_features, Exposure, Renderer};
+use crate::render::gpu::{wanted_features, Renderer};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 use crate::render::scene::{matter_scene, Scene};
 use crate::sim::Simulation;
@@ -196,10 +196,7 @@ impl WebApp {
         self.world.evict(t);
         let scene = matter_scene(&mut self.world, &self.sim.system, &self.camera, size, t);
         let overlay = self.overlay(&scene, fps);
-        let exposure = Exposure {
-            bias_stops: self.controls.exposure_bias,
-            adapt_seconds: Some(dt),
-        };
+        let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -228,6 +225,7 @@ impl WebApp {
             frame_count: self.sim.system.tree().frames().len(),
             fps,
             sim_lag: self.sim.lagging(),
+            exposure_fixed: self.controls.exposure_fixed,
             matter: MatterStats {
                 cells_selected: counts.cache.selected,
                 cells_ready: counts.cache.ready,

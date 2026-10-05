@@ -7,17 +7,86 @@
   "cells_pinned": 9,
   "cells_ready": 513,
   "cells_selected": 513,
-  "first_round_trip_seconds": 0.00531075,
+  "exposure_fixed_stops": null,
+  "first_round_trip_seconds": 0.005098041,
   "frames": 11,
-  "last_round_trip_seconds": 0.038351958,
+  "last_round_trip_seconds": 0.018672084,
   "lights_active": 1,
   "meshes_drawn": 0,
   "ready": true,
   "requests": 1034,
   "sim_lag": false,
   "sim_time_seconds_since_j2000": 0.0,
+  "sprites": [
+    {
+      "frame_id": 2,
+      "irradiance_w_m2": 0.000020265702248519762,
+      "position_px": [
+        121.15827941894531,
+        792.2879638671875
+      ],
+      "size_px": 5.306761741638184
+    },
+    {
+      "frame_id": 3,
+      "irradiance_w_m2": 0.00010845467672678312,
+      "position_px": null,
+      "size_px": 6.0
+    },
+    {
+      "frame_id": 4,
+      "irradiance_w_m2": 0.00002072406356449233,
+      "position_px": null,
+      "size_px": 5.316474914550781
+    },
+    {
+      "frame_id": 5,
+      "irradiance_w_m2": 5.846664674322124e-7,
+      "position_px": [
+        11039.494140625,
+        169.19955444335938
+      ],
+      "size_px": 3.7669081687927246
+    },
+    {
+      "frame_id": 6,
+      "irradiance_w_m2": 5.002767111868488e-6,
+      "position_px": null,
+      "size_px": 4.699210166931152
+    },
+    {
+      "frame_id": 7,
+      "irradiance_w_m2": 2.7856115860668586e-7,
+      "position_px": null,
+      "size_px": 3.444920539855957
+    },
+    {
+      "frame_id": 8,
+      "irradiance_w_m2": 2.3037338398319467e-9,
+      "position_px": [
+        1111.427490234375,
+        865.8303833007812
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 9,
+      "irradiance_w_m2": 3.549613559885389e-10,
+      "position_px": [
+        853.3253173828125,
+        908.993408203125
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 10,
+      "irradiance_w_m2": 4.4932552388798527e-7,
+      "position_px": null,
+      "size_px": 3.6525611877441406
+    }
+  ],
   "sprites_drawn": 9,
-  "stream_seconds": 18.984536216,
+  "stream_seconds": 19.05753905,
   "triangles_drawn": 0,
   "view": "key 1",
   "volumes_drawn": 198

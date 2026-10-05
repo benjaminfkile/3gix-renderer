@@ -59,7 +59,7 @@ The state of a sample decides how it is drawn:
 
 | State | Drawn as |
 |---|---|
-| solid, fluid | a surface: marching cubes at half the largest solid or fluid density of the cell (`docs/architecture.md`) |
+| solid, fluid | a surface: marching cubes at half the largest solid or fluid density of the cell, padded at each face by the neighbor's samples or by clamping (`docs/architecture.md`, the padding rule) |
 | gas, plasma | a volume: ray marched |
 
 Extraction counts gas and plasma as vacuum and the volume counts solid and
@@ -138,12 +138,17 @@ cache fetches once for this purpose and keeps (pinned, never evicted):
   frame, and for a frame in the transition whose cells are beyond the
   selection range (`gx_core::lod` culls cells farther than
   `4 * root_extent`), so a far hot frame keeps lighting the rest.
-- **Cold**: the active lights reflected by a Lambertian disc of radius
-  `R = root_extent / 8` facing each light, with the mass-weighted mean
-  albedo `a` of the cell: `E = sum a E_l R^2 max(0, cos theta) / D^2`, with
-  `E_l` the irradiance from the light at the frame and `theta` the angle at
-  the frame between the light and the camera. A frame seen from its lit side
-  is a dot, one seen from its dark side or with no light is nothing.
+- **Cold**: the active lights reflected by a Lambertian ball of radius
+  `R = root_extent / 8` with the mass-weighted mean albedo `a` of the cell:
+  `E = sum (2/3) a E_l R^2 phi(alpha) / D^2`, with `E_l` the irradiance from
+  the light at the frame, `alpha` the phase angle (at the frame, between the
+  light and the camera), and `phi(alpha) = (sin alpha + (pi - alpha)
+  cos alpha) / pi` the Lambertian phase function (`farfield::lambert_ball_phase`):
+  1 at full phase, `1 / pi` at a right angle, 0 only with the light straight
+  behind the frame. A frame seen past a right angle from its light still
+  shows its lit crescent as a dim dot; with no light it is nothing. (Before
+  D5 the model was a disc facing each light, `a E_l R^2 max(0, cos theta) /
+  D^2`, which put every frame seen past a right angle at exactly 0.)
 
 The sprite is a disc `s` pixels across, `s = 2 + log10(Y / 1e-8 W m^-2)`
 clamped to 2 to 6 (`Y` the luminance-weighted irradiance), with a flat
@@ -164,8 +169,8 @@ under them.
 
 ## Exposure
 
-The radiance target spans many orders of magnitude, so exposure is
-automatic:
+The radiance target spans many orders of magnitude, so by default exposure
+is automatic:
 
 1. A compute pass sums `ln(Y)` over every covered pixel whose luminance `Y`
    is above 1e-12 W m^-2 sr^-1, in 16 x 16 blocks, with
@@ -181,6 +186,33 @@ automatic:
 4. The exposure is `0.18 * 2^bias / Y_adapted`: the log-average maps to
    middle grey, and the user bias (`+` and `-`, half a stop per press,
    between -16 and +16 stops) shifts it.
+
+### Fixed exposure
+
+`--exposure-stops <s>` fixes the exposure and turns adaptation off. The
+number is in stops relative to a reference: the automatic exposure (bias 0)
+of a scene whose log-average luminance is exactly `Y_ref = 1 W m^-2 sr^-1`
+(`render::gpu::REFERENCE_LUMINANCE`). The exposure is then
+
+```
+exposure = 0.18 * 2^s / Y_ref    (m^2 sr W^-1)
+```
+
+so at `s = 0` a radiance of 1 W m^-2 sr^-1 lands on middle grey (0.18
+before the tone curve, 0.267 after it, 141 in the 8-bit sRGB image), and a
+radiance `L` lands there at `s = log2(Y_ref / L)`. Nothing in it depends on
+the image, the device, or the frame time, so one number means the same
+exposure everywhere. `+` and `-` change the fixed value by half a stop,
+between -64 and +64 stops, and the overlay shows `exposure fixed <s>`; with
+the automatic exposure it shows `exposure auto`. `tests/farfield.rs` checks
+that a grey sprite of radiance `L` alone in view gives the same pixels at
+the automatic exposure and at `s = log2(Y_ref / L)`.
+
+A far field sprite delivering an irradiance `E` (luminance weighted) is a
+disc `s_px` across with radiance `E f^2 / (pi (s_px / 2)^2)` (above), so the
+exposure that puts it on middle grey is
+`log2(Y_ref pi (s_px / 2)^2 / (E f^2))` stops. `scripts/e2e.sh` uses that
+for `home.png`.
 
 ## Tone curve
 
@@ -223,6 +255,7 @@ matter.
    depth buffer, no depth writes).
 3. Sprite pass: far field sprites, added, tested against the surface depth,
    no depth writes.
-4. Exposure compute passes.
+4. Exposure compute passes (the reduction runs for a fixed exposure too,
+   the adaptation does not).
 5. Display pass: the tone-mapped radiance as a full-screen triangle, then
    lines and markers against the surface depth, then the overlay text.

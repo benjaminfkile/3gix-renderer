@@ -9,6 +9,10 @@
 //    log-average luminance is exp(sum / count). The adapted luminance moves
 //    toward it in log space by params.alpha (1 - exp(-dt / 0.5 s), or 1 to
 //    jump straight there), and the exposure is KEY * 2^bias / adapted.
+//    A fixed exposure (params.fixed = 1) skips the adaptation: the exposure
+//    is KEY * 2^stops / REFERENCE_LUMINANCE, the automatic exposure of a
+//    scene whose log-average luminance is REFERENCE_LUMINANCE, shifted by
+//    the fixed stops. The sums are still taken for the pixel count.
 // 3. fs_tonemap: scales the float target by the exposure and applies the
 //    filmic curve. The output target encodes sRGB.
 //
@@ -22,6 +26,8 @@ const LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 const MIN_LUMINANCE: f32 = 1.0e-12;
 // Middle grey: the log-average luminance maps here before the bias.
 const KEY: f32 = 0.18;
+// W m^-2 sr^-1. The reference scene of a fixed exposure (render::gpu).
+const REFERENCE_LUMINANCE: f32 = 1.0;
 
 struct State {
     // Adapted luminance, W m^-2 sr^-1; 0 until the first lit frame.
@@ -34,10 +40,11 @@ struct State {
 };
 
 struct Params {
-    bias_stops: f32,
+    // The bias, or the fixed exposure when fixed is 1, stops.
+    stops: f32,
     alpha: f32,
     partial_count: u32,
-    pad: u32,
+    fixed: u32,
 };
 
 @group(0) @binding(0) var hdr: texture_2d<f32>;
@@ -112,10 +119,12 @@ fn cs_adapt(@builtin(local_invocation_index) li: u32) {
             }
         }
         state.adapted = adapted;
-        if adapted > 0.0 {
-            state.exposure = KEY * exp2(params.bias_stops) / adapted;
+        if params.fixed != 0u {
+            state.exposure = KEY * exp2(params.stops) / REFERENCE_LUMINANCE;
+        } else if adapted > 0.0 {
+            state.exposure = KEY * exp2(params.stops) / adapted;
         } else {
-            state.exposure = exp2(params.bias_stops);
+            state.exposure = exp2(params.stops);
         }
         state.pixels = total;
         state.pad = 0.0;

@@ -14,7 +14,8 @@
 #      text, markers, or lines), each waiting until every cell it selected
 #      is ready (--wait-ready-seconds) and writing its overlay statistics
 #      (--stats-json):
-#        home.png               the Home view at launch time
+#        home.png               the Home view at launch time, at a fixed
+#                               exposure (--exposure-stops, see below)
 #        frame-3.png            the number key 3 view at launch time
 #        frame-3-plus-90d.png   the same view 90 days after the epoch
 #        frame-1-close.png      the number key 1 view at a quarter of its
@@ -62,6 +63,27 @@ PNG_STATS=$ROOT_DIR/target/release/png-stats
 WIDTH=640
 HEIGHT=360
 NINETY_DAYS=7776000
+
+# The fixed exposure of home.png, in stops relative to the automatic
+# exposure of a scene whose log-average luminance is exactly
+# 1 W m^-2 sr^-1 (render::gpu::REFERENCE_LUMINANCE): the multiplier before
+# the tone curve is 0.18 * 2^stops m^2 sr W^-1. It is chosen so that a far
+# field sprite delivering COLD_IRRADIANCE W m^-2 (luminance weighted) to the
+# camera lands on middle grey, 0.18 before the curve: the sprite is a disc
+# s = clamp(2 + log10(E / 1e-8 W m^-2), 2, 6) pixels across with radiance
+# L = E f^2 / (pi (s / 2)^2), f = HEIGHT / (2 tan(30 deg)) the focal length
+# in pixels (docs/shading.md, far field), so stops = log2(1 W m^-2 sr^-1 / L).
+# 5e-13 W m^-2 is the dimmest of the four frames that project 24 px or more
+# from the hot frame (6.4e-13 W m^-2, from the sprites in home.json),
+# rounded down, so all four sit at or above middle grey
+# (docs/e2e/README.md).
+COLD_IRRADIANCE=5e-13
+HOME_STOPS=$(awk -v e="$COLD_IRRADIANCE" -v height="$HEIGHT" 'BEGIN {
+    pi = atan2(0, -1); t = sin(pi / 6) / cos(pi / 6); f = height / (2 * t)
+    s = 2 + log(e / 1e-8) / log(10); if (s < 2) s = 2; if (s > 6) s = 6
+    l = e * f * f / (pi * (s / 2) * (s / 2))
+    printf "%.2f", log(1 / l) / log(2)
+}')
 
 PGHOST=${PGHOST:-127.0.0.1}
 PGPORT=${PGPORT:-5432}
@@ -178,7 +200,10 @@ echo "compiler: connected to the hub (pid $compiler_pid)"
 
 # 3. The renderer and the image statistics tool.
 echo "renderer: building (release)"
-(cd "$ROOT_DIR" && cargo build --release --quiet -p renderer --bin gx-renderer -p png-stats) ||
+# Two builds: --bin would limit a shared build to that one binary and leave
+# png-stats stale.
+(cd "$ROOT_DIR" && cargo build --release --quiet -p renderer --bin gx-renderer &&
+    cargo build --release --quiet -p png-stats) ||
     die "renderer build failed"
 core_rev=$(sed -n 's|^source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#\(.*\)"|\1|p' \
     "$ROOT_DIR/Cargo.lock" | head -n 1)
@@ -201,7 +226,8 @@ shoot() {
         fail "screenshot $name.png: gx-renderer exited non-zero"
     fi
 }
-shoot home --view home
+echo "exposure: home.png at $HOME_STOPS stops, a sprite of $COLD_IRRADIANCE W m^-2 at middle grey"
+shoot home --view home --exposure-stops "$HOME_STOPS"
 shoot frame-3 --view 3
 shoot frame-3-plus-90d --view 3 --start-offset-seconds "$NINETY_DAYS"
 shoot frame-1-close --view 1 --view-distance-scale 0.25
@@ -216,8 +242,12 @@ check() {
     fi
 }
 cd "$OUT" || die "cannot enter $OUT"
-# At least 9 separate bright blobs.
-check blobs home.png --threshold 32 --min-count 9
+# At the fixed exposure: at least 5 separate bright blobs, the hot frame
+# saturated at the center (frames 1 to 5 and 10 project within 7 px of it
+# and merge into its component) plus the four frames that project 24 px or
+# more from it, and the largest component is the hot frame's, centered
+# within 8 px of the image center.
+check blobs home.png --threshold 32 --min-count 5 --largest-within 8
 # One large lit disc, 5 to 60 percent of the image, leaning to one side:
 # its brighter half at least 1.2 times as bright as its darker half (a disc
 # lit face on has no lean and a ratio of 1).

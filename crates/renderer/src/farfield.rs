@@ -34,11 +34,15 @@
 //!   [`crate::light::cell_emitter`]) delivers the irradiance of a point source
 //!   of intensity `band_power / (4 pi)` at the camera: `I / D^2`
 //!   ([`hot_irradiance`]);
-//! - a cold frame reflects the active lights as a Lambertian disc of radius
-//!   `root_extent / 8` facing each light, with the mass-weighted mean albedo
-//!   of its depth-0 cell: `a E_l R^2 max(0, cos theta) / D^2` per light, with
-//!   `E_l = I_l / d_l^2` the irradiance from the light and `theta` the angle
-//!   at the frame between the light and the camera ([`reflected_irradiance`]).
+//! - a cold frame reflects the active lights as a Lambertian ball of
+//!   radius `R = root_extent / 8` with the mass-weighted mean albedo `a` of
+//!   its depth-0 cell: `(2/3) a E_l R^2 phi(alpha) / D^2` per light, with
+//!   `E_l = I_l / d_l^2` the irradiance from the light, `alpha` the phase
+//!   angle (at the frame, between the light and the camera), and
+//!   `phi(alpha) = (sin alpha + (pi - alpha) cos alpha) / pi` the phase
+//!   function of a Lambertian ball, 1 at full phase and 0 only with the
+//!   light straight behind the frame ([`reflected_irradiance`]). A frame
+//!   seen past a right angle from its light still shows a lit crescent.
 //!   With no light it delivers nothing and no sprite is drawn.
 //!
 //! The sprite is a disc whose diameter grows by one pixel per decade of
@@ -202,10 +206,22 @@ pub fn hot_irradiance(emitter: &Emitter, distance: f64) -> [f64; 3] {
     radiant_intensity(emitter.band_power).map(|i| i / d2)
 }
 
+/// The phase function of a Lambertian ball for the cosine `c` of the
+/// phase angle `alpha`: `(sin alpha + (pi - alpha) cos alpha) / pi`, the
+/// light it reflects toward an observer relative to full phase: 1 at
+/// `c = 1`, `1 / pi` at a right angle, and 0 at `c = -1`.
+pub fn lambert_ball_phase(c: f64) -> f64 {
+    let c = c.clamp(-1.0, 1.0);
+    let alpha = c.acos();
+    let sin = (1.0 - c * c).sqrt();
+    ((sin + (core::f64::consts::PI - alpha) * c) / core::f64::consts::PI).max(0.0)
+}
+
 /// Irradiance per band, W m^-2, at the camera from a cold frame at
 /// `frame_rel` (camera-relative, meters) reflecting `lights` as a Lambertian
-/// disc of `radius` meters and `albedo` facing each light (see the module
-/// docs).
+/// ball of `radius` meters and `albedo` (see the module docs):
+/// `(2/3) a E_l R^2 phi(alpha) / D^2` per light, with
+/// [`lambert_ball_phase`] for `phi`.
 pub fn reflected_irradiance(
     albedo: [f64; 3],
     radius: f64,
@@ -228,10 +244,13 @@ pub fn reflected_irradiance(
         let Some(n) = to_light.normalized() else {
             continue;
         };
-        let cos = n.dot(to_camera).max(0.0);
+        let phase = lambert_ball_phase(n.dot(to_camera));
+        if phase <= 0.0 {
+            continue;
+        }
         for b in 0..3 {
             let e_l = f64::from(l.intensity[b]) / dl2;
-            out[b] += albedo[b] * e_l * radius * radius * cos / d2;
+            out[b] += 2.0 / 3.0 * albedo[b] * e_l * radius * radius * phase / d2;
         }
     }
     out
@@ -371,8 +390,19 @@ mod tests {
         };
         let frame = Vec3::new(0.0, 0.0, -10.0);
         let full = reflected_irradiance([0.5; 3], 2.0, frame, &[light]);
-        // E_l = 100 / 400; a E_l R^2 / D^2 = 0.5 * 0.25 * 4 / 100.
-        assert!((full[0] - 0.005).abs() < 1e-15, "{full:?}");
+        // E_l = 100 / 400; (2/3) a E_l R^2 / D^2 = (2/3) 0.5 * 0.25 * 4 / 100.
+        assert!((full[0] - 0.005 * 2.0 / 3.0).abs() < 1e-15, "{full:?}");
+        // At a right angle, a half lit disc: 1 / pi of full phase. The light
+        // is 20 m from the frame with 4 times the intensity, so E_l = 1 W m^-2,
+        // 4 times the full phase case.
+        let side = PointLight {
+            position: [20.0, 0.0, -10.0],
+            intensity: [100.0 * 4.0; 3],
+            ..light
+        };
+        let quarter = reflected_irradiance([0.5; 3], 2.0, frame, &[side]);
+        let want = 4.0 * full[0] / core::f64::consts::PI;
+        assert!((quarter[0] - want).abs() < 1e-15, "{quarter:?} {want}");
         // The light beyond the frame: the camera sees the unlit side.
         let behind = PointLight {
             position: [0.0, 0.0, -30.0],
@@ -383,5 +413,16 @@ mod tests {
             [0.0; 3]
         );
         assert_eq!(reflected_irradiance([0.5; 3], 2.0, frame, &[]), [0.0; 3]);
+    }
+
+    #[test]
+    fn lambert_ball_phase_values() {
+        assert_eq!(lambert_ball_phase(1.0), 1.0);
+        assert_eq!(lambert_ball_phase(-1.0), 0.0);
+        assert!((lambert_ball_phase(0.0) - 1.0 / core::f64::consts::PI).abs() < 1e-15);
+        // Past a right angle it falls smoothly and stays above 0.
+        let a = lambert_ball_phase(-0.14);
+        assert!(a > 0.2 && a < 1.0 / core::f64::consts::PI, "{a}");
+        assert_eq!(lambert_ball_phase(2.0), 1.0);
     }
 }

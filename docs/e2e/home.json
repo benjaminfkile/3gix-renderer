@@ -7,17 +7,110 @@
   "cells_pinned": 10,
   "cells_ready": 1,
   "cells_selected": 1,
-  "first_round_trip_seconds": 0.014066583,
+  "exposure_fixed_stops": 25.95,
+  "first_round_trip_seconds": 0.015947208,
   "frames": 11,
-  "last_round_trip_seconds": 0.03435175,
+  "last_round_trip_seconds": 0.036683375,
   "lights_active": 1,
   "meshes_drawn": 0,
   "ready": true,
   "requests": 22,
   "sim_lag": false,
   "sim_time_seconds_since_j2000": 0.0,
-  "sprites_drawn": 5,
-  "stream_seconds": 10.175797713,
+  "sprites": [
+    {
+      "frame_id": 1,
+      "irradiance_w_m2": 0.16514638962826733,
+      "position_px": [
+        319.9644470214844,
+        180.01316833496094
+      ],
+      "size_px": 6.0
+    },
+    {
+      "frame_id": 2,
+      "irradiance_w_m2": 1.0826547770685209e-11,
+      "position_px": [
+        319.3187561035156,
+        182.0017852783203
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 3,
+      "irradiance_w_m2": 7.471884798220214e-11,
+      "position_px": [
+        316.3857727050781,
+        180.24374389648438
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 4,
+      "irradiance_w_m2": 1.3323015897896359e-11,
+      "position_px": [
+        319.07659912109375,
+        175.56640625
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 5,
+      "irradiance_w_m2": 1.6762069329924501e-12,
+      "position_px": [
+        326.8863525390625,
+        180.00619506835938
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 6,
+      "irradiance_w_m2": 1.381046812695169e-10,
+      "position_px": [
+        340.2386474609375,
+        166.14659118652344
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 7,
+      "irradiance_w_m2": 2.8707277638421317e-11,
+      "position_px": [
+        353.07110595703125,
+        148.10340881347656
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 8,
+      "irradiance_w_m2": 1.9457298311003358e-12,
+      "position_px": [
+        385.8600158691406,
+        237.11288452148438
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 9,
+      "irradiance_w_m2": 6.425076782769714e-13,
+      "position_px": [
+        392.3387145996094,
+        278.9319152832031
+      ],
+      "size_px": 2.0
+    },
+    {
+      "frame_id": 10,
+      "irradiance_w_m2": 2.8794254537326454e-13,
+      "position_px": [
+        319.0668640136719,
+        175.57537841796875
+      ],
+      "size_px": 2.0
+    }
+  ],
+  "sprites_drawn": 10,
+  "stream_seconds": 10.228375797,
   "triangles_drawn": 0,
   "view": "home",
   "volumes_drawn": 0
