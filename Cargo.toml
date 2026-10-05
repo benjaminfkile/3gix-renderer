@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/renderer"]
+members = ["crates/renderer", "tools/png-stats"]
 
 # Line tables only for our code and no debug info for dependencies: the
 # test binaries link wgpu, winit, and a TLS stack, and full debug info makes

@@ -133,8 +133,11 @@ cache fetches once for this purpose and keeps (pinned, never evicted):
 
 - **Hot** (the cell has an emitter, see "Lights" above): the irradiance of
   a point source of intensity `I = band_power / (4 pi)` at the camera
-  distance `D`: `E = I / D^2` per band. The emitter of a sprite-only frame
-  also stays a point light, so a far hot frame keeps lighting the rest.
+  distance `D`: `E = I / D^2` per band. The emitter also stays a point
+  light whenever none of the frame's drawn cells is hot: for a sprite-only
+  frame, and for a frame in the transition whose cells are beyond the
+  selection range (`gx_core::lod` culls cells farther than
+  `4 * root_extent`), so a far hot frame keeps lighting the rest.
 - **Cold**: the active lights reflected by a Lambertian disc of radius
   `R = root_extent / 8` facing each light, with the mass-weighted mean
   albedo `a` of the cell: `E = sum a E_l R^2 max(0, cos theta) / D^2`, with

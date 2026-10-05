@@ -269,24 +269,31 @@ impl Camera {
         )
     }
 
-    /// A view of `frame_id`: parented to it at `3 * root_extent / 8` from its
-    /// origin along the direction from the root origin, looking back at the
-    /// frame origin. `None` if the id is not in the tree.
+    /// A view of `frame_id` from above, the way [`Camera::home`] sees the
+    /// root: parented to the frame, `3 * root_extent / 8` from its origin
+    /// along root `+z`, looking along root `-z` with root `+y` up. The
+    /// direction is fixed in root axes, so whatever lights the frame shows
+    /// up as a lit side and a dark side whose direction follows the light
+    /// as simulation time passes. `None` if the id is not in the tree.
     pub fn view_of(system: &FrameSystem, frame_id: u64) -> Option<Camera> {
         let frame = system.tree().get(frame_id)?;
-        let root = system.tree().root().frame_id;
-        let away = system
-            .relative(Vec3::zero(), frame_id, Vec3::zero(), root)
-            .normalized()
-            .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
         let distance = 3.0 * frame.root_extent.value() / 8.0;
         Some(Camera::placed(
             system,
             frame_id,
-            away.scale(distance),
-            -away,
-            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, distance),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(0.0, 1.0, 0.0),
         ))
+    }
+
+    /// The same camera at `factor` times its distance from its frame
+    /// origin, along the same line, with the same view direction.
+    pub fn with_distance_scale(self, factor: f64) -> Camera {
+        Camera {
+            position: self.position.scale(factor),
+            ..self
+        }
     }
 
     /// The view the number key with this index selects (see
@@ -435,12 +442,10 @@ mod tests {
         let to_origin = cam.relative(&s, Vec3::zero(), 5).normalized().unwrap();
         let forward = cam.root_orientation(&s).rotate(Vec3::new(0.0, 0.0, -1.0));
         assert!(close(forward, to_origin, 1e-9));
-        // Placed on the far side of the frame from the root.
-        let from_root = s
-            .relative(Vec3::zero(), 5, Vec3::zero(), 1)
-            .normalized()
-            .unwrap();
-        assert!(close(to_origin, -from_root, 1e-9));
+        // Placed above the frame, looking down root -z with root +y up.
+        assert!(close(to_origin, Vec3::new(0.0, 0.0, -1.0), 1e-9));
+        let up = cam.root_orientation(&s).rotate(Vec3::new(0.0, 1.0, 0.0));
+        assert!(close(up, Vec3::new(0.0, 1.0, 0.0), 1e-9));
         assert!(Camera::view_of_index(&s, 3).is_none());
     }
 
@@ -494,5 +499,20 @@ mod tests {
         let after = cam.orientation.rotate(Vec3::new(0.0, 0.0, -1.0));
         let angle = before.dot(after).clamp(-1.0, 1.0).acos();
         assert!((angle - 100.0 * LOOK_RADIANS_PER_PIXEL).abs() < 1e-9);
+    }
+
+    #[test]
+    fn distance_scale_keeps_line_and_direction() {
+        let s = system();
+        let cam = Camera::view_of_index(&s, 0).unwrap();
+        let near = cam.with_distance_scale(0.25);
+        assert_eq!(near.frame_id, cam.frame_id);
+        assert_eq!(near.orientation, cam.orientation);
+        assert!((near.position.length() - 0.25 * cam.position.length()).abs() < 1e-9);
+        assert!(close(
+            near.position.normalized().unwrap(),
+            cam.position.normalized().unwrap(),
+            1e-12
+        ));
     }
 }

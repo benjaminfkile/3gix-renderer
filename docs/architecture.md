@@ -49,6 +49,27 @@ Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/volume.wgsl`
 Binaries: `gx-renderer` (`src/main.rs`) and `gx-mock-hub`
 (`src/bin/gx-mock-hub.rs`).
 
+The workspace also holds `tools/png-stats`, a small crate with no renderer
+code that measures screenshots (bright blobs, a lit disc and its two sides,
+the centroid of bright pixels, the steepest step between neighboring
+pixels) for the end to end run, `scripts/e2e.sh` (`docs/e2e/README.md`).
+
+## The headless run
+
+`app::render_headless_view` integrates to the launch offset, places the
+camera for the run's view (`Home`, or the view of a number key, at a factor
+of its distance), selects once, and streams until every selected and pinned
+cell is resolved. With `--wait-ready-seconds` it waits for every one to be
+drawable (`World::ready`: `Ready` with its mesh, or `Empty`; a `Gone` cell
+is not ready) and the binary exits non-zero after writing the image when
+the time runs out; without it the run renders whatever has settled within
+60 s. `--stats-json` writes the overlay statistics of the rendered frame
+(`app::HeadlessStats`), including the request totals of the fetcher
+(`stream::FetchTally`): requests, cells fetched (answered `200`), bytes,
+and the round trips of the first and the latest request. `--no-overlay`
+leaves out the text, the frame markers, and the lines, so only matter is
+in the image.
+
 `hub`, `mock_hub`, `app`, and `render::headless` are native only. The library
 builds for `wasm32-unknown-unknown` without them, with the `web` feature off
 or on; with it on, `web` adds the canvas loop and the browser fetch path
@@ -192,8 +213,10 @@ a light, a dense sample is a surface.
    `root_extent / 8` region projects to under 2 px has no cells selected
    and is a point sprite instead; between 2 and 8 px the sprite fades out
    as the cells fade in. Its depth-0 cell is pinned in the cache (fetched
-   once, never evicted) for the sprite's brightness, and for a sprite-only
-   frame its hot matter still makes a light (`docs/shading.md`).
+   once, never evicted) for the sprite's brightness, and when none of the
+   frame's drawn cells is hot (a sprite-only frame, or one in the
+   transition whose cells are beyond the selection range) its hot matter
+   still makes a light (`docs/shading.md`).
 7. **Placement** (`render::scene::add_matter`). A mesh is uploaded once
    with positions relative to its cell origin in `f32`. Per frame, the cell
    origin is made relative to the camera in `f64` with

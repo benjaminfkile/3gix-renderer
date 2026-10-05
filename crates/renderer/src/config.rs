@@ -60,6 +60,13 @@ FLAGS:
     --screenshot <path.png>        render one frame headless and write it as PNG
     --width <u32>                  render width in pixels (default 1280)
     --height <u32>                 render height in pixels (default 720)
+    --view <home|0-9>              headless view: home (default) or the number key's view
+    --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
+    --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
+                                   with a non-zero status after this many seconds
+    --stats-json <path.json>       headless: write the overlay statistics as JSON
+    --no-overlay                   headless: leave the overlay text, frame markers, and lines
+                                   out of the image, drawing matter only
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
@@ -94,6 +101,42 @@ impl fmt::Display for ApiKey {
     }
 }
 
+/// The camera view a headless run renders.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// The `Home` view of the whole system.
+    #[default]
+    Home,
+    /// The view a number key selects, by its index: key `1` is index 0,
+    /// key `0` is index 9 (see [`crate::camera::selectable_frames`]).
+    Key(usize),
+}
+
+impl View {
+    /// Parses `home` or a number key `0` to `9`.
+    pub fn parse(v: &str) -> Option<View> {
+        match v.trim() {
+            "home" | "Home" => Some(View::Home),
+            "0" => Some(View::Key(9)),
+            d if d.len() == 1 => d
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| (1..=9).contains(&n))
+                .map(|n| View::Key(n - 1)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for View {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            View::Home => f.write_str("home"),
+            View::Key(i) => write!(f, "key {}", (i + 1) % 10),
+        }
+    }
+}
+
 /// The resolved configuration of one run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -117,6 +160,19 @@ pub struct Config {
     pub width: u32,
     /// Render height in pixels.
     pub height: u32,
+    /// The view a headless run renders.
+    pub view: View,
+    /// Factor on the view's distance from its frame origin.
+    pub view_distance_scale: f64,
+    /// Headless: wait at most this long, seconds, for every selected cell
+    /// to be ready, and fail if they are not. `None` renders whatever
+    /// arrived within [`crate::app::HEADLESS_STREAM_SECONDS`].
+    pub wait_ready_seconds: Option<f64>,
+    /// Headless: write the overlay statistics to this JSON file.
+    pub stats_json: Option<PathBuf>,
+    /// Draw the overlay text, the frame markers, and the lines between them
+    /// (headless; the window always draws them).
+    pub overlay: bool,
 }
 
 /// The command line flags, each `None` when not given.
@@ -134,6 +190,16 @@ pub struct Flags {
     pub width: Option<u32>,
     /// `--height`.
     pub height: Option<u32>,
+    /// `--view`.
+    pub view: Option<View>,
+    /// `--view-distance-scale`.
+    pub view_distance_scale: Option<f64>,
+    /// `--wait-ready-seconds`.
+    pub wait_ready_seconds: Option<f64>,
+    /// `--stats-json`.
+    pub stats_json: Option<PathBuf>,
+    /// `--no-overlay`.
+    pub no_overlay: bool,
     /// `--hub-url`.
     pub hub_url: Option<String>,
     /// `--space-id`.
@@ -191,6 +257,29 @@ where
             "--screenshot" => flags.screenshot = Some(PathBuf::from(value(&name)?)),
             "--width" => flags.width = Some(parse_u32(&name, &value(&name)?)?),
             "--height" => flags.height = Some(parse_u32(&name, &value(&name)?)?),
+            "--view" => {
+                let v = value(&name)?;
+                flags.view = Some(
+                    View::parse(&v)
+                        .ok_or_else(|| err(format!("{name}: {v:?} is not home or 0 to 9")))?,
+                )
+            }
+            "--view-distance-scale" => {
+                let x = parse_f64(&name, &value(&name)?)?;
+                if x <= 0.0 {
+                    return Err(err(format!("{name}: must be above zero")));
+                }
+                flags.view_distance_scale = Some(x)
+            }
+            "--wait-ready-seconds" => {
+                let x = parse_f64(&name, &value(&name)?)?;
+                if x < 0.0 {
+                    return Err(err(format!("{name}: must not be negative")));
+                }
+                flags.wait_ready_seconds = Some(x)
+            }
+            "--stats-json" => flags.stats_json = Some(PathBuf::from(value(&name)?)),
+            "--no-overlay" => flags.no_overlay = true,
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
             "--build-id" => flags.build_id = Some(value(&name)?),
@@ -291,6 +380,11 @@ impl Config {
             screenshot: flags.screenshot.clone(),
             width: flags.width.unwrap_or(DEFAULT_WIDTH),
             height: flags.height.unwrap_or(DEFAULT_HEIGHT),
+            view: flags.view.unwrap_or_default(),
+            view_distance_scale: flags.view_distance_scale.unwrap_or(1.0),
+            wait_ready_seconds: flags.wait_ready_seconds,
+            stats_json: flags.stats_json.clone(),
+            overlay: !flags.no_overlay,
         })
     }
 }
@@ -364,6 +458,40 @@ mod tests {
         assert_eq!(c.start_offset_seconds, 0.0);
         assert!(!c.headless);
         assert_eq!((c.width, c.height), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        assert_eq!(c.view, View::Home);
+        assert_eq!(c.view_distance_scale, 1.0);
+        assert_eq!(c.wait_ready_seconds, None);
+        assert_eq!(c.stats_json, None);
+        assert!(c.overlay);
+    }
+
+    #[test]
+    fn view_and_headless_flags() {
+        let flags = parse_flags([
+            "--view",
+            "3",
+            "--view-distance-scale=0.25",
+            "--wait-ready-seconds",
+            "120",
+            "--stats-json",
+            "s.json",
+            "--no-overlay",
+        ])
+        .unwrap();
+        let c = Config::resolve(&base_env(), &flags).unwrap();
+        assert_eq!(c.view, View::Key(2));
+        assert_eq!(c.view_distance_scale, 0.25);
+        assert_eq!(c.wait_ready_seconds, Some(120.0));
+        assert_eq!(c.stats_json, Some(PathBuf::from("s.json")));
+        assert!(!c.overlay);
+        assert_eq!(View::parse("0"), Some(View::Key(9)));
+        assert_eq!(View::parse("1"), Some(View::Key(0)));
+        assert_eq!(View::parse("home"), Some(View::Home));
+        assert_eq!(View::Key(9).to_string(), "key 0");
+        assert!(parse_flags(["--view", "10"]).is_err());
+        assert!(parse_flags(["--view", "x"]).is_err());
+        assert!(parse_flags(["--view-distance-scale", "0"]).is_err());
+        assert!(parse_flags(["--wait-ready-seconds", "-1"]).is_err());
     }
 
     #[test]

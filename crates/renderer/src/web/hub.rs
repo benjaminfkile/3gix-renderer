@@ -21,7 +21,7 @@ use crate::protocol::{
     builds_url, chunk_url, classify_status, frame_system_from_chunk, parse_ready_frame,
     pick_active_build, ready_url, subscribe_frame, BuildSummary, ChunkFetch, API_KEY_HEADER,
 };
-use crate::stream::{decode_cell, FetchEvent, FetchOutcome};
+use crate::stream::{decode_cell, FetchEvent, FetchOutcome, FetchTally};
 use anyhow::{anyhow, bail, Context, Result};
 use gx_core::frames::FrameSystem;
 use gx_core::key::{CellKey, ChunkKey, REGISTRY_KEY};
@@ -268,8 +268,7 @@ pub struct WebFetcher {
     hub: Rc<WebHub>,
     socket: Option<Rc<ReadySocket>>,
     events: Rc<RefCell<Vec<FetchEvent>>>,
-    bytes_fetched: u64,
-    last_round_trip: Option<Duration>,
+    tally: FetchTally,
 }
 
 impl WebFetcher {
@@ -279,8 +278,7 @@ impl WebFetcher {
             hub,
             socket: socket.map(Rc::new),
             events: Rc::default(),
-            bytes_fetched: 0,
-            last_round_trip: None,
+            tally: FetchTally::default(),
         }
     }
 
@@ -327,25 +325,12 @@ impl WebFetcher {
                 }
             }
         }
-        for e in &events {
-            if let FetchEvent::Completed {
-                bytes, round_trip, ..
-            } = e
-            {
-                self.bytes_fetched += bytes;
-                self.last_round_trip = Some(*round_trip);
-            }
-        }
+        self.tally.record(&events);
         events
     }
 
-    /// Body bytes received this session.
-    pub fn bytes_fetched(&self) -> u64 {
-        self.bytes_fetched
-    }
-
-    /// Round-trip time of the latest finished request.
-    pub fn last_round_trip(&self) -> Option<Duration> {
-        self.last_round_trip
+    /// The totals over every finished request this session.
+    pub fn tally(&self) -> FetchTally {
+        self.tally
     }
 }

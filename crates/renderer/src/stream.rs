@@ -328,6 +328,8 @@ pub struct CacheCounts {
     pub pending: usize,
     /// Requests in flight.
     pub in_flight: usize,
+    /// Pinned cells (see [`CellCache::pin`]).
+    pub pinned: usize,
     /// Every cell in the cache.
     pub cached: usize,
 }
@@ -558,6 +560,9 @@ impl CellCache {
             if e.state == CellState::Requested {
                 c.in_flight += 1;
             }
+            if e.pinned {
+                c.pinned += 1;
+            }
             if !e.selected {
                 continue;
             }
@@ -653,12 +658,51 @@ pub enum FetchEvent {
     ChunkReady(CellKey),
 }
 
+/// Running totals over finished requests, for the overlay and the
+/// headless statistics. Shared by the desktop and the browser fetchers.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct FetchTally {
+    /// Requests finished, whatever the hub answered.
+    pub requests: u64,
+    /// Requests answered with a chunk body (`200`): the cells fetched.
+    pub bodies: u64,
+    /// Chunk body bytes received.
+    pub bytes: u64,
+    /// Round-trip time of the first finished request.
+    pub first_round_trip: Option<std::time::Duration>,
+    /// Round-trip time of the latest finished request.
+    pub last_round_trip: Option<std::time::Duration>,
+}
+
+impl FetchTally {
+    /// Adds the finished requests among `events`, in order.
+    pub fn record(&mut self, events: &[FetchEvent]) {
+        for e in events {
+            if let FetchEvent::Completed {
+                outcome,
+                bytes,
+                round_trip,
+                ..
+            } = e
+            {
+                self.requests += 1;
+                if matches!(outcome, FetchOutcome::Decoded(_) | FetchOutcome::Invalid(_)) {
+                    self.bodies += 1;
+                }
+                self.bytes += bytes;
+                self.first_round_trip.get_or_insert(*round_trip);
+                self.last_round_trip = Some(*round_trip);
+            }
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::Fetcher;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{decode_cell, FetchEvent, FetchOutcome};
+    use super::{decode_cell, FetchEvent, FetchOutcome, FetchTally};
     use crate::hub::{ChunkFetch, HubClient};
     use gx_core::key::{CellKey, ChunkKey};
     use gx_core::units::Meters;
@@ -679,8 +723,7 @@ mod native {
         events_tx: mpsc::Sender<FetchEvent>,
         events: mpsc::Receiver<FetchEvent>,
         subscribe: tokio_mpsc::UnboundedSender<String>,
-        bytes_fetched: u64,
-        last_round_trip: Option<Duration>,
+        tally: FetchTally,
     }
 
     impl Fetcher {
@@ -733,8 +776,7 @@ mod native {
                 events_tx,
                 events,
                 subscribe,
-                bytes_fetched: 0,
-                last_round_trip: None,
+                tally: FetchTally::default(),
             }
         }
 
@@ -780,7 +822,7 @@ mod native {
         /// the last round-trip time.
         pub fn drain(&mut self) -> Vec<FetchEvent> {
             let events: Vec<FetchEvent> = self.events.try_iter().collect();
-            self.account(&events);
+            self.tally.record(&events);
             events
         }
 
@@ -791,30 +833,23 @@ mod native {
                 events.push(e);
             }
             events.extend(self.events.try_iter());
-            self.account(&events);
+            self.tally.record(&events);
             events
         }
 
-        fn account(&mut self, events: &[FetchEvent]) {
-            for e in events {
-                if let FetchEvent::Completed {
-                    bytes, round_trip, ..
-                } = e
-                {
-                    self.bytes_fetched += bytes;
-                    self.last_round_trip = Some(*round_trip);
-                }
-            }
+        /// The totals over every finished request this session.
+        pub fn tally(&self) -> FetchTally {
+            self.tally
         }
 
         /// Body bytes received this session.
         pub fn bytes_fetched(&self) -> u64 {
-            self.bytes_fetched
+            self.tally.bytes
         }
 
         /// Round-trip time of the latest finished request.
         pub fn last_round_trip(&self) -> Option<Duration> {
-            self.last_round_trip
+            self.tally.last_round_trip
         }
     }
 }
@@ -988,6 +1023,29 @@ mod tests {
         assert_eq!(d(&c, &drawable), kids.to_vec());
         // Nothing drawable anywhere: nothing drawn.
         assert!(d(&c, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn tally_counts_requests_bodies_and_round_trips() {
+        use std::time::Duration;
+        let done = |outcome: FetchOutcome, bytes: u64, ms: u64| FetchEvent::Completed {
+            key: key(1, 0, 0, 0),
+            outcome,
+            bytes,
+            round_trip: Duration::from_millis(ms),
+        };
+        let mut t = FetchTally::default();
+        t.record(&[
+            done(FetchOutcome::Pending, 0, 30),
+            FetchEvent::ChunkReady(key(1, 0, 0, 0)),
+            done(ready(), 100, 5),
+        ]);
+        t.record(&[done(FetchOutcome::Decoded(None), 72, 2)]);
+        assert_eq!(t.requests, 3);
+        assert_eq!(t.bodies, 2);
+        assert_eq!(t.bytes, 172);
+        assert_eq!(t.first_round_trip, Some(Duration::from_millis(30)));
+        assert_eq!(t.last_round_trip, Some(Duration::from_millis(2)));
     }
 
     #[test]
