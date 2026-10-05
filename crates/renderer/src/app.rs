@@ -20,6 +20,7 @@ use crate::config::{Config, View};
 use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
+use crate::farfield::focal_px;
 use crate::hub::HubClient;
 use crate::render::gpu::{wanted_features, Exposure, Renderer};
 use crate::render::headless::{Headless, Image};
@@ -98,11 +99,13 @@ pub fn launch_simulation(system: FrameSystem, config: &Config) -> Simulation {
     Simulation::new(system, clock)
 }
 
-/// The overlay values for the current state.
+/// The overlay values for the current state, with the fixed exposure in
+/// stops or `None` for the automatic exposure.
 pub fn overlay_info(
     sim: &Simulation,
     camera: &Camera,
     fps: Option<f64>,
+    exposure_fixed: Option<f64>,
     matter: MatterStats,
 ) -> OverlayInfo {
     OverlayInfo {
@@ -114,6 +117,7 @@ pub fn overlay_info(
         frame_count: sim.system.tree().frames().len(),
         fps,
         sim_lag: sim.lagging(),
+        exposure_fixed,
         matter,
     }
 }
@@ -136,6 +140,9 @@ pub struct HeadlessRun {
     /// Draw the overlay text, the frame markers, and the lines between
     /// them into the image. Without them only matter is drawn.
     pub overlay: bool,
+    /// A fixed exposure, stops ([`crate::render::gpu::fixed_exposure`]);
+    /// `None` exposes for the frame's own log-average luminance.
+    pub exposure_stops: Option<f64>,
 }
 
 impl HeadlessRun {
@@ -149,6 +156,7 @@ impl HeadlessRun {
             view_distance_scale: 1.0,
             wait_ready_seconds: None,
             overlay: true,
+            exposure_stops: None,
         }
     }
 
@@ -161,6 +169,7 @@ impl HeadlessRun {
             view_distance_scale: config.view_distance_scale,
             wait_ready_seconds: config.wait_ready_seconds,
             overlay: config.overlay,
+            exposure_stops: config.exposure_stops,
         }
     }
 }
@@ -179,6 +188,46 @@ pub struct HeadlessStats {
     pub ready: bool,
     /// Wall-clock seconds spent streaming before drawing.
     pub stream_seconds: f64,
+    /// The far field sprites drawn, in ascending frame id order.
+    pub sprites: Vec<SpriteStats>,
+}
+
+/// What one far field sprite delivered, for `--stats-json`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SpriteStats {
+    /// The frame it stands for.
+    pub frame_id: u64,
+    /// Where its center projects, pixels from the top left corner, or
+    /// `None` behind the camera.
+    pub position_px: Option<(f32, f32)>,
+    /// Diameter, pixels.
+    pub size_px: f32,
+    /// Luminance-weighted irradiance at the camera, W m^-2: the Rec. 709
+    /// luma of the band irradiances, recovered from the sprite's radiance
+    /// as `L pi (s / 2)^2 / f^2` (`docs/shading.md`, far field).
+    pub irradiance: f64,
+}
+
+/// The [`SpriteStats`] of every sprite of `scene` in a view of
+/// `width` x `height` pixels.
+pub fn sprite_stats(scene: &Scene, width: u32, height: u32) -> Vec<SpriteStats> {
+    let f = focal_px(f64::from(height.max(1)));
+    scene
+        .sprites
+        .iter()
+        .map(|sp| {
+            let luma = 0.2126 * f64::from(sp.radiance[0])
+                + 0.7152 * f64::from(sp.radiance[1])
+                + 0.0722 * f64::from(sp.radiance[2]);
+            let r = 0.5 * f64::from(sp.size_px);
+            SpriteStats {
+                frame_id: sp.frame_id,
+                position_px: scene.project(sp.position, width, height),
+                size_px: sp.size_px,
+                irradiance: luma * std::f64::consts::PI * r * r / (f * f),
+            }
+        })
+        .collect()
 }
 
 impl HeadlessStats {
@@ -207,8 +256,15 @@ impl HeadlessStats {
             "volumes_drawn": m.volumes_drawn,
             "sprites_drawn": m.sprites_drawn,
             "lights_active": m.lights_active,
+            "exposure_fixed_stops": o.exposure_fixed,
             "ready": self.ready,
             "stream_seconds": self.stream_seconds,
+            "sprites": self.sprites.iter().map(|s| serde_json::json!({
+                "frame_id": s.frame_id,
+                "position_px": s.position_px.map(|(x, y)| [x, y]),
+                "size_px": s.size_px,
+                "irradiance_w_m2": s.irradiance,
+            })).collect::<Vec<_>>(),
         })
     }
 }
@@ -305,10 +361,15 @@ pub fn render_headless_view(
         sim,
         &camera,
         None,
+        run.exposure_stops,
         matter_stats(&world, fetcher.as_deref(), &scene),
     );
     let text = info.text();
-    let image = headless.render(&scene, run.overlay.then_some(text.as_str()))?;
+    let exposure = Exposure {
+        fixed_stops: run.exposure_stops,
+        ..Exposure::default()
+    };
+    let image = headless.render_with(&scene, run.overlay.then_some(text.as_str()), exposure)?;
     Ok(HeadlessFrame {
         image,
         stats: HeadlessStats {
@@ -317,6 +378,7 @@ pub fn render_headless_view(
             cells_pinned: world.counts().cache.pinned,
             ready: world.ready(),
             stream_seconds,
+            sprites: sprite_stats(&scene, width, height),
         },
     })
 }
@@ -380,7 +442,7 @@ pub fn run_windowed(
         world: World::new(default_threads()),
         fetcher: Fetcher::new(runtime, client),
         started: Instant::now(),
-        controls: Controls::default(),
+        controls: Controls::new(config.exposure_stops),
         gfx: None,
         size: (config.width, config.height),
         last_frame: None,
@@ -528,11 +590,15 @@ impl App {
         self.world.evict(t);
         let scene = matter_scene(&mut self.world, system, &self.camera, size, t);
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
-        let overlay = overlay_info(&self.sim, &self.camera, fps, stats).text();
-        let exposure = Exposure {
-            bias_stops: self.controls.exposure_bias,
-            adapt_seconds: Some(dt),
-        };
+        let overlay = overlay_info(
+            &self.sim,
+            &self.camera,
+            fps,
+            self.controls.exposure_fixed,
+            stats,
+        )
+        .text();
+        let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,

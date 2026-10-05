@@ -86,6 +86,8 @@ pub struct OverlayInfo {
     pub fps: Option<f64>,
     /// `true` when the integrator was clamped this frame.
     pub sim_lag: bool,
+    /// The fixed exposure, stops, or `None` for the automatic exposure.
+    pub exposure_fixed: Option<f64>,
     /// The matter pipeline.
     pub matter: MatterStats,
 }
@@ -109,6 +111,10 @@ impl OverlayInfo {
             match self.fps {
                 Some(fps) => format!("fps {fps:.1}"),
                 None => "fps -".to_string(),
+            },
+            match self.exposure_fixed {
+                Some(stops) => format!("exposure fixed {}", format_stops(stops)),
+                None => "exposure auto".to_string(),
             },
         ];
         let m = &self.matter;
@@ -149,6 +155,18 @@ impl OverlayInfo {
     }
 }
 
+/// Stops with up to two decimals and no trailing zeros: `12.81`, `-3`,
+/// `0.5`.
+fn format_stops(stops: f64) -> String {
+    let s = format!("{stops:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// A time scale without trailing noise: integers as integers, fractions with
 /// up to six significant digits.
 fn format_scale(scale: f64) -> String {
@@ -174,6 +192,7 @@ mod tests {
             frame_count: 6,
             fps: Some(59.94),
             sim_lag: false,
+            exposure_fixed: None,
             matter: MatterStats {
                 cells_selected: 12,
                 cells_ready: 9,
@@ -200,12 +219,13 @@ mod tests {
         assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m");
         assert_eq!(l[3], "frames 6");
         assert_eq!(l[4], "fps 59.9");
-        assert_eq!(l[5], "cells selected 12  ready 9  pending 3");
-        assert_eq!(l[6], "meshes 4  triangles 5120  lights 1");
-        assert_eq!(l[7], "volumes 2  sprites 7");
-        assert_eq!(l[8], "requests 20  fetched 11 cells 1048576 B");
-        assert_eq!(l[9], "rtt first 0.250 s  last 0.043 s");
-        assert_eq!(l.len(), 10);
+        assert_eq!(l[5], "exposure auto");
+        assert_eq!(l[6], "cells selected 12  ready 9  pending 3");
+        assert_eq!(l[7], "meshes 4  triangles 5120  lights 1");
+        assert_eq!(l[8], "volumes 2  sprites 7");
+        assert_eq!(l[9], "requests 20  fetched 11 cells 1048576 B");
+        assert_eq!(l[10], "rtt first 0.250 s  last 0.043 s");
+        assert_eq!(l.len(), 11);
     }
 
     #[test]
@@ -215,14 +235,19 @@ mod tests {
             paused: true,
             fps: None,
             sim_lag: true,
+            exposure_fixed: Some(12.8125),
             matter: MatterStats::default(),
             ..info()
         }
         .lines();
         assert_eq!(l[1], "time scale 0.25x (paused)");
         assert_eq!(l[4], "fps -");
-        assert_eq!(l[8], "requests 0  fetched 0 cells 0 B");
-        assert_eq!(l[9], "rtt first -  last -");
-        assert_eq!(l[10], "sim lag");
+        assert_eq!(l[5], "exposure fixed 12.81");
+        assert_eq!(l[9], "requests 0  fetched 0 cells 0 B");
+        assert_eq!(l[10], "rtt first -  last -");
+        assert_eq!(l[11], "sim lag");
+        assert_eq!(format_stops(-3.0), "-3");
+        assert_eq!(format_stops(0.5), "0.5");
+        assert_eq!(format_stops(-0.001), "0");
     }
 }

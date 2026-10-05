@@ -3,12 +3,13 @@
 //!
 //! Turns `winit` window events into flight input for the [`Camera`],
 //! actions on the [`SimClock`](crate::sim::SimClock), view jumps, and the
-//! exposure bias. The bindings are listed in `docs/controls.md`. Keys are
+//! exposure: the bias of the automatic exposure, or the fixed exposure when
+//! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
 //! keyboard layout.
 
 use crate::camera::{Camera, FlightInput};
-use crate::render::gpu::EXPOSURE_STEP_STOPS;
+use crate::render::gpu::{Exposure, EXPOSURE_STEP_STOPS};
 use crate::sim::{ClockAction, Simulation};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -19,17 +20,44 @@ pub const PIXELS_PER_NOTCH: f64 = 40.0;
 /// Limits of the exposure bias, stops.
 pub const EXPOSURE_BIAS_LIMITS: (f64, f64) = (-16.0, 16.0);
 
-/// Held keys, accumulated mouse movement, and the exposure bias.
+/// Limits of a fixed exposure, stops relative to
+/// [`crate::render::gpu::REFERENCE_LUMINANCE`].
+pub const EXPOSURE_FIXED_LIMITS: (f64, f64) = (-64.0, 64.0);
+
+/// Held keys, accumulated mouse movement, and the exposure.
 #[derive(Clone, Debug, Default)]
 pub struct Controls {
     flight: FlightInput,
     looking: bool,
     cursor: Option<(f64, f64)>,
-    /// User exposure bias, stops.
+    /// User exposure bias of the automatic exposure, stops.
     pub exposure_bias: f64,
+    /// The fixed exposure, stops (see [`crate::render::gpu::fixed_exposure`]);
+    /// `None` for the automatic exposure.
+    pub exposure_fixed: Option<f64>,
 }
 
 impl Controls {
+    /// Controls with the automatic exposure, or a fixed exposure of
+    /// `fixed_stops` (clamped to [`EXPOSURE_FIXED_LIMITS`]).
+    pub fn new(fixed_stops: Option<f64>) -> Controls {
+        let (lo, hi) = EXPOSURE_FIXED_LIMITS;
+        Controls {
+            exposure_fixed: fixed_stops.map(|s| s.clamp(lo, hi)),
+            ..Controls::default()
+        }
+    }
+
+    /// How to expose this frame, `adapt_seconds` after the previous one
+    /// (see [`Exposure::adapt_seconds`]).
+    pub fn exposure(&self, adapt_seconds: Option<f64>) -> Exposure {
+        Exposure {
+            bias_stops: self.exposure_bias,
+            fixed_stops: self.exposure_fixed,
+            adapt_seconds,
+        }
+    }
+
     /// This frame's flight input; clears the accumulated mouse movement.
     pub fn take_flight(&mut self) -> FlightInput {
         let out = self.flight;
@@ -121,9 +149,19 @@ impl Controls {
         false
     }
 
+    /// `+` and `-`: shift the fixed exposure if there is one, the bias of
+    /// the automatic exposure otherwise.
     fn bias_exposure(&mut self, stops: f64) {
-        let (lo, hi) = EXPOSURE_BIAS_LIMITS;
-        self.exposure_bias = (self.exposure_bias + stops).clamp(lo, hi);
+        match &mut self.exposure_fixed {
+            Some(fixed) => {
+                let (lo, hi) = EXPOSURE_FIXED_LIMITS;
+                *fixed = (*fixed + stops).clamp(lo, hi);
+            }
+            None => {
+                let (lo, hi) = EXPOSURE_BIAS_LIMITS;
+                self.exposure_bias = (self.exposure_bias + stops).clamp(lo, hi);
+            }
+        }
     }
 }
 
@@ -142,4 +180,29 @@ pub fn digit_index(code: KeyCode) -> Option<usize> {
         KeyCode::Digit0,
     ];
     DIGITS.iter().position(|&d| d == code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_move_the_fixed_exposure_when_there_is_one() {
+        let mut auto = Controls::new(None);
+        auto.bias_exposure(EXPOSURE_STEP_STOPS);
+        assert_eq!(auto.exposure_bias, 0.5);
+        assert_eq!(auto.exposure(None).fixed_stops, None);
+
+        let mut fixed = Controls::new(Some(12.81));
+        fixed.bias_exposure(-EXPOSURE_STEP_STOPS);
+        assert_eq!(fixed.exposure_bias, 0.0);
+        let e = fixed.exposure(Some(0.016));
+        assert_eq!(e.fixed_stops, Some(12.31));
+        assert_eq!(e.adapt_seconds, Some(0.016));
+
+        assert_eq!(Controls::new(Some(100.0)).exposure_fixed, Some(64.0));
+        let mut low = Controls::new(Some(-64.0));
+        low.bias_exposure(-EXPOSURE_STEP_STOPS);
+        assert_eq!(low.exposure_fixed, Some(-64.0));
+    }
 }

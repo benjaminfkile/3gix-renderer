@@ -14,6 +14,7 @@ use gx_core::units::{Attenuation, Density, Kelvin, Kilograms, Meters, Quat, Rati
 use renderer::app::matter_scene;
 use renderer::camera::{look_rotation, Camera};
 use renderer::farfield::{depth_zero_key, far_frames};
+use renderer::render::gpu::{fixed_exposure, Exposure, REFERENCE_LUMINANCE};
 use renderer::render::headless::Headless;
 use renderer::render::scene::Scene;
 use renderer::stream::{decode_cell, FetchOutcome};
@@ -179,6 +180,53 @@ fn far_hot_frame_is_a_sprite_where_it_projects() {
     }
     // Two renders of one state are one image.
     assert!(image == headless.render(&scene, None).unwrap());
+}
+
+#[test]
+fn fixed_exposure_is_relative_to_the_reference_scene() {
+    let system = system(&[Vec3::new(30.0, 2000.0, 15.0)]);
+    let chunks: BTreeMap<CellKey, Vec<u8>> = [(depth_zero_key(2), cell(2, hot()))].into();
+    let (mut scene, _) = stream(&system, &chunks);
+    let (x, y) = scene
+        .project(scene.sprites[0].position, WIDTH, HEIGHT)
+        .expect("in front of the camera");
+    let (px, py) = (x as u32, y as u32);
+    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let fixed = |stops: f64| Exposure {
+        fixed_stops: Some(stops),
+        ..Exposure::default()
+    };
+    for radiance in [1.0f32, 1.0e-4] {
+        // A grey sprite is the only covered thing, so the automatic
+        // exposure maps its radiance to middle grey. A fixed exposure of
+        // log2(1 W m^-2 sr^-1 / radiance) stops does the same: 0.18 before
+        // the curve, 0.267 after it, 141 in sRGB.
+        scene.sprites[0].radiance = [radiance; 3];
+        let stops = (REFERENCE_LUMINANCE / f64::from(radiance)).log2();
+        let auto = headless.render(&scene, None).unwrap().pixel(px, py);
+        let same = headless
+            .render_with(&scene, None, fixed(stops))
+            .unwrap()
+            .pixel(px, py);
+        println!("radiance {radiance}: stops {stops:.3}, auto {auto:?}, fixed {same:?}");
+        for c in 0..3 {
+            assert!((139..=143).contains(&auto[c]), "{auto:?}");
+            assert!(auto[c].abs_diff(same[c]) <= 1, "{auto:?} {same:?}");
+        }
+        // One stop up is brighter, twenty down is black: nothing adapts.
+        let up = headless
+            .render_with(&scene, None, fixed(stops + 1.0))
+            .unwrap()
+            .pixel(px, py);
+        let down = headless
+            .render_with(&scene, None, fixed(stops - 20.0))
+            .unwrap()
+            .pixel(px, py);
+        assert!(up[1] > same[1] + 20, "{up:?}");
+        assert_eq!(&down[..3], &[0, 0, 0], "{down:?}");
+    }
+    assert_eq!(fixed_exposure(0.0), 0.18);
+    assert_eq!(fixed_exposure(2.0), 0.72);
 }
 
 #[test]

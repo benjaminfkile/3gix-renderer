@@ -113,6 +113,10 @@ pub struct ReadyCell {
     /// Mass-weighted mean albedo, for the far field
     /// ([`crate::farfield::mean_albedo`]).
     pub mean_albedo: [f64; 3],
+    /// Some sample has a density above 0. A composite can hold samples and
+    /// still no matter; such a cell counts as empty for
+    /// [`CellCache::known_empty`].
+    pub has_matter: bool,
 }
 
 impl ReadyCell {
@@ -123,6 +127,9 @@ impl ReadyCell {
             emitter: cell_emitter(&section),
             volume: VolumeGrid::from_section(&section).map(Arc::new),
             mean_albedo: mean_albedo(&section),
+            has_matter: section.samples().is_some_and(|s| {
+                (0..s.len()).any(|i| s.get(i).is_some_and(|x| x.density.value() > 0.0))
+            }),
             section: Arc::new(section),
         }
     }
@@ -152,6 +159,16 @@ pub enum CellState {
     Empty,
     /// `410`, or bytes that fail validation. Never drawn.
     Gone,
+}
+
+/// What the cache knows of the matter in a face neighbor
+/// ([`CellCache::face_neighbors`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NeighborMatter<'a> {
+    /// The neighbor is `Ready`.
+    Ready(&'a Arc<ReadyCell>),
+    /// The neighbor holds no matter ([`CellCache::known_empty`]).
+    Empty,
 }
 
 /// The result of one fetch, decoded.
@@ -360,6 +377,65 @@ impl CellCache {
     /// Every entry, in key order.
     pub fn entries(&self) -> impl Iterator<Item = (&CellKey, &CellEntry)> {
         self.entries.iter()
+    }
+
+    /// What the cache knows of the cells across the six faces of `key` at
+    /// the same depth, in the order of [`crate::extract::face_index`]
+    /// (`-x, +x, -y, +y, -z, +z`): the `Ready` ones and the ones known to
+    /// hold no matter ([`CellCache::known_empty`]). A face at the edge of
+    /// the root cube, or whose neighbor is neither, is `None`. Extraction
+    /// pads with these ([`crate::extract`]).
+    pub fn face_neighbors(&self, key: &CellKey) -> [Option<(CellKey, NeighborMatter<'_>)>; 6] {
+        face_neighbor_keys(key).map(|k| {
+            let k = k?;
+            match self.state(&k) {
+                Some(CellState::Ready(cell)) => Some((k, NeighborMatter::Ready(cell))),
+                _ if self.known_empty(&k) => Some((k, NeighborMatter::Empty)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Returns `true` when the cache knows that `key` holds no matter: it
+    /// holds none itself (`Empty`, or `Ready` without a sample of density
+    /// above 0), an ancestor holds none, or its descendants down to
+    /// [`COVER_LEVELS`] levels below hold none, covering it. The cell itself
+    /// need not be cached: the selection may hold its region at another
+    /// depth.
+    pub fn known_empty(&self, key: &CellKey) -> bool {
+        let empty = |k: &CellKey| self.holds_no_matter(k);
+        let mut up = Some(*key);
+        while let Some(k) = up {
+            if empty(&k) {
+                return true;
+            }
+            up = k.parent();
+        }
+        self.empty_below(key, COVER_LEVELS)
+    }
+
+    /// `key` itself is fetched and holds no matter.
+    fn holds_no_matter(&self, key: &CellKey) -> bool {
+        match self.state(key) {
+            Some(CellState::Empty) => true,
+            Some(CellState::Ready(cell)) => !cell.has_matter,
+            _ => false,
+        }
+    }
+
+    /// `key` holds no matter, or every child holds none, recursively within
+    /// `levels`.
+    fn empty_below(&self, key: &CellKey, levels: u8) -> bool {
+        if self.holds_no_matter(key) {
+            return true;
+        }
+        if levels == 0 {
+            return false;
+        }
+        match key.children() {
+            Some(children) => children.iter().all(|c| self.empty_below(c, levels - 1)),
+            None => false,
+        }
     }
 
     /// The latest selection.
@@ -618,6 +694,22 @@ impl CellCache {
         }
         set.into_iter().collect()
     }
+}
+
+/// The keys of the cells across the six faces of `key` at the same depth,
+/// in the order of [`crate::extract::face_index`] (`-x, +x, -y, +y, -z,
+/// +z`); `None` where the face is the boundary of the root cube.
+pub fn face_neighbor_keys(key: &CellKey) -> [Option<CellKey>; 6] {
+    core::array::from_fn(|face| {
+        let (axis, high) = (face / 2, face % 2 == 1);
+        let mut c = [key.x, key.y, key.z];
+        c[axis] = if high {
+            c[axis].checked_add(1)?
+        } else {
+            c[axis].checked_sub(1)?
+        };
+        CellKey::new(key.frame_id, key.depth, c[0], c[1], c[2]).ok()
+    })
 }
 
 /// Drawable descendants within `levels` that cover all of `key`, or `None`.
@@ -1073,5 +1165,73 @@ mod tests {
             decode_cell(&k, &encode_chunk(&[], &[]), Meters::new(8.0)),
             FetchOutcome::Decoded(None)
         );
+    }
+
+    #[test]
+    fn face_neighbors_at_the_same_depth() {
+        let k = key(2, 0, 1, 3);
+        assert_eq!(
+            face_neighbor_keys(&k),
+            [
+                None,
+                Some(key(2, 1, 1, 3)),
+                Some(key(2, 0, 0, 3)),
+                Some(key(2, 0, 2, 3)),
+                Some(key(2, 0, 1, 2)),
+                None,
+            ]
+        );
+        assert_eq!(face_neighbor_keys(&key(0, 0, 0, 0)), [None; 6]);
+
+        let mut c = CellCache::new();
+        c.set_selection(sel(&[k, key(2, 1, 1, 3), key(2, 0, 0, 3)]), 0.0);
+        c.complete(key(2, 1, 1, 3), ready(), 0.0);
+        c.complete(key(2, 0, 0, 3), FetchOutcome::NotFound, 0.0);
+        // A Ready cell one depth down touching the +y face is not a neighbor.
+        c.complete(key(3, 1, 4, 6), ready(), 0.0);
+        let n = c.face_neighbors(&k);
+        assert!(matches!(n[1], Some((_, NeighborMatter::Ready(_)))));
+        assert_eq!(n[2], Some((key(2, 0, 0, 3), NeighborMatter::Empty)));
+        assert!(n[0].is_none() && n[3].is_none() && n[4].is_none() && n[5].is_none());
+
+        // The -z neighbor (2, 0, 1, 2) is not cached, but every child of it
+        // is fetched and empty: known empty. One child unknown: not.
+        let below = key(2, 0, 1, 2).children().unwrap();
+        for child in &below[1..] {
+            c.complete(*child, FetchOutcome::NotFound, 0.0);
+        }
+        assert!(c.face_neighbors(&k)[4].is_none());
+        c.complete(below[0], FetchOutcome::NotFound, 0.0);
+        assert_eq!(
+            c.face_neighbors(&k)[4],
+            Some((key(2, 0, 1, 2), NeighborMatter::Empty))
+        );
+        // An empty ancestor covers everything under it.
+        c.complete(key(1, 0, 0, 1), FetchOutcome::NotFound, 0.0);
+        assert!(c.known_empty(&key(3, 1, 2, 5)));
+        assert!(!c.known_empty(&key(3, 1, 2, 3)));
+    }
+
+    #[test]
+    fn a_composite_of_vacuum_holds_no_matter() {
+        use gx_core::matter::{Sample, Samples};
+        let k = key(2, 1, 1, 1);
+        let zero = Sample::VACUUM;
+        let s = Section::new(
+            k,
+            Vec3::zero(),
+            Meters::new(1.0),
+            2,
+            Samples::filled(2, zero),
+        );
+        let cell = ReadyCell::new(s.unwrap());
+        assert!(!cell.has_matter);
+        let mut c = CellCache::new();
+        c.complete(k, FetchOutcome::Decoded(Some(Arc::new(cell))), 0.0);
+        assert!(c.known_empty(&k));
+        assert!(c.known_empty(&key(3, 2, 3, 2)));
+        if let FetchOutcome::Decoded(Some(full)) = ready() {
+            assert!(full.has_matter);
+        }
     }
 }

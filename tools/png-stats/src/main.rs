@@ -17,8 +17,11 @@ USAGE:
     png-stats summary <png> [--threshold <luma>]
         luma percentiles, bright pixel count and centroid, components
     png-stats blobs <png> --threshold <luma> --min-count <n> [--min-pixels <n>]
+                    [--largest-within <px>]
         at least n 8-connected components above the threshold, counting
-        only components of at least min-pixels pixels (default 1)
+        only components of at least min-pixels pixels (default 1); with
+        largest-within, the largest of them must also have its centroid
+        within px pixels of the image center
     png-stats disc <png> --threshold <luma> --min-percent <p> --max-percent <p>
                    --min-side-ratio <r>
         the largest component above the threshold covers between the two
@@ -138,20 +141,44 @@ fn run(args: &[String]) -> Result<bool, String> {
             let t = a.number("threshold")?;
             let min_count = a.number("min-count")?;
             let min_pixels = a.number_or("min-pixels", 1.0)?;
+            let within = a.number_or("largest-within", f64::INFINITY)?;
             let all = components(&img, t);
-            let sizes: Vec<usize> = all
+            let kept: Vec<_> = all
                 .iter()
-                .map(|c| c.pixels.len())
-                .filter(|&n| n as f64 >= min_pixels)
+                .filter(|c| c.pixels.len() as f64 >= min_pixels)
                 .collect();
+            let sizes: Vec<usize> = kept.iter().map(|c| c.pixels.len()).collect();
             let n = sizes.len();
+            // Pixel centers are at whole numbers, so the image center is at
+            // ((w - 1) / 2, (h - 1) / 2).
+            let center = (
+                (img.width as f64 - 1.0) / 2.0,
+                (img.height as f64 - 1.0) / 2.0,
+            );
+            // The first of the largest in scan order, so ties are stable.
+            // (`max_by_key` keeps the last maximum, so search in reverse.)
+            let largest = kept.iter().rev().max_by_key(|c| c.pixels.len());
+            let offset = largest.map(|c| (c.centroid.0 - center.0).hypot(c.centroid.1 - center.1));
+            let centered = within.is_infinite() || offset.is_some_and(|d| d <= within);
+            let centroids: Vec<String> = kept
+                .iter()
+                .map(|c| format!("({:.1}, {:.1})", c.centroid.0, c.centroid.1))
+                .collect();
+            let mut detail = format!(
+                "{n} components above luma {t} of at least {min_pixels} px (need {min_count}), sizes {sizes:?}, centroids [{}]",
+                centroids.join(", ")
+            );
+            if within.is_finite() {
+                detail += &format!(
+                    ", largest {} from the center (need at most {within})",
+                    offset.map_or("-".into(), |d| format!("{d:.1} px"))
+                );
+            }
             Ok(verdict(
                 "blobs",
                 &file,
-                n as f64 >= min_count,
-                format!(
-                    "{n} components above luma {t} of at least {min_pixels} px (need {min_count}), sizes {sizes:?}"
-                ),
+                n as f64 >= min_count && centered,
+                detail,
             ))
         }
         "disc" => {

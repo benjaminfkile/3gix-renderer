@@ -50,12 +50,15 @@ rendered frames; the integrator is never skipped.
 
 | Input | Action |
 |---|---|
-| `=` / numpad `+` | Brighten: exposure bias up half a stop |
-| `-` / numpad `-` | Darken: exposure bias down half a stop |
+| `=` / numpad `+` | Brighten: exposure up half a stop |
+| `-` / numpad `-` | Darken: exposure down half a stop |
 
-Exposure follows the log-average luminance of the lit pixels on screen with
-a 0.5 s adaptation; the bias, between -16 and +16 stops, applies on top. See
-`docs/shading.md`.
+By default exposure follows the log-average luminance of the lit pixels on
+screen with a 0.5 s adaptation, and the keys move a bias, between -16 and
++16 stops, that applies on top. With `--exposure-stops <s>` the exposure is
+fixed instead (no adaptation) and the keys move that fixed value, between
+-64 and +64 stops. The overlay shows `exposure auto` or `exposure fixed <s>`.
+See `docs/shading.md`.
 
 ## Window
 
