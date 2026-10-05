@@ -7,11 +7,15 @@
 //! - `GET /space/{s}/builds`: one `Active` build.
 //! - `GET /space/{s}/build/{b}/chunk/registry`: `202 Accepted` for the
 //!   first [`MockHubOptions::pending_responses`] requests, then `200 OK` with
-//!   the registry container. Any other key answers `404`.
+//!   the registry container.
+//! - `GET /space/{s}/build/{b}/chunk/{cell}`: for a key in
+//!   [`MockHubOptions::cells`], `202 Accepted` for the first
+//!   [`MockHubOptions::cell_pending_responses`] requests, then `200 OK` with
+//!   its container. Any other key answers `404`.
 //! - `GET /space/{s}/build/{b}/chunks/ready` (WebSocket): accepts
-//!   `{ "subscribe": "<key>" }` frames and, once a `202` for the registry has
-//!   been served, pushes `{ "chunkReady": "registry" }` to subscribers of
-//!   that key, so the push lands between the `202` and the `200`.
+//!   `{ "subscribe": "<key>" }` frames and, once a `202` for a key has been
+//!   served, pushes `{ "chunkReady": "<key>" }` to subscribers of that key,
+//!   so the push lands between the `202` and the `200`.
 //!
 //! Every request must carry the configured key in `X-API-Key`, or the mock
 //! answers `401`. It speaks just enough HTTP/1.1 for one request per
@@ -19,9 +23,10 @@
 
 use crate::hub::API_KEY_HEADER;
 use gx_core::key::REGISTRY_KEY;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -50,6 +55,10 @@ pub struct MockHubOptions {
     pub registry_chunk: Vec<u8>,
     /// How many registry requests answer `202` before the first `200`.
     pub pending_responses: u32,
+    /// Matter chunk containers by cell key string.
+    pub cells: BTreeMap<String, Vec<u8>>,
+    /// How many requests of each cell answer `202` before the first `200`.
+    pub cell_pending_responses: u32,
 }
 
 impl MockHubOptions {
@@ -61,16 +70,25 @@ impl MockHubOptions {
             api_key: MOCK_API_KEY.into(),
             registry_chunk,
             pending_responses: 1,
+            cells: BTreeMap::new(),
+            cell_pending_responses: 1,
         }
+    }
+
+    /// Adds a cell's chunk container.
+    pub fn with_cell(mut self, key: impl Into<String>, chunk: Vec<u8>) -> MockHubOptions {
+        self.cells.insert(key.into(), chunk);
+        self
     }
 }
 
 struct State {
     options: MockHubOptions,
-    registry_requests: AtomicU32,
+    /// Chunk requests served per key.
+    requests: Mutex<BTreeMap<String, u32>>,
     ready_pushes: AtomicU32,
-    /// Becomes `true` once a `202` for the registry has been served.
-    assembled: watch::Sender<bool>,
+    /// The keys for which a `202` has been served: ready to push.
+    assembled: watch::Sender<BTreeSet<String>>,
 }
 
 /// A running mock hub. Stops when dropped.
@@ -100,10 +118,10 @@ impl MockHub {
     pub async fn bind(options: MockHubOptions, addr: SocketAddr) -> std::io::Result<MockHub> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let (assembled, _) = watch::channel(false);
+        let (assembled, _) = watch::channel(BTreeSet::new());
         let state = Arc::new(State {
             options,
-            registry_requests: AtomicU32::new(0),
+            requests: Mutex::new(BTreeMap::new()),
             ready_pushes: AtomicU32::new(0),
             assembled,
         });
@@ -133,7 +151,18 @@ impl MockHub {
 
     /// Registry chunk requests served so far.
     pub fn registry_requests(&self) -> u32 {
-        self.state.registry_requests.load(Ordering::SeqCst)
+        self.chunk_requests(REGISTRY_KEY)
+    }
+
+    /// Requests served so far for one chunk key.
+    pub fn chunk_requests(&self, key: &str) -> u32 {
+        self.state
+            .requests
+            .lock()
+            .expect("request count lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// `chunkReady` frames pushed so far.
@@ -250,9 +279,19 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
         .await;
     }
     if let Some(key) = head.path.strip_prefix(&chunk_prefix) {
-        if key == REGISTRY_KEY {
-            let n = state.registry_requests.fetch_add(1, Ordering::SeqCst);
-            if n < o.pending_responses {
+        let served = if key == REGISTRY_KEY {
+            Some((&o.registry_chunk, o.pending_responses))
+        } else {
+            o.cells.get(key).map(|c| (c, o.cell_pending_responses))
+        };
+        if let Some((body, pending)) = served {
+            let n = {
+                let mut counts = state.requests.lock().expect("request count lock");
+                let n = counts.entry(key.to_string()).or_insert(0);
+                *n += 1;
+                *n - 1
+            };
+            if n < pending {
                 respond(
                     &mut stream,
                     "202 Accepted",
@@ -260,7 +299,9 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
                     b"",
                 )
                 .await?;
-                state.assembled.send_replace(true);
+                state.assembled.send_modify(|keys| {
+                    keys.insert(key.to_string());
+                });
                 return Ok(());
             }
             return respond(
@@ -270,7 +311,7 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
                     ("Content-Type", "application/octet-stream"),
                     ("Cache-Control", "public, max-age=31536000, immutable"),
                 ],
-                &o.registry_chunk,
+                body,
             )
             .await;
         }
@@ -291,8 +332,8 @@ async fn serve_socket(stream: TcpStream, state: Arc<State>) -> std::io::Result<(
         .map_err(std::io::Error::other)?;
     let (mut write, mut read) = socket.split();
     let mut assembled = state.assembled.subscribe();
-    let mut wants_registry = false;
-    let mut pushed = false;
+    let mut subscribed: BTreeSet<String> = BTreeSet::new();
+    let mut pushed: BTreeSet<String> = BTreeSet::new();
     loop {
         tokio::select! {
             msg = read.next() => match msg {
@@ -300,26 +341,34 @@ async fn serve_socket(stream: TcpStream, state: Arc<State>) -> std::io::Result<(
                     #[derive(serde::Deserialize)]
                     struct Subscribe { subscribe: Option<String> }
                     if let Ok(Subscribe { subscribe: Some(key) }) = serde_json::from_str(text.as_str()) {
-                        wants_registry |= key == REGISTRY_KEY;
+                        subscribed.insert(key);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
             },
-            changed = assembled.changed(), if !*assembled.borrow() => {
+            changed = assembled.changed() => {
                 if changed.is_err() {
                     break;
                 }
             }
         }
-        if wants_registry && !pushed && *assembled.borrow() {
-            let frame = format!(r#"{{"chunkReady":"{REGISTRY_KEY}"}}"#);
+        let due: Vec<String> = {
+            let ready = assembled.borrow_and_update();
+            subscribed
+                .iter()
+                .filter(|k| ready.contains(*k) && !pushed.contains(*k))
+                .cloned()
+                .collect()
+        };
+        for key in due {
+            let frame = format!(r#"{{"chunkReady":"{key}"}}"#);
             write
                 .send(Message::text(frame))
                 .await
                 .map_err(std::io::Error::other)?;
             state.ready_pushes.fetch_add(1, Ordering::SeqCst);
-            pushed = true;
+            pushed.insert(key);
         }
     }
     Ok(())

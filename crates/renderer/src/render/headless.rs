@@ -6,7 +6,7 @@
 //! window or display. `WGPU_BACKEND` and the other wgpu environment
 //! variables select the adapter as usual.
 
-use super::gpu::Renderer;
+use super::gpu::{Exposure, FrameStats, Renderer};
 use super::scene::Scene;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
@@ -121,10 +121,27 @@ impl Headless {
         &self.adapter_name
     }
 
-    /// Renders one frame and reads it back.
+    /// Renders one frame with the exposure jumping straight to the frame's
+    /// luminance and no bias, and reads it back. The same scene always
+    /// gives the same image.
     pub fn render(&mut self, scene: &Scene, overlay: Option<&str>) -> Result<Image> {
-        self.renderer.render(&self.view, scene, overlay);
+        self.render_with(scene, overlay, Exposure::default())
+    }
+
+    /// Renders one frame with the given exposure and reads it back.
+    pub fn render_with(
+        &mut self,
+        scene: &Scene,
+        overlay: Option<&str>,
+        exposure: Exposure,
+    ) -> Result<Image> {
+        self.renderer.render(&self.view, scene, overlay, exposure);
         self.read_back()
+    }
+
+    /// What the last frame drew.
+    pub fn stats(&self) -> FrameStats {
+        self.renderer.stats()
     }
 
     fn read_back(&self) -> Result<Image> {

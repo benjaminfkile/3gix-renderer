@@ -26,11 +26,19 @@ desktop binary, the headless tests, and the browser build share it.
 | `mock_hub` | A small hub for tests and `gx-mock-hub` | same |
 | `sim` | `SimClock` and integration of every frame to the simulation time | `space-model.md` 6 |
 | `camera` | Free camera parented to its nearest frame, re-parenting | `space-model.md` 5 |
-| `render::scene` | Camera-relative `f32` positions, projection, depth strategy | `space-model.md` 5 |
+| `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the fetcher | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
+| `extract` | Marching cubes over a composited section, the extraction worker pool | `space-model.md` 2 |
+| `light` | Emitters from hot matter, point lights, the emission lookup table | `matter-format.md` 3.3 |
+| `world` | Ties stream, extract, and light together for one frame | |
+| `render::scene` | Camera-relative `f32` positions, surface placement, projection, depth strategy | `space-model.md` 5 |
 | `render::overlay` | The overlay text | |
-| `render::gpu` | wgpu pipelines and the one render pass | |
+| `render::gpu` | wgpu pipelines: surface pass, exposure, display pass | |
 | `render::headless` | Offscreen RGBA8 target, readback, PNG | |
 | `app` | Desktop window loop and the headless run | |
+
+Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/exposure.wgsl`
+(luminance, adaptation, tone curve), `src/render/markers.wgsl` (markers and
+lines).
 
 Binaries: `gx-renderer` (`src/main.rs`) and `gx-mock-hub`
 (`src/bin/gx-mock-hub.rs`).
@@ -49,7 +57,11 @@ off; the browser build adds its own window and fetch path.
    never skipped.
 3. Free flight moves the camera; then, if `FrameSystem::nearest_frame` of the
    camera position differs from its frame, the camera re-parents.
-4. The scene is built camera-relative and drawn with the overlay.
+4. Matter streams: selection (every 100 ms), requests, fetch results,
+   readiness pushes, finished meshes, eviction. See "From selection to
+   pixels" below.
+5. The scene is built camera-relative with the drawn cells and their lights
+   and drawn with the overlay.
 
 ## `f64` versus `f32`
 
@@ -90,7 +102,8 @@ toward 0 at infinity. The depth buffer clears to 0 and the test keeps the
 greater value. Reversed-z puts the dense end of the float range at the far
 distances, which is where a perspective depth needs it, and the infinite far
 plane removes the far plane choice. The near plane is chosen per frame as half
-the distance to the nearest marker in front of the camera (at least 1 mm).
+the distance to the nearest marker in front of the camera or to the nearest
+drawn mesh's bounds, whichever is closer (at least 1 mm).
 
 ## Overlay text
 
@@ -113,3 +126,100 @@ need.
   pending after 10 s. The registry load gives up after 60 s with a clear
   error, and an invalid registry fails with the validator's code and reason.
 - Without `GX_BUILD_ID` the active build comes from `GET /space/{s}/builds`.
+
+## From selection to pixels
+
+Each step knows physics and geometry only. A cell is a cell, a hot sample is
+a light, a dense sample is a surface.
+
+1. **Selection** (`stream::select_all`, every 100 ms). A frame takes part
+   when its `root_extent / 8` region is inside the view cone or within
+   `4 * root_extent` of the camera. For each such frame,
+   `gx_core::lod::select_cells` runs with the camera in the frame's
+   coordinates, a pixel error of 4, the viewport height, the vertical field
+   of view, and at most 512 cells. Each selected cell keeps its projected
+   size in pixels as its request priority.
+2. **The cell cache** (`stream::CellCache`), keyed by
+   `(frame_id, depth, x, y, z)`:
+
+   | State | Meaning |
+   |---|---|
+   | `Missing` | Selected, not requested yet (or a failed request waiting 2 s to retry) |
+   | `Requested` | A request is in flight; at most 16 at once, largest projected size first |
+   | `Pending(since)` | The hub answered `202`; subscribed to `chunkReady` for the key |
+   | `Ready(cell)` | `200`, decoded and composited |
+   | `Empty` | The composite holds no matter, or `404` (no layers for the key) |
+   | `Gone` | `410`, or bytes that fail validation |
+
+   A `chunkReady` push sends a `Pending` cell back to `Missing`; a push that
+   arrives while the request is still in flight makes the `202` ask again at
+   once. A cell still pending after 10 s is also polled every 2 s. Cells not
+   selected (or drawn as a stand-in) for 60 s are evicted, and beyond 4096
+   cached cells the least recently used go first. Selected cells and
+   requests in flight are never evicted.
+3. **Decode and composite** (`stream::decode_cell`).
+   `gx_core::container::decode_chunk` validates every section; each
+   section's `cell_origin` and `cell_edge` must also match the registry's
+   geometry for the key (`matter-format.md` 3.1); then
+   `gx_core::matter::composite` combines the layers. The composited
+   `Section` is kept together with its emitter (step 5).
+4. **Extraction** (`extract`) runs on a pool of `std::thread` workers fed by
+   a channel: marching cubes over the composited density at the sample
+   centers, at half the section's largest density. The browser build, with
+   no threads, extracts inline.
+5. **Lights** (`light`). Each drawn `Ready` cell's emitter is
+   `gx_core::emission::summarize(section, 1000 K)`. Emitters of one frame
+   merge: band powers add, the position is the power-weighted centroid. The
+   eight strongest merged emitters become point lights of radiant intensity
+   `band_power / (4 pi)` per band. Only cells in the draw set count, so a
+   parent and its children never both contribute.
+6. **Draw set** (`stream::CellCache::draw_set`), with the depth transition
+   rule below.
+7. **Placement** (`render::scene::add_matter`). A mesh is uploaded once
+   with positions relative to its cell origin in `f32`. Per frame, the cell
+   origin is made relative to the camera in `f64` with
+   `FrameSystem::relative` and cast to `f32`; that offset and the frame's
+   rotation are the draw's model transform. Light positions go through the
+   same `f64` camera-relative step. The near plane also comes in to half the
+   distance to the nearest mesh bounds.
+8. **Shading and exposure** (`render::gpu`, `docs/shading.md`): the lit
+   surface pass into a float target, automatic exposure, the tone curve,
+   then markers, lines, and the overlay.
+
+## The depth transition rule
+
+No holes, ever. For every selected cell:
+
+- if it can be drawn (its mesh is ready, or it is `Empty`), it is drawn;
+- else, if its descendants down to two levels are loaded and cover it, they
+  are drawn (the camera moved away and the coarse cell has not arrived);
+- else its nearest drawable ancestor is drawn instead.
+
+Then any drawn cell with a drawn ancestor is dropped. So while any child of
+a cell is not ready, the parent keeps drawing and none of the children do;
+the moment every child is ready, the children replace the parent. A `Gone`
+cell never counts as ready, so its parent stays rather than leaving a hole.
+
+## The extraction determinism contract
+
+The same composited section always gives bit-identical vertex and index
+buffers, whatever thread extracts it and however many times:
+
+- The grid is walked in index order, x fastest, then y, then z. Vertices are
+  created in that walk and shared through a table addressed by grid edge;
+  nothing is sorted, hashed, or ordered by pointer.
+- The triangle table is derived once, by a fixed procedure, from the cube
+  faces (`extract::case_table`).
+- Every value is plain `f64` arithmetic with `sqrt`, both correctly rounded
+  in IEEE 754; attributes are narrowed to `f32` last.
+- The isovalue is half the section's largest density, found in the same
+  walk.
+- A mesh depends only on its own section, so the order the pool finishes
+  jobs in changes only which frame a mesh first appears in.
+
+The section grid is padded with one layer of vacuum, so a surface always
+closes within half a sample of the cell boundary. Matter that fills a cell
+ends in a wall exactly at the boundary (where the density falls from full
+to zero, the crossing at half is midway), and two filled neighbors meet
+wall to wall rather than leaving a crack. Coarse cells give coarse meshes;
+the renderer does not smooth beyond the gradient normals.

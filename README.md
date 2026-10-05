@@ -54,7 +54,8 @@ Flags: `--time-scale <f64>` (default 1), `--start-offset-seconds <f64>`
 `--help`.
 
 Without a hub, `gx-mock-hub` serves a registry the way the hub does and prints
-the variables to use:
+the variables to use. `--cell <key>=<file>` adds a matter cell from a hub
+chunk container file:
 
 ```sh
 cargo run --bin gx-mock-hub &          # prints GX_HUB_URL, GX_API_KEY, GX_SPACE_ID
@@ -62,8 +63,12 @@ export GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=...
 cargo run --bin gx-renderer -- --headless --screenshot out.png
 ```
 
-Controls are in `docs/controls.md`; the module map, the floating origin, and
-the depth strategy are in `docs/architecture.md`.
+A headless run streams the cells the `Home` view selects (for up to 60 s)
+before it renders.
+
+Controls are in `docs/controls.md`; the module map, the floating origin, the
+depth strategy, and the matter pipeline are in `docs/architecture.md`; the
+lighting model, exposure, and tone curve are in `docs/shading.md`.
 
 ## Checks
 
@@ -72,7 +77,9 @@ sh scripts/ci.sh
 ```
 
 Runs format, clippy with `-D warnings`, the tests (including the headless
-render), the vocabulary lint, and the wasm32 build of the library crate.
+renders), the vocabulary lint, and the wasm32 build of the library crate. The
+matter render test saves its image as `target/tmp/matter-render.png` and its
+pixel statistics as `target/tmp/matter-render.txt`.
 
 ## Specification
 

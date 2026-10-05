@@ -7,18 +7,25 @@
 //!    section 6),
 //! 2. apply free flight to the [`Camera`] and re-parent it to its nearest
 //!    frame ([`crate::camera`], `space-model.md` section 5),
-//! 3. build the camera-relative scene and draw it with the overlay
-//!    ([`crate::render`]).
+//! 3. stream matter: select cells (every 100 ms), start requests, apply
+//!    fetch results and readiness pushes, collect extracted meshes, and
+//!    evict ([`crate::world`], [`crate::stream`]),
+//! 4. build the camera-relative scene with the drawn cells and their lights
+//!    and draw it with the overlay ([`crate::render`]).
 //!
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
 use crate::camera::{Camera, FlightInput};
 use crate::config::Config;
-use crate::render::gpu::Renderer;
+use crate::extract::default_threads;
+use crate::hub::HubClient;
+use crate::render::gpu::{Exposure, Renderer, EXPOSURE_STEP_STOPS};
 use crate::render::headless::{Headless, Image};
-use crate::render::overlay::OverlayInfo;
-use crate::render::scene::build_scene;
+use crate::render::overlay::{MatterStats, OverlayInfo};
+use crate::render::scene::{add_matter, build_scene, Scene};
 use crate::sim::{ClockAction, SimClock, Simulation};
+use crate::stream::{FetchEvent, Fetcher};
+use crate::world::World;
 use anyhow::{anyhow, Context, Result};
 use gx_core::frames::FrameSystem;
 use gx_core::units::Seconds;
@@ -42,6 +49,69 @@ pub const MAX_FRAME_SECONDS: f64 = 0.25;
 /// Pixels of trackpad scroll that count as one wheel notch.
 pub const PIXELS_PER_NOTCH: f64 = 40.0;
 
+/// Longest a headless run waits for the selected cells, seconds, before it
+/// renders whatever has arrived.
+pub const HEADLESS_STREAM_SECONDS: f64 = 60.0;
+
+/// Limits of the exposure bias, stops.
+pub const EXPOSURE_BIAS_LIMITS: (f64, f64) = (-16.0, 16.0);
+
+/// Starts requests for the cells the world wants and applies every fetch
+/// event that has arrived.
+pub fn stream_step(
+    world: &mut World,
+    fetcher: &mut Fetcher,
+    system: &FrameSystem,
+    events: Vec<FetchEvent>,
+    now: f64,
+) {
+    for event in events {
+        match event {
+            FetchEvent::Completed { key, outcome, .. } => world.complete(key, outcome, now),
+            FetchEvent::ChunkReady(key) => world.chunk_ready(&key),
+        }
+    }
+    for key in world.take_requests(now) {
+        if let Some(frame) = system.tree().get(key.frame_id) {
+            fetcher.request(key, frame.root_extent);
+        }
+    }
+    world.pump();
+}
+
+/// The matter values for the overlay.
+pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> MatterStats {
+    let counts = world.counts();
+    MatterStats {
+        cells_selected: counts.cache.selected,
+        cells_ready: counts.cache.ready,
+        cells_pending: counts.cache.pending,
+        meshes_drawn: scene.surfaces.len(),
+        triangles_drawn: scene.surfaces.iter().map(|d| d.mesh.triangle_count()).sum(),
+        lights_active: scene.lights.len(),
+        bytes_fetched: fetcher.map_or(0, Fetcher::bytes_fetched),
+        last_round_trip: fetcher
+            .and_then(Fetcher::last_round_trip)
+            .map(|d| d.as_secs_f64()),
+    }
+}
+
+/// The scene for the camera: frame markers plus the world's drawn cells and
+/// lights.
+pub fn matter_scene(
+    world: &mut World,
+    system: &FrameSystem,
+    camera: &Camera,
+    size: (u32, u32),
+    now: f64,
+) -> Scene {
+    let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
+    let mut scene = build_scene(system, camera, aspect);
+    let draw = world.draw_list(system, camera, now);
+    add_matter(&mut scene, system, camera, &draw);
+    scene
+}
+
 /// A simulation at the configured launch offset and time scale, with the
 /// system still at its epoch.
 pub fn launch_simulation(system: FrameSystem, config: &Config) -> Simulation {
@@ -50,7 +120,12 @@ pub fn launch_simulation(system: FrameSystem, config: &Config) -> Simulation {
 }
 
 /// The overlay values for the current state.
-pub fn overlay_info(sim: &Simulation, camera: &Camera, fps: Option<f64>) -> OverlayInfo {
+pub fn overlay_info(
+    sim: &Simulation,
+    camera: &Camera,
+    fps: Option<f64>,
+    matter: MatterStats,
+) -> OverlayInfo {
     OverlayInfo {
         sim_time: sim.system.time(),
         time_scale: sim.clock.scale,
@@ -60,13 +135,21 @@ pub fn overlay_info(sim: &Simulation, camera: &Camera, fps: Option<f64>) -> Over
         frame_count: sim.system.tree().frames().len(),
         fps,
         sim_lag: sim.lagging(),
+        matter,
     }
 }
 
 /// Renders one headless frame of `sim` from the `Home` view: integrates
 /// toward the launch offset (at most [`HEADLESS_CATCH_UP_ROUNDS`] clamped
-/// rounds), places the camera, and reads the image back.
-pub fn render_headless_frame(sim: &mut Simulation, width: u32, height: u32) -> Result<Image> {
+/// rounds), places the camera, streams the selected cells through
+/// `fetcher` until every one is resolved (at most
+/// [`HEADLESS_STREAM_SECONDS`]), and reads the image back.
+pub fn render_headless_frame(
+    sim: &mut Simulation,
+    mut fetcher: Option<&mut Fetcher>,
+    width: u32,
+    height: u32,
+) -> Result<Image> {
     for _ in 0..HEADLESS_CATCH_UP_ROUNDS {
         if !sim.integrate_toward_target().lagging {
             break;
@@ -74,18 +157,44 @@ pub fn render_headless_frame(sim: &mut Simulation, width: u32, height: u32) -> R
     }
     let mut camera = Camera::home(&sim.system);
     camera.update_parent(&sim.system);
-    let scene = build_scene(&sim.system, &camera, f64::from(width) / f64::from(height));
+    let mut world = World::new(default_threads());
+    let start = Instant::now();
+    world.select(&sim.system, &camera, (width, height), 0.0, true);
+    if let Some(f) = fetcher.as_deref_mut() {
+        loop {
+            let now = start.elapsed().as_secs_f64();
+            let events = f.wait(Duration::from_millis(50));
+            stream_step(&mut world, f, &sim.system, events, now);
+            if world.settled() {
+                break;
+            }
+            if now > HEADLESS_STREAM_SECONDS {
+                tracing::warn!("not every cell arrived in time, rendering what did");
+                break;
+            }
+        }
+    }
+    world.finish_extraction();
+    let now = start.elapsed().as_secs_f64();
+    let scene = matter_scene(&mut world, &sim.system, &camera, (width, height), now);
     let mut headless = Headless::new(width, height)?;
     tracing::info!(adapter = headless.adapter_name(), "headless rendering");
-    let overlay = overlay_info(sim, &camera, None).text();
+    let stats = matter_stats(&world, fetcher.as_deref(), &scene);
+    let overlay = overlay_info(sim, &camera, None, stats).text();
     headless.render(&scene, Some(&overlay))
 }
 
 /// The `--headless` run: one frame offscreen, written to the screenshot path
-/// if one was given.
-pub fn run_headless(config: &Config, system: FrameSystem) -> Result<()> {
+/// if one was given. Cells are fetched through `client` on `runtime`.
+pub fn run_headless(
+    config: &Config,
+    system: FrameSystem,
+    client: Arc<HubClient>,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let mut sim = launch_simulation(system, config);
-    let image = render_headless_frame(&mut sim, config.width, config.height)?;
+    let mut fetcher = Fetcher::new(runtime, client);
+    let image = render_headless_frame(&mut sim, Some(&mut fetcher), config.width, config.height)?;
     match &config.screenshot {
         Some(path) => {
             image.write_png(path)?;
@@ -96,8 +205,14 @@ pub fn run_headless(config: &Config, system: FrameSystem) -> Result<()> {
     Ok(())
 }
 
-/// The desktop run: a window, the frame loop, and the controls.
-pub fn run_windowed(config: &Config, system: FrameSystem) -> Result<()> {
+/// The desktop run: a window, the frame loop, and the controls. Cells are
+/// fetched through `client` on `runtime`.
+pub fn run_windowed(
+    config: &Config,
+    system: FrameSystem,
+    client: Arc<HubClient>,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let event_loop = EventLoop::new().context("opening the window system")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let sim = launch_simulation(system, config);
@@ -105,6 +220,10 @@ pub fn run_windowed(config: &Config, system: FrameSystem) -> Result<()> {
     let mut app = App {
         sim,
         camera,
+        world: World::new(default_threads()),
+        fetcher: Fetcher::new(runtime, client),
+        started: Instant::now(),
+        exposure_bias: 0.0,
         input: Input::default(),
         gfx: None,
         size: (config.width, config.height),
@@ -233,6 +352,10 @@ impl Gfx {
 struct App {
     sim: Simulation,
     camera: Camera,
+    world: World,
+    fetcher: Fetcher,
+    started: Instant,
+    exposure_bias: f64,
     input: Input,
     gfx: Option<Gfx>,
     size: (u32, u32),
@@ -259,6 +382,8 @@ impl App {
             KeyCode::Period => self.sim.clock.apply(ClockAction::StepForward),
             KeyCode::KeyR => self.sim.clock.apply(ClockAction::Reset),
             KeyCode::Home => self.camera = Camera::home(&self.sim.system),
+            KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
+            KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => event_loop.exit(),
             other => {
                 if let Some(index) = digit_index(other) {
@@ -271,6 +396,11 @@ impl App {
                 }
             }
         }
+    }
+
+    fn bias_exposure(&mut self, stops: f64) {
+        let (lo, hi) = EXPOSURE_BIAS_LIMITS;
+        self.exposure_bias = (self.exposure_bias + stops).clamp(lo, hi);
     }
 
     fn frame(&mut self) {
@@ -289,9 +419,20 @@ impl App {
         let Some(gfx) = self.gfx.as_mut() else {
             return;
         };
-        let (w, h) = gfx.renderer.size();
-        let scene = build_scene(&self.sim.system, &self.camera, f64::from(w) / f64::from(h));
-        let overlay = overlay_info(&self.sim, &self.camera, fps).text();
+        let size = gfx.renderer.size();
+        let t = self.started.elapsed().as_secs_f64();
+        let system = &self.sim.system;
+        self.world.select(system, &self.camera, size, t, false);
+        let events = self.fetcher.drain();
+        stream_step(&mut self.world, &mut self.fetcher, system, events, t);
+        self.world.evict(t);
+        let scene = matter_scene(&mut self.world, system, &self.camera, size, t);
+        let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
+        let overlay = overlay_info(&self.sim, &self.camera, fps, stats).text();
+        let exposure = Exposure {
+            bias_stops: self.exposure_bias,
+            adapt_seconds: Some(dt),
+        };
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -304,7 +445,7 @@ impl App {
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        gfx.renderer.render(&view, &scene, Some(&overlay));
+        gfx.renderer.render(&view, &scene, Some(&overlay), exposure);
         gfx.window.pre_present_notify();
         gfx.queue.present(texture);
     }
