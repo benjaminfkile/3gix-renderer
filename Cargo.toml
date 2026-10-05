@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/renderer"]
+
+# Line tables only for our code and no debug info for dependencies: the
+# test binaries link wgpu, winit, and a TLS stack, and full debug info makes
+# several parallel links run out of memory on small machines.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -1,0 +1,82 @@
+{
+  "epoch": {
+    "bits": "0x41c823cf40000000",
+    "decimal": "8.1e8"
+  },
+  "frame_count": 1,
+  "frames": [
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3ec8088a682354ef",
+          "decimal": "2.865e-6"
+        }
+      ],
+      "frame_id": 1,
+      "mass": {
+        "bits": "0x46391ace3d05aef4",
+        "decimal": "1.989e30"
+      },
+      "max_depth": 14,
+      "orientation": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3fe3333333333333",
+          "decimal": "6e-1"
+        },
+        {
+          "bits": "0x3fe999999999999a",
+          "decimal": "8e-1"
+        }
+      ],
+      "parent_frame_id": 18446744073709551615,
+      "position": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x42a5d3ef79800000",
+        "decimal": "1.2e13"
+      },
+      "velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    }
+  ]
+}

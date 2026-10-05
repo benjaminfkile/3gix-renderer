@@ -1,0 +1,15 @@
+earth
+planet
+moon
+sun
+star
+solar
+terrain
+ocean
+sea
+water
+land
+sky
+atmosphere
+sphere
+globe
