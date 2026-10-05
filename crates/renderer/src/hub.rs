@@ -25,13 +25,15 @@
 //! never logged.
 
 use crate::config::{ApiKey, Config};
+use crate::protocol::{builds_url, chunk_url, ready_url};
+pub use crate::protocol::{
+    classify_status, frame_system_from_chunk, parse_ready_frame, pick_active_build,
+    subscribe_frame, BuildSummary, ChunkFetch, API_KEY_HEADER,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use gx_core::container::decode_registry_chunk;
 use gx_core::frames::FrameSystem;
 use gx_core::key::REGISTRY_KEY;
-use gx_core::registry::FrameTree;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,42 +42,6 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-
-/// The header that carries the API key.
-pub const API_KEY_HEADER: &str = "X-API-Key";
-
-/// The outcome of one chunk request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChunkFetch {
-    /// `200 OK`: the assembled chunk container.
-    Ready(Arc<[u8]>),
-    /// `202 Accepted`: compilation was dispatched; ask again when ready.
-    Pending,
-    /// `404 Not Found`: the build has no layers to compile it.
-    NotFound,
-    /// `410 Gone`: a required compiler is retired; it can never be produced.
-    Gone,
-    /// Anything else: transport failure or an unexpected status.
-    Error(String),
-}
-
-/// The outcome for an HTTP status of the chunk endpoint. A `200` needs its
-/// body, so it maps to `None` here and is handled by the caller.
-pub fn classify_status(status: u16) -> Option<ChunkFetch> {
-    match status {
-        200 => None,
-        202 => Some(ChunkFetch::Pending),
-        404 => Some(ChunkFetch::NotFound),
-        410 => Some(ChunkFetch::Gone),
-        401 => Some(ChunkFetch::Error(
-            "hub refused the API key (401 Unauthorized)".into(),
-        )),
-        403 => Some(ChunkFetch::Error(
-            "the API key lacks the fetch:chunks capability (403 Forbidden)".into(),
-        )),
-        other => Some(ChunkFetch::Error(format!("unexpected status {other}"))),
-    }
-}
 
 /// How long to wait for a pending chunk, and how to poll for it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -97,51 +63,6 @@ impl Default for ReadyPolicy {
             deadline: Duration::from_secs(60),
         }
     }
-}
-
-/// One frame the client sends on the readiness socket.
-#[derive(Serialize)]
-struct SubscribeFrame<'a> {
-    subscribe: &'a str,
-}
-
-/// One frame the hub pushes on the readiness socket.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadyFrame {
-    chunk_ready: String,
-}
-
-/// Parses a readiness push, `{ "chunkReady": "<key>" }`, or returns `None`
-/// for anything else.
-pub fn parse_ready_frame(text: &str) -> Option<String> {
-    serde_json::from_str::<ReadyFrame>(text)
-        .ok()
-        .map(|f| f.chunk_ready)
-}
-
-/// The text of a subscription frame, `{"subscribe":"<key>"}`.
-pub fn subscribe_frame(key: &str) -> String {
-    serde_json::to_string(&SubscribeFrame { subscribe: key }).expect("a string serializes")
-}
-
-/// One entry of `GET /space/{spaceId}/builds`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildSummary {
-    /// The build id.
-    pub build_id: String,
-    /// `Active` for the build clients should draw, `Archived` for the rest.
-    pub status: String,
-}
-
-/// Picks the active build from a builds listing: the first entry whose
-/// status is `Active` (the hub lists newest first).
-pub fn pick_active_build(builds: &[BuildSummary]) -> Option<&str> {
-    builds
-        .iter()
-        .find(|b| b.status.eq_ignore_ascii_case("active"))
-        .map(|b| b.build_id.as_str())
 }
 
 /// A connection to one build of one space on the hub.
@@ -202,7 +123,7 @@ impl HubClient {
 
     /// Asks the hub for the active build of the space.
     pub async fn active_build(&self) -> Result<String> {
-        let url = format!("{}/space/{}/builds", self.base_url, self.space_id);
+        let url = builds_url(&self.base_url, &self.space_id);
         let resp = self
             .http
             .get(&url)
@@ -223,26 +144,13 @@ impl HubClient {
     }
 
     fn chunk_url(&self, key: &str) -> String {
-        format!(
-            "{}/space/{}/build/{}/chunk/{}",
-            self.base_url, self.space_id, self.build_id, key
-        )
+        chunk_url(&self.base_url, &self.space_id, &self.build_id, key)
     }
 
     /// The readiness WebSocket URL for `build`: the hub URL with `http`
     /// replaced by `ws` (or `https` by `wss`).
     pub fn ready_url(&self, build: &str) -> String {
-        let ws_base = if let Some(rest) = self.base_url.strip_prefix("https://") {
-            format!("wss://{rest}")
-        } else if let Some(rest) = self.base_url.strip_prefix("http://") {
-            format!("ws://{rest}")
-        } else {
-            self.base_url.clone()
-        };
-        format!(
-            "{ws_base}/space/{}/build/{build}/chunks/ready",
-            self.space_id
-        )
+        ready_url(&self.base_url, &self.space_id, build)
     }
 
     /// Fetches one chunk. A key that has answered `200` before is served
@@ -419,17 +327,6 @@ impl ReadySubscription {
     }
 }
 
-/// Decodes a registry chunk container and builds the frame system at the
-/// epoch. Fails with the validator's code and reason if any registry or the
-/// union of them is invalid.
-pub fn frame_system_from_chunk(bytes: &[u8]) -> Result<FrameSystem> {
-    let registries = decode_registry_chunk(bytes)
-        .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
-    let tree = FrameTree::from_registries(&registries)
-        .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
-    Ok(FrameSystem::from_tree(tree))
-}
-
 /// Loads the frame registry of the client's build: opens the readiness
 /// socket (polling instead if it does not open), fetches the `registry`
 /// chunk with [`HubClient::wait_for_chunk`], then decodes and validates it.
@@ -454,38 +351,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn statuses_map_to_outcomes() {
-        assert_eq!(classify_status(200), None);
-        assert_eq!(classify_status(202), Some(ChunkFetch::Pending));
-        assert_eq!(classify_status(404), Some(ChunkFetch::NotFound));
-        assert_eq!(classify_status(410), Some(ChunkFetch::Gone));
-        assert!(matches!(classify_status(500), Some(ChunkFetch::Error(_))));
-        assert!(matches!(classify_status(401), Some(ChunkFetch::Error(_))));
-    }
-
-    #[test]
-    fn socket_frames() {
-        assert_eq!(subscribe_frame("registry"), r#"{"subscribe":"registry"}"#);
-        assert_eq!(
-            parse_ready_frame(r#"{"chunkReady":"4-1-0-1-0"}"#).as_deref(),
-            Some("4-1-0-1-0")
-        );
-        assert_eq!(parse_ready_frame(r#"{"other":1}"#), None);
-        assert_eq!(parse_ready_frame("not json"), None);
-    }
-
-    #[test]
-    fn active_build_is_the_first_active() {
-        let builds: Vec<BuildSummary> = serde_json::from_str(
-            r#"[{"buildId":"b2","spaceId":"s","createdAt":"t","status":"Archived"},
-                {"buildId":"b1","spaceId":"s","createdAt":"t","status":"Active"}]"#,
-        )
-        .unwrap();
-        assert_eq!(pick_active_build(&builds), Some("b1"));
-        assert_eq!(pick_active_build(&builds[..1]), None);
-    }
-
-    #[test]
     fn ready_url_swaps_the_scheme() {
         let c = HubClient::new("https://hub.invalid/", ApiKey::new("k"), "s", "b").unwrap();
         assert_eq!(
@@ -501,11 +366,5 @@ mod tests {
             c.chunk_url("registry"),
             "http://hub.invalid/space/s/build/b/chunk/registry"
         );
-    }
-
-    #[test]
-    fn invalid_registry_chunk_is_a_clear_error() {
-        let e = frame_system_from_chunk(&[1, 2, 3]).unwrap_err().to_string();
-        assert!(e.starts_with("registry is invalid: code"), "{e}");
     }
 }

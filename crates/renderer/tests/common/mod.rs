@@ -1,7 +1,7 @@
 //! The synthetic scene shared by the matter render test and the mock hub
 //! test: one root frame (mass 0) and one child frame, a hot plasma blob at
-//! 6000 K in the root frame's depth 0 cell, a dense solid blob at 300 K in
-//! the child frame's depth 0 cell, and an empty cell.
+//! 6000 K in the root frame's depth 0 cell (drawn as a volume), a dense
+//! solid blob at 300 K in the child frame's depth 0 cell, and an empty cell.
 //!
 //! Every blob is built numerically from a radius test on the sample
 //! centers. Nothing here is named after anything.
@@ -128,7 +128,13 @@ fn blob(key: CellKey, extent: f64, res: u8, radius: f64, matter: Sample) -> Sect
     Section::new(key, g.origin, g.edge, res, samples).expect("a valid section")
 }
 
-/// The hot blob section: plasma at 6000 K, emissivity 1.
+/// Density of the hot blob, kilograms per cubic meter.
+pub const HOT_DENSITY: f64 = 0.01;
+/// Mass attenuation of the hot blob, square meters per kilogram: an
+/// extinction of 0.4 per meter, optical depth 2 through its center.
+pub const HOT_ATTENUATION: f64 = 20.0;
+
+/// The hot blob section: plasma at 6000 K, emissivity 1, drawn as a volume.
 pub fn hot_section() -> Section {
     blob(
         hot_key(),
@@ -136,12 +142,12 @@ pub fn hot_section() -> Section {
         64,
         HOT_RADIUS,
         Sample {
-            density: Density::new(0.01),
+            density: Density::new(HOT_DENSITY),
             state: State::Plasma,
             temperature: Kelvin::new(HOT_TEMPERATURE),
             albedo: [Ratio::new(0.0); 3],
             roughness: Ratio::new(1.0),
-            attenuation: Attenuation::new(0.0),
+            attenuation: Attenuation::new(HOT_ATTENUATION),
         },
     )
 }
@@ -200,4 +206,66 @@ pub fn camera() -> Camera {
         orientation: look_rotation(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
         speed: 1.0,
     }
+}
+
+/// The gas frame of the full scene: a child of the root holding a cloud of
+/// warm gas at its origin. Mass 0, so it never leaves for the far field.
+pub const GAS: u64 = 3;
+/// Gas frame cube edge, meters.
+pub const GAS_EXTENT: f64 = 8.0;
+/// Gas frame origin relative to the root, meters: up and to the left of
+/// the hot blob as the fixed camera sees it.
+pub const GAS_OFFSET: [f64; 3] = [-12.0, 6.0, 7.0];
+/// Radius of the gas cloud, meters.
+pub const GAS_RADIUS: f64 = 3.0;
+/// Temperature of the gas cloud, kelvin.
+pub const GAS_TEMPERATURE: f64 = 4000.0;
+
+/// The registry of the full scene: the D2 frames plus the gas frame.
+pub fn full_registry() -> Registry {
+    Registry::new(
+        Seconds::new(0.0),
+        vec![
+            frame(ROOT, ROOT_PARENT, ROOT_EXTENT, 0.0, [0.0; 3]),
+            frame(CHILD, ROOT, CHILD_EXTENT, 1.0e3, CHILD_OFFSET),
+            frame(GAS, ROOT, GAS_EXTENT, 0.0, GAS_OFFSET),
+        ],
+    )
+    .expect("a valid registry")
+}
+
+/// The frame system of the full scene at the epoch.
+pub fn full_system() -> FrameSystem {
+    FrameSystem::from_tree(FrameTree::from_registries(&[full_registry()]).expect("valid union"))
+}
+
+/// The gas cloud's cell.
+pub fn gas_key() -> CellKey {
+    CellKey::new(GAS, 0, 0, 0, 0).unwrap()
+}
+
+/// The gas cloud section: gas at 2500 K, extinction 0.5 per meter.
+pub fn gas_section() -> Section {
+    blob(
+        gas_key(),
+        GAS_EXTENT,
+        32,
+        GAS_RADIUS,
+        Sample {
+            density: Density::new(0.05),
+            state: State::Gas,
+            temperature: Kelvin::new(GAS_TEMPERATURE),
+            albedo: [Ratio::new(0.3); 3],
+            roughness: Ratio::new(0.0),
+            attenuation: Attenuation::new(10.0),
+        },
+    )
+}
+
+/// The chunk containers of the full scene: the D2 cells plus the gas cell.
+pub fn full_chunks() -> BTreeMap<CellKey, Vec<u8>> {
+    let mut out = chunks();
+    let gas = encode(&gas_section(), Compression::Zstd);
+    out.insert(gas_key(), encode_chunk(&[&gas], &["layer-c"]));
+    out
 }

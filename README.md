@@ -13,7 +13,8 @@ Nothing in this repository knows what any piece of matter is. There is no code p
 - Fetches the frame registry for a build and integrates every frame forward from the epoch under Newtonian gravity.
 - Fetches matter cells near the camera at a depth chosen by distance, through the hub's chunk endpoint and readiness WebSocket.
 - Composites overlapping sections, relaxes fluid matter toward the local equipotential, derives emission from temperature.
-- Extracts surfaces or ray marches the density field and draws with camera-relative single precision over a floating origin.
+- Extracts surfaces from solid and fluid matter, ray marches gas and plasma as volumes, and draws with camera-relative single precision over a floating origin.
+- Draws frames too far away for cells as point sprites of the right brightness, so hot matter is visible from anywhere.
 - Lets the camera go anywhere, at any time scale.
 
 ## What it depends on
@@ -66,9 +67,20 @@ cargo run --bin gx-renderer -- --headless --screenshot out.png
 A headless run streams the cells the `Home` view selects (for up to 60 s)
 before it renders.
 
+Browser, with WebGPU (see `docs/web.md`):
+
+```sh
+sh web/build.sh
+cd web && python3 -m http.server 8000
+```
+
+The page asks for the hub URL, API key, space id, build id, and time scale
+and keeps them in `localStorage`.
+
 Controls are in `docs/controls.md`; the module map, the floating origin, the
 depth strategy, and the matter pipeline are in `docs/architecture.md`; the
-lighting model, exposure, and tone curve are in `docs/shading.md`.
+lighting model, volumes, the far field, exposure, and tone curve are in
+`docs/shading.md`; the browser build is in `docs/web.md`.
 
 ## Checks
 
@@ -77,9 +89,12 @@ sh scripts/ci.sh
 ```
 
 Runs format, clippy with `-D warnings`, the tests (including the headless
-renders), the vocabulary lint, and the wasm32 build of the library crate. The
-matter render test saves its image as `target/tmp/matter-render.png` and its
-pixel statistics as `target/tmp/matter-render.txt`.
+renders and the GPU volume against its CPU reference), the vocabulary lint,
+the wasm32 builds with the `web` feature off and on, and `web/build.sh`. The
+matter render tests save their images as `target/tmp/matter-render.png` and
+`target/tmp/full-scene.png` with pixel statistics beside them in `.txt`
+files. The browser build is not run in CI; it is verified by hand
+(`docs/web.md`).
 
 ## Specification
 

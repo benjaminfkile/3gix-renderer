@@ -6,6 +6,11 @@
 //! sample is inside a surface, and the surface is where the density crosses
 //! half the largest density in the section.
 //!
+//! Only solid and fluid samples form surfaces ([`forms_surface`]). Gas and
+//! plasma have no hard surface; they count as vacuum here and are drawn as a
+//! volume instead ([`crate::volume`]). A cell that holds both gives a mesh
+//! from its solid and fluid samples and a volume from the rest.
+//!
 //! # The grid
 //!
 //! The samples of a section of resolution `n` are values at the sample
@@ -18,7 +23,8 @@
 //!
 //! # The isovalue
 //!
-//! Half the largest density found in the section, per section. A cell at a
+//! Half the largest density of the section's solid and fluid samples, per
+//! section; gas and plasma samples take no part. A cell at a
 //! coarse depth gives a coarse mesh: that is the compiler's chosen
 //! complexity, and nothing here smooths it.
 //!
@@ -60,6 +66,12 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Returns `true` for the states that form surfaces: solid and fluid.
+/// Everything else (vacuum, gas, plasma) counts as vacuum for extraction.
+pub fn forms_surface(state: State) -> bool {
+    matches!(state, State::Solid | State::Fluid)
+}
+
 /// Per-vertex attributes other than the position.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SurfaceVertex {
@@ -84,7 +96,8 @@ pub struct SurfaceMesh {
     pub key: CellKey,
     /// Minimum corner of the cell, meters, frame coordinates.
     pub origin: Vec3,
-    /// The density the surface follows, kilograms per cubic meter.
+    /// The density the surface follows, kilograms per cubic meter: half the
+    /// largest density of the solid and fluid samples.
     pub isovalue: f64,
     /// Vertex positions, meters, frame coordinates.
     pub positions: Vec<[f64; 3]>,
@@ -254,7 +267,9 @@ impl Grid<'_> {
         })
     }
 
-    /// The sample at grid point `p`, or `None` in the vacuum padding.
+    /// The sample at grid point `p`, or `None` in the vacuum padding. Its
+    /// weight in the attributes is the grid density, which is 0 for samples
+    /// that do not form surfaces.
     fn sample(&self, p: [usize; 3]) -> Option<gx_core::matter::Sample> {
         let n = self.m - 2;
         if p.iter().any(|&c| c == 0 || c > n) {
@@ -265,8 +280,9 @@ impl Grid<'_> {
     }
 }
 
-/// Extracts the surface of a composited section. An empty section, or one
-/// whose densities are all 0, gives an empty mesh.
+/// Extracts the surface of the solid and fluid samples of a composited
+/// section. An empty section, or one with no solid or fluid sample, gives an
+/// empty mesh.
 pub fn extract(section: &Section) -> SurfaceMesh {
     let key = section.key();
     let origin = section.origin();
@@ -290,7 +306,11 @@ pub fn extract(section: &Section) -> SurfaceMesh {
     for z in 0..n {
         for y in 0..n {
             for x in 0..n {
-                let d = samples.density(x + n * (y + n * z)).value();
+                let i = x + n * (y + n * z);
+                if !forms_surface(samples.state(i)) {
+                    continue;
+                }
+                let d = samples.density(i).value();
                 density[(x + 1) + m * ((y + 1) + m * (z + 1))] = d;
                 if d > max {
                     max = d;
@@ -409,7 +429,8 @@ fn edge_vertex(
         n
     };
 
-    // Density-weighted attributes; vacuum (and the padding) weighs nothing.
+    // Density-weighted attributes; vacuum, gas, plasma, and the padding
+    // weigh nothing.
     let (sa, sb) = (grid.sample(a), grid.sample(b));
     let wa = (1.0 - t) * da;
     let wb = t * db;
@@ -736,6 +757,71 @@ mod tests {
             assert_eq!(mesh.bounds_min[a], 0.0);
             assert_eq!(mesh.bounds_max[a], 4.0);
         }
+    }
+
+    #[test]
+    fn gas_and_plasma_take_no_part() {
+        // A solid core inside a much denser hot gas shell: the surface
+        // follows the solid alone, at half the solid density.
+        let res = 16;
+        let step = EDGE / f64::from(res);
+        let samples = Samples::from_fn(res, |x, y, z| {
+            let c = |i: u32| (f64::from(i) + 0.5) * step - EDGE / 2.0;
+            let r = (c(x) * c(x) + c(y) * c(y) + c(z) * c(z)).sqrt();
+            if r < 2.0 {
+                solid(1000.0)
+            } else if r < 3.5 {
+                Sample {
+                    density: Density::new(5000.0),
+                    state: State::Gas,
+                    temperature: Kelvin::new(4000.0),
+                    albedo: [Ratio::new(0.1); 3],
+                    roughness: Ratio::new(0.0),
+                    attenuation: Attenuation::new(1.0),
+                }
+            } else {
+                Sample::VACUUM
+            }
+        });
+        let section = Section::new(
+            CellKey::new(2, 0, 0, 0, 0).unwrap(),
+            Vec3::new(-EDGE / 2.0, -EDGE / 2.0, -EDGE / 2.0),
+            Meters::new(EDGE),
+            res,
+            samples,
+        )
+        .unwrap();
+        let mesh = extract(&section);
+        assert_eq!(mesh.isovalue, 500.0);
+        assert!(!mesh.is_empty());
+        assert_closed(&mesh);
+        for (p, v) in mesh.positions.iter().zip(&mesh.vertices) {
+            let r = Vec3::new(p[0], p[1], p[2]).length();
+            assert!(r < 2.0 + step, "vertex at radius {r}");
+            assert_eq!(v.state, 1);
+            assert!((v.temperature - 300.0).abs() < 1e-3);
+        }
+
+        // Gas alone gives no surface.
+        let gas_only = Section::new(
+            CellKey::new(2, 0, 0, 0, 0).unwrap(),
+            Vec3::zero(),
+            Meters::new(EDGE),
+            2,
+            Samples::filled(
+                2,
+                Sample {
+                    density: Density::new(1.0),
+                    state: State::Plasma,
+                    temperature: Kelvin::new(6000.0),
+                    albedo: [Ratio::new(0.0); 3],
+                    roughness: Ratio::new(0.0),
+                    attenuation: Attenuation::new(1.0),
+                },
+            ),
+        )
+        .unwrap();
+        assert!(extract(&gas_only).is_empty());
     }
 
     #[test]

@@ -18,6 +18,9 @@
 // Every position is relative to the camera, in root axes. A mesh arrives
 // relative to its cell origin and the model transform adds the rotation of
 // its frame and the camera-relative cell origin.
+//
+// The radiance is scaled by the model's weight: 1, or less while the cell's
+// frame fades in from the far field (src/farfield.rs).
 
 const PI: f32 = 3.14159265358979;
 const F0: f32 = 0.04;
@@ -44,7 +47,7 @@ struct Model {
     c0: vec4<f32>,
     c1: vec4<f32>,
     c2: vec4<f32>,
-    // Camera-relative cell origin, root axes, meters.
+    // xyz: camera-relative cell origin, root axes, meters; w: weight.
     offset: vec4<f32>,
 };
 
@@ -68,6 +71,7 @@ struct VsOut {
     @location(2) albedo: vec3<f32>,
     @location(3) roughness: f32,
     @location(4) emission: vec3<f32>,
+    @location(5) weight: f32,
 };
 
 @vertex
@@ -87,6 +91,7 @@ fn vs_surface(in: VsIn) -> VsOut {
     out.albedo = in.albedo;
     out.roughness = in.roughness;
     out.emission = band * (vec3<f32>(1.0) - in.albedo);
+    out.weight = model.offset.w;
     return out;
 }
 
@@ -124,5 +129,5 @@ fn fs_surface(in: VsOut) -> @location(0) vec4<f32> {
         let specular = d * g * f / (4.0 * ndl * ndv);
         color += (in.albedo / PI + vec3<f32>(specular)) * irradiance;
     }
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(color * in.weight, 1.0);
 }

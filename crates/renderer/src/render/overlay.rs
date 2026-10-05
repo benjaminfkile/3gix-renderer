@@ -34,6 +34,10 @@ pub struct MatterStats {
     pub meshes_drawn: usize,
     /// Triangles drawn this frame.
     pub triangles_drawn: usize,
+    /// Volumes drawn this frame.
+    pub volumes_drawn: usize,
+    /// Far field point sprites drawn this frame.
+    pub sprites_drawn: usize,
     /// Point lights in use.
     pub lights_active: usize,
     /// Chunk body bytes received this session.
@@ -96,6 +100,10 @@ impl OverlayInfo {
             m.meshes_drawn, m.triangles_drawn, m.lights_active
         ));
         lines.push(format!(
+            "volumes {}  sprites {}",
+            m.volumes_drawn, m.sprites_drawn
+        ));
+        lines.push(format!(
             "fetched {} B  rtt {}",
             m.bytes_fetched,
             match m.last_round_trip {
@@ -146,6 +154,8 @@ mod tests {
                 cells_pending: 3,
                 meshes_drawn: 4,
                 triangles_drawn: 5120,
+                volumes_drawn: 2,
+                sprites_drawn: 7,
                 lights_active: 1,
                 bytes_fetched: 1_048_576,
                 last_round_trip: Some(0.0425),
@@ -163,8 +173,9 @@ mod tests {
         assert_eq!(l[4], "fps 59.9");
         assert_eq!(l[5], "cells selected 12  ready 9  pending 3");
         assert_eq!(l[6], "meshes 4  triangles 5120  lights 1");
-        assert_eq!(l[7], "fetched 1048576 B  rtt 0.043 s");
-        assert_eq!(l.len(), 8);
+        assert_eq!(l[7], "volumes 2  sprites 7");
+        assert_eq!(l[8], "fetched 1048576 B  rtt 0.043 s");
+        assert_eq!(l.len(), 9);
     }
 
     #[test]
@@ -180,7 +191,7 @@ mod tests {
         .lines();
         assert_eq!(l[1], "time scale 0.25x (paused)");
         assert_eq!(l[4], "fps -");
-        assert_eq!(l[7], "fetched 0 B  rtt -");
-        assert_eq!(l[8], "sim lag");
+        assert_eq!(l[8], "fetched 0 B  rtt -");
+        assert_eq!(l[9], "sim lag");
     }
 }

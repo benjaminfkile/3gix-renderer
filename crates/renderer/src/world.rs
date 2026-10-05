@@ -3,7 +3,9 @@
 //! Ties together the steps of `space-model.md` section 2 that turn chunks
 //! into something to draw: cell selection and the cell cache
 //! ([`crate::stream`]), surface extraction on a worker pool
-//! ([`crate::extract`]), and lights from hot matter ([`crate::light`]). It
+//! ([`crate::extract`]), volumes of gas and plasma ([`crate::volume`]),
+//! lights from hot matter ([`crate::light`]), and point sprites for far
+//! frames ([`crate::farfield`]). It
 //! does no I/O itself: the caller hands it fetch results (from the hub
 //! through [`crate::stream::Fetcher`] on the desktop, or straight from bytes
 //! in tests) and asks it what to request next. One [`World`] serves the
@@ -11,10 +13,12 @@
 
 use crate::camera::Camera;
 use crate::extract::{ExtractPool, SurfaceMesh};
+use crate::farfield::{depth_zero_key, far_frames, frame_sprite, Sprite};
 use crate::light::{merge_frame_emitters, strongest_lights, PointLight};
 use crate::stream::{
     select_all, CacheCounts, CellCache, CellState, FetchOutcome, SELECT_INTERVAL_SECONDS,
 };
+use crate::volume::VolumeGrid;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,8 +29,22 @@ use std::sync::Arc;
 pub struct DrawList {
     /// Non-empty meshes of the draw set, in key order.
     pub meshes: Vec<Arc<SurfaceMesh>>,
+    /// Volumes of the draw set, in key order.
+    pub volumes: Vec<Arc<VolumeGrid>>,
     /// The strongest lights, strongest first.
     pub lights: Vec<PointLight>,
+    /// Point sprites of far frames, in ascending frame id order.
+    pub sprites: Vec<Sprite>,
+    /// Weight of the cells of frames in the far field transition, by
+    /// frame id; frames not listed draw their cells at weight 1.
+    pub cell_weights: BTreeMap<u64, f32>,
+}
+
+impl DrawList {
+    /// The weight the cells of `frame_id` are drawn with.
+    pub fn cell_weight(&self, frame_id: u64) -> f32 {
+        self.cell_weights.get(&frame_id).copied().unwrap_or(1.0)
+    }
 }
 
 /// Counts for the overlay.
@@ -72,8 +90,9 @@ impl World {
     }
 
     /// Selects cells for the camera if [`SELECT_INTERVAL_SECONDS`] have
-    /// passed since the last selection (or `force`). Returns `true` if it
-    /// selected.
+    /// passed since the last selection (or `force`), and pins the depth-0
+    /// cell of every frame in the far field ([`crate::farfield`]). Returns
+    /// `true` if it selected.
     pub fn select(
         &mut self,
         system: &FrameSystem,
@@ -96,6 +115,9 @@ impl World {
             f64::from(view_px.1.max(1)),
         );
         self.cache.set_selection(cells, now);
+        for far in far_frames(system, camera, f64::from(view_px.1.max(1))) {
+            self.cache.pin(depth_zero_key(far.frame_id), now);
+        }
         true
     }
 
@@ -173,26 +195,50 @@ impl World {
         }
     }
 
-    /// Returns `true` when every selected cell is resolved: drawable, or
-    /// `Gone`, with nothing in flight or being extracted.
+    /// Returns `true` when every selected and every pinned cell is
+    /// resolved: drawable, or `Gone`, with nothing in flight or being
+    /// extracted.
     pub fn settled(&self) -> bool {
+        let resolved =
+            |k: &CellKey| self.drawable(k) || self.cache.state(k) == Some(&CellState::Gone);
         self.extracting.is_empty()
-            && self.cache.selection().iter().all(|s| {
-                self.drawable(&s.key) || self.cache.state(&s.key) == Some(&CellState::Gone)
-            })
+            && self.cache.selection().iter().all(|s| resolved(&s.key))
+            && self.cache.pinned().all(resolved)
     }
 
-    /// The draw set (see [`CellCache::draw_set`]), its meshes, and the
-    /// lights its hot matter makes. Marks the drawn cells as used.
-    pub fn draw_list(&mut self, system: &FrameSystem, camera: &Camera, now: f64) -> DrawList {
+    /// The draw set (see [`CellCache::draw_set`]), its meshes and volumes,
+    /// the lights its hot matter makes, and the sprites of far frames, for
+    /// a view of `view_px` pixels. Marks the drawn cells as used.
+    ///
+    /// Lights come from the hot matter of the drawn cells and, for frames
+    /// drawn as a sprite only, of their depth-0 cells, so a far hot frame
+    /// still lights the rest. Cold far frames reflect those lights.
+    pub fn draw_list(
+        &mut self,
+        system: &FrameSystem,
+        camera: &Camera,
+        view_px: (u32, u32),
+        now: f64,
+    ) -> DrawList {
+        let view_height = f64::from(view_px.1.max(1));
+        let far = far_frames(system, camera, view_height);
+        let cell_weights: BTreeMap<u64, f32> = far
+            .iter()
+            .map(|f| (f.frame_id, f.cell_weight() as f32))
+            .collect();
+        let weight = |frame: u64| cell_weights.get(&frame).copied().unwrap_or(1.0);
         let keys = self.cache.draw_set(|k| self.drawable(k));
         self.cache.touch(&keys, now);
         let mut meshes = Vec::new();
+        let mut volumes = Vec::new();
         let mut emitters = Vec::new();
-        for k in &keys {
+        for k in keys.iter().filter(|k| weight(k.frame_id) > 0.0) {
             if let Some(CellState::Ready(cell)) = self.cache.state(k) {
                 if let Some(e) = &cell.emitter {
                     emitters.push((k.frame_id, e));
+                }
+                if let Some(v) = &cell.volume {
+                    volumes.push(v.clone());
                 }
             }
             if let Some(m) = self.meshes.get(k) {
@@ -201,10 +247,30 @@ impl World {
                 }
             }
         }
+        for f in far.iter().filter(|f| f.sprite_only()) {
+            if let Some(CellState::Ready(cell)) = self.cache.state(&depth_zero_key(f.frame_id)) {
+                if let Some(e) = &cell.emitter {
+                    emitters.push((f.frame_id, e));
+                }
+            }
+        }
         let merged = merge_frame_emitters(emitters.iter().map(|(f, e)| (*f, *e)));
+        let lights = strongest_lights(&merged, system, camera);
+        let sprites = far
+            .iter()
+            .filter_map(|f| match self.cache.state(&depth_zero_key(f.frame_id)) {
+                Some(CellState::Ready(cell)) => {
+                    frame_sprite(system, camera, f, &cell.far_field(), &lights, view_height)
+                }
+                _ => None,
+            })
+            .collect();
         DrawList {
             meshes,
-            lights: strongest_lights(&merged, system, camera),
+            volumes,
+            lights,
+            sprites,
+            cell_weights,
         }
     }
 

@@ -1,11 +1,12 @@
-//! Headless render of matter: a solid blob lit by a hot blob beside it.
+//! Headless render of matter: a solid blob lit by a hot blob beside it, and
+//! the full scene with a gas cloud added.
 //!
 //! The cells go through the same path as on the desktop (selection, the
 //! cell cache, decoding and compositing, extraction on the worker pool,
-//! lights from hot matter), fed from in-memory chunk containers instead of
-//! the hub. The image is checked by pixel statistics and saved as
-//! `target/tmp/matter-render.png` with the statistics beside it in
-//! `target/tmp/matter-render.txt`.
+//! volumes, lights from hot matter), fed from in-memory chunk containers
+//! instead of the hub. The images are checked by pixel statistics and saved
+//! as `target/tmp/matter-render.png` and `target/tmp/full-scene.png` with
+//! the statistics beside them in `.txt` files of the same name.
 
 mod common;
 
@@ -27,12 +28,21 @@ fn luma(p: [u8; 4]) -> f64 {
 
 /// Streams every selected cell from the fixture's containers.
 fn stream_all(world: &mut World) {
-    let system = system();
+    stream_from(world, &system(), &chunks(), 2);
+}
+
+/// Streams every selected cell of `system` from `chunks`, expecting
+/// `expected` requests.
+fn stream_from(
+    world: &mut World,
+    system: &gx_core::frames::FrameSystem,
+    chunks: &std::collections::BTreeMap<gx_core::key::CellKey, Vec<u8>>,
+    expected: usize,
+) {
     let camera = camera();
-    let chunks = chunks();
-    world.select(&system, &camera, (WIDTH, HEIGHT), 0.0, true);
+    world.select(system, &camera, (WIDTH, HEIGHT), 0.0, true);
     let requests = world.take_requests(0.0);
-    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests.len(), expected, "{requests:?}");
     for key in requests {
         let extent = system.tree().get(key.frame_id).unwrap().root_extent;
         let outcome = match chunks.get(&key) {
@@ -88,7 +98,9 @@ fn solid_blob_is_lit_from_the_side_of_the_hot_blob() {
     let system = system();
     let camera = camera();
     let scene = matter_scene(&mut world, &system, &camera, (WIDTH, HEIGHT), 0.0);
-    assert_eq!(scene.surfaces.len(), 2);
+    // The solid blob is a mesh; the plasma blob is a volume.
+    assert_eq!(scene.surfaces.len(), 1);
+    assert_eq!(scene.volumes.len(), 1);
     assert_eq!(scene.lights.len(), 1);
     assert_eq!(scene.lights[0].frame_id, ROOT);
 
@@ -97,7 +109,8 @@ fn solid_blob_is_lit_from_the_side_of_the_hot_blob() {
     let stats = headless.stats();
     let second = headless.render(&scene, None).unwrap();
     assert!(first == second, "two renders of the same state differ");
-    assert_eq!(stats.meshes, 2);
+    assert_eq!(stats.meshes, 1);
+    assert_eq!(stats.volumes, 1);
     assert_eq!(stats.lights, 1);
 
     let hot = disc(
@@ -152,8 +165,17 @@ fn solid_blob_is_lit_from_the_side_of_the_hot_blob() {
          solid half away from the hot blob: {far_n} px, mean luma {far_mean:.2}\n\
          solid pixels with luma above 8: {lit_n}\n\
          brightest luma anywhere {max_all:.2}, outside the hot disc {max_outside_hot:.2}\n\
-         meshes {}, triangles {}, lights {}\n",
-        hot.x, hot.y, hot.r, solid.x, solid.y, solid.r, stats.meshes, stats.triangles, stats.lights
+         meshes {}, triangles {}, volumes {}, lights {}\n",
+        hot.x,
+        hot.y,
+        hot.r,
+        solid.x,
+        solid.y,
+        solid.r,
+        stats.meshes,
+        stats.triangles,
+        stats.volumes,
+        stats.lights
     );
     println!("{report}");
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -188,4 +210,143 @@ fn empty_composite_and_registry_geometry() {
     ));
     let mesh = world.mesh(&solid_key()).expect("extracted");
     assert!(mesh.triangle_count() > 1000);
+}
+
+/// Luma along row `y` from column `x0` for `len` pixels toward `step`.
+fn scan(image: &Image, x0: u32, y: u32, len: u32, step: i64) -> Vec<f64> {
+    (0..len)
+        .map(|i| {
+            let x = (i64::from(x0) + step * i64::from(i)).clamp(0, i64::from(image.width) - 1);
+            luma(image.pixel(x as u32, y))
+        })
+        .collect()
+}
+
+/// The brightest pixel of row `y` within `reach` pixels of column `x`.
+fn brightest_near(image: &Image, x: f64, y: u32, reach: i64) -> u32 {
+    let c = x as i64;
+    (c - reach..=c + reach)
+        .map(|x| x.clamp(0, i64::from(image.width) - 1) as u32)
+        .max_by(|a, b| {
+            luma(image.pixel(*a, y))
+                .total_cmp(&luma(image.pixel(*b, y)))
+                .then(b.cmp(a))
+        })
+        .unwrap()
+}
+
+/// Largest luma change that is 8-bit quantization rather than a rise: one
+/// step in one channel moves luma by at most 0.72.
+const QUANTUM: f64 = 1.0;
+
+/// Number of places a sequence goes up by more than [`QUANTUM`], and its
+/// largest rise of any size.
+fn rises(values: &[f64]) -> (usize, f64) {
+    let mut n = 0;
+    let mut max = 0.0f64;
+    for w in values.windows(2) {
+        if w[1] > w[0] + QUANTUM {
+            n += 1;
+        }
+        max = max.max(w[1] - w[0]);
+    }
+    (n, max)
+}
+
+fn describe(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(|v| format!("{v:.0}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn full_scene_draws_soft_glowing_volumes() {
+    let system = full_system();
+    let chunks = full_chunks();
+    let camera = camera();
+    let mut world = World::new(2);
+    stream_from(&mut world, &system, &chunks, 3);
+    let mut scene = matter_scene(&mut world, &system, &camera, (WIDTH, HEIGHT), 0.0);
+    // Matter only: the frame markers and lines are a debug aid drawn on top.
+    scene.markers.clear();
+    scene.lines.clear();
+    assert_eq!(scene.surfaces.len(), 1);
+    assert_eq!(scene.volumes.len(), 2);
+    // Back to front: the gas cloud is farther than the hot blob.
+    assert_eq!(scene.volumes[0].grid.key, gas_key());
+    assert_eq!(scene.volumes[1].grid.key, hot_key());
+    assert!(scene.volumes[0].distance > scene.volumes[1].distance);
+    // Hot blob and gas cloud both emit light.
+    assert_eq!(scene.lights.len(), 2);
+
+    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let first = headless.render(&scene, None).unwrap();
+    let stats = headless.stats();
+    let second = headless.render(&scene, None).unwrap();
+    assert!(first == second, "two renders of the same state differ");
+    assert_eq!((stats.meshes, stats.volumes), (1, 2));
+
+    let hot = disc(
+        &scene,
+        camera.relative(&system, Vec3::zero(), ROOT),
+        HOT_RADIUS,
+    );
+    let gas = disc(
+        &scene,
+        camera.relative(&system, Vec3::zero(), GAS),
+        GAS_RADIUS,
+    );
+    let mut report = format!("image {WIDTH} x {HEIGHT}\n");
+    let mut checks = Vec::new();
+    for (name, d) in [("hot blob", &hot), ("gas cloud", &gas)] {
+        let y = d.y as u32;
+        let cx = brightest_near(&first, d.x, y, 3);
+        let len = (1.5 * d.r).ceil() as u32;
+        let right = scan(&first, cx, y, len, 1);
+        let left = scan(&first, cx, y, len, -1);
+        let (up_r, max_r) = rises(&right);
+        let (up_l, max_l) = rises(&left);
+        // Soft edge: pixels strictly between the center value and black.
+        let partial = right
+            .iter()
+            .chain(&left)
+            .filter(|&&v| v > 4.0 && v < 0.9 * right[0])
+            .count();
+        report += &format!(
+            "{name}: disc center ({:.1}, {:.1}) radius {:.1} px; scan row {y} from column {cx}\n\
+             \x20 right: {}\n\
+             \x20 left: {}\n\
+             \x20 rises right {up_r} (largest {max_r:.2}), left {up_l} (largest {max_l:.2}); \
+             partial pixels {partial} of {}\n",
+            d.x,
+            d.y,
+            d.r,
+            describe(&right),
+            describe(&left),
+            2 * len
+        );
+        checks.push((name, right, left, partial));
+    }
+    println!("{report}");
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    first.write_png(&dir.join("full-scene.png")).unwrap();
+    std::fs::write(dir.join("full-scene.txt"), &report).unwrap();
+
+    for (name, right, left, partial) in checks {
+        // Bright at the center, black past the edge.
+        assert!(right[0] > 100.0, "{name}\n{report}");
+        assert!(
+            *right.last().unwrap() < 4.0 && *left.last().unwrap() < 4.0,
+            "{name}\n{report}"
+        );
+        // Monotonic decrease from the center outward on both sides, to
+        // within one 8-bit step: the nearest-sample march ripples by less
+        // than that where the profile is flat.
+        assert_eq!(rises(&right).0, 0, "{name}\n{report}");
+        assert_eq!(rises(&left).0, 0, "{name}\n{report}");
+        // A glow, not a hard-edged disc: the falloff spans several pixels.
+        assert!(partial >= 6, "{name}\n{report}");
+    }
 }

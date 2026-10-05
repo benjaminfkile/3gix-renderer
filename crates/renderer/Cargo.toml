@@ -8,6 +8,8 @@ description = "The 3GIX renderer: applies the laws to compiled matter and draws 
 [lib]
 name = "renderer"
 path = "src/lib.rs"
+# cdylib for wasm-pack (the browser build), rlib for the binaries and tests.
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "gx-renderer"
@@ -18,9 +20,20 @@ name = "gx-mock-hub"
 path = "src/bin/gx-mock-hub.rs"
 
 [features]
-# Browser build support. Off by default; the library builds for
-# wasm32-unknown-unknown without it. Filled in by the browser task.
-web = []
+# The browser build: winit on a canvas, wgpu on WebGPU, reqwest's fetch
+# client and a web-sys WebSocket for the hub, wasm-bindgen-futures for async,
+# and console_error_panic_hook. Only takes effect on wasm32-unknown-unknown;
+# the library also builds for that target without it.
+web = [
+    "wgpu/webgpu",
+    "dep:winit",
+    "dep:reqwest",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+]
 
 [dependencies]
 gx-core = { git = "https://github.com/benjaminfkile/3gix-core", branch = "grunt" }
@@ -44,3 +57,28 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 png = "0.18"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+winit = { version = "0.30", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "BinaryType",
+    "CloseEvent",
+    "Document",
+    "Element",
+    "Event",
+    "HtmlCanvasElement",
+    "MessageEvent",
+    "Performance",
+    "WebSocket",
+    "Window",
+    "console",
+] }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# wasm-opt runs from web/build.sh instead, with the installed binary.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gx-renderer</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    color: #e6e9ef;
+    font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #gx-canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    outline: none;
+  }
+  #settings {
+    position: fixed;
+    top: 8px;
+    right: 8px;
+    width: 280px;
+    padding: 10px;
+    background: rgba(20, 24, 32, 0.9);
+    border: 1px solid #39404f;
+    border-radius: 4px;
+  }
+  #settings label {
+    display: block;
+    margin-top: 6px;
+  }
+  #settings input {
+    box-sizing: border-box;
+    width: 100%;
+    margin-top: 2px;
+    padding: 3px 4px;
+    color: inherit;
+    background: #0d1017;
+    border: 1px solid #39404f;
+    font: inherit;
+  }
+  #settings button {
+    margin-top: 10px;
+    padding: 4px 12px;
+    font: inherit;
+  }
+  #status {
+    margin-top: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #settings.running {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="gx-canvas" tabindex="0"></canvas>
+<form id="settings">
+  <strong>gx-renderer</strong>
+  <label>Hub URL <input id="hub-url" type="url" placeholder="https://..." autocomplete="off" required></label>
+  <label>API key <input id="api-key" type="password" autocomplete="off" required></label>
+  <label>Space id <input id="space-id" autocomplete="off" required></label>
+  <label>Build id (empty for the active build) <input id="build-id" autocomplete="off"></label>
+  <label>Time scale (simulation s per wall s) <input id="time-scale" type="number" step="any" value="1"></label>
+  <button id="start" type="submit">Start</button>
+  <div id="status">Needs a browser with WebGPU.</div>
+</form>
+<script type="module">
+  import init, { start } from "./pkg/renderer.js";
+
+  // Every setting is kept in localStorage under these keys, so the panel
+  // comes back filled in. The API key is stored only in this browser.
+  const fields = {
+    "hub-url": "gx.hubUrl",
+    "api-key": "gx.apiKey",
+    "space-id": "gx.spaceId",
+    "build-id": "gx.buildId",
+    "time-scale": "gx.timeScale",
+  };
+  for (const [id, key] of Object.entries(fields)) {
+    const saved = localStorage.getItem(key);
+    if (saved !== null) {
+      document.getElementById(id).value = saved;
+    }
+  }
+
+  const form = document.getElementById("settings");
+  const status = document.getElementById("status");
+  const button = document.getElementById("start");
+  const value = (id) => document.getElementById(id).value;
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    for (const [id, key] of Object.entries(fields)) {
+      localStorage.setItem(key, value(id));
+    }
+    if (!navigator.gpu) {
+      status.textContent = "This browser has no WebGPU (navigator.gpu is missing).";
+      return;
+    }
+    button.disabled = true;
+    status.textContent = "Loading...";
+    try {
+      await init();
+      status.textContent = "Loading the registry...";
+      await start(
+        "gx-canvas",
+        value("hub-url"),
+        value("api-key"),
+        value("space-id"),
+        value("build-id"),
+        Number(value("time-scale") || "1"),
+      );
+      form.classList.add("running");
+      document.getElementById("gx-canvas").focus();
+    } catch (e) {
+      status.textContent = "Could not start: " + e;
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
