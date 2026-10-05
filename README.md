@@ -21,6 +21,59 @@ Nothing in this repository knows what any piece of matter is. There is no code p
 - `gx-core`, the shared library: matter format decoder and validator, units, laws, chunk keys, the frame registry.
 - `wgpu` and `winit` for graphics and windowing. Headless tests run on a software Vulkan driver with no window.
 
+## Running
+
+Configuration comes from the environment, or a `.env` file in the working
+directory (see `.env.example`). The API key needs the `fetch:chunks`
+capability and is never logged.
+
+```sh
+GX_HUB_URL=...      # hub base URL
+GX_API_KEY=...      # API key with fetch:chunks
+GX_SPACE_ID=...     # space id
+GX_BUILD_ID=...     # optional, defaults to the active build
+```
+
+Desktop, with a window:
+
+```sh
+cargo run --release --bin gx-renderer -- --time-scale 86400
+```
+
+Headless screenshot, no window or display needed (a software Vulkan driver is
+enough):
+
+```sh
+cargo run --release --bin gx-renderer -- --headless --screenshot out.png --width 1280 --height 720
+```
+
+Flags: `--time-scale <f64>` (default 1), `--start-offset-seconds <f64>`
+(simulation time offset from the epoch at launch), `--headless`,
+`--screenshot <path.png>` (implies `--headless`), `--width`, `--height`, and
+`--hub-url`, `--space-id`, `--build-id` to override the environment. See
+`--help`.
+
+Without a hub, `gx-mock-hub` serves a registry the way the hub does and prints
+the variables to use:
+
+```sh
+cargo run --bin gx-mock-hub &          # prints GX_HUB_URL, GX_API_KEY, GX_SPACE_ID
+export GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=...
+cargo run --bin gx-renderer -- --headless --screenshot out.png
+```
+
+Controls are in `docs/controls.md`; the module map, the floating origin, and
+the depth strategy are in `docs/architecture.md`.
+
+## Checks
+
+```sh
+sh scripts/ci.sh
+```
+
+Runs format, clippy with `-D warnings`, the tests (including the headless
+render), the vocabulary lint, and the wasm32 build of the library crate.
+
 ## Specification
 
 - Architecture: `3GIXHub/docs/architecture/space-model.md`

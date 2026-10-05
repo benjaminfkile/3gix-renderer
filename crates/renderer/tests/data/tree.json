@@ -1,0 +1,447 @@
+{
+  "epoch": {
+    "bits": "0x41c823cf40000000",
+    "decimal": "8.1e8"
+  },
+  "frame_count": 6,
+  "frames": [
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3ec8088a682354ef",
+          "decimal": "2.865e-6"
+        }
+      ],
+      "frame_id": 1,
+      "mass": {
+        "bits": "0x46391ace3d05aef4",
+        "decimal": "1.989e30"
+      },
+      "max_depth": 14,
+      "orientation": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3fe3333333333333",
+          "decimal": "6e-1"
+        },
+        {
+          "bits": "0x3fe999999999999a",
+          "decimal": "8e-1"
+        }
+      ],
+      "parent_frame_id": 18446744073709551615,
+      "position": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x42a5d3ef79800000",
+        "decimal": "1.2e13"
+      },
+      "velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    },
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3eb4cdc26b1f07d8",
+          "decimal": "1.24e-6"
+        }
+      ],
+      "frame_id": 10,
+      "mass": {
+        "bits": "0x44d179b07057cf97",
+        "decimal": "3.301e23"
+      },
+      "max_depth": 18,
+      "orientation": [
+        {
+          "bits": "0x3fd1eb851eb851ec",
+          "decimal": "2.8e-1"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3feeb851eb851eb8",
+          "decimal": "9.6e-1"
+        }
+      ],
+      "parent_frame_id": 1,
+      "position": [
+        {
+          "bits": "0x422af637c6000000",
+          "decimal": "5.79e10"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x417312d000000000",
+        "decimal": "2e7"
+      },
+      "velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x40e7200000000000",
+          "decimal": "4.736e4"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    },
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0xbe9410c7e8255ca0",
+          "decimal": "-2.99e-7"
+        }
+      ],
+      "frame_id": 20,
+      "mass": {
+        "bits": "0x45101a82650ae35e",
+        "decimal": "4.867e24"
+      },
+      "max_depth": 19,
+      "orientation": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3fe3333333333333",
+          "decimal": "6e-1"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3fe999999999999a",
+          "decimal": "8e-1"
+        }
+      ],
+      "parent_frame_id": 1,
+      "position": [
+        {
+          "bits": "0xc231b1f3f8000000",
+          "decimal": "-7.6e10"
+        },
+        {
+          "bits": "0x423229298c000000",
+          "decimal": "7.8e10"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x418312d000000000",
+        "decimal": "4e7"
+      },
+      "velocity": [
+        {
+          "bits": "0xc0d81f0000000000",
+          "decimal": "-2.47e4"
+        },
+        {
+          "bits": "0xc0d7700000000000",
+          "decimal": "-2.4e4"
+        },
+        {
+          "bits": "0x405b800000000000",
+          "decimal": "1.1e2"
+        }
+      ]
+    },
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3f131d940f96f6d2",
+          "decimal": "7.292e-5"
+        }
+      ],
+      "frame_id": 30,
+      "mass": {
+        "bits": "0x4513c27b13272fb6",
+        "decimal": "5.972e24"
+      },
+      "max_depth": 20,
+      "orientation": [
+        {
+          "bits": "0x3fdeb851eb851eb8",
+          "decimal": "4.8e-1"
+        },
+        {
+          "bits": "0x3fe3333333333333",
+          "decimal": "6e-1"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3fe47ae147ae147b",
+          "decimal": "6.4e-1"
+        }
+      ],
+      "parent_frame_id": 1,
+      "position": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0xc2416a6d6c000000",
+          "decimal": "-1.496e11"
+        },
+        {
+          "bits": "0x413e848000000000",
+          "decimal": "2e6"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x41b7d78400000000",
+        "decimal": "4e8"
+      },
+      "velocity": [
+        {
+          "bits": "0x40dd150000000000",
+          "decimal": "2.978e4"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    },
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3ec653f50cc1605b",
+          "decimal": "2.6617e-6"
+        }
+      ],
+      "frame_id": 31,
+      "mass": {
+        "bits": "0x44af18365c985637",
+        "decimal": "7.342e22"
+      },
+      "max_depth": 17,
+      "orientation": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0xbfd1eb851eb851ec",
+          "decimal": "-2.8e-1"
+        },
+        {
+          "bits": "0x3feeb851eb851eb8",
+          "decimal": "9.6e-1"
+        }
+      ],
+      "parent_frame_id": 30,
+      "position": [
+        {
+          "bits": "0x41b6e97a80000000",
+          "decimal": "3.844e8"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x415e848000000000",
+        "decimal": "8e6"
+      },
+      "velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x408ff00000000000",
+          "decimal": "1.022e3"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    },
+    {
+      "angular_velocity": [
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        },
+        {
+          "bits": "0x3f1294ad20b50154",
+          "decimal": "7.088e-5"
+        }
+      ],
+      "frame_id": 40,
+      "mass": {
+        "bits": "0x44e0fc540df5f605",
+        "decimal": "6.417e23"
+      },
+      "max_depth": 19,
+      "orientation": [
+        {
+          "bits": "0x3fe0000000000000",
+          "decimal": "5e-1"
+        },
+        {
+          "bits": "0x3fe0000000000000",
+          "decimal": "5e-1"
+        },
+        {
+          "bits": "0x3fe0000000000000",
+          "decimal": "5e-1"
+        },
+        {
+          "bits": "0x3fe0000000000000",
+          "decimal": "5e-1"
+        }
+      ],
+      "parent_frame_id": 1,
+      "position": [
+        {
+          "bits": "0x4242a05f20000000",
+          "decimal": "1.6e11"
+        },
+        {
+          "bits": "0x4242a05f20000000",
+          "decimal": "1.6e11"
+        },
+        {
+          "bits": "0xc1edcd6500000000",
+          "decimal": "-4e9"
+        }
+      ],
+      "root_extent": {
+        "bits": "0x417312d000000000",
+        "decimal": "2e7"
+      },
+      "velocity": [
+        {
+          "bits": "0xc0d09a0000000000",
+          "decimal": "-1.7e4"
+        },
+        {
+          "bits": "0x40d09a0000000000",
+          "decimal": "1.7e4"
+        },
+        {
+          "bits": "0x0000000000000000",
+          "decimal": "0e0"
+        }
+      ]
+    }
+  ]
+}
