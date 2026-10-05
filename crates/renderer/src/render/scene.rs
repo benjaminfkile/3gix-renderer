@@ -20,11 +20,20 @@
 //! near one, which is set per frame from the nearest visible marker (see
 //! [`near_plane`]) and pulled in to the nearest drawn mesh (see
 //! [`add_matter`]), so precision is spent where the nearest matter is.
+//!
+//! # Draw order
+//!
+//! Opaque meshes first, writing depth; then volumes sorted back to front by
+//! the camera distance to the center of their gas box, tested against the
+//! mesh depth and writing none; then point sprites of far frames, added on
+//! top and tested against the mesh depth (`docs/shading.md`).
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::extract::SurfaceMesh;
+use crate::farfield::Sprite;
 use crate::light::PointLight;
-use crate::world::DrawList;
+use crate::volume::VolumeGrid;
+use crate::world::{DrawList, World};
 use gx_core::frames::FrameSystem;
 use gx_core::units::Vec3;
 use std::sync::Arc;
@@ -74,6 +83,25 @@ pub struct SurfaceDraw {
     pub offset: [f32; 3],
     /// Columns of the rotation from the frame axes into root axes.
     pub rotation: [[f32; 3]; 3],
+    /// Weight of the cell's radiance, 0 to 1: below 1 while its frame fades
+    /// in from the far field ([`crate::farfield`]).
+    pub weight: f32,
+}
+
+/// One cell's volume placed for drawing, the same way as [`SurfaceDraw`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct VolumeDraw {
+    /// The gas and plasma of the cell.
+    pub grid: Arc<VolumeGrid>,
+    /// Cell origin relative to the camera, root axes, meters.
+    pub offset: [f32; 3],
+    /// Columns of the rotation from the frame axes into root axes.
+    pub rotation: [[f32; 3]; 3],
+    /// Weight of the volume's glow and opacity, 0 to 1.
+    pub weight: f32,
+    /// Distance from the camera to the center of the gas box, meters: the
+    /// sort key, farthest first.
+    pub distance: f64,
 }
 
 /// Everything one render pass draws, in camera-relative `f32`.
@@ -85,6 +113,10 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     /// Surfaces of the drawn cells, in key order.
     pub surfaces: Vec<SurfaceDraw>,
+    /// Volumes of the drawn cells, farthest first (ties in key order).
+    pub volumes: Vec<VolumeDraw>,
+    /// Point sprites of far frames.
+    pub sprites: Vec<Sprite>,
     /// Point lights from hot matter, strongest first.
     pub lights: Vec<PointLight>,
     /// Rotation from root axes into camera axes, column major.
@@ -193,6 +225,8 @@ pub fn build_scene(system: &FrameSystem, camera: &Camera, aspect: f64) -> Scene 
         markers,
         lines,
         surfaces: Vec::new(),
+        volumes: Vec::new(),
+        sprites: Vec::new(),
         lights: Vec::new(),
         view_rotation,
         near: near_plane(in_camera_axes, aspect) as f32,
@@ -211,40 +245,92 @@ fn box_distance(p: Vec3, lo: [f64; 3], hi: [f64; 3]) -> f64 {
     .length()
 }
 
+/// Columns of the rotation from `frame`'s axes into root axes.
+fn frame_rotation(system: &FrameSystem, frame: u64) -> [[f32; 3]; 3] {
+    let q = system.root_orientation(frame);
+    let col = |v: Vec3| {
+        let r = q.rotate(v);
+        [r.x as f32, r.y as f32, r.z as f32]
+    };
+    [
+        col(Vec3::new(1.0, 0.0, 0.0)),
+        col(Vec3::new(0.0, 1.0, 0.0)),
+        col(Vec3::new(0.0, 0.0, 1.0)),
+    ]
+}
+
+/// The camera position in `frame`'s coordinates.
+fn camera_in(system: &FrameSystem, camera: &Camera, frame: u64) -> Vec3 {
+    system
+        .root_orientation(frame)
+        .conjugate()
+        .rotate(system.relative(camera.position, camera.frame_id, Vec3::zero(), frame))
+}
+
 /// Adds the matter of a [`DrawList`] to a scene built by [`build_scene`]:
-/// every mesh placed relative to the camera, the lights, and a near plane
-/// pulled in to [`NEAR_FRACTION`] of the distance to the nearest mesh
-/// bounds (at least [`MIN_NEAR`]) when that is closer than the markers.
+/// every mesh and volume placed relative to the camera, volumes sorted
+/// farthest first, the lights, the sprites, and a near plane pulled in to
+/// [`NEAR_FRACTION`] of the distance to the nearest mesh bounds or gas box
+/// (at least [`MIN_NEAR`]) when that is closer than the markers.
 pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw: &DrawList) {
     let mut nearest = f64::INFINITY;
     for mesh in &draw.meshes {
         let frame = mesh.key.frame_id;
         let offset = camera.relative(system, mesh.origin, frame);
-        let q = system.root_orientation(frame);
-        let col = |v: Vec3| {
-            let r = q.rotate(v);
-            [r.x as f32, r.y as f32, r.z as f32]
-        };
-        let cam = system
-            .root_orientation(frame)
-            .conjugate()
-            .rotate(system.relative(camera.position, camera.frame_id, Vec3::zero(), frame));
+        let cam = camera_in(system, camera, frame);
         nearest = nearest.min(box_distance(cam, mesh.bounds_min, mesh.bounds_max));
         scene.surfaces.push(SurfaceDraw {
             mesh: mesh.clone(),
             offset: to_f32(offset),
-            rotation: [
-                col(Vec3::new(1.0, 0.0, 0.0)),
-                col(Vec3::new(0.0, 1.0, 0.0)),
-                col(Vec3::new(0.0, 0.0, 1.0)),
-            ],
+            rotation: frame_rotation(system, frame),
+            weight: draw.cell_weight(frame),
         });
     }
+    for grid in &draw.volumes {
+        let frame = grid.key.frame_id;
+        let offset = camera.relative(system, grid.origin, frame);
+        let cam = camera_in(system, camera, frame);
+        nearest = nearest.min(grid.distance_to(cam));
+        let center = Vec3::new(
+            0.5 * (grid.bounds_min[0] + grid.bounds_max[0]),
+            0.5 * (grid.bounds_min[1] + grid.bounds_max[1]),
+            0.5 * (grid.bounds_min[2] + grid.bounds_max[2]),
+        );
+        scene.volumes.push(VolumeDraw {
+            grid: grid.clone(),
+            offset: to_f32(offset),
+            rotation: frame_rotation(system, frame),
+            weight: draw.cell_weight(frame),
+            distance: (center - cam).length(),
+        });
+    }
+    scene.volumes.sort_by(|a, b| {
+        b.distance
+            .total_cmp(&a.distance)
+            .then(a.grid.key.cmp(&b.grid.key))
+    });
+    scene.sprites = draw.sprites.clone();
     scene.lights = draw.lights.clone();
     if nearest.is_finite() {
         let near = (nearest * NEAR_FRACTION).max(MIN_NEAR) as f32;
         scene.near = scene.near.min(near);
     }
+}
+
+/// The scene for the camera: frame markers plus the world's drawn cells,
+/// lights, and far field sprites.
+pub fn matter_scene(
+    world: &mut World,
+    system: &FrameSystem,
+    camera: &Camera,
+    size: (u32, u32),
+    now: f64,
+) -> Scene {
+    let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
+    let mut scene = build_scene(system, camera, aspect);
+    let draw = world.draw_list(system, camera, size, now);
+    add_matter(&mut scene, system, camera, &draw);
+    scene
 }
 
 /// The right handed reversed-z perspective projection with an infinite far

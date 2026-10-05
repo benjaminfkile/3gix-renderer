@@ -22,30 +22,38 @@ desktop binary, the headless tests, and the browser build share it.
 | Module | What it does | Spec |
 |---|---|---|
 | `config` | Environment, `.env`, and command line flags, flags winning | |
+| `protocol` | The hub protocol without I/O: statuses, socket frames, URLs, registry decode | `compiler-pipeline.md` 4, `matter-format.md` 5 and 6 |
 | `hub` | Chunk fetch (`200/202/404/410`), readiness WebSocket, registry load | `compiler-pipeline.md` 4, `matter-format.md` 5 and 6 |
 | `mock_hub` | A small hub for tests and `gx-mock-hub` | same |
 | `sim` | `SimClock` and integration of every frame to the simulation time | `space-model.md` 6 |
 | `camera` | Free camera parented to its nearest frame, re-parenting | `space-model.md` 5 |
 | `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the fetcher | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
-| `extract` | Marching cubes over a composited section, the extraction worker pool | `space-model.md` 2 |
+| `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
+| `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
+| `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
 | `light` | Emitters from hot matter, point lights, the emission lookup table | `matter-format.md` 3.3 |
-| `world` | Ties stream, extract, and light together for one frame | |
+| `world` | Ties stream, extract, volume, light, and farfield together for one frame | |
 | `render::scene` | Camera-relative `f32` positions, surface placement, projection, depth strategy | `space-model.md` 5 |
 | `render::overlay` | The overlay text | |
-| `render::gpu` | wgpu pipelines: surface pass, exposure, display pass | |
-| `render::headless` | Offscreen RGBA8 target, readback, PNG | |
+| `render::gpu` | wgpu pipelines: surface, volume, and sprite passes, exposure, display pass | |
+| `render::headless` | Offscreen RGBA8 target, readback of it and of the float radiance, PNG | |
+| `controls` | Keyboard and mouse bindings for the window and the canvas | |
 | `app` | Desktop window loop and the headless run | |
+| `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, `start` | `space-model.md` 10 |
 
-Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/exposure.wgsl`
-(luminance, adaptation, tone curve), `src/render/markers.wgsl` (markers and
-lines).
+Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/volume.wgsl`
+(the ray march), `src/shaders/sprite.wgsl` (far field sprites),
+`src/shaders/exposure.wgsl` (luminance, adaptation, tone curve),
+`src/render/markers.wgsl` (markers and lines).
 
 Binaries: `gx-renderer` (`src/main.rs`) and `gx-mock-hub`
 (`src/bin/gx-mock-hub.rs`).
 
 `hub`, `mock_hub`, `app`, and `render::headless` are native only. The library
-builds for `wasm32-unknown-unknown` without them and with the `web` feature
-off; the browser build adds its own window and fetch path.
+builds for `wasm32-unknown-unknown` without them, with the `web` feature off
+or on; with it on, `web` adds the canvas loop and the browser fetch path
+(`docs/web.md`). The binaries are empty stubs on `wasm32`, so the whole
+package builds for that target.
 
 ## The frame loop
 
@@ -164,9 +172,15 @@ a light, a dense sample is a surface.
    `gx_core::matter::composite` combines the layers. The composited
    `Section` is kept together with its emitter (step 5).
 4. **Extraction** (`extract`) runs on a pool of `std::thread` workers fed by
-   a channel: marching cubes over the composited density at the sample
-   centers, at half the section's largest density. The browser build, with
-   no threads, extracts inline.
+   a channel: marching cubes over the composited density of the solid and
+   fluid samples at the sample centers, at half the largest of those
+   densities. Gas and plasma samples count as vacuum here. The browser
+   build, with no threads, extracts inline.
+   **Volumes** (`volume`): the gas and plasma samples of the same section
+   become a `VolumeGrid` at decode time, drawn by ray marching
+   (`docs/shading.md`). A cell whose densest sample is gas or plasma is
+   therefore a volume, and a cell with both kinds draws a mesh and a
+   volume.
 5. **Lights** (`light`). Each drawn `Ready` cell's emitter is
    `gx_core::emission::summarize(section, 1000 K)`. Emitters of one frame
    merge: band powers add, the position is the power-weighted centroid. The
@@ -174,17 +188,24 @@ a light, a dense sample is a surface.
    `band_power / (4 pi)` per band. Only cells in the draw set count, so a
    parent and its children never both contribute.
 6. **Draw set** (`stream::CellCache::draw_set`), with the depth transition
-   rule below.
+   rule below, and the **far field** (`farfield`): a frame with mass whose
+   `root_extent / 8` region projects to under 2 px has no cells selected
+   and is a point sprite instead; between 2 and 8 px the sprite fades out
+   as the cells fade in. Its depth-0 cell is pinned in the cache (fetched
+   once, never evicted) for the sprite's brightness, and for a sprite-only
+   frame its hot matter still makes a light (`docs/shading.md`).
 7. **Placement** (`render::scene::add_matter`). A mesh is uploaded once
    with positions relative to its cell origin in `f32`. Per frame, the cell
    origin is made relative to the camera in `f64` with
    `FrameSystem::relative` and cast to `f32`; that offset and the frame's
-   rotation are the draw's model transform. Light positions go through the
+   rotation are the draw's model transform. Volumes are placed the same way
+   and sorted farthest first; light and sprite positions go through the
    same `f64` camera-relative step. The near plane also comes in to half the
-   distance to the nearest mesh bounds.
+   distance to the nearest mesh bounds or gas box.
 8. **Shading and exposure** (`render::gpu`, `docs/shading.md`): the lit
-   surface pass into a float target, automatic exposure, the tone curve,
-   then markers, lines, and the overlay.
+   surface pass into a float target, the volume pass, the sprite pass,
+   automatic exposure, the tone curve, then markers, lines, and the
+   overlay.
 
 ## The depth transition rule
 
@@ -212,8 +233,8 @@ buffers, whatever thread extracts it and however many times:
   faces (`extract::case_table`).
 - Every value is plain `f64` arithmetic with `sqrt`, both correctly rounded
   in IEEE 754; attributes are narrowed to `f32` last.
-- The isovalue is half the section's largest density, found in the same
-  walk.
+- The isovalue is half the largest density of the section's solid and
+  fluid samples, found in the same walk.
 - A mesh depends only on its own section, so the order the pool finishes
   jobs in changes only which frame a mesh first appears in.
 

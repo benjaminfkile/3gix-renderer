@@ -1,0 +1,7 @@
+# The test binaries, the two binaries, and the library's cdylib (needed by
+# wasm-pack for the browser build) each link wgpu, winit, and a TLS stack.
+# With one job per core those links run alongside the compiles of the test
+# crates and exhaust memory on machines with around 8 to 12 GB. Six jobs
+# keep the peak well below that at a small cost in build time.
+[build]
+jobs = 6

@@ -15,7 +15,7 @@
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
 //! of 4, the viewport height, the vertical field of view, and at most 512
-//! cells ([`select_all`]).
+//! cells ([`select_all`]), except frames drawn as a sprite only.
 //!
 //! # The cache
 //!
@@ -30,6 +30,11 @@
 //! `Empty`. Cells not selected for 60 s are evicted, and the cache never
 //! holds more than 4096 cells it could drop.
 //!
+//! A frame that is a sprite only in the far field ([`crate::farfield`]) has
+//! no cells selected. The depth-0 cell of every frame that may need a sprite
+//! is pinned ([`CellCache::pin`]): fetched once like a selected cell and
+//! never evicted, so the sprite's brightness is always at hand.
+//!
 //! # Depth transitions
 //!
 //! [`CellCache::draw_set`] never leaves a hole. A selected cell that cannot
@@ -39,7 +44,10 @@
 //! children is not ready, and stops once all of them are.
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::farfield::focal_px;
+use crate::farfield::{far_frames, mean_albedo, FarFieldCell};
 use crate::light::cell_emitter;
+use crate::volume::VolumeGrid;
 use gx_core::container::decode_chunk;
 use gx_core::emission::Emitter;
 use gx_core::frames::FrameSystem;
@@ -99,6 +107,33 @@ pub struct ReadyCell {
     /// The cell's hot matter as one emitter, if any
     /// ([`crate::light::cell_emitter`]).
     pub emitter: Option<Emitter>,
+    /// The cell's gas and plasma, if any, drawn as a volume
+    /// ([`crate::volume`]).
+    pub volume: Option<Arc<VolumeGrid>>,
+    /// Mass-weighted mean albedo, for the far field
+    /// ([`crate::farfield::mean_albedo`]).
+    pub mean_albedo: [f64; 3],
+}
+
+impl ReadyCell {
+    /// Derives everything the renderer keeps about a composited section:
+    /// its emitter, its volume, and its mean albedo.
+    pub fn new(section: Section) -> ReadyCell {
+        ReadyCell {
+            emitter: cell_emitter(&section),
+            volume: VolumeGrid::from_section(&section).map(Arc::new),
+            mean_albedo: mean_albedo(&section),
+            section: Arc::new(section),
+        }
+    }
+
+    /// What the far field needs from the cell.
+    pub fn far_field(&self) -> FarFieldCell {
+        FarFieldCell {
+            emitter: self.emitter,
+            mean_albedo: self.mean_albedo,
+        }
+    }
 }
 
 /// Where a cell is in its fetch.
@@ -159,20 +194,9 @@ pub fn decode_cell(key: &CellKey, bytes: &[u8], root_extent: Meters) -> FetchOut
     let refs: Vec<&Section> = sections.iter().collect();
     match composite(&refs) {
         Ok(c) if c.is_empty() => FetchOutcome::Decoded(None),
-        Ok(c) => {
-            let emitter = cell_emitter(&c);
-            FetchOutcome::Decoded(Some(Arc::new(ReadyCell {
-                section: Arc::new(c),
-                emitter,
-            })))
-        }
+        Ok(c) => FetchOutcome::Decoded(Some(Arc::new(ReadyCell::new(c)))),
         Err(e) => FetchOutcome::Invalid(format!("code {}: {}", e.code, e.reason)),
     }
-}
-
-/// Pixels per unit of `edge / distance` for a view `view_height_px` tall.
-fn focal_px(view_height_px: f64) -> f64 {
-    view_height_px / (2.0 * (0.5 * FIELD_OF_VIEW_Y).tan())
 }
 
 /// The camera position in `frame_id`'s coordinates (relative to its
@@ -204,8 +228,9 @@ pub fn frame_in_range(system: &FrameSystem, camera: &Camera, frame_id: u64, aspe
     off_axis <= half_diag + (region / d).min(1.0).asin()
 }
 
-/// Selects the cells of every frame in range ([`frame_in_range`]), in
-/// ascending key order, with their projected sizes.
+/// Selects the cells of every frame in range ([`frame_in_range`]) that is
+/// not a sprite only in the far field ([`crate::farfield::FarFrame::sprite_only`]),
+/// in ascending key order, with their projected sizes.
 pub fn select_all(
     system: &FrameSystem,
     camera: &Camera,
@@ -220,9 +245,16 @@ pub fn select_all(
         max_cells: MAX_CELLS_PER_FRAME,
     };
     let focal = focal_px(view_height_px);
+    let sprites: BTreeSet<u64> = far_frames(system, camera, view_height_px)
+        .iter()
+        .filter(|f| f.sprite_only())
+        .map(|f| f.frame_id)
+        .collect();
     let mut out = Vec::new();
     for frame in system.tree().frames() {
-        if !frame_in_range(system, camera, frame.frame_id, aspect) {
+        if sprites.contains(&frame.frame_id)
+            || !frame_in_range(system, camera, frame.frame_id, aspect)
+        {
             continue;
         }
         let cam = camera_in_frame(system, camera, frame.frame_id);
@@ -252,6 +284,9 @@ pub struct CellEntry {
     pub state: CellState,
     /// In the latest selection.
     pub selected: bool,
+    /// Kept for the far field: requested like a selected cell, never
+    /// evicted.
+    pub pinned: bool,
     /// Session time the cell was last selected or drawn, seconds.
     pub last_used: f64,
     /// Projected size at the latest selection, pixels.
@@ -271,6 +306,7 @@ impl CellEntry {
         CellEntry {
             state: CellState::Missing,
             selected: false,
+            pinned: false,
             last_used: now,
             projected_px: 0.0,
             requested_at: f64::NEG_INFINITY,
@@ -330,7 +366,8 @@ impl CellCache {
     }
 
     /// Replaces the selection. New keys start `Missing`; `Missing` keys no
-    /// longer selected are dropped, since there is nothing to keep.
+    /// longer selected or pinned are dropped, since there is nothing to
+    /// keep.
     pub fn set_selection(&mut self, cells: Vec<SelectedCell>, now: f64) {
         for e in self.entries.values_mut() {
             e.selected = false;
@@ -345,13 +382,33 @@ impl CellCache {
             e.projected_px = c.projected_px;
         }
         self.entries
-            .retain(|_, e| e.selected || e.state != CellState::Missing);
+            .retain(|_, e| e.selected || e.pinned || e.state != CellState::Missing);
         self.selection = cells;
     }
 
-    /// Picks the next requests: selected `Missing` cells, and `Pending`
-    /// cells due for a poll, largest projected size first (ties in key
-    /// order), up to [`MAX_IN_FLIGHT`] in flight. Marks them `Requested`.
+    /// Pins a cell: it is requested like a selected cell (if it is not
+    /// cached yet) and never evicted. Returns `true` if it was not pinned
+    /// before.
+    pub fn pin(&mut self, key: CellKey, now: f64) -> bool {
+        let e = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| CellEntry::new(now));
+        !std::mem::replace(&mut e.pinned, true)
+    }
+
+    /// The pinned cells, in key order.
+    pub fn pinned(&self) -> impl Iterator<Item = &CellKey> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.pinned)
+            .map(|(k, _)| k)
+    }
+
+    /// Picks the next requests: selected or pinned `Missing` cells, and
+    /// `Pending` cells due for a poll, largest projected size first (ties in
+    /// key order), up to [`MAX_IN_FLIGHT`] in flight. Marks them
+    /// `Requested`.
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
         let in_flight = self
             .entries
@@ -366,7 +423,7 @@ impl CellCache {
             .entries
             .iter()
             .filter(|(_, e)| {
-                e.selected
+                (e.selected || e.pinned)
                     && match e.state {
                         CellState::Missing => now >= e.retry_at,
                         CellState::Pending(since) => {
@@ -458,10 +515,11 @@ impl CellCache {
 
     /// Evicts cells not used for [`EVICT_AFTER_SECONDS`], then, while more
     /// than [`MAX_CACHED_CELLS`] remain, the least recently used (ties in key
-    /// order). Selected cells and requests in flight are never evicted.
+    /// order). Selected cells, pinned cells, and requests in flight are never
+    /// evicted.
     /// Returns the evicted keys in key order.
     pub fn evict(&mut self, now: f64) -> Vec<CellKey> {
-        let droppable = |e: &CellEntry| !e.selected && e.state != CellState::Requested;
+        let droppable = |e: &CellEntry| !e.selected && !e.pinned && e.state != CellState::Requested;
         let mut gone: BTreeSet<CellKey> = self
             .entries
             .iter()
@@ -577,12 +635,30 @@ fn cover_below(
     Some(out)
 }
 
+/// Something a fetcher reports back to the frame loop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FetchEvent {
+    /// A request finished.
+    Completed {
+        /// The cell.
+        key: CellKey,
+        /// What came back, decoded.
+        outcome: FetchOutcome,
+        /// Body bytes received.
+        bytes: u64,
+        /// Time from sending the request to having the body.
+        round_trip: std::time::Duration,
+    },
+    /// The hub pushed `chunkReady` for a cell.
+    ChunkReady(CellKey),
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{FetchEvent, Fetcher};
+pub use native::Fetcher;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{decode_cell, FetchOutcome};
+    use super::{decode_cell, FetchEvent, FetchOutcome};
     use crate::hub::{ChunkFetch, HubClient};
     use gx_core::key::{CellKey, ChunkKey};
     use gx_core::units::Meters;
@@ -590,24 +666,6 @@ mod native {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc as tokio_mpsc;
-
-    /// Something the fetcher reports back to the frame loop.
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum FetchEvent {
-        /// A request finished.
-        Completed {
-            /// The cell.
-            key: CellKey,
-            /// What came back, decoded.
-            outcome: FetchOutcome,
-            /// Body bytes received.
-            bytes: u64,
-            /// Time from sending the request to having the body.
-            round_trip: Duration,
-        },
-        /// The hub pushed `chunkReady` for a cell.
-        ChunkReady(CellKey),
-    }
 
     /// Fetches cells through the hub client on a tokio runtime and reports
     /// back over a channel the frame loop drains without blocking.
@@ -800,10 +858,7 @@ mod tests {
             ),
         )
         .unwrap();
-        FetchOutcome::Decoded(Some(Arc::new(ReadyCell {
-            section: Arc::new(s),
-            emitter: None,
-        })))
+        FetchOutcome::Decoded(Some(Arc::new(ReadyCell::new(s))))
     }
 
     #[test]
@@ -890,6 +945,22 @@ mod tests {
         assert_eq!(gone.len(), 10);
         assert_eq!(gone, many[..10].to_vec());
         assert_eq!(c.counts().cached, MAX_CACHED_CELLS);
+    }
+
+    #[test]
+    fn pinned_cells_are_requested_and_kept() {
+        let mut c = CellCache::new();
+        let k = key(0, 0, 0, 0);
+        assert!(c.pin(k, 0.0));
+        assert!(!c.pin(k, 0.0));
+        // Not selected, still requested.
+        c.set_selection(Vec::new(), 0.0);
+        assert_eq!(c.take_requests(0.0), vec![k]);
+        c.complete(k, ready(), 0.1);
+        c.set_selection(Vec::new(), 0.2);
+        assert!(c.evict(1000.0).is_empty());
+        assert!(matches!(c.state(&k), Some(CellState::Ready(_))));
+        assert_eq!(c.pinned().copied().collect::<Vec<_>>(), vec![k]);
     }
 
     #[test]

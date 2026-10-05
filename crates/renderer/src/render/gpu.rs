@@ -1,6 +1,6 @@
-//! The wgpu renderer: lit matter surfaces into a float target, automatic
-//! exposure, the tone curve, then frame markers, frame-to-parent lines, and
-//! the overlay text.
+//! The wgpu renderer: lit matter surfaces, ray marched volumes, and far
+//! field sprites into a float target, automatic exposure, the tone curve,
+//! then frame markers, frame-to-parent lines, and the overlay text.
 //!
 //! One frame is:
 //!
@@ -8,20 +8,33 @@
 //!    into an `Rgba32Float` target holding radiance per band, with the
 //!    reversed-z `Depth32Float` depth buffer cleared to 0 and a
 //!    greater-or-equal test (see [`crate::render::scene`]);
-//! 2. the exposure compute passes of `shaders/exposure.wgsl`: log-average
+//! 2. the volume pass: every drawn cell's gas and plasma with
+//!    `shaders/volume.wgsl`, back to front, blended over the surfaces, each
+//!    ray stopping at the surface depth (read as a texture; nothing writes
+//!    depth);
+//! 3. the sprite pass: far field point sprites with `shaders/sprite.wgsl`,
+//!    added to the target, tested against the surface depth;
+//! 4. the exposure compute passes of `shaders/exposure.wgsl`: log-average
 //!    luminance and adaptation;
-//! 3. the display pass into the color target (a window surface or the
+//! 5. the display pass into the color target (a window surface or the
 //!    offscreen texture of [`crate::render::headless`]): the tone-mapped
 //!    float target, then markers and lines tested against the surface
 //!    pass's depth, then the overlay text.
 //!
-//! The lighting model, exposure, and tone curve are described in
-//! `docs/shading.md`.
+//! Blending into an `Rgba32Float` target needs the `FLOAT32_BLENDABLE`
+//! device feature, which every desktop driver and current WebGPU browsers
+//! offer; the device is opened with it when the adapter has it
+//! ([`wanted_features`]). Without it volumes and sprites are written
+//! unblended: a volume then hides what is behind it.
+//!
+//! The lighting model, the volume model, the far field, exposure, and the
+//! tone curve are described in `docs/shading.md`.
 
 use super::overlay::{MARGIN_PX, TEXT_COLOR, TEXT_PX};
 use super::scene::Scene;
 use crate::extract::SurfaceMesh;
 use crate::light::{EmissionTable, EMISSION_TABLE_WIDTH, MAX_LIGHTS};
+use crate::volume::{VolumeGrid, CUBE_TRIANGLES};
 use bytemuck::{Pod, Zeroable};
 use gx_core::key::CellKey;
 use std::collections::BTreeMap;
@@ -58,8 +71,16 @@ const LUMINANCE_BLOCK: u32 = 16;
 /// Bytes between per-draw model transforms in the dynamic uniform buffer.
 const MODEL_STRIDE: u64 = 256;
 
-/// Frames a mesh may go undrawn before its GPU buffers are dropped.
+/// Frames a mesh or volume may go undrawn before its GPU buffers are
+/// dropped.
 const MESH_IDLE_FRAMES: u64 = 600;
+
+/// The device features the renderer uses when the adapter has them:
+/// `FLOAT32_BLENDABLE`, for blending volumes and sprites into the float
+/// radiance target.
+pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::FLOAT32_BLENDABLE
+}
 
 /// How one frame is exposed.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -127,6 +148,30 @@ struct SurfaceGpuVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct VolumeGlobals {
+    view_proj: [[f32; 4]; 4],
+    forward: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct VolumeGpu {
+    columns: [[f32; 4]; 3],
+    offset: [f32; 4],
+    box_min: [f32; 4],
+    box_max: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct SpriteInstance {
+    center: [f32; 3],
+    size_px: f32,
+    radiance: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct ExposureParams {
     bias_stops: f32,
     alpha: f32,
@@ -157,6 +202,13 @@ struct GpuMesh {
     last_drawn: u64,
 }
 
+/// A volume uploaded to the GPU: its two 3D textures and its uniform.
+struct GpuVolume {
+    uniform: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    last_drawn: u64,
+}
+
 /// What the last frame drew.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats {
@@ -166,12 +218,17 @@ pub struct FrameStats {
     pub triangles: usize,
     /// Point lights in use.
     pub lights: usize,
+    /// Volumes drawn.
+    pub volumes: usize,
+    /// Point sprites drawn.
+    pub sprites: usize,
 }
 
 /// The size-dependent targets: depth, the float radiance target, and the
 /// bind groups that read it.
 struct Targets {
     depth: wgpu::TextureView,
+    radiance_texture: wgpu::Texture,
     radiance: wgpu::TextureView,
     partial_count: u32,
     groups: (u32, u32),
@@ -203,6 +260,14 @@ pub struct Renderer {
     emission_texture: wgpu::Texture,
     emission_uploaded: usize,
     meshes: BTreeMap<CellKey, GpuMesh>,
+    volume_pipeline: wgpu::RenderPipeline,
+    volume_globals: wgpu::Buffer,
+    volume_globals_layout: wgpu::BindGroupLayout,
+    volume_layout: wgpu::BindGroupLayout,
+    cube: wgpu::Buffer,
+    volumes: BTreeMap<CellKey, GpuVolume>,
+    sprite_pipeline: wgpu::RenderPipeline,
+    sprites: GrowBuffer,
     exposure_layout: wgpu::BindGroupLayout,
     partial_pipeline: wgpu::ComputePipeline,
     adapt_pipeline: wgpu::ComputePipeline,
@@ -300,6 +365,23 @@ fn float_texture_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::Bi
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_entry(
+    binding: u32,
+    sample_type: wgpu::TextureSampleType,
+    view_dimension: wgpu::TextureViewDimension,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension,
             multisampled: false,
         },
         count: None,
@@ -513,6 +595,164 @@ impl Renderer {
             multiview_mask: None,
         });
 
+        // Volumes and sprites, blended into the radiance target when the
+        // device can blend 32-bit floats.
+        let blendable = device
+            .features()
+            .contains(wgpu::Features::FLOAT32_BLENDABLE);
+        let over = blendable.then_some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        });
+        let additive = blendable.then_some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        });
+        let volume_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../shaders/volume.wgsl"));
+        let volume_globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volume globals"),
+            size: std::mem::size_of::<VolumeGlobals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let volume_globals_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("volume globals"),
+                entries: &[
+                    uniform_entry(
+                        0,
+                        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        false,
+                    ),
+                    float_texture_entry(1, wgpu::ShaderStages::FRAGMENT),
+                    texture_entry(
+                        2,
+                        wgpu::TextureSampleType::Depth,
+                        wgpu::TextureViewDimension::D2,
+                    ),
+                ],
+            });
+        let volume_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("volume"),
+            entries: &[
+                uniform_entry(
+                    0,
+                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+                texture_entry(
+                    1,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D3,
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D3,
+                ),
+            ],
+        });
+        let volume_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("volumes"),
+                bind_group_layouts: &[Some(&volume_globals_layout), Some(&volume_layout)],
+                immediate_size: 0,
+            });
+        let volume_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("volumes"),
+            layout: Some(&volume_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &volume_shader,
+                entry_point: Some("vs_volume"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                })],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                // Back faces only: one fragment per covered pixel.
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &volume_shader,
+                entry_point: Some("fs_volume"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: RADIANCE_FORMAT,
+                    blend: over,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            cache: None,
+            multiview_mask: None,
+        });
+        let cube = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("volume box"),
+            contents: bytemuck::cast_slice(&CUBE_TRIANGLES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let sprite_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../shaders/sprite.wgsl"));
+        let sprite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sprites"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sprite_shader,
+                entry_point: Some("vs_sprite"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SpriteInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x4],
+                })],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sprite_shader,
+                entry_point: Some("fs_sprite"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: RADIANCE_FORMAT,
+                    blend: additive,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            cache: None,
+            multiview_mask: None,
+        });
+
         // Exposure.
         let exposure_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("exposure"),
@@ -637,6 +877,14 @@ impl Renderer {
             emission_texture: emission_tex,
             emission_uploaded: 0,
             meshes: BTreeMap::new(),
+            volume_pipeline,
+            volume_globals,
+            volume_globals_layout,
+            volume_layout,
+            cube,
+            volumes: BTreeMap::new(),
+            sprite_pipeline,
+            sprites: GrowBuffer::new(device, "sprites"),
             exposure_layout,
             partial_pipeline,
             adapt_pipeline,
@@ -719,18 +967,20 @@ impl Renderer {
             width,
             height,
             DEPTH_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         )
         .create_view(&wgpu::TextureViewDescriptor::default());
-        let radiance = texture_2d(
+        let radiance_texture = texture_2d(
             device,
             "radiance",
             width,
             height,
             RADIANCE_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        )
-        .create_view(&wgpu::TextureViewDescriptor::default());
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        let radiance = radiance_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let groups = (
             width.div_ceil(LUMINANCE_BLOCK),
             height.div_ceil(LUMINANCE_BLOCK),
@@ -780,6 +1030,7 @@ impl Renderer {
         });
         Targets {
             depth,
+            radiance_texture,
             radiance,
             partial_count,
             groups,
@@ -796,6 +1047,12 @@ impl Renderer {
     /// What the last frame drew.
     pub fn stats(&self) -> FrameStats {
         self.stats
+    }
+
+    /// The float radiance target of the last frame, W m^-2 sr^-1 per band
+    /// in red, green, blue, before exposure (`Rgba32Float`, copyable).
+    pub fn radiance_texture(&self) -> &wgpu::Texture {
+        &self.targets.radiance_texture
     }
 
     /// Resizes the depth buffer, the radiance target, and the overlay
@@ -857,6 +1114,69 @@ impl Renderer {
                     usage: wgpu::BufferUsages::INDEX,
                 }),
             index_count: mesh.indices.len() as u32,
+            last_drawn: self.frame,
+        }
+    }
+
+    /// Uploads a volume: its samples as two `n^3` 3D textures (see
+    /// [`VolumeGrid::texels`]), each temperature turned into an emission
+    /// table index, and a uniform buffer for its placement.
+    fn upload_volume(&mut self, grid: &VolumeGrid) -> GpuVolume {
+        let n = u32::from(grid.resolution);
+        let emission = &mut self.emission;
+        let (params, albedo) = grid.texels(|t| emission.index_for(t));
+        let texture = |label: &str, data: &[[f32; 4]]| {
+            self.device
+                .create_texture_with_data(
+                    &self.queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: n,
+                            height: n,
+                            depth_or_array_layers: n,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D3,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    bytemuck::cast_slice(data),
+                )
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let params = texture("volume samples", &params);
+        let albedo = texture("volume albedo", &albedo);
+        let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volume"),
+            size: std::mem::size_of::<VolumeGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("volume"),
+            layout: &self.volume_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&params),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&albedo),
+                },
+            ],
+        });
+        GpuVolume {
+            uniform,
+            bind,
             last_drawn: self.frame,
         }
     }
@@ -949,10 +1269,59 @@ impl Renderer {
                 m.last_drawn = self.frame;
             }
         }
+        for draw in &scene.volumes {
+            let key = draw.grid.key;
+            if !self.volumes.contains_key(&key) {
+                let gpu = self.upload_volume(&draw.grid);
+                self.volumes.insert(key, gpu);
+            }
+            if let Some(v) = self.volumes.get_mut(&key) {
+                v.last_drawn = self.frame;
+                let r = draw.rotation;
+                let g = &draw.grid;
+                let o = [g.origin.x, g.origin.y, g.origin.z];
+                let local =
+                    |c: [f64; 3]| -> [f32; 3] { core::array::from_fn(|a| (c[a] - o[a]) as f32) };
+                let (lo, hi) = (local(g.bounds_min), local(g.bounds_max));
+                let gpu = VolumeGpu {
+                    columns: [
+                        [r[0][0], r[0][1], r[0][2], 0.0],
+                        [r[1][0], r[1][1], r[1][2], 0.0],
+                        [r[2][0], r[2][1], r[2][2], 0.0],
+                    ],
+                    offset: [draw.offset[0], draw.offset[1], draw.offset[2], draw.weight],
+                    box_min: [lo[0], lo[1], lo[2], g.edge as f32],
+                    box_max: [hi[0], hi[1], hi[2], f32::from(g.resolution)],
+                };
+                self.queue
+                    .write_buffer(&v.uniform, 0, bytemuck::bytes_of(&gpu));
+            }
+        }
         let frame = self.frame;
         self.meshes
             .retain(|_, m| frame - m.last_drawn <= MESH_IDLE_FRAMES);
+        self.volumes
+            .retain(|_, v| frame - v.last_drawn <= MESH_IDLE_FRAMES);
         self.sync_emission();
+        // The view direction (camera -z) in root axes: minus the third row
+        // of the rotation from root into camera axes.
+        let vr = scene.view_rotation;
+        let volume_globals = VolumeGlobals {
+            view_proj,
+            forward: [-vr[0][2], -vr[1][2], -vr[2][2], scene.near],
+        };
+        self.queue
+            .write_buffer(&self.volume_globals, 0, bytemuck::bytes_of(&volume_globals));
+        let sprites: Vec<SpriteInstance> = scene
+            .sprites
+            .iter()
+            .map(|s| SpriteInstance {
+                center: s.position,
+                size_px: s.size_px,
+                radiance: [s.radiance[0], s.radiance[1], s.radiance[2], 0.0],
+            })
+            .collect();
+        self.sprites.write(&self.device, &self.queue, &sprites);
         let draws = scene.surfaces.len() as u64;
         if draws * MODEL_STRIDE > self.models.size() {
             self.models = Self::model_buffer(&self.device, draws.next_power_of_two());
@@ -968,7 +1337,7 @@ impl Renderer {
                     [r[1][0], r[1][1], r[1][2], 0.0],
                     [r[2][0], r[2][1], r[2][2], 0.0],
                 ],
-                offset: [draw.offset[0], draw.offset[1], draw.offset[2], 0.0],
+                offset: [draw.offset[0], draw.offset[1], draw.offset[2], draw.weight],
             };
             let at = i * MODEL_STRIDE as usize;
             model_bytes[at..at + std::mem::size_of::<ModelGpu>()]
@@ -1061,6 +1430,87 @@ impl Renderer {
                 stats.meshes += 1;
                 stats.triangles += m.index_count as usize / 3;
             }
+        }
+        if !scene.volumes.is_empty() {
+            let depth_view = &self.targets.depth;
+            let emission_view = self
+                .emission_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let globals_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("volume globals"),
+                layout: &self.volume_globals_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.volume_globals.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&emission_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("volume pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.radiance,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.volume_pipeline);
+            pass.set_bind_group(0, &globals_bind, &[]);
+            pass.set_vertex_buffer(0, self.cube.slice(..));
+            for draw in &scene.volumes {
+                let Some(v) = self.volumes.get(&draw.grid.key) else {
+                    continue;
+                };
+                pass.set_bind_group(1, &v.bind, &[]);
+                pass.draw(0..CUBE_TRIANGLES.len() as u32, 0..1);
+                stats.volumes += 1;
+            }
+        }
+        if self.sprites.len > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sprite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.radiance,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.sprite_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.sprites.buffer.slice(..));
+            pass.draw(0..6, 0..self.sprites.len);
+            stats.sprites = self.sprites.len as usize;
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

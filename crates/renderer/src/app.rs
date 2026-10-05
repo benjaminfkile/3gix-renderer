@@ -15,15 +15,18 @@
 //!
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
-use crate::camera::{Camera, FlightInput};
+use crate::camera::Camera;
 use crate::config::Config;
+use crate::controls::Controls;
+pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
 use crate::hub::HubClient;
-use crate::render::gpu::{Exposure, Renderer, EXPOSURE_STEP_STOPS};
+use crate::render::gpu::{wanted_features, Exposure, Renderer};
 use crate::render::headless::{Headless, Image};
 use crate::render::overlay::{MatterStats, OverlayInfo};
-use crate::render::scene::{add_matter, build_scene, Scene};
-use crate::sim::{ClockAction, SimClock, Simulation};
+pub use crate::render::scene::matter_scene;
+use crate::render::scene::Scene;
+use crate::sim::{SimClock, Simulation};
 use crate::stream::{FetchEvent, Fetcher};
 use crate::world::World;
 use anyhow::{anyhow, Context, Result};
@@ -33,9 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// How many clamped integration rounds a headless run takes to reach the
@@ -46,15 +48,9 @@ pub const HEADLESS_CATCH_UP_ROUNDS: usize = 64;
 /// does not turn into one giant step of flight or time.
 pub const MAX_FRAME_SECONDS: f64 = 0.25;
 
-/// Pixels of trackpad scroll that count as one wheel notch.
-pub const PIXELS_PER_NOTCH: f64 = 40.0;
-
 /// Longest a headless run waits for the selected cells, seconds, before it
 /// renders whatever has arrived.
 pub const HEADLESS_STREAM_SECONDS: f64 = 60.0;
-
-/// Limits of the exposure bias, stops.
-pub const EXPOSURE_BIAS_LIMITS: (f64, f64) = (-16.0, 16.0);
 
 /// Starts requests for the cells the world wants and applies every fetch
 /// event that has arrived.
@@ -88,28 +84,14 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         cells_pending: counts.cache.pending,
         meshes_drawn: scene.surfaces.len(),
         triangles_drawn: scene.surfaces.iter().map(|d| d.mesh.triangle_count()).sum(),
+        volumes_drawn: scene.volumes.len(),
+        sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),
         bytes_fetched: fetcher.map_or(0, Fetcher::bytes_fetched),
         last_round_trip: fetcher
             .and_then(Fetcher::last_round_trip)
             .map(|d| d.as_secs_f64()),
     }
-}
-
-/// The scene for the camera: frame markers plus the world's drawn cells and
-/// lights.
-pub fn matter_scene(
-    world: &mut World,
-    system: &FrameSystem,
-    camera: &Camera,
-    size: (u32, u32),
-    now: f64,
-) -> Scene {
-    let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
-    let mut scene = build_scene(system, camera, aspect);
-    let draw = world.draw_list(system, camera, now);
-    add_matter(&mut scene, system, camera, &draw);
-    scene
 }
 
 /// A simulation at the configured launch offset and time scale, with the
@@ -223,8 +205,7 @@ pub fn run_windowed(
         world: World::new(default_threads()),
         fetcher: Fetcher::new(runtime, client),
         started: Instant::now(),
-        exposure_bias: 0.0,
-        input: Input::default(),
+        controls: Controls::default(),
         gfx: None,
         size: (config.width, config.height),
         last_frame: None,
@@ -237,24 +218,6 @@ pub fn run_windowed(
     match app.error {
         Some(e) => Err(e),
         None => Ok(()),
-    }
-}
-
-/// Held keys and accumulated mouse movement between frames.
-#[derive(Default)]
-struct Input {
-    flight: FlightInput,
-    looking: bool,
-    cursor: Option<(f64, f64)>,
-}
-
-impl Input {
-    /// This frame's flight input; clears the accumulated mouse movement.
-    fn take(&mut self) -> FlightInput {
-        let out = self.flight;
-        self.flight.look = (0.0, 0.0);
-        self.flight.wheel = 0.0;
-        out
     }
 }
 
@@ -313,6 +276,7 @@ impl Gfx {
         .map_err(|e| anyhow!("no graphics adapter for the window: {e}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("window"),
+            required_features: wanted_features(&adapter),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))
@@ -355,8 +319,7 @@ struct App {
     world: World,
     fetcher: Fetcher,
     started: Instant,
-    exposure_bias: f64,
-    input: Input,
+    controls: Controls,
     gfx: Option<Gfx>,
     size: (u32, u32),
     last_frame: Option<Instant>,
@@ -365,44 +328,6 @@ struct App {
 }
 
 impl App {
-    fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, event_loop: &ActiveEventLoop) {
-        let f = &mut self.input.flight;
-        match code {
-            KeyCode::KeyW => f.forward = pressed,
-            KeyCode::KeyS => f.back = pressed,
-            KeyCode::KeyA => f.left = pressed,
-            KeyCode::KeyD => f.right = pressed,
-            KeyCode::KeyE => f.up = pressed,
-            KeyCode::KeyQ => f.down = pressed,
-            _ if !pressed || repeat => {}
-            KeyCode::Space => self.sim.clock.apply(ClockAction::TogglePause),
-            KeyCode::BracketLeft => self.sim.clock.apply(ClockAction::HalveScale),
-            KeyCode::BracketRight => self.sim.clock.apply(ClockAction::DoubleScale),
-            KeyCode::Comma => self.sim.clock.apply(ClockAction::StepBack),
-            KeyCode::Period => self.sim.clock.apply(ClockAction::StepForward),
-            KeyCode::KeyR => self.sim.clock.apply(ClockAction::Reset),
-            KeyCode::Home => self.camera = Camera::home(&self.sim.system),
-            KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
-            KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
-            KeyCode::Escape => event_loop.exit(),
-            other => {
-                if let Some(index) = digit_index(other) {
-                    if let Some(cam) = Camera::view_of_index(&self.sim.system, index) {
-                        self.camera = Camera {
-                            speed: self.camera.speed,
-                            ..cam
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    fn bias_exposure(&mut self, stops: f64) {
-        let (lo, hi) = EXPOSURE_BIAS_LIMITS;
-        self.exposure_bias = (self.exposure_bias + stops).clamp(lo, hi);
-    }
-
     fn frame(&mut self) {
         let now = Instant::now();
         let dt = self
@@ -412,7 +337,7 @@ impl App {
         let fps = self.fps.frame(now);
 
         self.sim.update(Seconds::new(dt));
-        let input = self.input.take();
+        let input = self.controls.take_flight();
         self.camera.fly(&self.sim.system, &input, dt);
         self.camera.update_parent(&self.sim.system);
 
@@ -430,7 +355,7 @@ impl App {
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
         let overlay = overlay_info(&self.sim, &self.camera, fps, stats).text();
         let exposure = Exposure {
-            bias_stops: self.exposure_bias,
+            bias_stops: self.controls.exposure_bias,
             adapt_seconds: Some(dt),
         };
         let texture = match gfx.surface.get_current_texture() {
@@ -449,23 +374,6 @@ impl App {
         gfx.window.pre_present_notify();
         gfx.queue.present(texture);
     }
-}
-
-/// Number keys: `1` to `9` select indices 0 to 8, `0` selects index 9.
-fn digit_index(code: KeyCode) -> Option<usize> {
-    const DIGITS: [KeyCode; 10] = [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-        KeyCode::Digit0,
-    ];
-    DIGITS.iter().position(|&d| d == code)
 }
 
 impl ApplicationHandler for App {
@@ -493,35 +401,15 @@ impl ApplicationHandler for App {
                     gfx.resize(size.width, size.height);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let pressed = event.state == ElementState::Pressed;
-                    self.key(code, pressed, event.repeat, event_loop);
-                }
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Right,
-                ..
-            } => {
-                self.input.looking = state == ElementState::Pressed;
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let p = (position.x, position.y);
-                if let (true, Some(last)) = (self.input.looking, self.input.cursor) {
-                    self.input.flight.look.0 += p.0 - last.0;
-                    self.input.flight.look.1 += p.1 - last.1;
-                }
-                self.input.cursor = Some(p);
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.input.flight.wheel += match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / PIXELS_PER_NOTCH,
-                };
-            }
             WindowEvent::RedrawRequested => self.frame(),
-            _ => {}
+            other => {
+                if self
+                    .controls
+                    .handle(&other, &mut self.sim, &mut self.camera)
+                {
+                    event_loop.exit();
+                }
+            }
         }
     }
 

@@ -1,7 +1,9 @@
 # Controls
 
-Every key and mouse binding of the desktop renderer. Keys are matched by
+Every key and mouse binding of the desktop renderer and the browser build
+(the bindings live in `src/controls.rs`, shared by both). Keys are matched by
 physical position, so they sit in the same place on every keyboard layout.
+In the browser, click the canvas first so it has the keyboard focus.
 
 ## Camera
 

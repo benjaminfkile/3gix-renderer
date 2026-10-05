@@ -6,7 +6,7 @@
 //! window or display. `WGPU_BACKEND` and the other wgpu environment
 //! variables select the adapter as usual.
 
-use super::gpu::{Exposure, FrameStats, Renderer};
+use super::gpu::{wanted_features, Exposure, FrameStats, Renderer};
 use super::scene::Scene;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
@@ -52,6 +52,25 @@ impl Image {
     }
 }
 
+/// The float radiance target read back: W m^-2 sr^-1 per band in red,
+/// green, blue, and the coverage in alpha, top row first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadianceImage {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// `width * height` texels.
+    pub texels: Vec<[f32; 4]>,
+}
+
+impl RadianceImage {
+    /// The texel of one pixel.
+    pub fn pixel(&self, x: u32, y: u32) -> [f32; 4] {
+        self.texels[(y * self.width + x) as usize]
+    }
+}
+
 /// A device, a renderer, and an offscreen texture to render into.
 pub struct Headless {
     device: wgpu::Device,
@@ -82,6 +101,7 @@ impl Headless {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("headless"),
+                required_features: wanted_features(&adapter),
                 required_limits: wgpu::Limits::downlevel_defaults()
                     .using_resolution(adapter.limits()),
                 ..Default::default()
@@ -144,8 +164,47 @@ impl Headless {
         self.renderer.stats()
     }
 
+    /// Whether the device blends into the float radiance target (see
+    /// [`wanted_features`]).
+    pub fn float_blending(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::FLOAT32_BLENDABLE)
+    }
+
+    /// Reads back the float radiance target of the last frame: radiance
+    /// before exposure and the tone curve.
+    pub fn read_radiance(&self) -> Result<RadianceImage> {
+        let bytes = self.copy_out(self.renderer.radiance_texture(), 16)?;
+        Ok(RadianceImage {
+            width: self.width,
+            height: self.height,
+            texels: bytes
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|t| {
+                    core::array::from_fn(|i| {
+                        f32::from_le_bytes([t[4 * i], t[4 * i + 1], t[4 * i + 2], t[4 * i + 3]])
+                    })
+                })
+                .collect(),
+        })
+    }
+
     fn read_back(&self) -> Result<Image> {
-        let unpadded = self.width * 4;
+        let rgba = self.copy_out(&self.texture, 4)?;
+        Ok(Image {
+            width: self.width,
+            height: self.height,
+            rgba,
+        })
+    }
+
+    /// Copies a texture of the target size with `texel_bytes` per texel to
+    /// memory, tightly packed rows, top row first.
+    fn copy_out(&self, texture: &wgpu::Texture, texel_bytes: u32) -> Result<Vec<u8>> {
+        let unpadded = self.width * texel_bytes;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = unpadded.div_ceil(align) * align;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -161,7 +220,7 @@ impl Headless {
             });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -201,10 +260,6 @@ impl Headless {
             }
         }
         buffer.unmap();
-        Ok(Image {
-            width: self.width,
-            height: self.height,
-            rgba,
-        })
+        Ok(rgba)
     }
 }
