@@ -22,7 +22,9 @@ pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
 use crate::farfield::focal_px;
 use crate::hub::HubClient;
-use crate::render::gpu::{wanted_features, Exposure, Renderer};
+use crate::render::gpu::{
+    describe_adapter, pick_adapter, present_mode, wanted_features, Exposure, Renderer,
+};
 use crate::render::headless::{Headless, Image};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 pub use crate::render::scene::matter_scene;
@@ -123,7 +125,7 @@ pub fn overlay_info(
 }
 
 /// What a headless run renders and how long it waits for matter.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HeadlessRun {
     /// Image width, pixels.
     pub width: u32,
@@ -143,6 +145,8 @@ pub struct HeadlessRun {
     /// A fixed exposure, stops ([`crate::render::gpu::fixed_exposure`]);
     /// `None` exposes for the frame's own log-average luminance.
     pub exposure_stops: Option<f64>,
+    /// A part of the graphics adapter's name ([`crate::render::gpu::pick_adapter`]).
+    pub adapter: Option<String>,
 }
 
 impl HeadlessRun {
@@ -157,6 +161,7 @@ impl HeadlessRun {
             wait_ready_seconds: None,
             overlay: true,
             exposure_stops: None,
+            adapter: None,
         }
     }
 
@@ -170,6 +175,7 @@ impl HeadlessRun {
             wait_ready_seconds: config.wait_ready_seconds,
             overlay: config.overlay,
             exposure_stops: config.exposure_stops,
+            adapter: config.adapter.clone(),
         }
     }
 }
@@ -355,7 +361,7 @@ pub fn render_headless_view(
         scene.markers.clear();
         scene.lines.clear();
     }
-    let mut headless = Headless::new(width, height)?;
+    let mut headless = Headless::new(width, height, run.adapter.as_deref())?;
     tracing::info!(adapter = headless.adapter_name(), "headless rendering");
     let info = overlay_info(
         sim,
@@ -433,7 +439,10 @@ pub fn run_windowed(
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let event_loop = EventLoop::new().context("opening the window system")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Wait, not Poll: each frame asks for the next redraw, so the loop
+    // still runs continuously, but paced by the surface's present mode (one
+    // frame per display refresh) and the optional cap instead of spinning.
+    event_loop.set_control_flow(ControlFlow::Wait);
     let sim = launch_simulation(system, config);
     let camera = Camera::home(&sim.system);
     let mut app = App {
@@ -443,6 +452,10 @@ pub fn run_windowed(
         fetcher: Fetcher::new(runtime, client),
         started: Instant::now(),
         controls: Controls::new(config.exposure_stops),
+        adapter: config.adapter.clone(),
+        frame_interval: (config.max_fps > 0)
+            .then(|| Duration::from_secs_f64(1.0 / f64::from(config.max_fps))),
+        next_frame: None,
         gfx: None,
         size: (config.width, config.height),
         last_frame: None,
@@ -490,7 +503,7 @@ struct Gfx {
 }
 
 impl Gfx {
-    fn new(event_loop: &ActiveEventLoop, size: (u32, u32)) -> Result<Gfx> {
+    fn new(event_loop: &ActiveEventLoop, size: (u32, u32), adapter: Option<&str>) -> Result<Gfx> {
         let attrs = Window::default_attributes()
             .with_title("gx-renderer")
             .with_inner_size(PhysicalSize::new(size.0, size.1));
@@ -506,11 +519,9 @@ impl Gfx {
         let surface = instance
             .create_surface(window.clone())
             .context("creating the window surface")?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .map_err(|e| anyhow!("no graphics adapter for the window: {e}"))?;
+        let adapter = pollster::block_on(pick_adapter(&instance, Some(&surface), adapter))
+            .context("choosing the graphics adapter for the window")?;
+        tracing::info!(adapter = describe_adapter(&adapter), "rendering with");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("window"),
             required_features: wanted_features(&adapter),
@@ -527,6 +538,8 @@ impl Gfx {
         if let Some(srgb) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
             surface_config.format = srgb;
         }
+        surface_config.present_mode = present_mode(&caps);
+        tracing::info!(present_mode = ?surface_config.present_mode, "window surface");
         surface.configure(&device, &surface_config);
         let renderer = Renderer::new(&device, &queue, surface_config.format, w, h);
         Ok(Gfx {
@@ -557,6 +570,12 @@ struct App {
     fetcher: Fetcher,
     started: Instant,
     controls: Controls,
+    /// A part of the graphics adapter's name to render with, if chosen.
+    adapter: Option<String>,
+    /// Minimum time between frames when `--max-fps` is given.
+    frame_interval: Option<Duration>,
+    /// With a cap: the earliest the next frame may start.
+    next_frame: Option<Instant>,
     gfx: Option<Gfx>,
     size: (u32, u32),
     last_frame: Option<Instant>,
@@ -571,6 +590,7 @@ impl App {
             .last_frame
             .map_or(0.0, |t| (now - t).as_secs_f64().min(MAX_FRAME_SECONDS));
         self.last_frame = Some(now);
+        self.next_frame = self.frame_interval.map(|i| now + i);
         let fps = self.fps.frame(now);
 
         self.sim.update(Seconds::new(dt));
@@ -622,7 +642,7 @@ impl ApplicationHandler for App {
         if self.gfx.is_some() {
             return;
         }
-        match Gfx::new(event_loop, self.size) {
+        match Gfx::new(event_loop, self.size, self.adapter.as_deref()) {
             Ok(gfx) => {
                 gfx.window.request_redraw();
                 self.gfx = Some(gfx);
@@ -654,9 +674,19 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(gfx) = &self.gfx {
-            gfx.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(gfx) = &self.gfx else {
+            return;
+        };
+        // With a frame cap, wait for the next slot instead of redrawing at
+        // once; the loop wakes at `next_frame` and comes back here.
+        if let Some(next) = self.next_frame {
+            if Instant::now() < next {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                return;
+            }
         }
+        event_loop.set_control_flow(ControlFlow::Wait);
+        gfx.window.request_redraw();
     }
 }

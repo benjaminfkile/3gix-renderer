@@ -31,9 +31,17 @@ pub const ENV_API_KEY: &str = "GX_API_KEY";
 pub const ENV_SPACE_ID: &str = "GX_SPACE_ID";
 /// Name of the optional variable holding the build id.
 pub const ENV_BUILD_ID: &str = "GX_BUILD_ID";
+/// Name of the optional variable naming the graphics adapter to use.
+pub const ENV_ADAPTER: &str = "GX_ADAPTER";
 
 /// Every variable the renderer reads, in a fixed order.
-pub const ENV_KEYS: [&str; 4] = [ENV_HUB_URL, ENV_API_KEY, ENV_SPACE_ID, ENV_BUILD_ID];
+pub const ENV_KEYS: [&str; 5] = [
+    ENV_HUB_URL,
+    ENV_API_KEY,
+    ENV_SPACE_ID,
+    ENV_BUILD_ID,
+    ENV_ADAPTER,
+];
 
 /// Default render width in pixels.
 pub const DEFAULT_WIDTH: u32 = 1280;
@@ -52,6 +60,8 @@ ENVIRONMENT (also read from .env):
     GX_API_KEY      API key with the fetch:chunks capability
     GX_SPACE_ID     space id
     GX_BUILD_ID     build id (optional; defaults to the active build)
+    GX_ADAPTER      graphics adapter to render with, by a part of its name (optional;
+                    defaults to the high performance adapter, so the discrete GPU)
 
 FLAGS:
     --time-scale <f64>             simulation seconds per wall second (default 1)
@@ -73,6 +83,9 @@ FLAGS:
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
+    --adapter <name>               overrides GX_ADAPTER
+    --max-fps <u32>                cap the window frame rate below the display refresh
+                                   (default 0: one frame per refresh)
     --help                         print this text
 ";
 
@@ -151,6 +164,12 @@ pub struct Config {
     pub space_id: String,
     /// The build to draw; `None` resolves the active build at startup.
     pub build_id: Option<String>,
+    /// A part of the name of the graphics adapter to use; `None` lets the
+    /// system pick the high performance adapter.
+    pub adapter: Option<String>,
+    /// Window frame rate cap, frames per second; 0 means one frame per
+    /// display refresh (the present mode already limits it to that).
+    pub max_fps: u32,
     /// Simulation seconds per wall-clock second.
     pub time_scale: f64,
     /// Simulation time offset from the registry epoch at launch, seconds.
@@ -215,6 +234,10 @@ pub struct Flags {
     pub space_id: Option<String>,
     /// `--build-id`.
     pub build_id: Option<String>,
+    /// `--adapter`.
+    pub adapter: Option<String>,
+    /// `--max-fps`.
+    pub max_fps: Option<u32>,
     /// `--help`.
     pub help: bool,
 }
@@ -293,6 +316,8 @@ where
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
             "--build-id" => flags.build_id = Some(value(&name)?),
+            "--adapter" => flags.adapter = Some(value(&name)?),
+            "--max-fps" => flags.max_fps = Some(parse_u32(&name, &value(&name)?)?),
             "--help" | "-h" => flags.help = true,
             other => return Err(err(format!("unknown argument {other:?}, see --help"))),
         }
@@ -396,6 +421,8 @@ impl Config {
             stats_json: flags.stats_json.clone(),
             overlay: !flags.no_overlay,
             exposure_stops: flags.exposure_stops,
+            adapter: pick(&flags.adapter, ENV_ADAPTER).filter(|a| !a.trim().is_empty()),
+            max_fps: flags.max_fps.unwrap_or(0),
         })
     }
 }
@@ -475,6 +502,24 @@ mod tests {
         assert_eq!(c.stats_json, None);
         assert!(c.overlay);
         assert_eq!(c.exposure_stops, None);
+        assert_eq!(c.adapter, None);
+        assert_eq!(c.max_fps, 0);
+    }
+
+    #[test]
+    fn adapter_and_frame_cap() {
+        let mut env = base_env();
+        env.insert(ENV_ADAPTER.into(), "Intel".into());
+        let c = Config::resolve(&env, &Flags::default()).unwrap();
+        assert_eq!(c.adapter.as_deref(), Some("Intel"), "GX_ADAPTER is read");
+        let flags = parse_flags(["--adapter", "NVIDIA", "--max-fps=30"]).unwrap();
+        let c = Config::resolve(&env, &flags).unwrap();
+        assert_eq!(c.adapter.as_deref(), Some("NVIDIA"), "the flag wins");
+        assert_eq!(c.max_fps, 30);
+        let flags = parse_flags(["--adapter", "  "]).unwrap();
+        let c = Config::resolve(&base_env(), &flags).unwrap();
+        assert_eq!(c.adapter, None, "a blank adapter name means no preference");
+        assert!(parse_flags(["--max-fps", "fast"]).is_err());
     }
 
     #[test]

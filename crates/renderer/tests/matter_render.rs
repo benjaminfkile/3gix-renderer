@@ -104,7 +104,8 @@ fn solid_blob_is_lit_from_the_side_of_the_hot_blob() {
     assert_eq!(scene.lights.len(), 1);
     assert_eq!(scene.lights[0].frame_id, ROOT);
 
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let first = headless.render(&scene, None).unwrap();
     let stats = headless.stats();
     let second = headless.render(&scene, None).unwrap();
@@ -281,7 +282,8 @@ fn full_scene_draws_soft_glowing_volumes() {
     // Hot blob and gas cloud both emit light.
     assert_eq!(scene.lights.len(), 2);
 
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let first = headless.render(&scene, None).unwrap();
     let stats = headless.stats();
     let second = headless.render(&scene, None).unwrap();

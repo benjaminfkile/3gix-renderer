@@ -6,7 +6,7 @@
 //! window or display. `WGPU_BACKEND` and the other wgpu environment
 //! variables select the adapter as usual.
 
-use super::gpu::{wanted_features, Exposure, FrameStats, Renderer};
+use super::gpu::{describe_adapter, pick_adapter, wanted_features, Exposure, FrameStats, Renderer};
 use super::scene::Scene;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
@@ -84,20 +84,20 @@ pub struct Headless {
 }
 
 impl Headless {
-    /// Opens the first adapter wgpu offers (software drivers included) and
-    /// creates an offscreen target of the given size.
-    pub fn new(width: u32, height: u32) -> Result<Headless> {
-        pollster::block_on(Headless::new_async(width, height))
+    /// Opens the adapter [`pick_adapter`] chooses (software drivers
+    /// included, so this works without a GPU) and creates an offscreen
+    /// target of the given size.
+    pub fn new(width: u32, height: u32, adapter: Option<&str>) -> Result<Headless> {
+        pollster::block_on(Headless::new_async(width, height, adapter))
     }
 
-    async fn new_async(width: u32, height: u32) -> Result<Headless> {
+    async fn new_async(width: u32, height: u32, wanted: Option<&str>) -> Result<Headless> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
+        let adapter = pick_adapter(&instance, None, wanted)
             .await
-            .map_err(|e| anyhow!("no graphics adapter: {e}"))?;
-        let adapter_name = adapter.get_info().name;
+            .context("choosing the graphics adapter")?;
+        let adapter_name = describe_adapter(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("headless"),

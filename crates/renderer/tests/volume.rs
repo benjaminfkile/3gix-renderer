@@ -84,7 +84,7 @@ fn center_pixel_matches_the_cpu_integration() {
     add_matter(&mut scene, &system, &camera, &draw);
     assert_eq!(scene.volumes.len(), 1);
 
-    let mut headless = Headless::new(SIZE, SIZE).expect("a wgpu adapter, software is fine");
+    let mut headless = Headless::new(SIZE, SIZE, None).expect("a wgpu adapter, software is fine");
     headless.render(&scene, None).unwrap();
     assert_eq!(headless.stats().volumes, 1);
     let radiance = headless.read_radiance().unwrap();
@@ -189,7 +189,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
         cell_weights: BTreeMap::new(),
     };
     add_matter(&mut scene, &system, &camera, &draw);
-    let mut headless = Headless::new(SIZE, SIZE).expect("a wgpu adapter, software is fine");
+    let mut headless = Headless::new(SIZE, SIZE, None).expect("a wgpu adapter, software is fine");
     headless.render(&scene, None).unwrap();
     assert_eq!((headless.stats().meshes, headless.stats().volumes), (1, 1));
     let center = headless.read_radiance().unwrap().pixel(SIZE / 2, SIZE / 2);

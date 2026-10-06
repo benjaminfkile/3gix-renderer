@@ -13,7 +13,7 @@ use super::hub::{now_seconds, WebFetcher};
 use crate::camera::Camera;
 use crate::controls::Controls;
 use crate::extract::default_threads;
-use crate::render::gpu::{wanted_features, Renderer};
+use crate::render::gpu::{describe_adapter, present_mode, wanted_features, Renderer};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 use crate::render::scene::{matter_scene, Scene};
 use crate::sim::Simulation;
@@ -55,11 +55,15 @@ impl Gfx {
             .context("creating the canvas surface")?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 ..Default::default()
             })
             .await
             .map_err(|e| anyhow!("no WebGPU adapter (does this browser support WebGPU?): {e}"))?;
+        web_sys::console::info_1(
+            &format!("gx-renderer: rendering with {}", describe_adapter(&adapter)).into(),
+        );
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("canvas"),
@@ -81,6 +85,7 @@ impl Gfx {
         if view_format != config.format {
             config.view_formats.push(view_format);
         }
+        config.present_mode = present_mode(&surface.get_capabilities(&adapter));
         surface.configure(&device, &config);
         let renderer = Renderer::new(&device, &queue, view_format, w, h);
         Ok(Gfx {

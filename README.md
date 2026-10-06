@@ -54,6 +54,12 @@ Flags: `--time-scale <f64>` (default 1), `--start-offset-seconds <f64>`
 `--hub-url`, `--space-id`, `--build-id` to override the environment. See
 `--help`.
 
+The renderer asks for the high performance adapter, so a machine with an
+integrated and a discrete GPU draws on the discrete one; `GX_ADAPTER` or
+`--adapter <name>` picks an adapter by a part of its name instead (the log
+names the one in use). The window presents one frame per display refresh;
+`--max-fps <u32>` caps it lower.
+
 Headless runs also take `--view <home|0-9>` (the `Home` view, the default,
 or the view a number key jumps to), `--view-distance-scale <f64>` (a factor
 on that view's distance from its frame origin), `--wait-ready-seconds <f64>`

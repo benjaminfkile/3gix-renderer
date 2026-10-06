@@ -83,7 +83,10 @@ pub async fn start(
     );
     let fetcher = WebFetcher::new(Rc::new(hub), socket);
     let event_loop = EventLoop::new().map_err(js_error)?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Wait, not Poll: on the web Poll is a busy loop that starves the page.
+    // Each frame requests the next redraw, which the browser delivers once
+    // per display refresh.
+    event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.spawn_app(app::WebApp::new(sim, fetcher, canvas));
     Ok(())
 }

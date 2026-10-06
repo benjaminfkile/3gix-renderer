@@ -73,18 +73,29 @@
 <script type="module">
   import init, { start } from "./pkg/renderer.js";
 
-  // Every setting is kept in localStorage under these keys, so the panel
-  // comes back filled in. The API key is stored only in this browser.
+  // Settings come from three places, in order of priority: web/config.js
+  // (optional, gitignored; copy config.example.js), then what this browser
+  // saved last time, then the empty fields. The API key never leaves this
+  // machine either way.
   const fields = {
-    "hub-url": "gx.hubUrl",
-    "api-key": "gx.apiKey",
-    "space-id": "gx.spaceId",
-    "build-id": "gx.buildId",
-    "time-scale": "gx.timeScale",
+    "hub-url": ["gx.hubUrl", "hubUrl"],
+    "api-key": ["gx.apiKey", "apiKey"],
+    "space-id": ["gx.spaceId", "spaceId"],
+    "build-id": ["gx.buildId", "buildId"],
+    "time-scale": ["gx.timeScale", "timeScale"],
   };
-  for (const [id, key] of Object.entries(fields)) {
-    const saved = localStorage.getItem(key);
-    if (saved !== null) {
+  let config = {};
+  try {
+    config = (await import("./config.js")).default ?? {};
+  } catch (e) {
+    // No config.js: the panel is filled in by hand.
+  }
+  for (const [id, [storageKey, configKey]] of Object.entries(fields)) {
+    const fromConfig = config[configKey];
+    const saved = localStorage.getItem(storageKey);
+    if (fromConfig !== undefined && fromConfig !== null) {
+      document.getElementById(id).value = String(fromConfig);
+    } else if (saved !== null) {
       document.getElementById(id).value = saved;
     }
   }
@@ -96,8 +107,8 @@
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    for (const [id, key] of Object.entries(fields)) {
-      localStorage.setItem(key, value(id));
+    for (const [id, [storageKey]] of Object.entries(fields)) {
+      localStorage.setItem(storageKey, value(id));
     }
     if (!navigator.gpu) {
       status.textContent = "This browser has no WebGPU (navigator.gpu is missing).";
@@ -123,6 +134,10 @@
       button.disabled = false;
     }
   });
+
+  if (config.autostart && form.checkValidity()) {
+    form.requestSubmit();
+  }
 </script>
 </body>
 </html>

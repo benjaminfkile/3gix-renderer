@@ -101,6 +101,68 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     adapter.features() & wgpu::Features::FLOAT32_BLENDABLE
 }
 
+/// One line naming an adapter: its name, backend, and kind.
+pub fn describe_adapter(adapter: &wgpu::Adapter) -> String {
+    let info = adapter.get_info();
+    format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type)
+}
+
+/// Picks the adapter to render with. With `wanted`, the first adapter whose
+/// name contains it (case-insensitive) among those that can draw to
+/// `surface`; without, the one the system considers high performance, so a
+/// machine with an integrated and a discrete GPU uses the discrete one.
+/// Software adapters are allowed, so headless runs work without a GPU.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    wanted: Option<&str>,
+) -> anyhow::Result<wgpu::Adapter> {
+    if let Some(wanted) = wanted.map(str::trim).filter(|w| !w.is_empty()) {
+        let needle = wanted.to_lowercase();
+        let mut names = Vec::new();
+        for adapter in instance.enumerate_adapters(wgpu::Backends::all()).await {
+            let name = adapter.get_info().name;
+            if name.to_lowercase().contains(&needle)
+                && surface.is_none_or(|s| adapter.is_surface_supported(s))
+            {
+                return Ok(adapter);
+            }
+            names.push(describe_adapter(&adapter));
+        }
+        anyhow::bail!(
+            "no graphics adapter matches {wanted:?}; available: {}",
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+    }
+    instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: surface,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("no graphics adapter: {e}"))
+}
+
+/// The present mode for a window surface: `Fifo` (one frame per display
+/// refresh, so the frame rate cannot run away) when the surface offers it,
+/// otherwise the first mode it lists.
+pub fn present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+        wgpu::PresentMode::Fifo
+    } else {
+        caps.present_modes
+            .first()
+            .copied()
+            .unwrap_or(wgpu::PresentMode::Fifo)
+    }
+}
+
 /// How one frame is exposed.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Exposure {

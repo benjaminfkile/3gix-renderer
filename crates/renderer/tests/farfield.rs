@@ -155,7 +155,8 @@ fn far_hot_frame_is_a_sprite_where_it_projects() {
         .project(sprite.position, WIDTH, HEIGHT)
         .expect("in front of the camera");
     let (px, py) = (x as u32, y as u32);
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let image = headless.render(&scene, None).unwrap();
     assert_eq!(headless.stats().sprites, 1);
     let p = image.pixel(px, py);
@@ -191,7 +192,8 @@ fn fixed_exposure_is_relative_to_the_reference_scene() {
         .project(scene.sprites[0].position, WIDTH, HEIGHT)
         .expect("in front of the camera");
     let (px, py) = (x as u32, y as u32);
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let fixed = |stops: f64| Exposure {
         fixed_stops: Some(stops),
         ..Exposure::default()
@@ -240,7 +242,8 @@ fn far_cold_frame_needs_light_from_its_side() {
     assert!(requested.contains(&depth_zero_key(2)));
     assert!(scene.sprites.is_empty());
     assert!(scene.lights.is_empty());
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let image = headless.render(&scene, None).unwrap();
     assert!(image.rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]));
     assert!(headless
@@ -283,7 +286,8 @@ fn transition_blends_the_sprite_out_as_the_cells_blend_in() {
     assert_eq!(scene.volumes.len(), 1);
     assert_eq!(scene.sprites.len(), 1);
     assert!((f64::from(scene.volumes[0].weight) - (1.0 - w)).abs() < 1e-6);
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     headless.render(&scene, None).unwrap();
     let stats = headless.stats();
     assert_eq!((stats.volumes, stats.sprites), (1, 1));

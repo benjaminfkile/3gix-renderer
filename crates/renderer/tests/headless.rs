@@ -54,7 +54,8 @@ fn home_view_renders_markers_and_overlay_deterministically() {
     }
     .text();
 
-    let mut headless = Headless::new(WIDTH, HEIGHT).expect("a wgpu adapter, software is fine");
+    let mut headless =
+        Headless::new(WIDTH, HEIGHT, None).expect("a wgpu adapter, software is fine");
     let first = headless.render(&scene, Some(&overlay)).unwrap();
     let second = headless.render(&scene, Some(&overlay)).unwrap();
     let bare = headless.render(&scene, None).unwrap();
@@ -113,7 +114,7 @@ fn single_root_and_frame_views_render() {
     let scene = build_scene(&system, &camera, f64::from(WIDTH) / f64::from(HEIGHT));
     assert_eq!(scene.markers.len(), 1);
     assert!(scene.lines.is_empty());
-    let mut headless = Headless::new(WIDTH, HEIGHT).unwrap();
+    let mut headless = Headless::new(WIDTH, HEIGHT, None).unwrap();
     let image = headless.render(&scene, None).unwrap();
     let (cx, cy) = (WIDTH / 2, HEIGHT / 2);
     assert!(lit_in(&image, cx - 4, cy - 4, cx + 5, cy + 5) > 0);
