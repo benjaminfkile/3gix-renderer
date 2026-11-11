@@ -29,10 +29,13 @@ frame stays in view at any time scale. Its spin is not followed: the view
 direction stays fixed in space and the frame turns in front of the camera.
 The overlay's camera line ends in `free` or `following <frame id>`.
 
-Flight speed also scales on its own with the distance from the camera to its
-frame's `root_extent / 8` region: one second covers the remaining distance to
-that region, with a floor of 1 m/s inside it. Flying near a frame is slow and
-flying in deep space is fast. The wheel multiplier applies on top.
+Flight speed also scales on its own with the distance from the camera to the
+nearest `root_extent / 8` region of any frame that holds matter
+(`max_depth > 0`): one second covers the remaining distance to that region,
+with a floor of 1 m/s inside it. Flying near matter is slow and flying in
+deep space is fast. The parent frame plays no part, so a massless origin such
+as the barycenter, whose region spans the whole system, never slows the
+camera. The wheel multiplier applies on top.
 
 The number keys index the frames in registry order: frame ids sorted
 ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.

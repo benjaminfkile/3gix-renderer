@@ -164,15 +164,29 @@ impl Camera {
     }
 
     /// The automatic flight speed in meters per second: the distance from
-    /// the camera to its frame's `root_extent / 8` region per second, at
-    /// least [`MIN_SPEED_MPS`], times the wheel multiplier. Slow near a
-    /// frame, fast in deep space.
+    /// the camera to the nearest `root_extent / 8` region of a frame that
+    /// holds matter (`max_depth > 0`) per second, at least
+    /// [`MIN_SPEED_MPS`], times the wheel multiplier. Slow near matter,
+    /// fast in deep space. The parent frame does not matter: a massless
+    /// coordinate origin such as a barycenter has no matter to slow down
+    /// for, and its region can span the whole system. With no such frame,
+    /// every frame counts.
     pub fn flight_speed(&self, system: &FrameSystem) -> f64 {
-        let extent = system
-            .tree()
-            .get(self.frame_id)
-            .map_or(0.0, |f| f.root_extent.value());
-        let gap = self.position.length() - extent / 8.0;
+        let here = self.root_position(system);
+        let gap = |only_matter: bool| {
+            system
+                .tree()
+                .frames()
+                .iter()
+                .filter(|f| !only_matter || f.max_depth > 0)
+                .map(|f| {
+                    (system.root_position(f.frame_id) - here).length() - f.root_extent.value() / 8.0
+                })
+                .fold(None, |acc: Option<f64>, g| {
+                    Some(acc.map_or(g, |a| a.min(g)))
+                })
+        };
+        let gap = gap(true).or_else(|| gap(false)).unwrap_or(0.0);
         gap.max(MIN_SPEED_MPS) * self.speed
     }
 
@@ -371,13 +385,18 @@ mod tests {
     fn system() -> FrameSystem {
         let h = std::f64::consts::FRAC_1_SQRT_2;
         let frames = vec![
-            frame(
-                1,
-                ROOT_PARENT,
-                1.0e4,
-                Vec3::zero(),
-                Quat::new(0.0, 0.0, 0.6, 0.8),
-            ),
+            {
+                // A massless origin with no matter, like a barycenter.
+                let mut root = frame(
+                    1,
+                    ROOT_PARENT,
+                    1.0e4,
+                    Vec3::zero(),
+                    Quat::new(0.0, 0.0, 0.6, 0.8),
+                );
+                root.max_depth = 0;
+                root
+            },
             frame(
                 5,
                 1,
@@ -411,7 +430,8 @@ mod tests {
     /// A massless root and one massless frame moving at 1000 m/s along
     /// root +x and spinning about root +z at 0.1 rad/s.
     fn moving_system() -> FrameSystem {
-        let f = frame(1, ROOT_PARENT, 1.0e5, Vec3::zero(), Quat::identity());
+        let mut f = frame(1, ROOT_PARENT, 1.0e5, Vec3::zero(), Quat::identity());
+        f.max_depth = 0;
         let mut g = frame(2, 1, 1.0e3, Vec3::new(1.0e4, 0.0, 0.0), Quat::identity());
         g.velocity = Vec3::new(1000.0, 0.0, 0.0);
         g.angular_velocity = Vec3::new(0.0, 0.0, 0.1);
@@ -575,6 +595,50 @@ mod tests {
         let up = cam.root_orientation(&s).rotate(Vec3::new(0.0, 1.0, 0.0));
         assert!(close(up, Vec3::new(0.0, 1.0, 0.0), 1e-9));
         assert!(Camera::view_of_index(&s, 3).is_none());
+    }
+
+    /// The sun case: a massless barycenter root whose region spans the
+    /// whole system, and a star a little off its origin. A camera that
+    /// approaches from the far side is parented to the root (its origin is
+    /// nearer than the star's), and must still fly at a speed set by the
+    /// distance to the star, not crawl at the floor.
+    #[test]
+    fn flight_toward_a_star_near_a_massless_root_does_not_stall() {
+        let mut root = frame(1, ROOT_PARENT, 2.0e13, Vec3::zero(), Quat::identity());
+        root.max_depth = 0;
+        let star_radius = 6.957e8;
+        let star = frame(
+            2,
+            1,
+            8.0 * star_radius,
+            Vec3::new(1.0e9, 0.0, 0.0),
+            Quat::identity(),
+        );
+        let reg = Registry::new(Seconds::new(0.0), vec![root, star]).unwrap();
+        let s = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let mut cam = Camera {
+            frame_id: 1,
+            position: Vec3::new(-1.0e11, 0.0, 0.0),
+            orientation: look_rotation(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+            speed: 1.0,
+        };
+        assert!(!cam.update_parent(&s), "parented to the root");
+        let expected = 1.01e11 - star_radius;
+        assert!((cam.flight_speed(&s) - expected).abs() < 1.0);
+        let input = FlightInput {
+            forward: true,
+            ..FlightInput::default()
+        };
+        // Ten seconds of holding W at 60 frames per second.
+        for _ in 0..600 {
+            cam.fly(&s, &input, 1.0 / 60.0);
+            cam.update_parent(&s);
+        }
+        let to_surface = cam.relative(&s, Vec3::zero(), 2).length() - star_radius;
+        assert!(
+            (0.0..1.0e7).contains(&to_surface),
+            "within 10,000 km of the surface, got {to_surface} m"
+        );
     }
 
     #[test]
