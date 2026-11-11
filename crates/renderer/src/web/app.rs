@@ -201,7 +201,11 @@ impl WebApp {
             .select(&self.sim.system, &self.camera, size, t, false);
         stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);
         self.world.evict(t);
-        let scene = matter_scene(&mut self.world, &self.sim.system, &self.camera, size, t);
+        let mut scene = matter_scene(&mut self.world, &self.sim.system, &self.camera, size, t);
+        if self.controls.hide_guides {
+            scene.markers.clear();
+            scene.lines.clear();
+        }
         let overlay = self.overlay(&scene, fps);
         let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {

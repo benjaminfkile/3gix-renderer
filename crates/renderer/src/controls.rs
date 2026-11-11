@@ -35,6 +35,9 @@ pub struct Controls {
     /// The fixed exposure, stops (see [`crate::render::gpu::fixed_exposure`]);
     /// `None` for the automatic exposure.
     pub exposure_fixed: Option<f64>,
+    /// `true` while frame markers and frame-to-parent lines are hidden
+    /// (`M`): they are drawing aids, not matter.
+    pub hide_guides: bool,
 }
 
 impl Controls {
@@ -133,6 +136,7 @@ impl Controls {
             KeyCode::Period => sim.clock.apply(ClockAction::StepForward),
             KeyCode::KeyR => sim.clock.apply(ClockAction::Reset),
             KeyCode::Home => *camera = Camera::home(&sim.system),
+            KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,

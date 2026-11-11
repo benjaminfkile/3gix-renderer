@@ -611,7 +611,11 @@ impl App {
         let events = self.fetcher.drain();
         stream_step(&mut self.world, &mut self.fetcher, system, events, t);
         self.world.evict(t);
-        let scene = matter_scene(&mut self.world, system, &self.camera, size, t);
+        let mut scene = matter_scene(&mut self.world, system, &self.camera, size, t);
+        if self.controls.hide_guides {
+            scene.markers.clear();
+            scene.lines.clear();
+        }
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
         let overlay = OverlayInfo {
             ..overlay_info(

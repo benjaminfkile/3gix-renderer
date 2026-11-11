@@ -17,6 +17,7 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `Shift` (held) | Boost: fly at ten times the set speed while held |
 | `1` to `9`, `0` | Jump to a view of the frame with that index (see below) |
 | `Home` | Jump to a view of the whole system from above the root frame |
+| `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
 
 The camera behaves like an observer floating free in space: simulation time
 moves and turns the frames, but not the camera, which keeps its place and
