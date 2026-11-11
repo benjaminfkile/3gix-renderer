@@ -157,7 +157,9 @@ impl Controls {
                             cruise: camera.cruise,
                             ..cam
                         };
-                        self.follow = Some(cam.frame_id);
+                        // A jump never follows: the camera floats free
+                        // where it lands until `F` is pressed.
+                        self.follow = None;
                     }
                 }
             }
@@ -201,6 +203,41 @@ pub fn digit_index(code: KeyCode) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn number_keys_jump_without_following_and_f_toggles_follow() {
+        use crate::sim::SimClock;
+        use gx_core::frames::FrameSystem;
+        use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
+        use gx_core::units::{Kilograms, Meters, Quat, Seconds, Vec3};
+        let frame = |id, parent, x| Frame {
+            frame_id: id,
+            parent_frame_id: parent,
+            root_extent: Meters::new(1.0e3),
+            max_depth: 4,
+            mass: Kilograms::new(0.0),
+            position: Vec3::new(x, 0.0, 0.0),
+            velocity: Vec3::zero(),
+            orientation: Quat::identity(),
+            angular_velocity: Vec3::zero(),
+        };
+        let reg = Registry::new(
+            Seconds::new(0.0),
+            vec![frame(1, ROOT_PARENT, 0.0), frame(2, 1, 1.0e4)],
+        )
+        .unwrap();
+        let system = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let mut sim = Simulation::new(system, SimClock::new(Seconds::new(0.0), 1.0));
+        let mut camera = Camera::home(&sim.system);
+        let mut c = Controls::default();
+        c.key(KeyCode::Digit1, true, false, &mut sim, &mut camera);
+        assert_eq!(camera.frame_id, 2, "jumped to the first frame");
+        assert_eq!(c.follow, None, "a jump floats free");
+        c.key(KeyCode::KeyF, true, false, &mut sim, &mut camera);
+        assert_eq!(c.follow, Some(2));
+        c.key(KeyCode::Digit1, true, false, &mut sim, &mut camera);
+        assert_eq!(c.follow, None, "a jump stops following");
+    }
 
     #[test]
     fn keys_move_the_fixed_exposure_when_there_is_one() {

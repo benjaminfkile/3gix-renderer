@@ -13,7 +13,7 @@
 //! space, so a simulation step that moves or turns its frame does not carry
 //! it along. [`Camera::hold`] before the step and [`Camera::keep`] after it
 //! put it back at the same place and view direction in root coordinates.
-//! Following a frame (the `F` key, the number keys) adds that frame's
+//! Following a frame (only ever switched on with the `F` key) adds that frame's
 //! displacement over the step, and still not its spin.
 //!
 //! After every simulation step [`Camera::update_parent`] asks
