@@ -29,6 +29,11 @@ frame stays in view at any time scale. Its spin is not followed: the view
 direction stays fixed in space and the frame turns in front of the camera.
 The overlay's camera line ends in `free` or `following <frame id>`.
 
+W flies along the view direction, which is always the screen center; a
+crosshair drawn with the overlay marks it. S flies the opposite way, A and D
+slide sideways, Q and E slide down and up, and a right drag turns the view, so
+whatever is under the crosshair is what W flies toward.
+
 The camera is an observer that nothing in space acts on. Holding a movement
 key flies a straight line at the flight speed, in meters per second, and only
 the wheel changes that speed (1e-3 to 1e15 m/s, 1e11 m/s for a newly placed

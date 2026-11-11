@@ -19,7 +19,8 @@
 //! 5. the display pass into the color target (a window surface or the
 //!    offscreen texture of [`crate::render::headless`]): the tone-mapped
 //!    float target, then markers and lines tested against the surface
-//!    pass's depth, then the overlay text.
+//!    pass's depth, then the overlay: a crosshair at the screen center
+//!    (the view direction, where the forward key flies) and the text.
 //!
 //! Blending into an `Rgba32Float` target needs the `FLOAT32_BLENDABLE`
 //! device feature, which every desktop driver and current WebGPU browsers
@@ -55,6 +56,10 @@ pub const DEPTH_CLEAR: f32 = 0.0;
 /// The color the target clears to. Space itself is not drawn
 /// (`space-model.md` section 1, rule 3), so it stays black.
 pub const CLEAR_COLOR: wgpu::Color = wgpu::Color::BLACK;
+
+/// Vertices of the crosshair drawn with the overlay (`vs_crosshair` in
+/// `markers.wgsl`): eight bars of two triangles.
+const CROSSHAIR_VERTICES: u32 = 48;
 
 /// The overlay typeface, embedded so every machine draws the same glyphs.
 pub const OVERLAY_FONT: &[u8] = epaint_default_fonts::HACK_REGULAR;
@@ -333,6 +338,7 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     marker_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    crosshair_pipeline: wgpu::RenderPipeline,
     markers: GrowBuffer,
     lines: GrowBuffer,
     surface_pipeline: wgpu::RenderPipeline,
@@ -606,6 +612,31 @@ impl Renderer {
             },
             wgpu::PrimitiveTopology::LineList,
         );
+        let crosshair_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crosshair"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_crosshair"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(no_depth.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_crosshair"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            cache: None,
+            multiview_mask: None,
+        });
 
         // Surfaces.
         let surface_globals = device.create_buffer(&wgpu::BufferDescriptor {
@@ -950,6 +981,7 @@ impl Renderer {
             bind_group,
             marker_pipeline,
             line_pipeline,
+            crosshair_pipeline,
             markers: GrowBuffer::new(device, "markers"),
             lines: GrowBuffer::new(device, "lines"),
             surface_pipeline,
@@ -1649,6 +1681,9 @@ impl Renderer {
                 pass.draw(0..6, 0..self.markers.len);
             }
             if overlay.is_some() {
+                // The view direction: where the forward key flies.
+                pass.set_pipeline(&self.crosshair_pipeline);
+                pass.draw(0..CROSSHAIR_VERTICES, 0..1);
                 self.brush.draw(&mut pass);
             }
         }

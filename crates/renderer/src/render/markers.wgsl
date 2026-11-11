@@ -74,3 +74,49 @@ fn vs_line(@location(0) position: vec3<f32>, @location(1) color: vec4<f32>) -> L
 fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     return in.color;
 }
+
+// The crosshair at the screen center: the view direction, where the forward
+// flight key moves the camera. Four arms around an open center, each a light
+// bar over a slightly larger dark bar so it shows on bright and dark matter.
+// No vertex buffer: 48 vertices, 8 bars of 6.
+
+// Gap from the center to each arm, arm end, and bar half thicknesses, pixels.
+const CROSS_GAP: f32 = 5.0;
+const CROSS_END: f32 = 16.0;
+const CROSS_HALF_LIGHT: f32 = 1.0;
+const CROSS_HALF_DARK: f32 = 2.0;
+
+struct CrossOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_crosshair(@builtin(vertex_index) vi: u32) -> CrossOut {
+    let bar = vi / 6u;
+    let dark = bar < 4u;
+    let arm = bar % 4u;
+    let pad = select(0.0, CROSS_HALF_DARK - CROSS_HALF_LIGHT, dark);
+    let half = select(CROSS_HALF_LIGHT, CROSS_HALF_DARK, dark);
+    // The bar along +x from the center, then turned to its arm.
+    let c = CORNERS[vi % 6u] * 0.5 + vec2<f32>(0.5, 0.5);
+    let along = mix(CROSS_GAP - pad, CROSS_END + pad, c.x);
+    let across = mix(-half, half, c.y);
+    var d = vec2<f32>(along, across);
+    if arm == 1u {
+        d = vec2<f32>(-d.y, d.x);
+    } else if arm == 2u {
+        d = -d;
+    } else if arm == 3u {
+        d = vec2<f32>(d.y, -d.x);
+    }
+    var out: CrossOut;
+    out.clip = vec4<f32>(d * 2.0 / globals.viewport, 0.0, 1.0);
+    out.color = select(vec4<f32>(0.9, 0.9, 0.9, 1.0), vec4<f32>(0.0, 0.0, 0.0, 1.0), dark);
+    return out;
+}
+
+@fragment
+fn fs_crosshair(in: CrossOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
