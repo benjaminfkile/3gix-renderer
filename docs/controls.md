@@ -15,22 +15,14 @@ In the browser, click the canvas first so it has the keyboard focus.
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
 | Mouse wheel | Set the flight speed: each notch multiplies or divides it by 1.25 (about ten notches per factor of ten) |
 | `Shift` (held) | Boost: fly at ten times the set speed while held |
-| `1` to `9`, `0` | Jump to a view of the frame with that index; the camera floats free there (see below) |
-| `F` | Follow the frame the camera is in, or stop following (the only way to start following) |
-| `Home` | Jump to a view of the whole system from above the root frame, not following |
+| `1` to `9`, `0` | Jump to a view of the frame with that index (see below) |
+| `Home` | Jump to a view of the whole system from above the root frame |
 
 The camera behaves like an observer floating free in space: simulation time
 moves and turns the frames, but not the camera, which keeps its place and
 view direction in root coordinates. Bodies move past it on their orbits. The
 frame the camera is parented to is only a precision device (the camera
 re-parents to the nearest frame as it flies) and never carries it along.
-
-Following is only ever switched on with `F`. Following a frame moves the
-camera along with that frame's origin, so the frame stays in view at any time
-scale; it also carries the camera along that frame's orbit, so everything
-else slides past. Press `F` again to float free. Its spin is not followed: the view
-direction stays fixed in space and the frame turns in front of the camera.
-The overlay's camera line ends in `free` or `following <frame id>`.
 
 W flies along the view direction, which is always the screen center; a
 crosshair drawn with the overlay marks it. S flies the opposite way, A and D
@@ -54,9 +46,8 @@ A jump places the camera at `3 * root_extent / 8` from the frame origin,
 above it the way `Home` sees the root: along root `+z`, looking along root
 `-z` with root `+y` up. Because that direction is fixed in root axes, the
 frame shows a lit side and a dark side, and the lit side turns as the light
-moves over simulation time. The jump does not follow the frame: the camera
-floats free where it lands, and the body moves on along its orbit (press `F`
-to follow it). A key past the last frame does nothing.
+moves over simulation time. The camera floats free where it lands, and the
+body moves on along its orbit. A key past the last frame does nothing.
 
 ## Simulation time
 

@@ -13,8 +13,6 @@
 //! space, so a simulation step that moves or turns its frame does not carry
 //! it along. [`Camera::hold`] before the step and [`Camera::keep`] after it
 //! put it back at the same place and view direction in root coordinates.
-//! Following a frame (only ever switched on with the `F` key) adds that frame's
-//! displacement over the step, and still not its spin.
 //!
 //! After every simulation step [`Camera::update_parent`] asks
 //! [`FrameSystem::nearest_frame`] for the frame nearest the camera and, when
@@ -101,8 +99,6 @@ pub struct Camera {
 pub struct Hold {
     root_position: Vec3,
     root_orientation: Quat,
-    /// The followed frame and its origin in root coordinates.
-    follow: Option<(u64, Vec3)>,
 }
 
 /// A rotation of `angle` radians about the unit `axis`.
@@ -239,27 +235,19 @@ impl Camera {
     }
 
     /// Records where the camera is in space before a simulation step, for
-    /// [`Camera::keep`] after it. With `follow`, the camera also records
-    /// that frame's origin so it moves along with it.
-    pub fn hold(&self, system: &FrameSystem, follow: Option<u64>) -> Hold {
+    /// [`Camera::keep`] after it.
+    pub fn hold(&self, system: &FrameSystem) -> Hold {
         Hold {
             root_position: self.root_position(system),
             root_orientation: self.root_orientation(system),
-            follow: follow.map(|id| (id, system.root_position(id))),
         }
     }
 
     /// Puts the camera back where `hold` recorded it after a simulation
     /// step moved and turned its frame: the same place and view direction
     /// in root coordinates, the way an observer floating free would see it.
-    /// When following a frame, the place moves by that frame's displacement
-    /// over the step (its spin is not followed, so the view direction stays
-    /// fixed in space).
     pub fn keep(&mut self, system: &FrameSystem, hold: Hold) {
-        let shift = hold.follow.map_or(Vec3::zero(), |(id, before)| {
-            system.root_position(id) - before
-        });
-        self.position = system.to_frame(hold.root_position + shift, self.frame_id);
+        self.position = system.to_frame(hold.root_position, self.frame_id);
         let to_frame = system.root_orientation(self.frame_id).conjugate();
         self.orientation = (to_frame * hold.root_orientation)
             .normalized()
@@ -445,7 +433,7 @@ mod tests {
         let v = Vec3::new(0.3, -0.2, 0.9);
         let view = cam.root_orientation(&s).rotate(v);
         for _ in 0..10 {
-            let held = cam.hold(&s, None);
+            let held = cam.hold(&s);
             step(&mut s, 1.0);
             cam.keep(&s, held);
             cam.update_parent(&s);
@@ -458,27 +446,6 @@ mod tests {
             "turned a radian, x = {x:?}"
         );
         assert!(close(cam.root_position(&s), place, 1e-6));
-        assert!(close(cam.root_orientation(&s).rotate(v), view, 1e-9));
-    }
-
-    #[test]
-    fn a_following_camera_moves_with_its_frame_but_not_its_spin() {
-        let mut s = moving_system();
-        let mut cam = Camera::view_of(&s, 2).unwrap();
-        let offset = cam.root_position(&s) - s.root_position(2);
-        let v = Vec3::new(0.3, -0.2, 0.9);
-        let view = cam.root_orientation(&s).rotate(v);
-        for _ in 0..10 {
-            let held = cam.hold(&s, Some(2));
-            step(&mut s, 1.0);
-            cam.keep(&s, held);
-            cam.update_parent(&s);
-        }
-        assert!(close(
-            cam.root_position(&s) - s.root_position(2),
-            offset,
-            1e-6
-        ));
         assert!(close(cam.root_orientation(&s).rotate(v), view, 1e-9));
     }
 
@@ -632,7 +599,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut parents = std::collections::BTreeSet::new();
         for _ in 0..600 {
-            let held = cam.hold(&s, None);
+            let held = cam.hold(&s);
             step(&mut s, 100.0 * dt);
             cam.keep(&s, held);
             cam.fly(&w, dt);

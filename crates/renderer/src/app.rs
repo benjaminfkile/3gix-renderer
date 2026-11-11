@@ -117,7 +117,6 @@ pub fn overlay_info(
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
         camera_speed: camera.cruise,
-        following: None,
         frame_count: sim.system.tree().frames().len(),
         fps,
         sim_lag: sim.lagging(),
@@ -595,7 +594,7 @@ impl App {
         self.next_frame = self.frame_interval.map(|i| now + i);
         let fps = self.fps.frame(now);
 
-        let held = self.camera.hold(&self.sim.system, self.controls.follow);
+        let held = self.camera.hold(&self.sim.system);
         self.sim.update(Seconds::new(dt));
         self.camera.keep(&self.sim.system, held);
         let input = self.controls.take_flight();
@@ -615,7 +614,6 @@ impl App {
         let scene = matter_scene(&mut self.world, system, &self.camera, size, t);
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
         let overlay = OverlayInfo {
-            following: self.controls.follow,
             ..overlay_info(
                 &self.sim,
                 &self.camera,

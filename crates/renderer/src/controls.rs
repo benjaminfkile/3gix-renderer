@@ -2,8 +2,7 @@
 //! browser canvas.
 //!
 //! Turns `winit` window events into flight input for the [`Camera`],
-//! actions on the [`SimClock`](crate::sim::SimClock), view jumps, the
-//! followed frame (see [`Camera::hold`]), and the
+//! actions on the [`SimClock`](crate::sim::SimClock), view jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -36,9 +35,6 @@ pub struct Controls {
     /// The fixed exposure, stops (see [`crate::render::gpu::fixed_exposure`]);
     /// `None` for the automatic exposure.
     pub exposure_fixed: Option<f64>,
-    /// The frame the camera moves along with, or `None` for a camera that
-    /// floats free in space.
-    pub follow: Option<u64>,
 }
 
 impl Controls {
@@ -136,16 +132,7 @@ impl Controls {
             KeyCode::Comma => sim.clock.apply(ClockAction::StepBack),
             KeyCode::Period => sim.clock.apply(ClockAction::StepForward),
             KeyCode::KeyR => sim.clock.apply(ClockAction::Reset),
-            KeyCode::Home => {
-                *camera = Camera::home(&sim.system);
-                self.follow = None;
-            }
-            KeyCode::KeyF => {
-                self.follow = match self.follow {
-                    Some(_) => None,
-                    None => Some(camera.frame_id),
-                };
-            }
+            KeyCode::Home => *camera = Camera::home(&sim.system),
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
@@ -157,9 +144,6 @@ impl Controls {
                             cruise: camera.cruise,
                             ..cam
                         };
-                        // A jump never follows: the camera floats free
-                        // where it lands until `F` is pressed.
-                        self.follow = None;
                     }
                 }
             }
@@ -203,41 +187,6 @@ pub fn digit_index(code: KeyCode) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn number_keys_jump_without_following_and_f_toggles_follow() {
-        use crate::sim::SimClock;
-        use gx_core::frames::FrameSystem;
-        use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
-        use gx_core::units::{Kilograms, Meters, Quat, Seconds, Vec3};
-        let frame = |id, parent, x| Frame {
-            frame_id: id,
-            parent_frame_id: parent,
-            root_extent: Meters::new(1.0e3),
-            max_depth: 4,
-            mass: Kilograms::new(0.0),
-            position: Vec3::new(x, 0.0, 0.0),
-            velocity: Vec3::zero(),
-            orientation: Quat::identity(),
-            angular_velocity: Vec3::zero(),
-        };
-        let reg = Registry::new(
-            Seconds::new(0.0),
-            vec![frame(1, ROOT_PARENT, 0.0), frame(2, 1, 1.0e4)],
-        )
-        .unwrap();
-        let system = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
-        let mut sim = Simulation::new(system, SimClock::new(Seconds::new(0.0), 1.0));
-        let mut camera = Camera::home(&sim.system);
-        let mut c = Controls::default();
-        c.key(KeyCode::Digit1, true, false, &mut sim, &mut camera);
-        assert_eq!(camera.frame_id, 2, "jumped to the first frame");
-        assert_eq!(c.follow, None, "a jump floats free");
-        c.key(KeyCode::KeyF, true, false, &mut sim, &mut camera);
-        assert_eq!(c.follow, Some(2));
-        c.key(KeyCode::Digit1, true, false, &mut sim, &mut camera);
-        assert_eq!(c.follow, None, "a jump stops following");
-    }
 
     #[test]
     fn keys_move_the_fixed_exposure_when_there_is_one() {
