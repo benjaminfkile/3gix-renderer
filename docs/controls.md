@@ -14,8 +14,20 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `E` / `Q` | Fly up / down along the camera's up axis |
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
 | Mouse wheel | Scale flight speed: each notch multiplies or divides it by 1.25 |
-| `1` to `9`, `0` | Jump to a view of the frame with that index (see below) |
-| `Home` | Jump to a view of the whole system from above the root frame |
+| `1` to `9`, `0` | Jump to a view of the frame with that index and follow it (see below) |
+| `F` | Follow the frame the camera is in, or stop following |
+| `Home` | Jump to a view of the whole system from above the root frame, not following |
+
+The camera behaves like an observer floating free in space: simulation time
+moves and turns the frames, but not the camera, which keeps its place and
+view direction in root coordinates. Bodies move past it on their orbits. The
+frame the camera is parented to is only a precision device (the camera
+re-parents to the nearest frame as it flies) and never carries it along.
+
+Following a frame moves the camera along with that frame's origin, so the
+frame stays in view at any time scale. Its spin is not followed: the view
+direction stays fixed in space and the frame turns in front of the camera.
+The overlay's camera line ends in `free` or `following <frame id>`.
 
 Flight speed also scales on its own with the distance from the camera to its
 frame's `root_extent / 8` region: one second covers the remaining distance to
@@ -28,7 +40,8 @@ A jump places the camera at `3 * root_extent / 8` from the frame origin,
 above it the way `Home` sees the root: along root `+z`, looking along root
 `-z` with root `+y` up. Because that direction is fixed in root axes, the
 frame shows a lit side and a dark side, and the lit side turns as the light
-moves over simulation time. A key past the last frame does nothing.
+moves over simulation time. The jump also follows the frame (`F` stops
+following). A key past the last frame does nothing.
 
 ## Simulation time
 

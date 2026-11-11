@@ -46,6 +46,7 @@ fn home_view_renders_markers_and_overlay_deterministically() {
         paused: false,
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
+        following: None,
         frame_count: system.tree().frames().len(),
         fps: None,
         sim_lag: false,

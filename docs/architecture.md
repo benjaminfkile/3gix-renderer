@@ -26,7 +26,7 @@ desktop binary, the headless tests, and the browser build share it.
 | `hub` | Chunk fetch (`200/202/404/410`), readiness WebSocket, registry load | `compiler-pipeline.md` 4, `matter-format.md` 5 and 6 |
 | `mock_hub` | A small hub for tests and `gx-mock-hub` | same |
 | `sim` | `SimClock` and integration of every frame to the simulation time | `space-model.md` 6 |
-| `camera` | Free camera parented to its nearest frame, re-parenting | `space-model.md` 5 |
+| `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
 | `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the fetcher | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |

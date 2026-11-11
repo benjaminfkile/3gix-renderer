@@ -80,6 +80,8 @@ pub struct OverlayInfo {
     pub camera_frame: u64,
     /// Distance from the camera to its frame origin, meters.
     pub camera_distance: f64,
+    /// The frame the camera follows, or `None` when it floats free.
+    pub following: Option<u64>,
     /// Number of frames in the registry.
     pub frame_count: usize,
     /// Rendered frames per second, or `None` when not measured (headless).
@@ -104,8 +106,13 @@ impl OverlayInfo {
                 if self.paused { " (paused)" } else { "" }
             ),
             format!(
-                "camera frame {}  |p| {:.4e} m",
-                self.camera_frame, self.camera_distance
+                "camera frame {}  |p| {:.4e} m  {}",
+                self.camera_frame,
+                self.camera_distance,
+                match self.following {
+                    Some(id) => format!("following {id}"),
+                    None => "free".to_string(),
+                }
             ),
             format!("frames {}", self.frame_count),
             match self.fps {
@@ -189,6 +196,7 @@ mod tests {
             paused: false,
             camera_frame: 4,
             camera_distance: 1.5e8,
+            following: None,
             frame_count: 6,
             fps: Some(59.94),
             sim_lag: false,
@@ -216,7 +224,7 @@ mod tests {
         let l = info().lines();
         assert_eq!(l[0], "J2000 + 9375.0000 d");
         assert_eq!(l[1], "time scale 86400x");
-        assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m");
+        assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m  free");
         assert_eq!(l[3], "frames 6");
         assert_eq!(l[4], "fps 59.9");
         assert_eq!(l[5], "exposure auto");
@@ -236,11 +244,13 @@ mod tests {
             fps: None,
             sim_lag: true,
             exposure_fixed: Some(12.8125),
+            following: Some(4),
             matter: MatterStats::default(),
             ..info()
         }
         .lines();
         assert_eq!(l[1], "time scale 0.25x (paused)");
+        assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m  following 4");
         assert_eq!(l[4], "fps -");
         assert_eq!(l[5], "exposure fixed 12.81");
         assert_eq!(l[9], "requests 0  fetched 0 cells 0 B");

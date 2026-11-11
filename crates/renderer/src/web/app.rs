@@ -184,7 +184,9 @@ impl WebApp {
         self.last_frame = Some(now);
         let fps = self.fps(now);
 
+        let held = self.camera.hold(&self.sim.system, self.controls.follow);
         self.sim.update(Seconds::new(dt));
+        self.camera.keep(&self.sim.system, held);
         let input = self.controls.take_flight();
         self.camera.fly(&self.sim.system, &input, dt);
         self.camera.update_parent(&self.sim.system);
@@ -227,6 +229,7 @@ impl WebApp {
             paused: self.sim.clock.paused,
             camera_frame: self.camera.frame_id,
             camera_distance: self.camera.position.length(),
+            following: self.controls.follow,
             frame_count: self.sim.system.tree().frames().len(),
             fps,
             sim_lag: self.sim.lagging(),

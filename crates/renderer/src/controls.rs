@@ -2,7 +2,8 @@
 //! browser canvas.
 //!
 //! Turns `winit` window events into flight input for the [`Camera`],
-//! actions on the [`SimClock`](crate::sim::SimClock), view jumps, and the
+//! actions on the [`SimClock`](crate::sim::SimClock), view jumps, the
+//! followed frame (see [`Camera::hold`]), and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -35,6 +36,9 @@ pub struct Controls {
     /// The fixed exposure, stops (see [`crate::render::gpu::fixed_exposure`]);
     /// `None` for the automatic exposure.
     pub exposure_fixed: Option<f64>,
+    /// The frame the camera moves along with, or `None` for a camera that
+    /// floats free in space.
+    pub follow: Option<u64>,
 }
 
 impl Controls {
@@ -131,7 +135,16 @@ impl Controls {
             KeyCode::Comma => sim.clock.apply(ClockAction::StepBack),
             KeyCode::Period => sim.clock.apply(ClockAction::StepForward),
             KeyCode::KeyR => sim.clock.apply(ClockAction::Reset),
-            KeyCode::Home => *camera = Camera::home(&sim.system),
+            KeyCode::Home => {
+                *camera = Camera::home(&sim.system);
+                self.follow = None;
+            }
+            KeyCode::KeyF => {
+                self.follow = match self.follow {
+                    Some(_) => None,
+                    None => Some(camera.frame_id),
+                };
+            }
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
@@ -142,6 +155,7 @@ impl Controls {
                             speed: camera.speed,
                             ..cam
                         };
+                        self.follow = Some(cam.frame_id);
                     }
                 }
             }

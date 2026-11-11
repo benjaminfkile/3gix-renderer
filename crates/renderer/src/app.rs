@@ -116,6 +116,7 @@ pub fn overlay_info(
         paused: sim.clock.paused,
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
+        following: None,
         frame_count: sim.system.tree().frames().len(),
         fps,
         sim_lag: sim.lagging(),
@@ -593,7 +594,9 @@ impl App {
         self.next_frame = self.frame_interval.map(|i| now + i);
         let fps = self.fps.frame(now);
 
+        let held = self.camera.hold(&self.sim.system, self.controls.follow);
         self.sim.update(Seconds::new(dt));
+        self.camera.keep(&self.sim.system, held);
         let input = self.controls.take_flight();
         self.camera.fly(&self.sim.system, &input, dt);
         self.camera.update_parent(&self.sim.system);
@@ -610,13 +613,16 @@ impl App {
         self.world.evict(t);
         let scene = matter_scene(&mut self.world, system, &self.camera, size, t);
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
-        let overlay = overlay_info(
-            &self.sim,
-            &self.camera,
-            fps,
-            self.controls.exposure_fixed,
-            stats,
-        )
+        let overlay = OverlayInfo {
+            following: self.controls.follow,
+            ..overlay_info(
+                &self.sim,
+                &self.camera,
+                fps,
+                self.controls.exposure_fixed,
+                stats,
+            )
+        }
         .text();
         let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {

@@ -8,9 +8,13 @@
 //!
 //! A [`Camera`] is a frame id, a position in that frame (relative to the
 //! frame origin, in the frame axes, meters, `f64`), an orientation relative
-//! to the frame axes, and a speed multiplier. Because the camera lives in its
-//! frame's axes, it turns with a frame that spins, like any point addressed
-//! in that frame (see `gx_core::frames`).
+//! to the frame axes, and a speed multiplier. The parent frame is only a
+//! precision device: the camera behaves like an observer floating free in
+//! space, so a simulation step that moves or turns its frame does not carry
+//! it along. [`Camera::hold`] before the step and [`Camera::keep`] after it
+//! put it back at the same place and view direction in root coordinates.
+//! Following a frame (the `F` key, the number keys) adds that frame's
+//! displacement over the step, and still not its spin.
 //!
 //! After every simulation step [`Camera::update_parent`] asks
 //! [`FrameSystem::nearest_frame`] for the frame nearest the camera and, when
@@ -75,6 +79,16 @@ pub struct Camera {
     pub orientation: Quat,
     /// Multiplier on the automatic flight speed, changed by the wheel.
     pub speed: f64,
+}
+
+/// The camera's place in space before a simulation step (see
+/// [`Camera::hold`] and [`Camera::keep`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Hold {
+    root_position: Vec3,
+    root_orientation: Quat,
+    /// The followed frame and its origin in root coordinates.
+    follow: Option<(u64, Vec3)>,
 }
 
 /// A rotation of `angle` radians about the unit `axis`.
@@ -215,6 +229,34 @@ impl Camera {
         }
         self.reparent_to(system, nearest);
         true
+    }
+
+    /// Records where the camera is in space before a simulation step, for
+    /// [`Camera::keep`] after it. With `follow`, the camera also records
+    /// that frame's origin so it moves along with it.
+    pub fn hold(&self, system: &FrameSystem, follow: Option<u64>) -> Hold {
+        Hold {
+            root_position: self.root_position(system),
+            root_orientation: self.root_orientation(system),
+            follow: follow.map(|id| (id, system.root_position(id))),
+        }
+    }
+
+    /// Puts the camera back where `hold` recorded it after a simulation
+    /// step moved and turned its frame: the same place and view direction
+    /// in root coordinates, the way an observer floating free would see it.
+    /// When following a frame, the place moves by that frame's displacement
+    /// over the step (its spin is not followed, so the view direction stays
+    /// fixed in space).
+    pub fn keep(&mut self, system: &FrameSystem, hold: Hold) {
+        let shift = hold.follow.map_or(Vec3::zero(), |(id, before)| {
+            system.root_position(id) - before
+        });
+        self.position = system.to_frame(hold.root_position + shift, self.frame_id);
+        let to_frame = system.root_orientation(self.frame_id).conjugate();
+        self.orientation = (to_frame * hold.root_orientation)
+            .normalized()
+            .unwrap_or(self.orientation);
     }
 
     /// A camera in `frame_id` at `offset` from the frame origin (root axes)
@@ -364,6 +406,92 @@ mod tests {
 
     fn close(a: Vec3, b: Vec3, tol: f64) -> bool {
         (a - b).length() <= tol
+    }
+
+    /// A massless root and one massless frame moving at 1000 m/s along
+    /// root +x and spinning about root +z at 0.1 rad/s.
+    fn moving_system() -> FrameSystem {
+        let f = frame(1, ROOT_PARENT, 1.0e5, Vec3::zero(), Quat::identity());
+        let mut g = frame(2, 1, 1.0e3, Vec3::new(1.0e4, 0.0, 0.0), Quat::identity());
+        g.velocity = Vec3::new(1000.0, 0.0, 0.0);
+        g.angular_velocity = Vec3::new(0.0, 0.0, 0.1);
+        let reg = Registry::new(Seconds::new(0.0), vec![f, g]).unwrap();
+        FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap())
+    }
+
+    fn step(s: &mut FrameSystem, seconds: f64) {
+        gx_core::integrate::step(s, Seconds::new(seconds), Default::default());
+    }
+
+    #[test]
+    fn a_free_camera_stays_put_while_its_frame_moves_and_spins() {
+        let mut s = moving_system();
+        let mut cam = Camera::view_of(&s, 2).unwrap();
+        let place = cam.root_position(&s);
+        let v = Vec3::new(0.3, -0.2, 0.9);
+        let view = cam.root_orientation(&s).rotate(v);
+        for _ in 0..10 {
+            let held = cam.hold(&s, None);
+            step(&mut s, 1.0);
+            cam.keep(&s, held);
+            cam.update_parent(&s);
+        }
+        // The frame moved 10 km and turned a radian; the camera did not.
+        assert!((s.root_position(2).x - 2.0e4).abs() < 1e-6);
+        let x = s.root_orientation(2).rotate(Vec3::new(1.0, 0.0, 0.0));
+        assert!(
+            (x.x - 1.0f64.cos()).abs() < 1e-2,
+            "turned a radian, x = {x:?}"
+        );
+        assert!(close(cam.root_position(&s), place, 1e-6));
+        assert!(close(cam.root_orientation(&s).rotate(v), view, 1e-9));
+    }
+
+    #[test]
+    fn a_following_camera_moves_with_its_frame_but_not_its_spin() {
+        let mut s = moving_system();
+        let mut cam = Camera::view_of(&s, 2).unwrap();
+        let offset = cam.root_position(&s) - s.root_position(2);
+        let v = Vec3::new(0.3, -0.2, 0.9);
+        let view = cam.root_orientation(&s).rotate(v);
+        for _ in 0..10 {
+            let held = cam.hold(&s, Some(2));
+            step(&mut s, 1.0);
+            cam.keep(&s, held);
+            cam.update_parent(&s);
+        }
+        assert!(close(
+            cam.root_position(&s) - s.root_position(2),
+            offset,
+            1e-6
+        ));
+        assert!(close(cam.root_orientation(&s).rotate(v), view, 1e-9));
+    }
+
+    #[test]
+    fn flying_left_moves_what_is_ahead_right_on_screen() {
+        use crate::render::scene::build_scene;
+        let s = moving_system();
+        let mut cam = Camera::view_of(&s, 2).unwrap();
+        let x_of_frame_2 = |cam: &Camera| {
+            let scene = build_scene(&s, cam, 16.0 / 9.0);
+            let m = scene.markers.iter().find(|m| m.frame_id == 2).unwrap();
+            scene.project(m.position, 1600, 900).unwrap().0
+        };
+        let before = x_of_frame_2(&cam);
+        assert!((before - 800.0).abs() < 1.0, "frame 2 starts centered");
+        let left = FlightInput {
+            left: true,
+            ..FlightInput::default()
+        };
+        cam.fly(&s, &left, 0.01);
+        assert!(x_of_frame_2(&cam) > before + 1.0, "A slides the view right");
+        let right = FlightInput {
+            right: true,
+            ..FlightInput::default()
+        };
+        cam.fly(&s, &right, 0.02);
+        assert!(x_of_frame_2(&cam) < before - 1.0, "D slides the view left");
     }
 
     #[test]
