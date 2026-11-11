@@ -8,7 +8,7 @@
 //!
 //! A [`Camera`] is a frame id, a position in that frame (relative to the
 //! frame origin, in the frame axes, meters, `f64`), an orientation relative
-//! to the frame axes, and a speed multiplier. The parent frame is only a
+//! to the frame axes, and a flight speed. The parent frame is only a
 //! precision device: the camera behaves like an observer floating free in
 //! space, so a simulation step that moves or turns its frame does not carry
 //! it along. [`Camera::hold`] before the step and [`Camera::keep`] after it
@@ -36,15 +36,14 @@ pub const FIELD_OF_VIEW_Y: f64 = std::f64::consts::FRAC_PI_3;
 /// Look rotation per pixel of right mouse drag, radians.
 pub const LOOK_RADIANS_PER_PIXEL: f64 = 0.003;
 
-/// Factor applied to the speed multiplier per mouse wheel notch.
-pub const WHEEL_FACTOR: f64 = 1.25;
+/// Factor applied to the flight speed per mouse wheel notch.
+pub const WHEEL_FACTOR: f64 = 2.0;
 
-/// Limits of the speed multiplier.
-pub const SPEED_LIMITS: (f64, f64) = (1.0e-6, 1.0e6);
+/// Limits of the flight speed, meters per second.
+pub const SPEED_LIMITS: (f64, f64) = (1.0e-3, 1.0e15);
 
-/// The slowest automatic flight speed, meters per second, reached inside a
-/// frame's `root_extent / 8` region.
-pub const MIN_SPEED_MPS: f64 = 1.0;
+/// The flight speed of a newly placed camera, meters per second.
+pub const DEFAULT_SPEED_MPS: f64 = 1.0e11;
 
 /// The keys and mouse movement of one rendered frame.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -77,7 +76,8 @@ pub struct Camera {
     pub position: Vec3,
     /// Camera axes relative to the frame axes, a unit quaternion.
     pub orientation: Quat,
-    /// Multiplier on the automatic flight speed, changed by the wheel.
+    /// Flight speed while a movement key is held, meters per second. Set
+    /// only by the wheel: nothing in space changes it.
     pub speed: f64,
 }
 
@@ -163,36 +163,9 @@ impl Camera {
         system.relative(point, frame_id, self.position, self.frame_id)
     }
 
-    /// The automatic flight speed in meters per second: the distance from
-    /// the camera to the nearest `root_extent / 8` region of a frame that
-    /// holds matter (`max_depth > 0`) per second, at least
-    /// [`MIN_SPEED_MPS`], times the wheel multiplier. Slow near matter,
-    /// fast in deep space. The parent frame does not matter: a massless
-    /// coordinate origin such as a barycenter has no matter to slow down
-    /// for, and its region can span the whole system. With no such frame,
-    /// every frame counts.
-    pub fn flight_speed(&self, system: &FrameSystem) -> f64 {
-        let here = self.root_position(system);
-        let gap = |only_matter: bool| {
-            system
-                .tree()
-                .frames()
-                .iter()
-                .filter(|f| !only_matter || f.max_depth > 0)
-                .map(|f| {
-                    (system.root_position(f.frame_id) - here).length() - f.root_extent.value() / 8.0
-                })
-                .fold(None, |acc: Option<f64>, g| {
-                    Some(acc.map_or(g, |a| a.min(g)))
-                })
-        };
-        let gap = gap(true).or_else(|| gap(false)).unwrap_or(0.0);
-        gap.max(MIN_SPEED_MPS) * self.speed
-    }
-
     /// Applies one frame of free flight: look, wheel, then movement in the
     /// camera axes over `dt` seconds of wall-clock time.
-    pub fn fly(&mut self, system: &FrameSystem, input: &FlightInput, dt: f64) {
+    pub fn fly(&mut self, input: &FlightInput, dt: f64) {
         let (dx, dy) = input.look;
         if dx != 0.0 || dy != 0.0 {
             let yaw = axis_angle(Vec3::new(0.0, 1.0, 0.0), -dx * LOOK_RADIANS_PER_PIXEL);
@@ -212,10 +185,7 @@ impl Camera {
             axis(input.back, input.forward),
         );
         if let Some(dir) = local.normalized() {
-            let step = self
-                .orientation
-                .rotate(dir)
-                .scale(self.flight_speed(system) * dt);
+            let step = self.orientation.rotate(dir).scale(self.speed * dt);
             self.position = self.position + step;
         }
     }
@@ -289,7 +259,7 @@ impl Camera {
             frame_id,
             position: to_frame.rotate(offset),
             orientation: (to_frame * look).normalized().unwrap_or(look),
-            speed: 1.0,
+            speed: DEFAULT_SPEED_MPS,
         }
     }
 
@@ -493,6 +463,7 @@ mod tests {
         use crate::render::scene::build_scene;
         let s = moving_system();
         let mut cam = Camera::view_of(&s, 2).unwrap();
+        cam.speed = 100.0;
         let x_of_frame_2 = |cam: &Camera| {
             let scene = build_scene(&s, cam, 16.0 / 9.0);
             let m = scene.markers.iter().find(|m| m.frame_id == 2).unwrap();
@@ -504,13 +475,13 @@ mod tests {
             left: true,
             ..FlightInput::default()
         };
-        cam.fly(&s, &left, 0.01);
+        cam.fly(&left, 0.01);
         assert!(x_of_frame_2(&cam) > before + 1.0, "A slides the view right");
         let right = FlightInput {
             right: true,
             ..FlightInput::default()
         };
-        cam.fly(&s, &right, 0.02);
+        cam.fly(&right, 0.02);
         assert!(x_of_frame_2(&cam) < before - 1.0, "D slides the view left");
     }
 
@@ -597,62 +568,76 @@ mod tests {
         assert!(Camera::view_of_index(&s, 3).is_none());
     }
 
-    /// The sun case: a massless barycenter root whose region spans the
-    /// whole system, and a star a little off its origin. A camera that
-    /// approaches from the far side is parented to the root (its origin is
-    /// nearer than the star's), and must still fly at a speed set by the
-    /// distance to the star, not crawl at the floor.
+    /// The camera is not affected by anything in space: holding W flies a
+    /// straight line at the set speed through a star and past it, no matter
+    /// what frame it is parented to, how near matter is, or how the frames
+    /// move while the simulation runs.
     #[test]
-    fn flight_toward_a_star_near_a_massless_root_does_not_stall() {
+    fn flight_is_a_straight_line_at_the_set_speed_through_matter() {
         let mut root = frame(1, ROOT_PARENT, 2.0e13, Vec3::zero(), Quat::identity());
         root.max_depth = 0;
         let star_radius = 6.957e8;
-        let star = frame(
+        let mut star = frame(
             2,
             1,
             8.0 * star_radius,
             Vec3::new(1.0e9, 0.0, 0.0),
             Quat::identity(),
         );
+        star.velocity = Vec3::new(0.0, 4.5e4, 0.0);
+        star.angular_velocity = Vec3::new(0.0, 0.0, 1.0e-3);
         let reg = Registry::new(Seconds::new(0.0), vec![root, star]).unwrap();
-        let s = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let mut s = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let start = Vec3::new(-1.0e11, 0.0, 0.0);
         let mut cam = Camera {
             frame_id: 1,
-            position: Vec3::new(-1.0e11, 0.0, 0.0),
+            position: start,
             orientation: look_rotation(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
-            speed: 1.0,
+            speed: 2.0e10,
         };
-        assert!(!cam.update_parent(&s), "parented to the root");
-        let expected = 1.01e11 - star_radius;
-        assert!((cam.flight_speed(&s) - expected).abs() < 1.0);
-        let input = FlightInput {
+        let view = cam.root_orientation(&s);
+        let w = FlightInput {
             forward: true,
             ..FlightInput::default()
         };
-        // Ten seconds of holding W at 60 frames per second.
+        // Ten seconds of holding W at 60 frames per second, the simulation
+        // running and the camera re-parenting as in the app.
+        let dt = 1.0 / 60.0;
+        let mut parents = std::collections::BTreeSet::new();
         for _ in 0..600 {
-            cam.fly(&s, &input, 1.0 / 60.0);
+            let held = cam.hold(&s, None);
+            step(&mut s, 100.0 * dt);
+            cam.keep(&s, held);
+            cam.fly(&w, dt);
             cam.update_parent(&s);
+            parents.insert(cam.frame_id);
         }
-        let to_surface = cam.relative(&s, Vec3::zero(), 2).length() - star_radius;
+        assert_eq!(parents.len(), 2, "re-parented to the star and back");
+        let flown = cam.root_position(&s) - start;
         assert!(
-            (0.0..1.0e7).contains(&to_surface),
-            "within 10,000 km of the surface, got {to_surface} m"
+            close(flown, Vec3::new(2.0e11, 0.0, 0.0), 1.0e2),
+            "{flown:?}"
         );
+        let v = Vec3::new(0.3, -0.2, 0.9);
+        assert!(close(
+            cam.root_orientation(&s).rotate(v),
+            view.rotate(v),
+            1e-9
+        ));
     }
 
     #[test]
-    fn flight_moves_along_view_and_scales_with_distance() {
+    fn flight_moves_along_view_at_the_set_speed() {
         let s = system();
         let mut cam = Camera::view_of(&s, 5).unwrap();
+        assert_eq!(cam.speed, DEFAULT_SPEED_MPS);
+        cam.speed = 100.0;
         let start = cam.position;
         let input = FlightInput {
             forward: true,
             ..FlightInput::default()
         };
-        // 150 m from the origin, region edge at 50 m: 100 m/s.
-        assert!((cam.flight_speed(&s) - 100.0).abs() < 1e-9);
-        cam.fly(&s, &input, 0.5);
+        cam.fly(&input, 0.5);
         let moved = cam.position - start;
         assert!((moved.length() - 50.0).abs() < 1e-9);
         assert!(close(
@@ -660,19 +645,15 @@ mod tests {
             -start.normalized().unwrap(),
             1e-9
         ));
-        // Inside the region the speed floors.
-        cam.position = Vec3::new(1.0, 0.0, 0.0);
-        assert_eq!(cam.flight_speed(&s), MIN_SPEED_MPS);
         // The wheel scales speed geometrically.
         cam.fly(
-            &s,
             &FlightInput {
                 wheel: 2.0,
                 ..FlightInput::default()
             },
             0.0,
         );
-        assert!((cam.speed - WHEEL_FACTOR * WHEEL_FACTOR).abs() < 1e-12);
+        assert!((cam.speed - 100.0 * WHEEL_FACTOR * WHEEL_FACTOR).abs() < 1e-9);
     }
 
     #[test]
@@ -681,7 +662,6 @@ mod tests {
         let mut cam = Camera::home(&s);
         let before = cam.orientation.rotate(Vec3::new(0.0, 0.0, -1.0));
         cam.fly(
-            &s,
             &FlightInput {
                 look: (100.0, 0.0),
                 ..FlightInput::default()

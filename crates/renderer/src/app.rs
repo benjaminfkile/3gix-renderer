@@ -116,6 +116,7 @@ pub fn overlay_info(
         paused: sim.clock.paused,
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
+        camera_speed: camera.speed,
         following: None,
         frame_count: sim.system.tree().frames().len(),
         fps,
@@ -598,7 +599,7 @@ impl App {
         self.sim.update(Seconds::new(dt));
         self.camera.keep(&self.sim.system, held);
         let input = self.controls.take_flight();
-        self.camera.fly(&self.sim.system, &input, dt);
+        self.camera.fly(&input, dt);
         self.camera.update_parent(&self.sim.system);
 
         let Some(gfx) = self.gfx.as_mut() else {

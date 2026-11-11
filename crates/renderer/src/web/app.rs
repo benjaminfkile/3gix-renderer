@@ -188,7 +188,7 @@ impl WebApp {
         self.sim.update(Seconds::new(dt));
         self.camera.keep(&self.sim.system, held);
         let input = self.controls.take_flight();
-        self.camera.fly(&self.sim.system, &input, dt);
+        self.camera.fly(&input, dt);
         self.camera.update_parent(&self.sim.system);
 
         let mut slot = self.gfx.borrow_mut();
@@ -229,6 +229,7 @@ impl WebApp {
             paused: self.sim.clock.paused,
             camera_frame: self.camera.frame_id,
             camera_distance: self.camera.position.length(),
+            camera_speed: self.camera.speed,
             following: self.controls.follow,
             frame_count: self.sim.system.tree().frames().len(),
             fps,

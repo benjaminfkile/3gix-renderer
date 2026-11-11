@@ -13,7 +13,7 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `A` / `D` | Fly left / right |
 | `E` / `Q` | Fly up / down along the camera's up axis |
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
-| Mouse wheel | Scale flight speed: each notch multiplies or divides it by 1.25 |
+| Mouse wheel | Scale flight speed: each notch multiplies or divides it by 2 |
 | `1` to `9`, `0` | Jump to a view of the frame with that index and follow it (see below) |
 | `F` | Follow the frame the camera is in, or stop following |
 | `Home` | Jump to a view of the whole system from above the root frame, not following |
@@ -29,13 +29,13 @@ frame stays in view at any time scale. Its spin is not followed: the view
 direction stays fixed in space and the frame turns in front of the camera.
 The overlay's camera line ends in `free` or `following <frame id>`.
 
-Flight speed also scales on its own with the distance from the camera to the
-nearest `root_extent / 8` region of any frame that holds matter
-(`max_depth > 0`): one second covers the remaining distance to that region,
-with a floor of 1 m/s inside it. Flying near matter is slow and flying in
-deep space is fast. The parent frame plays no part, so a massless origin such
-as the barycenter, whose region spans the whole system, never slows the
-camera. The wheel multiplier applies on top.
+The camera is an observer that nothing in space acts on. Holding a movement
+key flies a straight line at the flight speed, in meters per second, and only
+the wheel changes that speed (1e-3 to 1e15 m/s, 1e11 m/s for a newly placed
+camera, kept across number-key jumps). Matter, gravity, and the frame the
+camera happens to be parented to play no part: it flies through a star or a
+planet the same way it flies through empty space. The overlay's camera line
+shows the speed.
 
 The number keys index the frames in registry order: frame ids sorted
 ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.
