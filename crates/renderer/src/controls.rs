@@ -128,6 +128,7 @@ impl Controls {
             KeyCode::KeyD => f.right = pressed,
             KeyCode::KeyE => f.up = pressed,
             KeyCode::KeyQ => f.down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => f.boost = pressed,
             _ if !pressed || repeat => {}
             KeyCode::Space => sim.clock.apply(ClockAction::TogglePause),
             KeyCode::BracketLeft => sim.clock.apply(ClockAction::HalveScale),
@@ -153,6 +154,7 @@ impl Controls {
                     if let Some(cam) = Camera::view_of_index(&sim.system, index) {
                         *camera = Camera {
                             speed: camera.speed,
+                            cruise: camera.cruise,
                             ..cam
                         };
                         self.follow = Some(cam.frame_id);

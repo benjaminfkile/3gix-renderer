@@ -36,8 +36,16 @@ pub const FIELD_OF_VIEW_Y: f64 = std::f64::consts::FRAC_PI_3;
 /// Look rotation per pixel of right mouse drag, radians.
 pub const LOOK_RADIANS_PER_PIXEL: f64 = 0.003;
 
-/// Factor applied to the flight speed per mouse wheel notch.
-pub const WHEEL_FACTOR: f64 = 2.0;
+/// Factor applied to the set flight speed per mouse wheel notch: about ten
+/// notches per factor of ten.
+pub const WHEEL_FACTOR: f64 = 1.25;
+
+/// Factor on the set speed while the boost key (Shift) is held.
+pub const BOOST_FACTOR: f64 = 10.0;
+
+/// Time constant of the glide from the current flight speed to the set one,
+/// seconds: a change of speed is about 99 percent done after five of these.
+pub const SPEED_GLIDE_SECONDS: f64 = 0.15;
 
 /// Limits of the flight speed, meters per second.
 pub const SPEED_LIMITS: (f64, f64) = (1.0e-3, 1.0e15);
@@ -65,6 +73,8 @@ pub struct FlightInput {
     /// Mouse wheel notches since the last frame, positive away from the
     /// user.
     pub wheel: f64,
+    /// Fly at [`BOOST_FACTOR`] times the set speed (Shift held).
+    pub boost: bool,
 }
 
 /// The free camera: a place and a view direction in one frame.
@@ -76,9 +86,13 @@ pub struct Camera {
     pub position: Vec3,
     /// Camera axes relative to the frame axes, a unit quaternion.
     pub orientation: Quat,
-    /// Flight speed while a movement key is held, meters per second. Set
-    /// only by the wheel: nothing in space changes it.
+    /// The set flight speed, meters per second. Changed only by the
+    /// wheel: nothing in space changes it.
     pub speed: f64,
+    /// The current flight speed, meters per second: glides toward the set
+    /// speed (times [`BOOST_FACTOR`] while boosting) in
+    /// [`SPEED_GLIDE_SECONDS`], so a burst of wheel notches does not jump.
+    pub cruise: f64,
 }
 
 /// The camera's place in space before a simulation step (see
@@ -174,10 +188,19 @@ impl Camera {
                 .normalized()
                 .unwrap_or(self.orientation);
         }
+        let (lo, hi) = SPEED_LIMITS;
         if input.wheel != 0.0 {
-            let (lo, hi) = SPEED_LIMITS;
             self.speed = (self.speed * WHEEL_FACTOR.powf(input.wheel)).clamp(lo, hi);
         }
+        let target = if input.boost {
+            (self.speed * BOOST_FACTOR).min(hi)
+        } else {
+            self.speed
+        };
+        // Glide in log space, so every factor of ten takes the same time.
+        let k = 1.0 - (-dt / SPEED_GLIDE_SECONDS).exp();
+        let (now, to) = (self.cruise.clamp(lo, hi).ln(), target.ln());
+        self.cruise = (now + (to - now) * k).exp();
         let axis = |plus: bool, minus: bool| f64::from(u8::from(plus)) - f64::from(u8::from(minus));
         let local = Vec3::new(
             axis(input.right, input.left),
@@ -185,7 +208,7 @@ impl Camera {
             axis(input.back, input.forward),
         );
         if let Some(dir) = local.normalized() {
-            let step = self.orientation.rotate(dir).scale(self.speed * dt);
+            let step = self.orientation.rotate(dir).scale(self.cruise * dt);
             self.position = self.position + step;
         }
     }
@@ -260,6 +283,7 @@ impl Camera {
             position: to_frame.rotate(offset),
             orientation: (to_frame * look).normalized().unwrap_or(look),
             speed: DEFAULT_SPEED_MPS,
+            cruise: DEFAULT_SPEED_MPS,
         }
     }
 
@@ -464,6 +488,7 @@ mod tests {
         let s = moving_system();
         let mut cam = Camera::view_of(&s, 2).unwrap();
         cam.speed = 100.0;
+        cam.cruise = 100.0;
         let x_of_frame_2 = |cam: &Camera| {
             let scene = build_scene(&s, cam, 16.0 / 9.0);
             let m = scene.markers.iter().find(|m| m.frame_id == 2).unwrap();
@@ -509,6 +534,7 @@ mod tests {
             position: Vec3::new(3.0, -40.0, 12.5),
             orientation: axis_angle(Vec3::new(0.0, 1.0, 0.0), 0.7),
             speed: 1.0,
+            cruise: 1.0,
         };
         let before = cam.root_position(&s);
         let before_view = cam.root_orientation(&s);
@@ -594,6 +620,7 @@ mod tests {
             position: start,
             orientation: look_rotation(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
             speed: 2.0e10,
+            cruise: 2.0e10,
         };
         let view = cam.root_orientation(&s);
         let w = FlightInput {
@@ -632,6 +659,7 @@ mod tests {
         let mut cam = Camera::view_of(&s, 5).unwrap();
         assert_eq!(cam.speed, DEFAULT_SPEED_MPS);
         cam.speed = 100.0;
+        cam.cruise = 100.0;
         let start = cam.position;
         let input = FlightInput {
             forward: true,
@@ -654,6 +682,47 @@ mod tests {
             0.0,
         );
         assert!((cam.speed - 100.0 * WHEEL_FACTOR * WHEEL_FACTOR).abs() < 1e-9);
+    }
+
+    #[test]
+    fn speed_glides_to_the_set_speed_and_boost_multiplies_it() {
+        let s = system();
+        let mut cam = Camera::view_of(&s, 5).unwrap();
+        cam.speed = 100.0;
+        cam.cruise = 100.0;
+        let frame = |cam: &mut Camera, input: FlightInput| {
+            for _ in 0..60 {
+                cam.fly(&input, 1.0 / 60.0);
+            }
+        };
+        // Ten notches in one frame: the set speed jumps, the flight speed
+        // follows over the next second instead of at once.
+        cam.fly(
+            &FlightInput {
+                wheel: 10.0,
+                ..FlightInput::default()
+            },
+            1.0 / 60.0,
+        );
+        let set = 100.0 * WHEEL_FACTOR.powi(10);
+        assert!((cam.speed - set).abs() < 1e-9);
+        assert!(
+            cam.cruise > 100.0 && cam.cruise < 0.5 * set,
+            "{}",
+            cam.cruise
+        );
+        frame(&mut cam, FlightInput::default());
+        assert!((cam.cruise / set - 1.0).abs() < 1e-2, "{}", cam.cruise);
+        // Shift: ten times the set speed while held, back after release.
+        let boost = FlightInput {
+            boost: true,
+            ..FlightInput::default()
+        };
+        frame(&mut cam, boost);
+        assert!((cam.cruise / (BOOST_FACTOR * set) - 1.0).abs() < 1e-2);
+        assert!((cam.speed - set).abs() < 1e-9, "boost leaves the set speed");
+        frame(&mut cam, FlightInput::default());
+        assert!((cam.cruise / set - 1.0).abs() < 1e-2);
     }
 
     #[test]

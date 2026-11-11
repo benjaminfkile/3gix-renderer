@@ -28,6 +28,7 @@ fn same_point_from_two_frames() {
         position: system.root_orientation(30).conjugate().rotate(in30),
         orientation: axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.4),
         speed: 1.0,
+        cruise: 1.0,
     };
     // The vector from frame 31's origin to the camera, both ways.
     let before = system.relative(cam.position, 30, Vec3::zero(), 31);

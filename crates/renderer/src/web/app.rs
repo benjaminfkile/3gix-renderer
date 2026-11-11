@@ -229,7 +229,7 @@ impl WebApp {
             paused: self.sim.clock.paused,
             camera_frame: self.camera.frame_id,
             camera_distance: self.camera.position.length(),
-            camera_speed: self.camera.speed,
+            camera_speed: self.camera.cruise,
             following: self.controls.follow,
             frame_count: self.sim.system.tree().frames().len(),
             fps,

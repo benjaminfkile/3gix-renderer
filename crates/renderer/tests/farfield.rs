@@ -95,6 +95,7 @@ fn camera() -> Camera {
         position: Vec3::zero(),
         orientation: look_rotation(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
         speed: 1.0,
+        cruise: 1.0,
     }
 }
 

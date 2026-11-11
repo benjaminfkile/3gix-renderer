@@ -13,7 +13,8 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `A` / `D` | Fly left / right |
 | `E` / `Q` | Fly up / down along the camera's up axis |
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
-| Mouse wheel | Scale flight speed: each notch multiplies or divides it by 2 |
+| Mouse wheel | Set the flight speed: each notch multiplies or divides it by 1.25 (about ten notches per factor of ten) |
+| `Shift` (held) | Boost: fly at ten times the set speed while held |
 | `1` to `9`, `0` | Jump to a view of the frame with that index and follow it (see below) |
 | `F` | Follow the frame the camera is in, or stop following |
 | `Home` | Jump to a view of the whole system from above the root frame, not following |
@@ -36,11 +37,14 @@ whatever is under the crosshair is what W flies toward.
 
 The camera is an observer that nothing in space acts on. Holding a movement
 key flies a straight line at the flight speed, in meters per second, and only
-the wheel changes that speed (1e-3 to 1e15 m/s, 1e11 m/s for a newly placed
-camera, kept across number-key jumps). Matter, gravity, and the frame the
+your input changes that speed: the wheel sets it (1e-3 to 1e15 m/s, 1e11 m/s
+for a newly placed camera, kept across number-key jumps) and Shift boosts it
+tenfold while held. The flight speed glides to a new setting with a 0.15 s
+time constant (evenly per factor of ten), so a burst of notches or a Shift
+press does not jump. Matter, gravity, and the frame the
 camera happens to be parented to play no part: it flies through a star or a
 planet the same way it flies through empty space. The overlay's camera line
-shows the speed.
+shows the current flight speed.
 
 The number keys index the frames in registry order: frame ids sorted
 ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.

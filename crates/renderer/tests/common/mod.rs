@@ -205,6 +205,7 @@ pub fn camera() -> Camera {
         position: Vec3::new(7.0, -26.0, 0.0),
         orientation: look_rotation(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
         speed: 1.0,
+        cruise: 1.0,
     }
 }
 

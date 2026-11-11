@@ -116,7 +116,7 @@ pub fn overlay_info(
         paused: sim.clock.paused,
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
-        camera_speed: camera.speed,
+        camera_speed: camera.cruise,
         following: None,
         frame_count: sim.system.tree().frames().len(),
         fps,
