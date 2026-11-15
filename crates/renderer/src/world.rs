@@ -23,7 +23,7 @@ use crate::stream::{
 use crate::volume::VolumeGrid;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// What to draw this frame.
@@ -134,8 +134,9 @@ impl World {
 
     /// Selects cells for the camera if [`SELECT_INTERVAL_SECONDS`] have
     /// passed since the last selection (or `force`), and pins the depth-0
-    /// cell of every frame in the far field ([`crate::farfield`]). Returns
-    /// `true` if it selected.
+    /// cell of every frame with mass: the far field draws from it
+    /// ([`crate::farfield`]) and every light comes from it
+    /// ([`crate::light`]). Returns `true` if it selected.
     pub fn select(
         &mut self,
         system: &FrameSystem,
@@ -158,8 +159,13 @@ impl World {
             f64::from(view_px.1.max(1)),
         );
         self.cache.set_selection(cells, now);
-        for far in far_frames(system, camera, f64::from(view_px.1.max(1))) {
-            self.cache.pin(depth_zero_key(far.frame_id), now);
+        for f in system
+            .tree()
+            .frames()
+            .iter()
+            .filter(|f| f.mass.value() > 0.0)
+        {
+            self.cache.pin(depth_zero_key(f.frame_id), now);
         }
         true
     }
@@ -279,11 +285,10 @@ impl World {
     /// the lights its hot matter makes, and the sprites of far frames, for
     /// a view of `view_px` pixels. Marks the drawn cells as used.
     ///
-    /// Lights come from the hot matter of the drawn cells and, for far
-    /// frames none of whose drawn cells is hot (frames drawn as a sprite
-    /// only, and frames in the transition whose cells are beyond the
-    /// selection range), of their depth-0 cells, so a far hot frame still
-    /// lights the rest. Cold far frames reflect those lights.
+    /// Lights come from the depth-0 cell of every frame: it holds all of the
+    /// frame's matter, so the light escaping it is the light the frame
+    /// sends into space ([`crate::light`]). Cold far frames reflect those
+    /// lights.
     ///
     /// Everything is placed as `seen` sees it ([`crate::seen`]): every
     /// frame at its retarded state, and each frame with meshes or a sprite
@@ -302,12 +307,8 @@ impl World {
         self.cache.touch(&keys, now);
         let mut meshes = Vec::new();
         let mut volumes = Vec::new();
-        let mut emitters = Vec::new();
         for k in keys.iter().filter(|k| weight(k.frame_id) > 0.0) {
             if let Some(CellState::Ready(cell)) = self.cache.state(k) {
-                if let Some(e) = &cell.emitter {
-                    emitters.push((k.frame_id, e));
-                }
                 if let Some(v) = &cell.volume {
                     volumes.push(v.clone());
                 }
@@ -318,11 +319,8 @@ impl World {
                 }
             }
         }
-        // A far frame whose drawn cells carry no hot matter (a sprite only,
-        // or in the transition with its cells out of the selection range)
-        // still lights the rest through its depth-0 cell.
-        let lit: BTreeSet<u64> = emitters.iter().map(|(f, _)| *f).collect();
-        for f in far.iter().filter(|f| !lit.contains(&f.frame_id)) {
+        let mut emitters = Vec::new();
+        for f in system.tree().frames() {
             if let Some(CellState::Ready(cell)) = self.cache.state(&depth_zero_key(f.frame_id)) {
                 if let Some(e) = &cell.emitter {
                     emitters.push((f.frame_id, e));
@@ -394,6 +392,7 @@ mod tests {
             albedo: [Ratio::new(0.5); 3],
             roughness: Ratio::new(0.5),
             attenuation: Attenuation::new(0.0),
+            radiating_temperature: Kelvin::new(300.0),
         };
         let section = Section::new(
             key,

@@ -31,7 +31,8 @@ L = emission + sum over lights of (a / pi + specular) * E
 E = I / d^2 * max(0, n . l)
 ```
 
-- **Lights.** Point lights from hot matter (`docs/architecture.md`, step 5):
+- **Lights.** Point lights from the light escaping each frame's depth-0
+  cell (`docs/architecture.md`, step 5):
   radiant intensity `I = band_power / (4 pi)` W/sr per band. `d` and `l` come
   from the light position relative to the camera, computed in `f64` on the
   CPU and handed to the shader as `f32`. At most eight lights; no shadows in
@@ -43,7 +44,11 @@ E = I / d^2 * max(0, n . l)
   `G` with `k = alpha / 2`, and Schlick `F` with a fixed `F0` of 0.04. The
   specular term is the same in every band.
 - **Emission.** A hot surface glows whether or not any light reaches it:
-  `emitted_band_radiance(T, a) = band_radiance(T) * (1 - a)` from `gx-core`.
+  `emitted_band_radiance(T, a) = band_radiance(T) * (1 - a)` from `gx-core`,
+  with `T` the samples' radiating temperature (`matter-format.md` 3.3), what
+  the matter shows to the outside, so a coarse cell whose samples hold hot
+  interior matter still glows only as much as its surface does. Volumes use
+  the radiating temperature the same way.
   `gx-core` is `f64` CPU code, so the renderer evaluates `band_radiance` once
   per 1 K temperature bucket that appears in a drawn mesh and uploads the
   values as a small lookup texture (`light::EmissionTable`, 1024 texels per

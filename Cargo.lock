@@ -1160,7 +1160,7 @@ dependencies = [
 [[package]]
 name = "gx-core"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#cdb35838bfdd693312df3c771b8a2759512ee9fd"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#bf19604af2c939202712a42898aaa982fd831222"
 dependencies = [
  "wasm-bindgen",
  "zstd",
@@ -1169,7 +1169,7 @@ dependencies = [
 [[package]]
 name = "gx-module-host"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#cdb35838bfdd693312df3c771b8a2759512ee9fd"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#bf19604af2c939202712a42898aaa982fd831222"
 dependencies = [
  "gx-core",
  "wasmparser 0.261.0",

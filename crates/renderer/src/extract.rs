@@ -657,7 +657,7 @@ fn edge_vertex(
                 *acc += w * al.value();
             }
             roughness += w * s.roughness.value();
-            temperature += w * s.temperature.value();
+            temperature += w * s.radiating_temperature.value();
         }
     }
     let inside = if da > db { sa } else { sb };
@@ -799,6 +799,7 @@ mod tests {
             albedo: [Ratio::new(0.6), Ratio::new(0.5), Ratio::new(0.4)],
             roughness: Ratio::new(0.7),
             attenuation: Attenuation::new(0.0),
+            radiating_temperature: Kelvin::new(300.0),
         }
     }
 
@@ -1130,6 +1131,7 @@ mod tests {
                     albedo: [Ratio::new(0.1); 3],
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(1.0),
+                    radiating_temperature: Kelvin::new(4000.0),
                 }
             } else {
                 Sample::VACUUM
@@ -1169,6 +1171,7 @@ mod tests {
                     albedo: [Ratio::new(0.0); 3],
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(1.0),
+                    radiating_temperature: Kelvin::new(6000.0),
                 },
             ),
         )

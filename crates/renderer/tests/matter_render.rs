@@ -316,7 +316,10 @@ fn full_scene_draws_soft_glowing_volumes() {
     for (name, d) in [("hot blob", &hot), ("gas cloud", &gas)] {
         let y = d.y as u32;
         let cx = brightest_near(&first, d.x, y, 3);
-        let len = (1.5 * d.r).ceil() as u32;
+        // Twice the radius: the partly filled samples on the boundary
+        // reach past the ball by up to one sample, and under automatic
+        // exposure their faint gas shows.
+        let len = (2.0 * d.r).ceil() as u32;
         let right = scan(&first, cx, y, len, 1);
         let left = scan(&first, cx, y, len, -1);
         let (up_r, max_r) = rises(&right);

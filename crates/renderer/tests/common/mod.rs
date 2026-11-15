@@ -155,6 +155,7 @@ pub fn hot_section() -> Section {
             albedo: [Ratio::new(0.0); 3],
             roughness: Ratio::new(1.0),
             attenuation: Attenuation::new(HOT_ATTENUATION),
+            radiating_temperature: Kelvin::new(HOT_TEMPERATURE),
         },
     )
 }
@@ -173,6 +174,7 @@ pub fn solid_section() -> Section {
             albedo: [Ratio::new(0.5); 3],
             roughness: Ratio::new(0.8),
             attenuation: Attenuation::new(0.0),
+            radiating_temperature: Kelvin::new(SOLID_TEMPERATURE),
         },
     )
 }
@@ -263,6 +265,7 @@ pub fn gas_section() -> Section {
             albedo: [Ratio::new(0.3); 3],
             roughness: Ratio::new(0.0),
             attenuation: Attenuation::new(10.0),
+            radiating_temperature: Kelvin::new(GAS_TEMPERATURE),
         },
     )
 }

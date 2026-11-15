@@ -59,6 +59,7 @@ fn plasma_cell() -> Section {
         albedo: [Ratio::new(f64::from(ALBEDO)); 3],
         roughness: Ratio::new(0.0),
         attenuation: Attenuation::new(ATTENUATION),
+        radiating_temperature: Kelvin::new(6000.0),
     };
     Section::new(key, g.origin, g.edge, 8, Samples::filled(8, sample)).unwrap()
 }
@@ -173,6 +174,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
                         albedo: [Ratio::new(0.5); 3],
                         roughness: Ratio::new(1.0),
                         attenuation: Attenuation::new(0.0),
+                        radiating_temperature: Kelvin::new(3.0),
                     },
                 );
             }

@@ -49,7 +49,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
 | `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
-| `light` | Emitters from hot matter, point lights, the emission lookup table | `matter-format.md` 3.3 |
+| `light` | Emitters from the light escaping each frame's depth-0 cell, point lights, the emission lookup table | `matter-format.md` 3.3 |
 | `world` | Ties stream, extract, volume, light, and farfield together for one frame | |
 | `render::scene` | Camera-relative `f32` positions, surface placement, projection, depth strategy | `space-model.md` 5 |
 | `render::overlay` | The overlay text | |
@@ -272,7 +272,8 @@ a light, a dense sample is a surface.
    section's `cell_origin` and `cell_edge` must also match the registry's
    geometry for the key (`matter-format.md` 3.1); then
    `gx_core::matter::composite` combines the layers. The composited
-   `Section` is kept together with its emitter (step 5).
+   `Section` is kept together with its emitter if it is a depth-0 cell
+   (step 5).
 4. **Extraction** (`extract`) runs on a pool of `std::thread` workers fed by
    a channel: marching cubes over the composited density of the solid and
    fluid samples at the sample centers, at half the largest of those
@@ -289,21 +290,23 @@ a light, a dense sample is a surface.
    (`docs/shading.md`). A cell whose densest sample is gas or plasma is
    therefore a volume, and a cell with both kinds draws a mesh and a
    volume.
-5. **Lights** (`light`). Each drawn `Ready` cell's emitter is
-   `gx_core::emission::summarize(section, 1000 K)`. Emitters of one frame
-   merge: band powers add, the position is the power-weighted centroid. The
-   eight strongest merged emitters become point lights of radiant intensity
-   `band_power / (4 pi)` per band. Only cells in the draw set count, so a
-   parent and its children never both contribute.
+5. **Lights** (`light`). Every frame with mass has its depth-0 cell pinned
+   (fetched once, never evicted). That cell holds all of the frame's
+   matter, so its boundary is the frame's boundary with space, and the
+   light escaping it is the light the frame sends out:
+   `gx_core::emission::summarize(section, 1000 K)`, radiative transfer
+   through the section (opaque solids and fluids radiate from their exposed
+   faces, gas and plasma by their extinction) at each sample's radiating
+   temperature (`matter-format.md` 3.3). Finer cells give no lights: their
+   boundaries face other matter of the same frame. The eight strongest
+   frame emitters become point lights of radiant intensity
+   `band_power / (4 pi)` per band.
 6. **Draw set** (`stream::CellCache::draw_set`), with the depth transition
    rule below, and the **far field** (`farfield`): a frame with mass whose
    `root_extent / 8` region projects to under 2 px has no cells selected
    and is a point sprite instead; between 2 and 8 px the sprite fades out
-   as the cells fade in. Its depth-0 cell is pinned in the cache (fetched
-   once, never evicted) for the sprite's brightness, and when none of the
-   frame's drawn cells is hot (a sprite-only frame, or one in the
-   transition whose cells are beyond the selection range) its hot matter
-   still makes a light (`docs/shading.md`).
+   as the cells fade in. The sprite's brightness comes from the frame's
+   pinned depth-0 cell (`docs/shading.md`).
 7. **Placement** (`render::scene::add_matter`). A mesh is uploaded once
    with positions relative to its cell origin in `f32`. Per frame, the cell
    origin is made relative to the camera in `f64` with

@@ -1,16 +1,19 @@
-//! Lights from hot matter, and the emission lookup for hot surfaces.
+//! Lights from the light escaping matter, and the emission lookup for hot
+//! surfaces.
 //!
 //! Implements the renderer's step "derives emission from temperature" of
 //! `space-model.md` section 2 with the emission derived quantity of
-//! `matter-format.md` section 3.3 (blackbody radiance from temperature,
-//! scaled by `1 - albedo` per band). Nothing here knows what is hot: any
-//! sample at or above [`MIN_EMITTER_TEMPERATURE`] radiates.
+//! `matter-format.md` section 3.3 (blackbody radiance from the radiating
+//! temperature, scaled by `1 - albedo` per band, escaping through the
+//! matter around it). Nothing here knows what is hot.
 //!
 //! # From cells to lights
 //!
-//! 1. Every drawn `Ready` cell is reduced to one emitter by
-//!    [`gx_core::emission::summarize`] with `min_temperature` 1000 K
-//!    ([`cell_emitter`]).
+//! 1. The depth-0 cell of every frame (pinned, see [`crate::world`]) holds
+//!    all of the frame's matter, so the light escaping it is the light the
+//!    frame sends into space: [`gx_core::emission::summarize`], radiative
+//!    transfer through the section, with `min_temperature` 1000 K
+//!    ([`cell_emitter`]). Finer cells give none.
 //! 2. The emitters of one frame are merged ([`merge_frame_emitters`]): the
 //!    band powers add, and the position is the centroid weighted by total
 //!    power.
@@ -47,14 +50,15 @@ use gx_core::radiance::band_radiance;
 use gx_core::units::{Kelvin, Vec3};
 use std::collections::BTreeMap;
 
-/// Samples at or above this temperature, kelvin, become light sources.
+/// Samples at or above this radiating temperature, kelvin, become light
+/// sources (colder matter still absorbs).
 pub const MIN_EMITTER_TEMPERATURE: f64 = 1000.0;
 
 /// Most point lights in a scene.
 pub const MAX_LIGHTS: usize = 8;
 
-/// The emitter of one cell's composited section, or `None` when nothing in
-/// it is hot enough.
+/// The light escaping one cell's composited section, or `None` when nothing
+/// hot enough shows.
 pub fn cell_emitter(section: &Section) -> Option<Emitter> {
     summarize(section, Kelvin::new(MIN_EMITTER_TEMPERATURE))
 }
@@ -281,7 +285,9 @@ mod tests {
             temperature: Kelvin::new(t),
             albedo: [Ratio::new(0.1), Ratio::new(0.2), Ratio::new(0.3)],
             roughness: Ratio::new(1.0),
-            attenuation: Attenuation::new(0.0),
+            // Optically thick: 2e6 across one sample.
+            attenuation: Attenuation::new(1.0e9),
+            radiating_temperature: Kelvin::new(t),
         }
     }
 
@@ -305,9 +311,10 @@ mod tests {
     fn hot_samples_give_one_emitter_with_their_summed_power() {
         let s = section(3);
         let e = cell_emitter(&s).expect("hot samples emit");
-        // Sum over the qualifying samples as gx-core defines it: emitted
-        // band radiance times pi times six faces of edge e / n.
-        let face = 6.0 * 2.0 * 2.0;
+        // As gx-core defines it: emitted band radiance times 2 pi / 3 times
+        // (e / n)^2 per ray that escapes. The two hot samples touch along
+        // x, so each hides one face of the other: five rays each.
+        let face = 5.0 * 2.0 / 3.0 * 2.0 * 2.0;
         let mut want = [0.0; 3];
         for t in [6000.0, 4000.0] {
             // The section stores albedo as f32, as on the wire.

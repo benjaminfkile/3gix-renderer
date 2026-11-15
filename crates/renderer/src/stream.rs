@@ -111,8 +111,11 @@ pub struct SelectedCell {
 pub struct ReadyCell {
     /// The composite of every layer's section for the cell.
     pub section: Arc<Section>,
-    /// The cell's hot matter as one emitter, if any
-    /// ([`crate::light::cell_emitter`]).
+    /// The light escaping the cell's matter as one emitter, if any
+    /// ([`crate::light::cell_emitter`]). Computed for depth-0 cells only,
+    /// the ones that hold a frame's whole matter and so the only ones
+    /// whose boundary is the frame's boundary with space; `None` for every
+    /// other cell.
     pub emitter: Option<Emitter>,
     /// The cell's gas and plasma, if any, drawn as a volume
     /// ([`crate::volume`]).
@@ -137,7 +140,11 @@ impl ReadyCell {
     /// its emitter, its volume, and its mean albedo.
     pub fn new(section: Section) -> ReadyCell {
         ReadyCell {
-            emitter: cell_emitter(&section),
+            emitter: if section.key().depth == 0 {
+                cell_emitter(&section)
+            } else {
+                None
+            },
             volume: VolumeGrid::from_section(&section).map(Arc::new),
             mean_albedo: mean_albedo(&section),
             has_matter: section.samples().is_some_and(|s| {
@@ -1361,6 +1368,7 @@ mod tests {
                     albedo: [Ratio::new(0.0); 3],
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(0.0),
+                    radiating_temperature: Kelvin::new(1.0),
                 },
             ),
         )

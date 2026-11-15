@@ -128,7 +128,7 @@ impl VolumeGrid {
             }
             any = true;
             grid.density[i] = s.density.value() as f32;
-            grid.temperature[i] = s.temperature.value() as f32;
+            grid.temperature[i] = s.radiating_temperature.value() as f32;
             grid.albedo[i] = s.albedo.map(|a| a.value() as f32);
             grid.attenuation[i] = s.attenuation.value() as f32;
             let idx = [i % n, (i / n) % n, i / (n * n)];
@@ -349,6 +349,7 @@ mod tests {
             albedo: [Ratio::new(0.25); 3],
             roughness: Ratio::new(0.0),
             attenuation: Attenuation::new(attenuation),
+            radiating_temperature: Kelvin::new(6000.0),
         }
     }
 
