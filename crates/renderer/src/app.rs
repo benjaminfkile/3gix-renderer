@@ -723,6 +723,10 @@ impl App {
             overlay.push('\n');
             overlay.push_str(&line);
         }
+        if let Some(line) = self.controls.speed_entry_line(&self.observer) {
+            overlay.push('\n');
+            overlay.push_str(&line);
+        }
         let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)

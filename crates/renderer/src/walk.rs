@@ -83,17 +83,24 @@ pub const EYE_HEIGHT_FRACTION: f64 = 0.94;
 /// Speed a jump adds along up, meters per second.
 pub const JUMP_SPEED: f64 = 3.0;
 
-/// Walking speed the walking keys push toward, relative to the ground,
-/// meters per second.
+/// The walking speed a new observer starts with, relative to the ground,
+/// meters per second: a person's walking pace. The wheel and a typed speed
+/// change it ([`Observer::walk_speed`]).
 pub const WALK_SPEED: f64 = 1.4;
+
+/// Limits of the settable walking speed, meters per second: up to Mach 4,
+/// four times the speed of sound in air at sea level and 20 degrees C
+/// (343 m/s).
+pub const WALK_SPEED_LIMITS: (f64, f64) = (0.1, 4.0 * 343.0);
 
 /// Factor on the walking push and speed while running (Shift).
 pub const RUN_FACTOR: f64 = 2.0;
 
 /// Time the walking push takes to reach the walking speed from rest,
 /// seconds: the push is `mass * (target - v) / WALK_RESPONSE_SECONDS`
-/// along the walking direction, `v` the speed along it and `target`
-/// [`WALK_SPEED`], doubled when running.
+/// along the walking direction, `v` the speed along it and `target` the set
+/// walking speed, doubled when running (at most the top of
+/// [`WALK_SPEED_LIMITS`]).
 pub const WALK_RESPONSE_SECONDS: f64 = 0.25;
 
 /// Height of a spawn above the outermost matter, meters.
@@ -130,13 +137,16 @@ pub struct WalkInput {
     pub jump: bool,
     /// Right mouse drag since the last frame, pixels, `+x` right, `+y` down.
     pub look: (f64, f64),
+    /// The set walking speed, meters per second ([`Observer::walk_speed`]).
+    pub speed: f64,
 }
 
 impl WalkInput {
     /// The walking reading of the flight keys: W, A, S, D, Shift, and the
-    /// mouse, with `jump` from Space.
-    pub fn from_flight(f: &FlightInput, jump: bool) -> WalkInput {
+    /// mouse, with `jump` from Space and the set walking `speed`.
+    pub fn from_flight(f: &FlightInput, jump: bool, speed: f64) -> WalkInput {
         WalkInput {
+            speed,
             forward: f.forward,
             back: f.back,
             left: f.left,
@@ -400,11 +410,12 @@ impl Walker {
             return Vec3::zero();
         };
         let factor = if input.run { RUN_FACTOR } else { 1.0 };
+        let target = (input.speed * factor).min(WALK_SPEED_LIMITS.1);
         // Along the walking direction only: friction spares motion along
         // the push and stops the rest, so a push with a sideways part would
         // swing the velocity from side to side.
         let along = (self.state.velocity - c.ground_velocity).dot(dir);
-        let push = (WALK_SPEED * factor - along).max(0.0);
+        let push = (target - along).max(0.0);
         dir.scale(push * self.params.mass.value() / WALK_RESPONSE_SECONDS)
     }
 
@@ -567,6 +578,24 @@ pub fn spawn_menu_lines(frames: &[u64]) -> Vec<String> {
     vec![format!("spawn: {}  (G closes)", choices.join("  "))]
 }
 
+/// A speed for the overlay: meters per second with three significant
+/// figures, and the Mach number (343 m/s) from Mach 0.5 up.
+pub fn speed_label(speed: f64) -> String {
+    let mps = if speed >= 100.0 {
+        format!("{speed:.0} m/s")
+    } else if speed >= 10.0 {
+        format!("{speed:.1} m/s")
+    } else {
+        format!("{speed:.2} m/s")
+    };
+    let mach = speed / 343.0;
+    if mach >= 0.5 {
+        format!("{mps} (Mach {mach:.2})")
+    } else {
+        mps
+    }
+}
+
 /// The overlay lines of the mode ([`Observer::status_lines`]) and, while
 /// the spawn chooser is open, of the chooser ([`spawn_menu_lines`]).
 pub fn mode_lines(
@@ -599,7 +628,7 @@ pub fn spawn_by_index(
 }
 
 /// Fly or walk, and the velocity fly mode coasts at (module docs).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Observer {
     /// The body in walk mode; `None` in fly mode.
     pub walker: Option<Walker>,
@@ -608,12 +637,37 @@ pub struct Observer {
     pub drift: Vec3,
     /// The constants of the body in walk mode.
     pub params: ObserverParams,
+    /// The walking speed the walking keys push toward, meters per second,
+    /// within [`WALK_SPEED_LIMITS`]: the wheel in walk mode multiplies it
+    /// by [`crate::camera::WHEEL_FACTOR`] per notch, and a typed speed sets
+    /// it ([`Observer::set_walk_speed`]). Kept across fly and walk.
+    pub walk_speed: f64,
+}
+
+impl Default for Observer {
+    fn default() -> Observer {
+        Observer {
+            walker: None,
+            drift: Vec3::zero(),
+            params: ObserverParams::default(),
+            walk_speed: WALK_SPEED,
+        }
+    }
 }
 
 impl Observer {
     /// Fly mode at rest with the default body.
     pub fn new() -> Observer {
         Observer::default()
+    }
+
+    /// Sets the walking speed, meters per second, clamped to
+    /// [`WALK_SPEED_LIMITS`]; a value that is not a number is ignored.
+    pub fn set_walk_speed(&mut self, speed: f64) {
+        if !speed.is_nan() {
+            let (lo, hi) = WALK_SPEED_LIMITS;
+            self.walk_speed = speed.clamp(lo, hi);
+        }
     }
 
     /// `true` in walk mode.
@@ -695,12 +749,17 @@ impl Observer {
         camera: &mut Camera,
     ) {
         let start = sim.time();
+        if self.walker.is_some() && input.wheel != 0.0 {
+            let s = self.walk_speed * crate::camera::WHEEL_FACTOR.powf(input.wheel);
+            self.set_walk_speed(s);
+        }
+        let speed = self.walk_speed;
         match &mut self.walker {
             Some(w) => {
                 let mut clock = *sim.clock();
                 clock.tick(Seconds::new(wall_dt), hub_now);
                 let dt = (clock.time() - start).value();
-                let walk = WalkInput::from_flight(input, jump);
+                let walk = WalkInput::from_flight(input, jump, speed);
                 let stepped = w.step(sim.system(), cache, &walk, dt);
                 let anchor = w.anchor(sim.system(), stepped);
                 sim.update(Seconds::new(wall_dt), hub_now);
@@ -752,7 +811,7 @@ impl Observer {
                 "waiting for matter under the observer".to_string(),
             ],
             Some(w) => vec![format!(
-                "mode walk frame {}  {}  {:.2} m/s over matter",
+                "mode walk frame {}  {}  {:.2} m/s over matter  walk speed {}",
                 w.frame_id,
                 if w.state.contact.is_some() {
                     "contact"
@@ -760,6 +819,7 @@ impl Observer {
                     "no contact"
                 },
                 w.speed_over_matter(system),
+                speed_label(self.walk_speed),
             )],
         }
     }

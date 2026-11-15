@@ -85,7 +85,7 @@ pub struct Camera {
     /// Camera axes relative to the frame axes, a unit quaternion.
     pub orientation: Quat,
     /// The set flight speed, meters per second. Changed only by the
-    /// wheel: nothing in space changes it.
+    /// wheel and a typed speed (`V`): nothing in space changes it.
     pub speed: f64,
     /// The current flight speed, meters per second: glides toward the set
     /// speed (times [`BOOST_FACTOR`] while boosting) in

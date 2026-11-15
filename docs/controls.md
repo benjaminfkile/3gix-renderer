@@ -20,6 +20,7 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `Tab` | Switch between fly and walk (see Walk) |
 | `G` | Open or close the spawn chooser (see Spawning) |
 | `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
+| `V` | Type a speed in meters per second (see Typing a speed) |
 
 The camera behaves like an observer floating free in space: simulation time
 moves and turns the frames, but not the camera, which keeps its place and
@@ -59,7 +60,9 @@ body moves on along its orbit. A key past the last frame does nothing.
 |---|---|
 | `W` / `S` | Walk forward / backward along the ground, in the view's heading |
 | `A` / `D` | Walk left / right |
-| `Shift` (held) | Run: twice the walking speed, so twice the push from rest |
+| `Shift` (held) | Run: twice the walking speed, so twice the push from rest (at most Mach 4) |
+| Mouse wheel | Set the walking speed: each notch multiplies or divides it by 1.25, from 0.1 m/s up to Mach 4 (1,372 m/s) |
+| `V` | Type the walking speed (see Typing a speed) |
 | `Space` | Jump: 3 m/s along up, only while standing on solid matter |
 | Right mouse drag | Look around: yaw about up, pitch up and down, never past straight up or down |
 | `Tab` | Back to fly mode |
@@ -76,10 +79,17 @@ mouse look is relative to that up. Its heading turns with the matter it
 stands on.
 
 The walking keys push along the surface the observer stands on, toward
-1.4 m/s over the ground (2.8 m/s running), reaching it in about a quarter
-of a second; friction stops the observer when they are released. Off the
+the set walking speed over the ground (twice it running), reaching it in
+about a quarter of a second; friction stops the observer when they are
+released. The walking speed starts at 1.4 m/s, a person's pace, and the
+wheel or a typed speed sets it anywhere from 0.1 m/s to Mach 4 (4 times
+343 m/s, the speed of sound in air at sea level and 20 degrees C). It is
+kept across fly and walk. The laws still act: at high speed over uneven
+ground the observer leaves the surface on the next rise and comes down
+under gravity, and it outruns the cells being fetched under its feet, so
+it waits (`waiting for matter under the observer`) until they arrive. Off the
 ground (falling, jumping, or floating in gas) the walking keys do nothing.
-`E`, `Q`, and the wheel do nothing in walk mode. `Space` jumps instead of
+`E` and `Q` do nothing in walk mode. `Space` jumps instead of
 pausing; the other time keys work as in fly mode, and the observer stays
 where it is on its frame across any jump in time. At a fast playback rate
 the observer is stepped by at most 0.25 s of simulation time per frame and
@@ -101,8 +111,18 @@ arrived the observer is held in place on its frame, neither falling nor
 walking, and the overlay says `waiting for matter under the observer`.
 
 The overlay's last lines show the mode: `mode fly`, or `mode walk frame
-<id>` with `contact` (standing on solid matter) or `no contact`, and the
-speed over the matter.
+<id>` with `contact` (standing on solid matter) or `no contact`, the
+speed over the matter, and the set walking speed (with its Mach number
+from Mach 0.5 up).
+
+## Typing a speed
+
+`V` opens a speed entry on the overlay's last line: type a number of
+meters per second (digits, the number row or the numpad, and one decimal
+point), `Backspace` to correct, `Enter` to set it, `Escape` to cancel.
+In walk mode it sets the walking speed (clamped to 0.1 m/s to Mach 4), in
+fly mode the flight speed (clamped to 1e-3 to 1e15 m/s). While the entry
+is open every other key waits.
 
 ## Spawning
 

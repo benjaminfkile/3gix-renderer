@@ -333,6 +333,17 @@ fn spawns_settles_and_walks_on_a_solid_ball() {
         .unwrap()
         .speed_over_matter(run.sim.system());
     assert!((speed - WALK_SPEED).abs() < 0.05, "walking at {speed} m/s");
+
+    // A faster set speed: the push reaches it the same way. 5 m/s keeps the
+    // observer on this 50 m ball (orbit speed at its surface is 22 m/s).
+    run.observer.set_walk_speed(5.0);
+    for _ in 0..(1.0 / DT) as usize {
+        run.frame(&walk, DT);
+    }
+    let w = run.observer.walker.as_ref().unwrap();
+    assert!(w.state.contact.is_some());
+    let speed = w.speed_over_matter(run.sim.system());
+    assert!((speed - 5.0).abs() < 0.1, "walking at {speed} m/s");
 }
 
 /// Outer radius of the gas body, meters.

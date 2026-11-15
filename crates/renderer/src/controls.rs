@@ -10,7 +10,7 @@
 //! matched by physical position, so they sit in the same place on every
 //! keyboard layout.
 
-use crate::camera::{Camera, FlightInput};
+use crate::camera::{Camera, FlightInput, SPEED_LIMITS};
 use crate::render::gpu::{Exposure, EXPOSURE_STEP_STOPS};
 use crate::sim::{ClockAction, Simulation};
 use crate::walk::Observer;
@@ -48,7 +48,13 @@ pub struct Controls {
     spawn: Option<usize>,
     /// Space pressed in walk mode since the last frame.
     jump: bool,
+    /// The speed being typed after `V`, meters per second, as typed; `None`
+    /// when no speed is being typed.
+    pub speed_entry: Option<String>,
 }
+
+/// Longest typed speed, characters.
+pub const SPEED_ENTRY_MAX_CHARS: usize = 16;
 
 impl Controls {
     /// Controls with the automatic exposure, or a fixed exposure of
@@ -144,6 +150,10 @@ impl Controls {
         camera: &mut Camera,
         observer: &mut Observer,
     ) -> bool {
+        if self.speed_entry.is_some() && pressed {
+            self.type_speed(code, camera, observer);
+            return false;
+        }
         if code == KeyCode::Space && pressed && !repeat && observer.walking() {
             self.jump = true;
             return false;
@@ -175,6 +185,7 @@ impl Controls {
                 *camera = Camera::home(sim.system());
             }
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
+            KeyCode::KeyV => self.speed_entry = Some(String::new()),
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
@@ -195,6 +206,58 @@ impl Controls {
             }
         }
         false
+    }
+
+    /// One key while a speed is being typed: digits and one decimal point
+    /// add to it, `Backspace` removes the last character, `Enter` sets it
+    /// (the walking speed in walk mode, the flight speed in fly mode, each
+    /// clamped to its limits) and `Escape` drops it. Other keys do nothing
+    /// until the entry is closed.
+    fn type_speed(&mut self, code: KeyCode, camera: &mut Camera, observer: &mut Observer) {
+        let Some(text) = self.speed_entry.as_mut() else {
+            return;
+        };
+        let digit = digit_index(code)
+            .map(|i| char::from(b'0' + ((i + 1) % 10) as u8))
+            .or_else(|| numpad_digit(code));
+        match code {
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Ok(v) = text.parse::<f64>() {
+                    if observer.walking() {
+                        observer.set_walk_speed(v);
+                    } else if !v.is_nan() {
+                        let (lo, hi) = SPEED_LIMITS;
+                        camera.speed = v.clamp(lo, hi);
+                    }
+                }
+                self.speed_entry = None;
+            }
+            KeyCode::Escape => self.speed_entry = None,
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Period | KeyCode::NumpadDecimal if !text.contains('.') => {
+                if text.len() < SPEED_ENTRY_MAX_CHARS {
+                    text.push('.');
+                }
+            }
+            _ => {
+                if let Some(c) = digit {
+                    if text.len() < SPEED_ENTRY_MAX_CHARS {
+                        text.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The overlay line of the speed entry, or `None` when no speed is
+    /// being typed.
+    pub fn speed_entry_line(&self, observer: &Observer) -> Option<String> {
+        self.speed_entry.as_ref().map(|t| {
+            let what = if observer.walking() { "walk" } else { "flight" };
+            format!("type a {what} speed: {t}_ m/s  (Enter sets, Esc cancels)")
+        })
     }
 
     /// `+` and `-`: shift the fixed exposure if there is one, the bias of
@@ -230,9 +293,85 @@ pub fn digit_index(code: KeyCode) -> Option<usize> {
     DIGITS.iter().position(|&d| d == code)
 }
 
+/// Numpad digits as characters.
+fn numpad_digit(code: KeyCode) -> Option<char> {
+    const PAD: [KeyCode; 10] = [
+        KeyCode::Numpad0,
+        KeyCode::Numpad1,
+        KeyCode::Numpad2,
+        KeyCode::Numpad3,
+        KeyCode::Numpad4,
+        KeyCode::Numpad5,
+        KeyCode::Numpad6,
+        KeyCode::Numpad7,
+        KeyCode::Numpad8,
+        KeyCode::Numpad9,
+    ];
+    PAD.iter()
+        .position(|&d| d == code)
+        .map(|i| char::from(b'0' + i as u8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_speed_sets_the_walk_or_flight_speed() {
+        let mut c = Controls::new(None);
+        let mut camera = Camera {
+            frame_id: 0,
+            position: gx_core::units::Vec3::zero(),
+            orientation: gx_core::units::Quat::identity(),
+            speed: 1.0,
+            cruise: 1.0,
+        };
+        let mut observer = Observer::new();
+        let typing =
+            |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera, o: &mut Observer| {
+                c.speed_entry = Some(String::new());
+                for &k in keys {
+                    c.type_speed(k, cam, o);
+                }
+            };
+        // Fly mode: the flight speed.
+        typing(
+            &mut c,
+            &[
+                KeyCode::Digit2,
+                KeyCode::Digit5,
+                KeyCode::Period,
+                KeyCode::Numpad5,
+                KeyCode::Enter,
+            ],
+            &mut camera,
+            &mut observer,
+        );
+        assert_eq!(camera.speed, 25.5);
+        assert_eq!(c.speed_entry, None);
+        // Backspace, a second point ignored, Escape drops it.
+        typing(
+            &mut c,
+            &[
+                KeyCode::Digit9,
+                KeyCode::Backspace,
+                KeyCode::Digit7,
+                KeyCode::Period,
+                KeyCode::Period,
+            ],
+            &mut camera,
+            &mut observer,
+        );
+        assert_eq!(c.speed_entry.as_deref(), Some("7."));
+        c.type_speed(KeyCode::Escape, &mut camera, &mut observer);
+        assert_eq!(c.speed_entry, None);
+        assert_eq!(camera.speed, 25.5);
+        // The walking speed clamps to Mach 4.
+        observer.set_walk_speed(1.0e6);
+        assert_eq!(observer.walk_speed, crate::walk::WALK_SPEED_LIMITS.1);
+        observer.set_walk_speed(0.0);
+        assert_eq!(observer.walk_speed, crate::walk::WALK_SPEED_LIMITS.0);
+    }
 
     #[test]
     fn keys_move_the_fixed_exposure_when_there_is_one() {

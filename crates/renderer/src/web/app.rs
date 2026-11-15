@@ -293,6 +293,10 @@ impl WebApp {
             text.push('\n');
             text.push_str(&line);
         }
+        if let Some(line) = self.controls.speed_entry_line(&self.observer) {
+            text.push('\n');
+            text.push_str(&line);
+        }
         text
     }
 }
