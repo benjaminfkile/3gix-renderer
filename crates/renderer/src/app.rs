@@ -2,22 +2,25 @@
 //!
 //! Each rendered frame follows the same order in both modes:
 //!
-//! 1. advance the [`SimClock`] by the wall-clock delta and integrate every
-//!    frame toward the simulation time ([`crate::sim`], `space-model.md`
-//!    section 6),
+//! 1. advance the [`SimClock`] by the wall-clock delta, clamped to the
+//!    hub's now, and integrate every frame to the simulation time
+//!    ([`crate::sim`], `space-model.md` sections 6 and 7),
 //! 2. apply free flight to the [`Camera`] and re-parent it to its nearest
 //!    frame ([`crate::camera`], `space-model.md` section 5),
-//! 3. stream matter: select cells (every 100 ms), start requests, apply
+//! 3. solve the light time of every frame for the camera's position
+//!    ([`Seen`], `space-model.md` section 6.4); everything after this
+//!    reads the retarded states,
+//! 4. stream matter: select cells (every 100 ms), start requests, apply
 //!    what the fetcher brought in (streamed from the edge or the local
 //!    cache, or computed here by the worker), collect extracted meshes, and
 //!    evict ([`crate::world`], [`crate::stream`], [`crate::directions`]),
-//! 4. build the camera-relative scene with the drawn cells and their lights
+//! 5. build the camera-relative scene with the drawn cells and their lights
 //!    and draw it with the overlay ([`crate::render`]).
 //!
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
 use crate::camera::Camera;
-use crate::config::{Config, View};
+use crate::config::{Config, Start, View};
 use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
@@ -29,6 +32,7 @@ use crate::render::headless::{Headless, Image};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 pub use crate::render::scene::matter_scene;
 use crate::render::scene::Scene;
+use crate::seen::Seen;
 use crate::sim::{SimClock, Simulation};
 use crate::stream::{FetchEvent, Fetcher};
 use crate::world::World;
@@ -42,10 +46,6 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
-
-/// How many clamped integration rounds a headless run takes to reach the
-/// launch offset before it renders anyway, showing "sim lag".
-pub const HEADLESS_CATCH_UP_ROUNDS: usize = 64;
 
 /// Longest wall-clock delta one frame applies, seconds, so a stalled window
 /// does not turn into one giant step of flight or time.
@@ -100,14 +100,55 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
 /// (`client-compute.md` section 2.4): the simulation time converted from
 /// TDB to UTC milliseconds.
 pub fn set_fetch_time(fetcher: &mut Fetcher, sim: &Simulation) {
-    let t = gx_core::timescale::tdb_seconds_to_utc_ms(sim.system.time().value());
+    let t = gx_core::timescale::tdb_seconds_to_utc_ms(sim.time().value());
     fetcher.set_time_utc_ms(t);
 }
 
-/// A simulation at the configured launch offset and time scale, with the
-/// system still at its epoch.
-pub fn launch_simulation(system: FrameSystem, config: &Config) -> Simulation {
-    let clock = SimClock::new(Seconds::new(config.start_offset_seconds), config.time_scale);
+/// A UTC time in milliseconds as seconds of TDB since J2000.
+pub fn tdb_of_utc_ms(utc_ms: i64) -> Seconds {
+    Seconds::new(gx_core::timescale::utc_ms_to_tdb_seconds(utc_ms))
+}
+
+/// Seconds the registry epoch may differ from the hub's origin before
+/// [`check_origin`] warns.
+pub const ORIGIN_TOLERANCE_SECONDS: f64 = 2.0;
+
+/// Logs a warning when the registry epoch, which the renderer takes as the
+/// origin, is not the hub's origin converted to TDB (`matter-format.md`
+/// section 5.2 requires them to be equal). Returns whether they agree, or
+/// `true` while the hub has not reported an origin.
+pub fn check_origin(system: &FrameSystem, origin_utc_ms: Option<i64>) -> bool {
+    let Some(origin) = origin_utc_ms else {
+        return true;
+    };
+    let epoch = system.tree().epoch().value();
+    let hub = tdb_of_utc_ms(origin).value();
+    let agree = (epoch - hub).abs() <= ORIGIN_TOLERANCE_SECONDS;
+    if !agree {
+        tracing::warn!(
+            registry_epoch_tdb_s = epoch,
+            hub_origin_tdb_s = hub,
+            "the registry epoch is not the hub's origin; time runs from the registry epoch"
+        );
+    }
+    agree
+}
+
+/// The configured start (`--start`, `--start-offset-seconds`,
+/// `--time-scale`) of a simulation of `system` (at its epoch, the origin)
+/// whose now is `now`, seconds of TDB since J2000: at now by default.
+pub fn launch_simulation(system: FrameSystem, config: &Config, now: Seconds) -> Simulation {
+    let origin = system.tree().epoch();
+    let from = match config.start {
+        Start::Now => now,
+        Start::Origin => origin,
+    };
+    let clock = SimClock::starting_at(
+        origin,
+        now,
+        from + Seconds::new(config.start_offset_seconds),
+        config.time_scale,
+    );
     Simulation::new(system, clock)
 }
 
@@ -115,21 +156,26 @@ pub fn launch_simulation(system: FrameSystem, config: &Config) -> Simulation {
 /// stops or `None` for the automatic exposure.
 pub fn overlay_info(
     sim: &Simulation,
+    seen: &Seen,
     camera: &Camera,
     fps: Option<f64>,
     exposure_fixed: Option<f64>,
     matter: MatterStats,
 ) -> OverlayInfo {
+    let clock = sim.clock();
     OverlayInfo {
-        sim_time: sim.system.time(),
-        time_scale: sim.clock.scale,
-        paused: sim.clock.paused,
+        sim_time: sim.time(),
+        offset_from_now: clock.offset_from_now(),
+        at_now: clock.is_at_now(),
+        rate: clock.rate(),
+        rewinding: clock.rewinding(),
+        paused: clock.paused(),
+        crosshair: seen.nearest_to_crosshair().map(|(f, t)| (f, t.value())),
         camera_frame: camera.frame_id,
         camera_distance: camera.position.length(),
         camera_speed: camera.cruise,
-        frame_count: sim.system.tree().frames().len(),
+        frame_count: sim.system().tree().frames().len(),
         fps,
-        sim_lag: sim.lagging(),
         exposure_fixed,
         matter,
     }
@@ -252,13 +298,12 @@ impl HeadlessStats {
     pub fn to_json(&self) -> serde_json::Value {
         let o = &self.overlay;
         let m = &o.matter;
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "view": self.view.to_string(),
             "sim_time_seconds_since_j2000": o.sim_time.value(),
             "camera_frame": o.camera_frame,
             "camera_distance_m": o.camera_distance,
             "frames": o.frame_count,
-            "sim_lag": o.sim_lag,
             "cells_selected": m.cells_selected,
             "cells_pinned": self.cells_pinned,
             "cells_ready": m.cells_ready,
@@ -291,7 +336,18 @@ impl HeadlessStats {
                 "size_px": s.size_px,
                 "irradiance_w_m2": s.irradiance,
             })).collect::<Vec<_>>(),
-        })
+        });
+        let time = serde_json::json!({
+            "sim_time_utc_ms": gx_core::timescale::tdb_seconds_to_utc_ms(o.sim_time.value()),
+            "offset_from_now_seconds": o.offset_from_now.value(),
+            "at_now": o.at_now,
+            "crosshair_frame": o.crosshair.map(|(f, _)| f),
+            "crosshair_light_time_seconds": o.crosshair.map(|(_, t)| t),
+        });
+        if let (Some(all), serde_json::Value::Object(more)) = (out.as_object_mut(), time) {
+            all.extend(more);
+        }
+        out
     }
 }
 
@@ -326,27 +382,24 @@ pub fn render_headless_frame(
     Ok(render_headless_view(sim, fetcher, &HeadlessRun::home(width, height))?.image)
 }
 
-/// Renders one headless frame of `sim`: integrates toward the launch
-/// offset (at most [`HEADLESS_CATCH_UP_ROUNDS`] clamped rounds), places the
-/// camera for the run's view, streams the selected cells through
-/// `fetcher` until they are ready (or the wait ends), and reads the image
-/// back.
+/// Renders one headless frame of `sim` at its simulation time: places the
+/// camera for the run's view, solves the light time of every frame for it
+/// ([`Seen`]), streams the selected cells through `fetcher` until they are
+/// ready (or the wait ends), and reads the image back.
 pub fn render_headless_view(
     sim: &mut Simulation,
     mut fetcher: Option<&mut Fetcher>,
     run: &HeadlessRun,
 ) -> Result<HeadlessFrame> {
-    for _ in 0..HEADLESS_CATCH_UP_ROUNDS {
-        if !sim.integrate_toward_target().lagging {
-            break;
-        }
-    }
     let (width, height) = (run.width, run.height);
-    let mut camera = view_camera(&sim.system, run.view, run.view_distance_scale)?;
-    camera.update_parent(&sim.system);
+    let mut camera = view_camera(sim.system(), run.view, run.view_distance_scale)?;
+    camera.update_parent(sim.system());
+    sim.prepare_light(&camera);
+    let sim = &*sim;
+    let seen = sim.seen(&camera);
     let mut world = World::new(default_threads());
     let start = Instant::now();
-    world.select(&sim.system, &camera, (width, height), 0.0, true);
+    world.select(seen.system(), seen.camera(), (width, height), 0.0, true);
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
     let done = |world: &World| match run.wait_ready_seconds {
         Some(_) => world.ready(),
@@ -357,7 +410,7 @@ pub fn render_headless_view(
         loop {
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
-            stream_step(&mut world, f, &sim.system, events, now);
+            stream_step(&mut world, f, seen.system(), events, now);
             if done(&world) {
                 break;
             }
@@ -369,13 +422,7 @@ pub fn render_headless_view(
     }
     world.finish_extraction();
     let stream_seconds = start.elapsed().as_secs_f64();
-    let mut scene = matter_scene(
-        &mut world,
-        &sim.system,
-        &camera,
-        (width, height),
-        stream_seconds,
-    );
+    let mut scene = matter_scene(&mut world, &seen, (width, height), stream_seconds);
     if !run.overlay {
         // The markers and lines are visual aids like the text: only matter
         // remains.
@@ -386,6 +433,7 @@ pub fn render_headless_view(
     tracing::info!(adapter = headless.adapter_name(), "headless rendering");
     let info = overlay_info(
         sim,
+        &seen,
         &camera,
         None,
         run.exposure_stops,
@@ -415,7 +463,9 @@ pub fn render_headless_view(
 /// path. Cells come through `fetcher`. With `--wait-ready-seconds`, fails
 /// after writing both when the selection was not ready in time.
 pub fn run_headless(config: &Config, system: FrameSystem, mut fetcher: Fetcher) -> Result<()> {
-    let mut sim = launch_simulation(system, config);
+    check_origin(&system, fetcher.origin_utc_ms());
+    let now = tdb_of_utc_ms(fetcher.now_utc_ms());
+    let mut sim = launch_simulation(system, config, now);
     let run = HeadlessRun::from_config(config);
     let frame = render_headless_view(&mut sim, Some(&mut fetcher), &run)?;
     match &config.screenshot {
@@ -452,8 +502,10 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     // still runs continuously, but paced by the surface's present mode (one
     // frame per display refresh) and the optional cap instead of spinning.
     event_loop.set_control_flow(ControlFlow::Wait);
-    let sim = launch_simulation(system, config);
-    let camera = Camera::home(&sim.system);
+    check_origin(&system, fetcher.origin_utc_ms());
+    let now = tdb_of_utc_ms(fetcher.now_utc_ms());
+    let sim = launch_simulation(system, config, now);
+    let camera = Camera::home(sim.system());
     let mut app = App {
         sim,
         camera,
@@ -602,25 +654,28 @@ impl App {
         self.next_frame = self.frame_interval.map(|i| now + i);
         let fps = self.fps.frame(now);
 
-        let held = self.camera.hold(&self.sim.system);
-        self.sim.update(Seconds::new(dt));
-        self.camera.keep(&self.sim.system, held);
+        let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
+        let held = self.camera.hold(self.sim.system());
+        self.sim.update(Seconds::new(dt), hub_now);
+        self.camera.keep(self.sim.system(), held);
         let input = self.controls.take_flight();
         self.camera.fly(&input, dt);
-        self.camera.update_parent(&self.sim.system);
+        self.camera.update_parent(self.sim.system());
 
         let Some(gfx) = self.gfx.as_mut() else {
             return;
         };
         let size = gfx.renderer.size();
         let t = self.started.elapsed().as_secs_f64();
-        let system = &self.sim.system;
-        self.world.select(system, &self.camera, size, t, false);
+        self.sim.prepare_light(&self.camera);
+        let seen = self.sim.seen(&self.camera);
+        self.world
+            .select(seen.system(), seen.camera(), size, t, false);
         set_fetch_time(&mut self.fetcher, &self.sim);
         let events = self.fetcher.drain();
-        stream_step(&mut self.world, &mut self.fetcher, system, events, t);
+        stream_step(&mut self.world, &mut self.fetcher, seen.system(), events, t);
         self.world.evict(t);
-        let mut scene = matter_scene(&mut self.world, system, &self.camera, size, t);
+        let mut scene = matter_scene(&mut self.world, &seen, size, t);
         if self.controls.hide_guides {
             scene.markers.clear();
             scene.lines.clear();
@@ -629,6 +684,7 @@ impl App {
         let overlay = OverlayInfo {
             ..overlay_info(
                 &self.sim,
+                &seen,
                 &self.camera,
                 fps,
                 self.controls.exposure_fixed,

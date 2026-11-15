@@ -11,8 +11,9 @@
 //!   `retryMs`) and then computed; two clients at once compute each
 //!   section once between them; directions go out in batches of at most
 //!   512 keys;
-//! - a headless render against the mock hub produces a non-empty image,
-//!   saved as `target/tmp/mock-hub-home.png`.
+//! - a headless render against the mock hub, entered at now and at the
+//!   origin, produces a non-empty image each time, saved as
+//!   `target/tmp/mock-hub-home-now.png` and `target/tmp/mock-hub-home-origin.png`.
 //!
 //! The space has two layers: `frames`, a registry-only module declaring the
 //! two frames of the shared scene (`common`), and `matter`, the example
@@ -22,7 +23,9 @@ mod common;
 
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
-use renderer::app::{render_headless_view, stream_step, HeadlessRun};
+use gx_core::timescale::utc_ms_to_tdb_seconds;
+use gx_core::units::Seconds;
+use renderer::app::{check_origin, render_headless_view, stream_step, HeadlessRun};
 use renderer::camera::Camera;
 use renderer::config::{ApiKey, View};
 use renderer::extract::default_threads;
@@ -51,6 +54,10 @@ const HEIGHT: u32 = 180;
 const MATTER_DEPTH: u8 = 1;
 
 fn space(foreign_claim_ms: Option<u64>) -> MockHubOptions {
+    space_with_registry(foreign_claim_ms, common::registry_bytes())
+}
+
+fn space_with_registry(foreign_claim_ms: Option<u64>, registry: Vec<u8>) -> MockHubOptions {
     let (matter, tiles) = example_matter_layer(
         "matter",
         EXAMPLE_MODULE,
@@ -62,10 +69,7 @@ fn space(foreign_claim_ms: Option<u64>) -> MockHubOptions {
         20.0,
         6000.0,
     );
-    let mut options = MockHubOptions::new(
-        vec![registry_layer("frames", &common::registry_bytes()), matter],
-        tiles,
-    );
+    let mut options = MockHubOptions::new(vec![registry_layer("frames", &registry), matter], tiles);
     options.foreign_claim_ms = foreign_claim_ms;
     options
 }
@@ -321,38 +325,67 @@ fn directions_are_batched_and_empty_cells_need_nothing() {
 }
 
 #[test]
-fn headless_render_against_the_mock_hub_is_not_empty() {
+fn headless_render_at_now_and_at_the_origin() {
+    // A space whose origin is two days ago, with the registry at the
+    // origin, as the system module emits it (`matter-format.md` 5.2).
+    let origin_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 2 * 86_400_000;
+    let epoch = Seconds::new(utc_ms_to_tdb_seconds(origin_ms));
+    let registry = gx_core::registry::encode(&common::registry_at(epoch));
+    let mut options = space_with_registry(None, registry);
+    options.origin_utc_ms = Some(origin_ms);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let hub = rt.block_on(MockHub::start(space(None))).unwrap();
+    let hub = rt.block_on(MockHub::start(options)).unwrap();
     let dir = cache_dir("render");
     let mut c = connect(&rt, &hub, Some(&dir));
-    let mut sim = Simulation::new(
-        c.system.clone(),
-        SimClock::new(gx_core::units::Seconds::new(0.0), 1.0),
-    );
+    assert_eq!(c.system.tree().epoch(), epoch);
+    assert_eq!(c.fetcher.origin_utc_ms(), Some(origin_ms));
+    assert!(check_origin(&c.system, c.fetcher.origin_utc_ms()));
+    assert!(!check_origin(&c.system, Some(origin_ms + 60_000)));
     let run = HeadlessRun {
         overlay: false,
         wait_ready_seconds: Some(90.0),
         view: View::Home,
         ..HeadlessRun::home(WIDTH, HEIGHT)
     };
-    let frame = render_headless_view(&mut sim, Some(&mut c.fetcher), &run)
-        .expect("a wgpu adapter, software is fine");
-    assert!(frame.stats.ready, "every selected cell arrived");
-    let m = &frame.stats.overlay.matter;
-    assert!(m.sections_computed > 0 && m.modules_loaded == 2, "{m:?}");
-    assert!(m.volumes_drawn > 0, "{m:?}");
-    let lit = frame
-        .image
-        .rgba
-        .chunks(4)
-        .filter(|p| p[0] > 8 || p[1] > 8 || p[2] > 8)
-        .count();
-    assert!(lit > 100, "{lit} lit pixels");
-    let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("mock-hub-home.png");
-    frame.image.write_png(&out).unwrap();
-    let json = frame.stats.to_json();
-    assert_eq!(json["sections_computed"], m.sections_computed);
-    assert_eq!(json["modules_loaded"], 2);
+    for (name, at_origin) in [("now", false), ("origin", true)] {
+        let now = Seconds::new(utc_ms_to_tdb_seconds(c.fetcher.now_utc_ms()));
+        let clock = if at_origin {
+            SimClock::starting_at(epoch, now, epoch, 1.0)
+        } else {
+            SimClock::at_now(epoch, now)
+        };
+        let mut sim = Simulation::new(c.system.clone(), clock);
+        if at_origin {
+            assert_eq!(sim.time(), epoch);
+        } else {
+            assert!(sim.clock().is_at_now());
+            assert!(sim.time() >= epoch + Seconds::new(2.0 * 86_400.0 - 60.0));
+        }
+        let frame = render_headless_view(&mut sim, Some(&mut c.fetcher), &run)
+            .expect("a wgpu adapter, software is fine");
+        assert!(frame.stats.ready, "{name}: every selected cell arrived");
+        let m = &frame.stats.overlay.matter;
+        assert!(m.modules_loaded == 2, "{name}: {m:?}");
+        assert!(m.volumes_drawn > 0, "{name}: {m:?}");
+        let lit = frame
+            .image
+            .rgba
+            .chunks(4)
+            .filter(|p| p[0] > 8 || p[1] > 8 || p[2] > 8)
+            .count();
+        assert!(lit > 100, "{name}: {lit} lit pixels");
+        let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("mock-hub-home-{name}.png"));
+        frame.image.write_png(&out).unwrap();
+        let json = frame.stats.to_json();
+        assert_eq!(json["modules_loaded"], 2);
+        assert_eq!(json["at_now"], !at_origin);
+        assert!(m.directions_requests > 0);
+    }
+    assert!(c.fetcher.stats().worker.sections_computed > 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

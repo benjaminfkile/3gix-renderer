@@ -52,10 +52,15 @@ fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: [f64; 3]) -> Fr
     }
 }
 
-/// The registry: the root (mass 0) and the child.
+/// The registry: the root (mass 0) and the child, at J2000.
 pub fn registry() -> Registry {
+    registry_at(Seconds::new(0.0))
+}
+
+/// The registry with its epoch at `epoch`, seconds of TDB since J2000.
+pub fn registry_at(epoch: Seconds) -> Registry {
     Registry::new(
-        Seconds::new(0.0),
+        epoch,
         vec![
             frame(ROOT, ROOT_PARENT, ROOT_EXTENT, 0.0, [0.0; 3]),
             frame(CHILD, ROOT, CHILD_EXTENT, 1.0e3, CHILD_OFFSET),

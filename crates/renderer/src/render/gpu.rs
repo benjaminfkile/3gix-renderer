@@ -222,6 +222,8 @@ struct SurfaceGlobals {
 struct ModelGpu {
     columns: [[f32; 4]; 3],
     offset: [f32; 4],
+    /// Camera-relative light positions for this draw's frame.
+    lights: [[f32; 4]; MAX_LIGHTS],
 }
 
 /// One vertex of a surface mesh as the GPU reads it.
@@ -658,7 +660,11 @@ impl Renderer {
         });
         let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, true)],
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                true,
+            )],
         });
         let emission_tex = emission_texture(device, 1);
         let surface_bind =
@@ -1456,6 +1462,7 @@ impl Renderer {
                     [r[2][0], r[2][1], r[2][2], 0.0],
                 ],
                 offset: [draw.offset[0], draw.offset[1], draw.offset[2], draw.weight],
+                lights: draw.lights.map(|p| [p[0], p[1], p[2], 0.0]),
             };
             let at = i * MODEL_STRIDE as usize;
             model_bytes[at..at + std::mem::size_of::<ModelGpu>()]

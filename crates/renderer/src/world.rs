@@ -14,7 +14,8 @@
 use crate::camera::Camera;
 use crate::extract::{ExtractPool, FaceNeighbor, FaceNeighbors, SurfaceMesh};
 use crate::farfield::{depth_zero_key, far_frames, frame_sprite, Sprite};
-use crate::light::{merge_frame_emitters, strongest_lights, PointLight};
+use crate::light::{lights_for, merge_frame_emitters, strongest_lights, PointLight};
+use crate::seen::Seen;
 use crate::stream::{
     select_all, CacheCounts, CellCache, CellState, FetchOutcome, NeighborMatter,
     SELECT_INTERVAL_SECONDS,
@@ -32,8 +33,12 @@ pub struct DrawList {
     pub meshes: Vec<Arc<SurfaceMesh>>,
     /// Volumes of the draw set, in key order.
     pub volumes: Vec<Arc<VolumeGrid>>,
-    /// The strongest lights, strongest first.
+    /// The strongest lights, strongest first, where the observer sees
+    /// their emitters.
     pub lights: Vec<PointLight>,
+    /// The same lights as the matter of each frame with meshes or a sprite
+    /// receives them ([`lights_for`]), by frame id.
+    pub frame_lights: BTreeMap<u64, Vec<PointLight>>,
     /// Point sprites of far frames, in ascending frame id order.
     pub sprites: Vec<Sprite>,
     /// Weight of the cells of frames in the far field transition, by
@@ -45,6 +50,15 @@ impl DrawList {
     /// The weight the cells of `frame_id` are drawn with.
     pub fn cell_weight(&self, frame_id: u64) -> f32 {
         self.cell_weights.get(&frame_id).copied().unwrap_or(1.0)
+    }
+
+    /// The lights as the matter of `frame_id` receives them: its entry in
+    /// [`DrawList::frame_lights`], or [`DrawList::lights`] for a frame
+    /// without one.
+    pub fn lights_of(&self, frame_id: u64) -> &[PointLight] {
+        self.frame_lights
+            .get(&frame_id)
+            .map_or(&self.lights, Vec::as_slice)
     }
 }
 
@@ -255,13 +269,13 @@ impl World {
     /// only, and frames in the transition whose cells are beyond the
     /// selection range), of their depth-0 cells, so a far hot frame still
     /// lights the rest. Cold far frames reflect those lights.
-    pub fn draw_list(
-        &mut self,
-        system: &FrameSystem,
-        camera: &Camera,
-        view_px: (u32, u32),
-        now: f64,
-    ) -> DrawList {
+    ///
+    /// Everything is placed as `seen` sees it ([`crate::seen`]): every
+    /// frame at its retarded state, and each frame with meshes or a sprite
+    /// lit from where each emitter was one light-travel time before that
+    /// frame is seen.
+    pub fn draw_list(&mut self, seen: &Seen, view_px: (u32, u32), now: f64) -> DrawList {
+        let (system, camera) = (seen.system(), seen.camera());
         let view_height = f64::from(view_px.1.max(1));
         let far = far_frames(system, camera, view_height);
         let cell_weights: BTreeMap<u64, f32> = far
@@ -302,12 +316,27 @@ impl World {
         }
         let merged = merge_frame_emitters(emitters.iter().map(|(f, e)| (*f, *e)));
         let lights = strongest_lights(&merged, system, camera);
+        let mut frame_lights = BTreeMap::new();
+        let mut lit = |frame: u64| -> Vec<PointLight> {
+            frame_lights
+                .entry(frame)
+                .or_insert_with(|| lights_for(&lights, frame, |l, e| seen.emitter_shift(l, e)))
+                .clone()
+        };
+        for m in &meshes {
+            lit(m.key.frame_id);
+        }
         let sprites = far
             .iter()
             .filter_map(|f| match self.cache.state(&depth_zero_key(f.frame_id)) {
-                Some(CellState::Ready(cell)) => {
-                    frame_sprite(system, camera, f, &cell.far_field(), &lights, view_height)
-                }
+                Some(CellState::Ready(cell)) => frame_sprite(
+                    system,
+                    camera,
+                    f,
+                    &cell.far_field(),
+                    &lit(f.frame_id),
+                    view_height,
+                ),
                 _ => None,
             })
             .collect();
@@ -315,6 +344,7 @@ impl World {
             meshes,
             volumes,
             lights,
+            frame_lights,
             sprites,
             cell_weights,
         }

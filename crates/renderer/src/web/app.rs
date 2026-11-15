@@ -1,7 +1,9 @@
 //! The browser frame loop on a canvas.
 //!
 //! The same steps as the desktop window loop of [`crate::app`]: advance the
-//! simulation clock and integrate, fly and re-parent the camera, stream
+//! simulation clock (clamped to the hub's now) and integrate, fly and
+//! re-parent the camera, solve the light time of every frame
+//! ([`crate::seen`]), stream
 //! matter through [`WebFetcher`], build the camera-relative scene, and draw
 //! it with [`Renderer`]. Differences are only in the platform: `winit`
 //! drives a canvas element instead of a window, wgpu runs on the browser's
@@ -17,6 +19,7 @@ use crate::extract::default_threads;
 use crate::render::gpu::{describe_adapter, present_mode, wanted_features, Renderer};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 use crate::render::scene::{matter_scene, Scene};
+use crate::seen::Seen;
 use crate::sim::Simulation;
 use crate::stream::FetchEvent;
 use crate::world::World;
@@ -114,7 +117,7 @@ impl Gfx {
 /// event that has arrived.
 fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, now: f64) {
     fetcher.set_time_utc_ms(gx_core::timescale::tdb_seconds_to_utc_ms(
-        sim.system.time().value(),
+        sim.time().value(),
     ));
     for event in fetcher.drain() {
         match event {
@@ -123,7 +126,7 @@ fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, no
         }
     }
     for key in world.take_requests(now) {
-        if let Some(frame) = sim.system.tree().get(key.frame_id) {
+        if let Some(frame) = sim.system().tree().get(key.frame_id) {
             fetcher.request(key, frame.root_extent);
         }
     }
@@ -150,7 +153,7 @@ impl WebApp {
     /// An application drawing `sim` on `canvas`, fetching through
     /// `fetcher`.
     pub fn new(sim: Simulation, fetcher: WebFetcher, canvas: web_sys::HtmlCanvasElement) -> WebApp {
-        let camera = Camera::home(&sim.system);
+        let camera = Camera::home(sim.system());
         WebApp {
             sim,
             camera,
@@ -188,12 +191,13 @@ impl WebApp {
         self.last_frame = Some(now);
         let fps = self.fps(now);
 
-        let held = self.camera.hold(&self.sim.system);
-        self.sim.update(Seconds::new(dt));
-        self.camera.keep(&self.sim.system, held);
+        let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
+        let held = self.camera.hold(self.sim.system());
+        self.sim.update(Seconds::new(dt), Seconds::new(hub_now));
+        self.camera.keep(self.sim.system(), held);
         let input = self.controls.take_flight();
         self.camera.fly(&input, dt);
-        self.camera.update_parent(&self.sim.system);
+        self.camera.update_parent(self.sim.system());
 
         let mut slot = self.gfx.borrow_mut();
         let Some(gfx) = slot.as_mut() else {
@@ -201,16 +205,18 @@ impl WebApp {
         };
         let size = gfx.renderer.size();
         let t = now - self.started;
+        self.sim.prepare_light(&self.camera);
+        let seen = self.sim.seen(&self.camera);
         self.world
-            .select(&self.sim.system, &self.camera, size, t, false);
+            .select(seen.system(), seen.camera(), size, t, false);
         stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);
         self.world.evict(t);
-        let mut scene = matter_scene(&mut self.world, &self.sim.system, &self.camera, size, t);
+        let mut scene = matter_scene(&mut self.world, &seen, size, t);
         if self.controls.hide_guides {
             scene.markers.clear();
             scene.lines.clear();
         }
-        let overlay = self.overlay(&scene, fps);
+        let overlay = self.overlay(&seen, &scene, fps);
         let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -229,18 +235,22 @@ impl WebApp {
         gfx.queue.present(texture);
     }
 
-    fn overlay(&self, scene: &Scene, fps: Option<f64>) -> String {
+    fn overlay(&self, seen: &Seen, scene: &Scene, fps: Option<f64>) -> String {
         let counts = self.world.counts();
+        let clock = self.sim.clock();
         OverlayInfo {
-            sim_time: self.sim.system.time(),
-            time_scale: self.sim.clock.scale,
-            paused: self.sim.clock.paused,
+            sim_time: self.sim.time(),
+            offset_from_now: clock.offset_from_now(),
+            at_now: clock.is_at_now(),
+            rate: clock.rate(),
+            rewinding: clock.rewinding(),
+            paused: clock.paused(),
+            crosshair: seen.nearest_to_crosshair().map(|(f, t)| (f, t.value())),
             camera_frame: self.camera.frame_id,
             camera_distance: self.camera.position.length(),
             camera_speed: self.camera.cruise,
-            frame_count: self.sim.system.tree().frames().len(),
+            frame_count: self.sim.system().tree().frames().len(),
             fps,
-            sim_lag: self.sim.lagging(),
             exposure_fixed: self.controls.exposure_fixed,
             matter: MatterStats {
                 cells_selected: counts.cache.selected,

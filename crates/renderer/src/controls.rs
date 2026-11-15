@@ -2,7 +2,7 @@
 //! browser canvas.
 //!
 //! Turns `winit` window events into flight input for the [`Camera`],
-//! actions on the [`SimClock`](crate::sim::SimClock), view jumps, and the
+//! actions on the simulation clock ([`crate::sim::ClockAction`]), view jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -129,20 +129,21 @@ impl Controls {
             KeyCode::KeyQ => f.down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => f.boost = pressed,
             _ if !pressed || repeat => {}
-            KeyCode::Space => sim.clock.apply(ClockAction::TogglePause),
-            KeyCode::BracketLeft => sim.clock.apply(ClockAction::HalveScale),
-            KeyCode::BracketRight => sim.clock.apply(ClockAction::DoubleScale),
-            KeyCode::Comma => sim.clock.apply(ClockAction::StepBack),
-            KeyCode::Period => sim.clock.apply(ClockAction::StepForward),
-            KeyCode::KeyR => sim.clock.apply(ClockAction::Reset),
-            KeyCode::Home => *camera = Camera::home(&sim.system),
+            KeyCode::Space => clock(sim, camera, ClockAction::TogglePause),
+            KeyCode::BracketLeft => clock(sim, camera, ClockAction::HalveRate),
+            KeyCode::BracketRight => clock(sim, camera, ClockAction::DoubleRate),
+            KeyCode::Comma => clock(sim, camera, ClockAction::StepBack),
+            KeyCode::Period => clock(sim, camera, ClockAction::StepForward),
+            KeyCode::Backspace => clock(sim, camera, ClockAction::ToggleRewind),
+            KeyCode::KeyN => clock(sim, camera, ClockAction::JumpToNow),
+            KeyCode::Home => *camera = Camera::home(sim.system()),
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
             other => {
                 if let Some(index) = digit_index(other) {
-                    if let Some(cam) = Camera::view_of_index(&sim.system, index) {
+                    if let Some(cam) = Camera::view_of_index(sim.system(), index) {
                         *camera = Camera {
                             speed: camera.speed,
                             cruise: camera.cruise,
@@ -169,6 +170,15 @@ impl Controls {
             }
         }
     }
+}
+
+/// Applies a clock action and integrates to the new time, keeping the
+/// camera where it was in space, as the frame loop does for every
+/// simulation step ([`Camera::hold`], [`Camera::keep`]).
+fn clock(sim: &mut Simulation, camera: &mut Camera, action: ClockAction) {
+    let held = camera.hold(sim.system());
+    sim.apply(action);
+    camera.keep(sim.system(), held);
 }
 
 /// Number keys: `1` to `9` select indices 0 to 8, `0` selects index 9.

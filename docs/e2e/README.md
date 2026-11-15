@@ -48,9 +48,9 @@ file beside each image).
 
 | File | Flags | What it is |
 |---|---|---|
-| `home.png` | `--view home --exposure-stops 25.95` | the `Home` view of the whole system at launch time, at a fixed exposure (below) |
-| `frame-3.png` | `--view 3` | the view number key 3 jumps to (the third non-root frame by ascending id) at launch time |
-| `frame-3-plus-90d.png` | `--view 3 --start-offset-seconds 7776000` | the same view 90 days (7776000 s) after the epoch |
+| `home.png` | `--view home --exposure-stops 25.95` | the `Home` view of the whole system at now, at a fixed exposure (below) |
+| `frame-3.png` | `--view 3` | the view number key 3 jumps to (the third non-root frame by ascending id) at now |
+| `frame-3-origin.png` | `--view 3 --start origin` | the same view at the space's origin (the script now shoots this instead of `frame-3-plus-90d.png`: time cannot go past now, so a view 90 days after the origin no longer exists; the images below are from the run before that change) |
 | `frame-1-close.png` | `--view 1 --view-distance-scale 0.25` | number key 1's view at a quarter of its distance |
 
 Only `home.png` uses a fixed exposure; the other three adapt automatically.

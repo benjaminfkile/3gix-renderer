@@ -25,7 +25,7 @@ pub mod worker;
 
 use crate::config::ApiKey;
 use crate::protocol::Routes;
-use crate::sim::{SimClock, Simulation};
+use crate::sim::Simulation;
 use fetch::WebFetcher;
 use hub::WebHub;
 use std::rc::Rc;
@@ -47,8 +47,8 @@ fn js_error(e: impl std::fmt::Display) -> JsValue {
 /// Connects to the hub, loads the frame registry of the build, and starts
 /// drawing on the canvas with id `canvas_id`.
 ///
-/// `build_id` may be empty for the active build of the space. `time_scale`
-/// is simulation seconds per wall-clock second. The returned promise
+/// `build_id` may be empty for the active build of the space. The client
+/// enters at the hub's now (`space-model.md` section 7). The returned promise
 /// resolves once the frame loop runs, and rejects with a message if the
 /// settings are incomplete, the hub refuses, or the registry is invalid or
 /// never becomes ready.
@@ -59,13 +59,9 @@ pub async fn start(
     api_key: String,
     space_id: String,
     build_id: String,
-    time_scale: f64,
 ) -> Result<(), JsValue> {
     if hub_url.trim().is_empty() || api_key.is_empty() || space_id.trim().is_empty() {
         return Err(js_error("hub URL, API key, and space id are required"));
-    }
-    if !time_scale.is_finite() {
-        return Err(js_error("the time scale must be a number"));
     }
     let canvas = web_sys::window()
         .and_then(|w| w.document())
@@ -90,10 +86,8 @@ pub async fn start(
         .load_registry()
         .await
         .map_err(|e| js_error(format!("{e:#}")))?;
-    let sim = Simulation::new(
-        system,
-        SimClock::new(gx_core::units::Seconds::new(0.0), time_scale),
-    );
+    let now = gx_core::timescale::utc_ms_to_tdb_seconds(fetcher.now_utc_ms());
+    let sim = Simulation::at_now(system, gx_core::units::Seconds::new(now));
     let event_loop = EventLoop::new().map_err(js_error)?;
     // Wait, not Poll: on the web Poll is a busy loop that starves the page.
     // Each frame requests the next redraw, which the browser delivers once

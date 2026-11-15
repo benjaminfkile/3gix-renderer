@@ -25,9 +25,12 @@
 //! The API key is held in an [`ApiKey`] whose `Debug` output is redacted, so
 //! logging a [`Config`] never prints it.
 //!
-//! The simulation time offset is in seconds and the time scale is a plain
-//! ratio of simulation seconds per wall-clock second (`space-model.md`
-//! section 6).
+//! Every client enters at now (`space-model.md` section 7). `--start origin`
+//! enters at the origin instead, and `--start-offset-seconds` moves the
+//! start from either, in seconds; the result is clamped between the origin
+//! and now. The time scale is the playback rate of a start in the past, a
+//! plain ratio of simulation seconds per wall-clock second (negative plays
+//! backwards); at now the rate is always 1.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -83,8 +86,11 @@ ENVIRONMENT (also read from .env):
                     defaults to the high performance adapter, so the discrete GPU)
 
 FLAGS:
-    --time-scale <f64>             simulation seconds per wall second (default 1)
-    --start-offset-seconds <f64>   simulation time offset from the epoch at launch (default 0)
+    --start <now|origin>           enter at now (default) or at the origin
+    --start-offset-seconds <f64>   simulation time offset from the start at launch, seconds,
+                                   clamped between the origin and now (default 0)
+    --time-scale <f64>             playback rate of a start in the past, simulation seconds
+                                   per wall second, negative backwards (default 1)
     --headless                     no window; render to an offscreen texture
     --screenshot <path.png>        render one frame headless and write it as PNG
     --width <u32>                  render width in pixels (default 1280)
@@ -141,6 +147,36 @@ impl fmt::Debug for ApiKey {
 impl fmt::Display for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted>")
+    }
+}
+
+/// Where the simulation time starts.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Start {
+    /// At now, following now.
+    #[default]
+    Now,
+    /// At the origin.
+    Origin,
+}
+
+impl Start {
+    /// Parses `now` or `origin`.
+    pub fn parse(v: &str) -> Option<Start> {
+        match v.trim() {
+            "now" => Some(Start::Now),
+            "origin" => Some(Start::Origin),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Start {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Start::Now => "now",
+            Start::Origin => "origin",
+        })
     }
 }
 
@@ -206,9 +242,12 @@ pub struct Config {
     pub cache_max_bytes: u64,
     /// Threads that run modules; `None` for the default.
     pub workers: Option<usize>,
-    /// Simulation seconds per wall-clock second.
+    /// Playback rate of a start in the past, simulation seconds per
+    /// wall-clock second; negative plays backwards.
     pub time_scale: f64,
-    /// Simulation time offset from the registry epoch at launch, seconds.
+    /// Where the simulation time starts.
+    pub start: Start,
+    /// Simulation time offset from [`Config::start`] at launch, seconds.
     pub start_offset_seconds: f64,
     /// Render offscreen with no window.
     pub headless: bool,
@@ -242,6 +281,8 @@ pub struct Config {
 pub struct Flags {
     /// `--time-scale`.
     pub time_scale: Option<f64>,
+    /// `--start`.
+    pub start: Option<Start>,
     /// `--start-offset-seconds`.
     pub start_offset_seconds: Option<f64>,
     /// `--headless`.
@@ -328,6 +369,13 @@ where
         };
         match name.as_str() {
             "--time-scale" => flags.time_scale = Some(parse_f64(&name, &value(&name)?)?),
+            "--start" => {
+                let v = value(&name)?;
+                flags.start = Some(
+                    Start::parse(&v)
+                        .ok_or_else(|| err(format!("{name}: {v:?} is not now or origin")))?,
+                )
+            }
             "--start-offset-seconds" => {
                 flags.start_offset_seconds = Some(parse_f64(&name, &value(&name)?)?)
             }
@@ -486,6 +534,7 @@ impl Config {
             space_id: space_id.trim().to_string(),
             build_id: build_id.map(|b| b.trim().to_string()),
             time_scale: flags.time_scale.unwrap_or(1.0),
+            start: flags.start.unwrap_or_default(),
             start_offset_seconds: flags.start_offset_seconds.unwrap_or(0.0),
             headless: flags.headless || flags.screenshot.is_some(),
             screenshot: flags.screenshot.clone(),
@@ -587,6 +636,7 @@ mod tests {
         assert_eq!(c.build_id, None);
         assert_eq!(c.time_scale, 1.0);
         assert_eq!(c.start_offset_seconds, 0.0);
+        assert_eq!(c.start, Start::Now);
         assert!(!c.headless);
         assert_eq!((c.width, c.height), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
         assert_eq!(c.view, View::Home);
@@ -696,6 +746,8 @@ mod tests {
             "86400",
             "--start-offset-seconds",
             "-3.5e6",
+            "--start",
+            "origin",
             "--width",
             "640",
             "--height=360",
@@ -706,6 +758,9 @@ mod tests {
         let c = Config::resolve(&base_env(), &flags).unwrap();
         assert_eq!(c.time_scale, 86400.0);
         assert_eq!(c.start_offset_seconds, -3.5e6);
+        assert_eq!(c.start, Start::Origin);
+        assert_eq!(Start::Origin.to_string(), "origin");
+        assert!(parse_flags(["--start", "later"]).is_err());
         assert_eq!((c.width, c.height), (640, 360));
         assert!(c.headless, "a screenshot implies headless");
         assert_eq!(c.screenshot, Some(PathBuf::from("out.png")));

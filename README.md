@@ -10,12 +10,14 @@ Nothing in this repository knows what any piece of matter is. There is no code p
 
 ## What it does
 
-- Fetches the frame registry for a build and integrates every frame forward from the epoch under Newtonian gravity.
+- Fetches the frame registry for a build and integrates every frame from the origin with first post-Newtonian gravity, oblateness, and rotation under torques, keeping checkpoints so any moment between the origin and now is one checkpoint interval away.
+- Enters at the hub's now and can go back to the origin and replay forward at any rate, never past now.
+- Draws every frame where it was when the light now reaching the camera left it, and lights every frame from where each emitter was one light-travel time earlier.
 - Asks the hub for directions for the cells near the camera, at a depth chosen by distance, and for each layer streams the finished section from the edge or the local cache, or computes it here: the worker runs the layer's compiler module (WebAssembly, by hash) on its source tiles, hands the section to the renderer at once, and uploads it with the claim. The registry is just another key.
 - Composites overlapping sections, relaxes fluid matter toward the local equipotential, derives emission from temperature.
 - Extracts surfaces from solid and fluid matter, ray marches gas and plasma as volumes, and draws with camera-relative single precision over a floating origin.
 - Draws frames too far away for cells as point sprites of the right brightness, so hot matter is visible from anywhere.
-- Lets the camera go anywhere, at any time scale.
+- Lets the camera go anywhere.
 
 ## What it depends on
 
@@ -39,7 +41,7 @@ GX_BUILD_ID=...     # optional, defaults to the active build
 Desktop, with a window:
 
 ```sh
-cargo run --release --bin gx-renderer -- --time-scale 86400
+cargo run --release --bin gx-renderer
 ```
 
 Headless screenshot, no window or display needed (a software Vulkan driver is
@@ -49,8 +51,9 @@ enough):
 cargo run --release --bin gx-renderer -- --headless --screenshot out.png --width 1280 --height 720
 ```
 
-Flags: `--time-scale <f64>` (default 1), `--start-offset-seconds <f64>`
-(simulation time offset from the epoch at launch), `--headless`,
+Flags: `--start <now|origin>` (default now), `--start-offset-seconds <f64>`
+(offset from that start, clamped between the origin and now),
+`--time-scale <f64>` (playback rate of a start in the past), `--headless`,
 `--screenshot <path.png>` (implies `--headless`), `--width`, `--height`, and
 `--hub-url`, `--space-id`, `--build-id` to override the environment. See
 `--help`.
@@ -105,7 +108,7 @@ sh web/build.sh
 cd web && python3 -m http.server 8000
 ```
 
-The page asks for the hub URL, API key, space id, build id, and time scale
+The page asks for the hub URL, API key, space id, and build id
 and keeps them in `localStorage`.
 
 Controls are in `docs/controls.md`; the module map, the floating origin, the

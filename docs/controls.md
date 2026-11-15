@@ -54,17 +54,35 @@ body moves on along its orbit. A key past the last frame does nothing.
 
 | Input | Action |
 |---|---|
+| `N` | Jump to now and follow it |
+| `,` | Step one hour (3600 s) back, at most to the origin |
+| `.` | Step one hour (3600 s) forward, at most to now |
+| `[` | Halve the playback rate |
+| `]` | Double the playback rate (does nothing at now) |
+| `Backspace` | Play backwards at the current rate, or forwards again (a toggle) |
 | `Space` | Pause or resume |
-| `[` | Halve the time scale |
-| `]` | Double the time scale |
-| `,` | Step one day (86400 s) backwards, while paused |
-| `.` | Step one day (86400 s) forwards, while paused |
-| `R` | Reset the simulation time to the launch offset |
 
-The time scale stays between 1/1024 and 1e12 in magnitude. When the scale
-asks for more than 20000 integration steps of 600 s in one rendered frame,
-the overlay shows `sim lag` and the frames catch up over the following
-rendered frames; the integrator is never skipped.
+Time runs between the origin of the space (the moment its universe began)
+and now (the hub's clock, measured at start and every minute so it does not
+drift with this machine's clock). The client enters at now, and at now the
+simulation time follows now at one second per second: the rate is 1 and
+`]` does nothing. Any other key leaves now for the past: `,` steps back an
+hour, `Backspace` runs time backwards, `Space` pauses, and `[` plays at half
+speed, so the time falls behind now. In the past, `[` and `]` set the rate
+between 1/1024 and 1048576 (2^20) simulated seconds per second, forwards or backwards.
+Time never goes past now: playing forward into now, or stepping forward
+past it, locks the clock to now again at rate 1. Going back stops at the
+origin. `N` returns to now from anywhere.
+
+Every jump costs at most one checkpoint interval (one simulated day) of
+integration, from the nearest checkpoint the renderer keeps.
+
+The overlay's first line shows the simulation time as a UTC date and time,
+followed by `now` at now or by the offset from now in seconds (`now -3600
+s`). The second shows the rate, `backwards` while rewinding, and `(paused)`.
+The third shows the light-travel time from the frame nearest the crosshair:
+every frame is drawn where it was when the light now reaching the camera
+left it, so that is how far in the past that frame is seen.
 
 ## Exposure
 

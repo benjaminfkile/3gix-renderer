@@ -884,8 +884,9 @@ mod native {
     }
 
     impl Fetcher {
-        /// Starts a fetcher on `handle`: the worker pool, and the readiness
-        /// socket.
+        /// Starts a fetcher on `handle`: the worker pool, the readiness
+        /// socket, and the task that keeps the hub's clock measured
+        /// ([`HubClient::keep_clock`]).
         pub fn new(
             handle: tokio::runtime::Handle,
             client: Arc<HubClient>,
@@ -910,6 +911,7 @@ mod native {
             let notices = tx.clone();
             let socket =
                 client.subscribe_ready(&handle, move |a| notices.send(Internal::Ready(a)).is_ok());
+            client.keep_clock(&handle);
             Ok(Fetcher {
                 handle,
                 client,
@@ -941,6 +943,19 @@ mod native {
         /// asked for it, clamped between the origin and the hub's now.
         pub fn set_time_utc_ms(&mut self, t: i64) {
             self.wanted_utc_ms = Some(t);
+        }
+
+        /// The hub's now, UTC milliseconds ([`HubClient::now_utc_ms`]).
+        pub fn now_utc_ms(&self) -> i64 {
+            self.client.now_utc_ms()
+        }
+
+        /// The space's origin, UTC milliseconds, once a directions answer
+        /// or the hub's clock has reported it.
+        pub fn origin_utc_ms(&self) -> Option<i64> {
+            self.coordinator
+                .origin_utc_ms()
+                .or_else(|| self.client.clock().origin_utc_ms())
         }
 
         /// Queues a request for `key`, a cell of a frame of edge

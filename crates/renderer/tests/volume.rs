@@ -82,6 +82,7 @@ fn center_pixel_matches_the_cpu_integration() {
         meshes: Vec::new(),
         volumes: vec![grid.clone()],
         lights: Vec::new(),
+        frame_lights: BTreeMap::new(),
         sprites: Vec::new(),
         cell_weights: BTreeMap::new(),
     };
@@ -190,6 +191,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
         meshes: vec![mesh],
         volumes: vec![grid.clone()],
         lights: Vec::new(),
+        frame_lights: BTreeMap::new(),
         sprites: Vec::new(),
         cell_weights: BTreeMap::new(),
     };
