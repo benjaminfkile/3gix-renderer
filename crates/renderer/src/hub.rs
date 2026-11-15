@@ -9,6 +9,10 @@
 //!   /space/{s}/build/active` (unless a build id is configured), and `GET
 //!   /space/{s}/build/{b}`, whose layer configs drive the depth of each
 //!   frame ([`crate::protocol::frame_system_from_registries`]).
+//! - [`HubClient::sync_clock`] measures the offset from the hub's clock,
+//!   at connect time and every minute after through
+//!   [`HubClient::keep_clock`] ([`crate::protocol::ClockSync`],
+//!   `space-model.md` section 7).
 //! - [`HubClient::directions`] posts one batch of at most 512 keys.
 //! - [`HubClient::get_blob`] reads `/section/{address}`, `/module/{hash}`,
 //!   `/source/{hash}`, and `/source-manifest/{hash}` from the edge.
@@ -26,7 +30,7 @@ use crate::config::{ApiKey, Config};
 pub use crate::protocol::API_KEY_HEADER;
 use crate::protocol::{
     parse_ready_frame, status_problem, subscribe_frame, ActiveBuild, BuildDescription, Clock,
-    DirectionsRequest, DirectionsResponse, Routes, CLAIM_HEADER, MAX_DIRECTION_KEYS,
+    ClockSync, DirectionsRequest, DirectionsResponse, Routes, CLAIM_HEADER, MAX_DIRECTION_KEYS,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +39,7 @@ use gx_core::sha256::to_hex;
 use gx_worker::BlobKind;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -47,8 +52,9 @@ pub struct HubClient {
     routes: Routes,
     api_key: ApiKey,
     build: BuildDescription,
-    clock: Clock,
-    clock_read_at: Instant,
+    clock: Mutex<ClockSync>,
+    /// The local monotonic clock's zero.
+    base: Instant,
 }
 
 impl HubClient {
@@ -87,16 +93,17 @@ impl HubClient {
                 build_id: String::new(),
                 layers: Vec::new(),
             },
-            clock: Clock {
-                origin_utc_ms: None,
-                now_utc_ms: 0,
-            },
-            clock_read_at: Instant::now(),
+            clock: Mutex::new(ClockSync::measure(
+                Clock {
+                    origin_utc_ms: None,
+                    now_utc_ms: 0,
+                },
+                0.0,
+                0.0,
+            )),
+            base: Instant::now(),
         };
-        client.clock = client
-            .get_json(&client.routes.clock(), "reading the clock")
-            .await?;
-        client.clock_read_at = Instant::now();
+        client.sync_clock().await?;
         let build_id = match build_id {
             Some(b) => b.to_string(),
             None => {
@@ -153,18 +160,58 @@ impl HubClient {
         &self.build
     }
 
-    /// The clock as read at connect time.
-    pub fn clock(&self) -> Clock {
-        self.clock
+    /// The hub's clock as this client keeps it.
+    pub fn clock(&self) -> ClockSync {
+        *self.clock.lock().expect("clock")
     }
 
-    /// The hub's now, UTC milliseconds: the clock read at connect time
-    /// advanced by the time since.
+    /// Seconds on the local monotonic clock since this client was made.
+    fn local_seconds(&self) -> f64 {
+        self.base.elapsed().as_secs_f64()
+    }
+
+    /// The hub's now, UTC milliseconds: the latest measurement of the
+    /// hub's clock advanced by the local monotonic clock since
+    /// ([`ClockSync`]).
     pub fn now_utc_ms(&self) -> i64 {
-        let elapsed = self.clock_read_at.elapsed().as_millis();
+        self.clock().now_utc_ms(self.local_seconds())
+    }
+
+    /// Measures the offset from the hub's clock again with `GET
+    /// /space/{s}/clock`. Done at connect time and, by
+    /// [`HubClient::keep_clock`], every
+    /// [`crate::protocol::CLOCK_SYNC_SECONDS`].
+    pub async fn sync_clock(&self) -> Result<()> {
+        let sent = self.local_seconds();
+        let clock: Clock = self
+            .get_json(&self.routes.clock(), "reading the clock")
+            .await?;
+        let received = self.local_seconds();
         self.clock
-            .now_utc_ms
-            .saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+            .lock()
+            .expect("clock")
+            .update(clock, sent, received);
+        Ok(())
+    }
+
+    /// Keeps the clock measured on `handle`: a task that measures it again
+    /// every [`crate::protocol::CLOCK_SYNC_SECONDS`] for as long as the
+    /// client lives. A failed measurement keeps the previous one and is
+    /// logged.
+    pub fn keep_clock(self: &Arc<Self>, handle: &tokio::runtime::Handle) {
+        let weak = Arc::downgrade(self);
+        handle.spawn(async move {
+            let period = Duration::from_secs_f64(crate::protocol::CLOCK_SYNC_SECONDS);
+            loop {
+                tokio::time::sleep(period).await;
+                let Some(client) = weak.upgrade() else {
+                    return;
+                };
+                if let Err(e) = client.sync_clock().await {
+                    tracing::warn!("{e:#}");
+                }
+            }
+        });
     }
 
     /// Asks for directions for at most 512 keys at `t_utc_ms`.

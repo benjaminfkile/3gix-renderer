@@ -17,6 +17,10 @@
 //! 3. The eight strongest merged emitters in the scene become point lights
 //!    ([`strongest_lights`]) with radiant intensity `band_power / (4 pi)` per
 //!    band, in watts per steradian.
+//! 4. Each lit frame receives every light from where its emitter was one
+//!    light-travel time before the lit frame is seen ([`lights_for`],
+//!    `space-model.md` section 6.4), so each surface draw carries its own
+//!    light positions.
 //!
 //! A surface point at distance `d` with unit normal `n` and unit direction
 //! `l` toward a light of intensity `I` receives the irradiance
@@ -150,6 +154,35 @@ pub fn strongest_lights(
                 frame_id: e.frame_id,
                 position: [rel.x as f32, rel.y as f32, rel.z as f32],
                 intensity: radiant_intensity(e.band_power).map(|v| v as f32),
+            }
+        })
+        .collect()
+}
+
+/// The lights as the matter of frame `lit` receives them: each light moved
+/// by `shift(lit, emitter frame)`, root axes, meters. With light time the
+/// shift is [`crate::seen::Seen::emitter_shift`]: the light that reaches the
+/// lit frame left its emitter one light-travel time before the lit frame's
+/// own retarded time (`space-model.md` section 6.4), so the light direction
+/// and the distance in the irradiance are taken from there. The offset is
+/// added in `f64` before the cast to `f32`.
+pub fn lights_for(
+    lights: &[PointLight],
+    lit: u64,
+    shift: impl Fn(u64, u64) -> Vec3,
+) -> Vec<PointLight> {
+    lights
+        .iter()
+        .map(|l| {
+            let d = shift(lit, l.frame_id);
+            let p = Vec3::new(
+                f64::from(l.position[0]),
+                f64::from(l.position[1]),
+                f64::from(l.position[2]),
+            ) + d;
+            PointLight {
+                position: [p.x as f32, p.y as f32, p.z as f32],
+                ..*l
             }
         })
         .collect()

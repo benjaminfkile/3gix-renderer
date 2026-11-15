@@ -66,7 +66,6 @@
   <label>API key <input id="api-key" type="password" autocomplete="off" required></label>
   <label>Space id <input id="space-id" autocomplete="off" required></label>
   <label>Build id (empty for the active build) <input id="build-id" autocomplete="off"></label>
-  <label>Time scale (simulation s per wall s) <input id="time-scale" type="number" step="any" value="1"></label>
   <button id="start" type="submit">Start</button>
   <div id="status">Needs a browser with WebGPU.</div>
 </form>
@@ -82,7 +81,6 @@
     "api-key": ["gx.apiKey", "apiKey"],
     "space-id": ["gx.spaceId", "spaceId"],
     "build-id": ["gx.buildId", "buildId"],
-    "time-scale": ["gx.timeScale", "timeScale"],
   };
   let config = {};
   try {
@@ -125,7 +123,6 @@
         value("api-key"),
         value("space-id"),
         value("build-id"),
-        Number(value("time-scale") || "1"),
       );
       form.classList.add("running");
       document.getElementById("gx-canvas").focus();

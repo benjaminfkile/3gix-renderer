@@ -6,6 +6,5 @@ export default {
   apiKey: "local-dev-3gix-key",
   spaceId: "a1000000-0000-0000-0000-000000000001",
   buildId: "",
-  timeScale: 3600,
   autostart: true,
 };

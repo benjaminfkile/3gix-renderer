@@ -16,6 +16,7 @@ use renderer::app::matter_scene;
 use renderer::camera::FIELD_OF_VIEW_Y;
 use renderer::render::headless::{Headless, Image};
 use renderer::render::scene::Scene;
+use renderer::seen::Seen;
 use renderer::stream::{decode_cell, CellState, FetchOutcome};
 use renderer::world::World;
 
@@ -97,7 +98,12 @@ fn solid_blob_is_lit_from_the_side_of_the_hot_blob() {
     stream_all(&mut world);
     let system = system();
     let camera = camera();
-    let scene = matter_scene(&mut world, &system, &camera, (WIDTH, HEIGHT), 0.0);
+    let scene = matter_scene(
+        &mut world,
+        &Seen::instant(&system, &camera),
+        (WIDTH, HEIGHT),
+        0.0,
+    );
     // The solid blob is a mesh; the plasma blob is a volume.
     assert_eq!(scene.surfaces.len(), 1);
     assert_eq!(scene.volumes.len(), 1);
@@ -269,7 +275,12 @@ fn full_scene_draws_soft_glowing_volumes() {
     let camera = camera();
     let mut world = World::new(2);
     stream_from(&mut world, &system, &chunks, 3);
-    let mut scene = matter_scene(&mut world, &system, &camera, (WIDTH, HEIGHT), 0.0);
+    let mut scene = matter_scene(
+        &mut world,
+        &Seen::instant(&system, &camera),
+        (WIDTH, HEIGHT),
+        0.0,
+    );
     // Matter only: the frame markers and lines are a debug aid drawn on top.
     scene.markers.clear();
     scene.lines.clear();

@@ -17,10 +17,10 @@
 #      text, markers, or lines), each waiting until every cell it selected
 #      is ready (--wait-ready-seconds) and writing its overlay statistics
 #      (--stats-json):
-#        home.png               the Home view at launch time, at a fixed
+#        home.png               the Home view at now, at a fixed
 #                               exposure (--exposure-stops, see below)
-#        frame-3.png            the number key 3 view at launch time
-#        frame-3-plus-90d.png   the same view 90 days after the epoch
+#        frame-3.png            the number key 3 view at now
+#        frame-3-origin.png     the same view at the space's origin
 #        frame-1-close.png      the number key 1 view at a quarter of its
 #                               distance
 #   5. Asserts on the images with png-stats (see tools/png-stats).
@@ -61,11 +61,9 @@ COMPILER_LOG=$WORK/compiler.log
 RENDERER=$ROOT_DIR/target/release/gx-renderer
 PNG_STATS=$ROOT_DIR/target/release/png-stats
 
-# Screenshot size, and the simulation time offset of the second view of
-# frame 3: 90 days of 86400 s.
+# Screenshot size.
 WIDTH=640
 HEIGHT=360
-NINETY_DAYS=7776000
 
 # The fixed exposure of home.png, in stops relative to the automatic
 # exposure of a scene whose log-average luminance is exactly
@@ -232,7 +230,7 @@ shoot() {
 echo "exposure: home.png at $HOME_STOPS stops, a sprite of $COLD_IRRADIANCE W m^-2 at middle grey"
 shoot home --view home --exposure-stops "$HOME_STOPS"
 shoot frame-3 --view 3
-shoot frame-3-plus-90d --view 3 --start-offset-seconds "$NINETY_DAYS"
+shoot frame-3-origin --view 3 --start origin
 shoot frame-1-close --view 1 --view-distance-scale 0.25
 
 # 5. Assertions on the images. check COMMAND...: runs png-stats, which
@@ -255,14 +253,15 @@ check blobs home.png --threshold 32 --min-count 5 --largest-within 8
 # its brighter half at least 1.2 times as bright as its darker half (a disc
 # lit face on has no lean and a ratio of 1).
 check disc frame-3.png --threshold 32 --min-percent 5 --max-percent 60 --min-side-ratio 1.2
-check disc frame-3-plus-90d.png --threshold 32 --min-percent 5 --max-percent 60 --min-side-ratio 1.2
-# Time advanced the frames: the lit pixels moved by at least 16 px.
-check moved frame-3.png frame-3-plus-90d.png --threshold 32 --min-shift 16
+check disc frame-3-origin.png --threshold 32 --min-percent 5 --max-percent 60 --min-side-ratio 1.2
+# No check that the frames moved between the two: time cannot go past now,
+# and a fresh space's origin is set by the first directions request of this
+# run, minutes before now, so frame 3 has barely moved.
 # A smooth falloff: at least 32 levels of range, no neighbor step above a
 # quarter of it (a hard edge steps the whole range at once).
 check smooth frame-1-close.png --min-range 32 --max-step-fraction 0.25
 # Each screenshot stays under 300 KB.
-for f in home frame-3 frame-3-plus-90d frame-1-close; do
+for f in home frame-3 frame-3-origin frame-1-close; do
     [ -f "$f.png" ] || continue
     size=$(wc -c <"$f.png" | tr -d ' ')
     if [ "$size" -lt 307200 ]; then
@@ -276,7 +275,7 @@ cd "$ROOT_DIR" || die "cannot enter $ROOT_DIR"
 # 6. Statistics and versions for docs/e2e/README.md.
 echo "versions: hub $hub_commit, compiler $compiler_commit, core $core_rev, renderer $renderer_rev"
 echo "stats: name | selected | pinned | requests | fetched | bytes | first rtt s | last rtt s | streamed s"
-for f in home frame-3 frame-3-plus-90d frame-1-close; do
+for f in home frame-3 frame-3-origin frame-1-close; do
     [ -f "$OUT/$f.json" ] || continue
     jq -r --arg n "$f" '[$n, .cells_selected, .cells_pinned, .requests, .cells_fetched,
         .bytes_fetched, .first_round_trip_seconds, .last_round_trip_seconds, .stream_seconds]

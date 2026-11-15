@@ -15,6 +15,10 @@
 // (at least MIN_ALPHA), Smith-Schlick G with k = alpha / 2, and Schlick F
 // with a fixed F0 of 0.04. No shadows in v1.
 //
+// Light travels at c: each light's position comes with the model, as the
+// cell's own frame receives it, so the lit side faces where the emitter was
+// when the light reaching that frame left it.
+//
 // Every position is relative to the camera, in root axes. A mesh arrives
 // relative to its cell origin and the model transform adds the rotation of
 // its frame and the camera-relative cell origin.
@@ -29,7 +33,8 @@ const MAX_LIGHTS: u32 = 8u;
 const EMISSION_TABLE_WIDTH: u32 = 1024u;
 
 struct Light {
-    // Camera-relative position, root axes, meters; w unused.
+    // Camera-relative position as the observer sees the emitter, root
+    // axes, meters; w unused. Surfaces use their model's light positions.
     position: vec4<f32>,
     // Radiant intensity per band, W sr^-1; w unused.
     intensity: vec4<f32>,
@@ -49,6 +54,10 @@ struct Model {
     c2: vec4<f32>,
     // xyz: camera-relative cell origin, root axes, meters; w: weight.
     offset: vec4<f32>,
+    // Camera-relative position of each light as this cell's frame receives
+    // it: from where the emitter was one light-travel time before the
+    // frame is seen (src/seen.rs). w unused.
+    lights: array<vec4<f32>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -108,7 +117,7 @@ fn fs_surface(in: VsOut) -> @location(0) vec4<f32> {
     let count = min(globals.counts.x, MAX_LIGHTS);
     for (var i = 0u; i < count; i++) {
         let light = globals.lights[i];
-        let to_light = light.position.xyz - in.rel;
+        let to_light = model.lights[i].xyz - in.rel;
         let d2 = dot(to_light, to_light);
         if d2 <= 0.0 {
             continue;

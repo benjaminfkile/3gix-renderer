@@ -5,12 +5,14 @@
 //! `epaint_default_fonts` (see `docs/architecture.md` for why). This module
 //! only formats the text so it can be tested without a GPU.
 //!
-//! Simulation time is shown as days since J2000, the reference of the
-//! registry epoch (`matter-format.md` section 5.1, `space-model.md`
-//! section 6).
+//! Simulation time is shown as a UTC date and time (converted from TDB with
+//! [`gx_core::timescale`]), with its offset from now in seconds, or "now"
+//! when the clock follows now (`space-model.md` section 7). One line gives
+//! the light-travel time to the frame nearest the crosshair
+//! (`space-model.md` section 6.4).
 
-use crate::sim::SECONDS_PER_DAY;
 use crate::stream::FetcherStats;
+use gx_core::timescale::tdb_seconds_to_utc_ms;
 use gx_core::units::Seconds;
 
 /// Left and top margin of the overlay, pixels.
@@ -99,12 +101,21 @@ impl MatterStats {
 /// The values the overlay reports.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct OverlayInfo {
-    /// Simulation time, seconds since J2000.
+    /// Simulation time, seconds of TDB since J2000.
     pub sim_time: Seconds,
-    /// Simulation seconds per wall-clock second.
-    pub time_scale: f64,
+    /// Simulation time minus now, seconds: 0 at now.
+    pub offset_from_now: Seconds,
+    /// `true` while the clock follows now.
+    pub at_now: bool,
+    /// Simulated seconds per wall-clock second, above 0.
+    pub rate: f64,
+    /// `true` while time runs backwards.
+    pub rewinding: bool,
     /// `true` while the clock is paused.
     pub paused: bool,
+    /// The frame nearest the crosshair and the light-travel time from it,
+    /// seconds, or `None` when no frame is in front of the camera.
+    pub crosshair: Option<(u64, f64)>,
     /// The frame the camera is parented to.
     pub camera_frame: u64,
     /// Distance from the camera to its frame origin, meters.
@@ -115,8 +126,6 @@ pub struct OverlayInfo {
     pub frame_count: usize,
     /// Rendered frames per second, or `None` when not measured (headless).
     pub fps: Option<f64>,
-    /// `true` when the integrator was clamped this frame.
-    pub sim_lag: bool,
     /// The fixed exposure, stops, or `None` for the automatic exposure.
     pub exposure_fixed: Option<f64>,
     /// The matter pipeline.
@@ -126,14 +135,28 @@ pub struct OverlayInfo {
 impl OverlayInfo {
     /// The overlay lines, top to bottom.
     pub fn lines(&self) -> Vec<String> {
-        let days = self.sim_time.value() / SECONDS_PER_DAY;
+        let utc = format_utc(tdb_seconds_to_utc_ms(self.sim_time.value()));
         let mut lines = vec![
-            format!("J2000 + {days:.4} d"),
+            if self.at_now {
+                format!("{utc}  now")
+            } else {
+                format!(
+                    "{utc}  now {} s",
+                    format_offset(self.offset_from_now.value())
+                )
+            },
             format!(
-                "time scale {}x{}",
-                format_scale(self.time_scale),
+                "rate {}x{}{}",
+                format_scale(self.rate),
+                if self.rewinding { " backwards" } else { "" },
                 if self.paused { " (paused)" } else { "" }
             ),
+            match self.crosshair {
+                Some((frame, seconds)) => {
+                    format!("light time frame {frame} {} s", format_light_time(seconds))
+                }
+                None => "light time -".to_string(),
+            },
             format!(
                 "camera frame {}  |p| {:.4e} m  speed {:.3e} m/s",
                 self.camera_frame, self.camera_distance, self.camera_speed,
@@ -184,15 +207,58 @@ impl OverlayInfo {
             "uploads pending {}  modules loaded {}",
             m.uploads_pending, m.modules_loaded
         ));
-        if self.sim_lag {
-            lines.push("sim lag".to_string());
-        }
         lines
     }
 
     /// The overlay as one block of text.
     pub fn text(&self) -> String {
         self.lines().join("\n")
+    }
+}
+
+/// A UTC time in milliseconds since the Unix epoch as
+/// `YYYY-MM-DD HH:MM:SS.mmm UTC` on the proleptic Gregorian calendar.
+pub fn format_utc(utc_ms: i64) -> String {
+    let days = utc_ms.div_euclid(86_400_000);
+    let ms = utc_ms.rem_euclid(86_400_000);
+    // Days to a civil date (the algorithm of H. Hinnant's date library).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{:03} UTC",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+/// An offset from now, seconds, with its sign and to the millisecond
+/// below 1000 s, whole seconds above: `-3600`, `-0.250`.
+fn format_offset(seconds: f64) -> String {
+    if seconds.abs() < 1000.0 {
+        format!("{seconds:+.3}")
+    } else {
+        format!("{seconds:+.0}")
+    }
+}
+
+/// A light-travel time, seconds: to the microsecond below 1 s, the
+/// millisecond below 1e6 s, and in exponent form above.
+fn format_light_time(seconds: f64) -> String {
+    if seconds < 1.0 {
+        format!("{seconds:.6}")
+    } else if seconds < 1.0e6 {
+        format!("{seconds:.3}")
+    } else {
+        format!("{seconds:.4e}")
     }
 }
 
@@ -222,18 +288,25 @@ fn format_scale(scale: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gx_core::timescale::utc_ms_to_tdb_seconds;
+
+    /// 2026-11-15 12:34:56.789 UTC.
+    const UTC_MS: i64 = 1_794_746_096_789;
 
     fn info() -> OverlayInfo {
         OverlayInfo {
-            sim_time: Seconds::new(8.1e8),
-            time_scale: 86400.0,
+            sim_time: Seconds::new(utc_ms_to_tdb_seconds(UTC_MS)),
+            offset_from_now: Seconds::new(0.0),
+            at_now: true,
+            rate: 1.0,
+            rewinding: false,
             paused: false,
+            crosshair: Some((3, 499.0123)),
             camera_frame: 4,
             camera_distance: 1.5e8,
             camera_speed: 2.5e4,
             frame_count: 6,
             fps: Some(59.94),
-            sim_lag: false,
             exposure_fixed: None,
             matter: MatterStats {
                 cells_selected: 12,
@@ -265,44 +338,61 @@ mod tests {
     #[test]
     fn lines_report_every_value() {
         let l = info().lines();
-        assert_eq!(l[0], "J2000 + 9375.0000 d");
-        assert_eq!(l[1], "time scale 86400x");
-        assert_eq!(l[2], "camera frame 4  |p| 1.5000e8 m  speed 2.500e4 m/s");
-        assert_eq!(l[3], "frames 6");
-        assert_eq!(l[4], "fps 59.9");
-        assert_eq!(l[5], "exposure auto");
-        assert_eq!(l[6], "cells selected 12  ready 9  pending 3");
-        assert_eq!(l[7], "meshes 4  triangles 5120  lights 1");
-        assert_eq!(l[8], "volumes 2  sprites 7");
-        assert_eq!(l[9], "cells done 20  with sections 11  1048576 B");
-        assert_eq!(l[10], "rtt first 0.250 s  last 0.043 s");
-        assert_eq!(l[11], "sections streamed 36 (cache 6)  computed here 4");
-        assert_eq!(l[12], "uploads pending 1  modules loaded 2");
-        assert_eq!(l.len(), 13);
+        assert_eq!(l[0], "2026-11-15 12:34:56.789 UTC  now");
+        assert_eq!(l[1], "rate 1x");
+        assert_eq!(l[2], "light time frame 3 499.012 s");
+        assert_eq!(l[3], "camera frame 4  |p| 1.5000e8 m  speed 2.500e4 m/s");
+        assert_eq!(l[4], "frames 6");
+        assert_eq!(l[5], "fps 59.9");
+        assert_eq!(l[6], "exposure auto");
+        assert_eq!(l[7], "cells selected 12  ready 9  pending 3");
+        assert_eq!(l[8], "meshes 4  triangles 5120  lights 1");
+        assert_eq!(l[9], "volumes 2  sprites 7");
+        assert_eq!(l[10], "cells done 20  with sections 11  1048576 B");
+        assert_eq!(l[11], "rtt first 0.250 s  last 0.043 s");
+        assert_eq!(l[12], "sections streamed 36 (cache 6)  computed here 4");
+        assert_eq!(l[13], "uploads pending 1  modules loaded 2");
+        assert_eq!(l.len(), 14);
     }
 
     #[test]
-    fn lag_paused_and_fractions() {
+    fn past_paused_backwards_and_fractions() {
         let l = OverlayInfo {
-            time_scale: 0.25,
+            sim_time: Seconds::new(utc_ms_to_tdb_seconds(UTC_MS - 3_600_000)),
+            offset_from_now: Seconds::new(-3600.0),
+            at_now: false,
+            rate: 0.25,
+            rewinding: true,
             paused: true,
+            crosshair: None,
             fps: None,
-            sim_lag: true,
             exposure_fixed: Some(12.8125),
             matter: MatterStats::default(),
             ..info()
         }
         .lines();
-        assert_eq!(l[1], "time scale 0.25x (paused)");
-        assert_eq!(l[4], "fps -");
-        assert_eq!(l[5], "exposure fixed 12.81");
-        assert_eq!(l[9], "cells done 0  with sections 0  0 B");
-        assert_eq!(l[10], "rtt first -  last -");
-        assert_eq!(l[11], "sections streamed 0 (cache 0)  computed here 0");
-        assert_eq!(l[12], "uploads pending 0  modules loaded 0");
-        assert_eq!(l[13], "sim lag");
+        assert_eq!(l[0], "2026-11-15 11:34:56.789 UTC  now -3600 s");
+        assert_eq!(l[1], "rate 0.25x backwards (paused)");
+        assert_eq!(l[2], "light time -");
+        assert_eq!(l[5], "fps -");
+        assert_eq!(l[6], "exposure fixed 12.81");
+        assert_eq!(l[10], "cells done 0  with sections 0  0 B");
+        assert_eq!(l[11], "rtt first -  last -");
+        assert_eq!(l[12], "sections streamed 0 (cache 0)  computed here 0");
+        assert_eq!(l[13], "uploads pending 0  modules loaded 0");
         assert_eq!(format_stops(-3.0), "-3");
         assert_eq!(format_stops(0.5), "0.5");
         assert_eq!(format_stops(-0.001), "0");
+        assert_eq!(format_offset(-0.25), "-0.250");
+        assert_eq!(format_light_time(0.0334), "0.033400");
+        assert_eq!(format_light_time(2.5e7), "2.5000e7");
+    }
+
+    #[test]
+    fn utc_dates() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00.000 UTC");
+        assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00:00.000 UTC");
+        assert_eq!(format_utc(-1), "1969-12-31 23:59:59.999 UTC");
+        assert_eq!(format_utc(UTC_MS), "2026-11-15 12:34:56.789 UTC");
     }
 }

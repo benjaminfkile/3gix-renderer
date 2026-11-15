@@ -74,8 +74,10 @@ pub struct WebFetcher {
 
 impl WebFetcher {
     /// A fetcher over `hub`, caching in `cache` when the page has one.
+    /// Keeps the hub's clock measured ([`WebHub::keep_clock`]).
     pub fn new(hub: Rc<WebHub>, cache: Option<WebCache>) -> WebFetcher {
         let socket = ReadySocket::open(&hub.routes().ready(hub.build_id()));
+        hub.keep_clock();
         WebFetcher {
             hub,
             cache: cache.map(Rc::new),
@@ -102,6 +104,11 @@ impl WebFetcher {
     /// The hub connection.
     pub fn hub(&self) -> &Rc<WebHub> {
         &self.hub
+    }
+
+    /// The hub's now, UTC milliseconds ([`WebHub::now_utc_ms`]).
+    pub fn now_utc_ms(&self) -> i64 {
+        self.hub.now_utc_ms()
     }
 
     /// Asks for directions at `t` (UTC milliseconds) from now on, clamped

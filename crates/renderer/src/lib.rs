@@ -16,8 +16,12 @@
 //!   frame registry (native only).
 //! - [`mock_hub`]: a small in-process hub for tests and local runs (native
 //!   only).
-//! - [`sim`]: the simulation clock and the integration of every frame to the
-//!   simulation time (`space-model.md` section 6).
+//! - [`sim`]: the simulation clock between the origin and now, and the
+//!   integration of every frame to it with the relativistic laws and
+//!   checkpoints (`space-model.md` sections 6.1, 6.2, and 7).
+//! - [`seen`]: every frame at its retarded state for the observer and every
+//!   light from its emitter's retarded position (`space-model.md` section
+//!   6.4).
 //! - [`camera`]: the free camera parented to its nearest frame, the floating
 //!   origin of `space-model.md` section 5.
 //! - [`controls`]: keyboard and mouse bindings, shared by the window and the
@@ -54,6 +58,7 @@ pub mod farfield;
 pub mod light;
 pub mod protocol;
 pub mod render;
+pub mod seen;
 pub mod sim;
 pub mod stream;
 pub mod volume;

@@ -73,8 +73,8 @@ HTTPS.
 
 The page is one canvas filling the window and a small settings panel: hub
 URL, API key, space id, build id
-(empty for the active build of the space), and time scale (simulation
-seconds per wall-clock second). The values are stored in the browser's
+(empty for the active build of the space). The client enters at the hub's
+now, like the desktop one. The values are stored in the browser's
 `localStorage`, the API key included, so use a key meant for this purpose.
 `Start` loads the module, connects to the hub, loads the registry, and
 starts the frame loop; an error shows in the panel. Controls are those of
@@ -129,7 +129,8 @@ by hand on a desktop browser, against a hub:
 3. Matter streams in or is computed here (the overlay's cell counts,
    sections streamed, and sections computed here rise), surfaces are lit,
    hot gas glows as a volume, and far frames show as dots.
-4. Fly with the desktop controls, change the time scale with `[` and `]`,
+4. Fly with the desktop controls, go back in time with `,` or `Backspace`
+   and return with `N`,
    reload the page and see the panel come back filled in.
 
 No automated test pretends to cover these steps.

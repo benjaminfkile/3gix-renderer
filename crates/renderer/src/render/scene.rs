@@ -6,6 +6,11 @@
 //! with [`FrameSystem::relative`] from the camera position in its frame, and
 //! only the resulting small vector is cast to `f32`.
 //!
+//! What is placed is what the observer sees ([`crate::seen`],
+//! `space-model.md` section 6.4): [`matter_scene`] takes the frame system
+//! of retarded states and the camera in it, and each surface draw carries
+//! the light positions its own frame is lit from.
+//!
 //! Positions are in root axes, relative to the camera. The rotation from
 //! root axes into camera axes is handed over separately as
 //! [`Scene::view_rotation`], so later passes can rotate larger vertex sets on
@@ -31,7 +36,8 @@
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::extract::SurfaceMesh;
 use crate::farfield::Sprite;
-use crate::light::PointLight;
+use crate::light::{PointLight, MAX_LIGHTS};
+use crate::seen::Seen;
 use crate::volume::VolumeGrid;
 use crate::world::{DrawList, World};
 use gx_core::frames::FrameSystem;
@@ -86,6 +92,12 @@ pub struct SurfaceDraw {
     /// Weight of the cell's radiance, 0 to 1: below 1 while its frame fades
     /// in from the far field ([`crate::farfield`]).
     pub weight: f32,
+    /// Where each of the scene's [`Scene::lights`] is for this cell's
+    /// frame, relative to the camera, root axes, meters: the light as the
+    /// frame receives it, from where its emitter was one light-travel time
+    /// before the frame is seen ([`crate::light::lights_for`]). Entries past
+    /// the scene's light count are 0.
+    pub lights: [[f32; 3]; MAX_LIGHTS],
 }
 
 /// One cell's volume placed for drawing, the same way as [`SurfaceDraw`].
@@ -279,11 +291,16 @@ pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw
         let offset = camera.relative(system, mesh.origin, frame);
         let cam = camera_in(system, camera, frame);
         nearest = nearest.min(box_distance(cam, mesh.bounds_min, mesh.bounds_max));
+        let mut lights = [[0.0; 3]; MAX_LIGHTS];
+        for (slot, l) in lights.iter_mut().zip(draw.lights_of(frame)) {
+            *slot = l.position;
+        }
         scene.surfaces.push(SurfaceDraw {
             mesh: mesh.clone(),
             offset: to_f32(offset),
             rotation: frame_rotation(system, frame),
             weight: draw.cell_weight(frame),
+            lights,
         });
     }
     for grid in &draw.volumes {
@@ -317,18 +334,15 @@ pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw
     }
 }
 
-/// The scene for the camera: frame markers plus the world's drawn cells,
-/// lights, and far field sprites.
-pub fn matter_scene(
-    world: &mut World,
-    system: &FrameSystem,
-    camera: &Camera,
-    size: (u32, u32),
-    now: f64,
-) -> Scene {
+/// The scene as `seen` sees it: frame markers plus the world's drawn
+/// cells, lights, and far field sprites, every frame at its retarded state
+/// and every lit frame lit from its emitters' retarded positions
+/// ([`crate::seen`], `space-model.md` section 6.4).
+pub fn matter_scene(world: &mut World, seen: &Seen, size: (u32, u32), now: f64) -> Scene {
     let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
+    let (system, camera) = (seen.system(), seen.camera());
     let mut scene = build_scene(system, camera, aspect);
-    let draw = world.draw_list(system, camera, size, now);
+    let draw = world.draw_list(seen, size, now);
     add_matter(&mut scene, system, camera, &draw);
     scene
 }

@@ -36,11 +36,12 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | Module | What it does | Spec |
 |---|---|---|
 | `config` | Environment, `.env`, and command line flags, flags winning | |
-| `protocol` | The hub protocol without I/O: clock, builds and layer configs, directions, statuses, socket frames, URLs, the frame system from the union of the layers' registries | `client-compute.md` 2.2 to 2.5, `matter-format.md` 5 and 6 |
+| `protocol` | The hub protocol without I/O: clock and its sync, builds and layer configs, directions, statuses, socket frames, URLs, the frame system from the union of the layers' registries | `client-compute.md` 2.2 to 2.5, `matter-format.md` 5 and 6 |
 | `hub` | The native hub client v2: clock, active build, build, directions, edge reads, uploads with `X-Claim`, the readiness socket keyed by address | `client-compute.md` 2.3 to 2.5 |
 | `directions` | The client loop as a state machine without I/O: batches of at most 512 keys, deduplication in flight, `ready`/`compute`/`pending`/`empty` per layer, retries with backoff, readiness notices | `client-compute.md` 1, 2.4 |
 | `mock_hub` | A small v2 hub for tests and `gx-mock-hub` | `client-compute.md` 2 |
-| `sim` | `SimClock` and integration of every frame to the simulation time | `space-model.md` 6 |
+| `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every simulated day, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
+| `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
 | `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
@@ -71,8 +72,9 @@ pixels) for the end to end run, `scripts/e2e.sh` (`docs/e2e/README.md`).
 
 ## The headless run
 
-`app::render_headless_view` integrates to the launch offset, places the
-camera for the run's view (`Home`, or the view of a number key, at a factor
+`app::render_headless_view` draws the simulation at its time (entered at
+now, or wherever `--start` and `--start-offset-seconds` put it, clamped
+between the origin and now), places the camera for the run's view (`Home`, or the view of a number key, at a factor
 of its distance), selects once, and streams until every selected and pinned
 cell is resolved. With `--wait-ready-seconds` it waits for every one to be
 drawable (`World::ready`: `Ready` with its mesh, or `Empty`; a `Gone` cell
@@ -96,20 +98,29 @@ package builds for that target.
 
 ## The frame loop
 
-1. The `SimClock` advances by the wall-clock delta times the time scale.
-2. `gx_core::integrate::advance` integrates every frame to the clock's time
-   with Yoshida4 and steps of at most 600 s. More than 20000 steps in one
-   rendered frame are clamped to 20000 and the overlay shows `sim lag`; the
-   frames chase the clock over the next rendered frames. Integration is
-   never skipped.
+1. The `SimClock` takes the hub's now (`protocol::ClockSync`, measured at
+   start and every minute) and advances by the wall-clock delta times the
+   rate, clamped between the origin and now; at now it follows now.
+2. Every frame is integrated to the clock's time with
+   `gx_core::integrate::Scheme::Relativistic` (first post-Newtonian gravity,
+   oblateness, rotation with torques) in steps of at most 600 s, read from a
+   fine `gx_core::history::History` that is rebuilt from a coarse one
+   (checkpoints every simulated day from the origin) whenever the time
+   leaves it. A jump anywhere costs at most one coarse interval.
 3. Free flight moves the camera; then, if `FrameSystem::nearest_frame` of the
    camera position differs from its frame, the camera re-parents.
-4. Matter streams: selection (every 100 ms), requests, directions,
-   streamed and computed sections, readiness notices, finished meshes,
-   eviction. See "From selection to
-   pixels" below.
-5. The scene is built camera-relative with the drawn cells and their lights
-   and drawn with the overlay.
+4. Light time: `seen::Seen` solves the light-time equation of every frame
+   for the camera's position against the fine history
+   (`gx_core::light::retarded_state`) and builds the frame system of
+   retarded states, with the camera at the same place in space among them.
+   Everything below reads it.
+5. Matter streams: selection (every 100 ms), requests, directions at the
+   simulation time, streamed and computed sections, readiness notices,
+   finished meshes, eviction. See "From selection to pixels" below.
+6. The scene is built camera-relative with the drawn cells and their lights
+   and drawn with the overlay. Each surface draw carries its own light
+   positions: where each emitter was one light-travel time before that
+   draw's frame is seen (`gx_core::light::retarded_emitter`).
 
 ## `f64` versus `f32`
 

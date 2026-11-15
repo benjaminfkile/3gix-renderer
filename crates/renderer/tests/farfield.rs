@@ -16,6 +16,7 @@ use renderer::farfield::{depth_zero_key, far_frames};
 use renderer::render::gpu::{fixed_exposure, Exposure, REFERENCE_LUMINANCE};
 use renderer::render::headless::Headless;
 use renderer::render::scene::Scene;
+use renderer::seen::Seen;
 use renderer::stream::{decode_cell, FetchOutcome};
 use renderer::world::World;
 use std::collections::BTreeMap;
@@ -126,7 +127,12 @@ fn stream(system: &FrameSystem, chunks: &BTreeMap<CellKey, Vec<Vec<u8>>>) -> (Sc
         }
     }
     assert!(world.settled());
-    let mut scene = matter_scene(&mut world, system, &camera, (WIDTH, HEIGHT), 1.0);
+    let mut scene = matter_scene(
+        &mut world,
+        &Seen::instant(system, &camera),
+        (WIDTH, HEIGHT),
+        1.0,
+    );
     scene.markers.clear();
     scene.lines.clear();
     (scene, requested)

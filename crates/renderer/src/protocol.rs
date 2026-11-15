@@ -49,6 +49,71 @@ pub struct Clock {
     pub now_utc_ms: i64,
 }
 
+/// How often the client measures its offset from the hub's clock again,
+/// seconds (`space-model.md` section 7: now is the hub's now).
+pub const CLOCK_SYNC_SECONDS: f64 = 60.0;
+
+/// The hub's clock as the client keeps it: the offset of the hub's now from
+/// the client's own monotonic clock, measured at connect time and again
+/// every [`CLOCK_SYNC_SECONDS`].
+///
+/// A measurement takes the local time just before the clock request was
+/// sent and just after the answer arrived, and assumes the hub read its
+/// clock halfway between the two. Between measurements "now" advances with
+/// the local monotonic clock only, so it never jumps with a change of the
+/// local wall clock and drifts from the hub's by at most the local clock's
+/// rate error over one interval.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ClockSync {
+    /// The hub's now minus the local monotonic clock, milliseconds.
+    offset_ms: f64,
+    /// The local monotonic time of the latest measurement, seconds.
+    measured_at: f64,
+    /// The origin as the hub last reported it.
+    origin_utc_ms: Option<i64>,
+}
+
+impl ClockSync {
+    /// A clock from one answer, read between the local monotonic times
+    /// `sent` and `received`, seconds.
+    pub fn measure(clock: Clock, sent: f64, received: f64) -> ClockSync {
+        let mut s = ClockSync {
+            offset_ms: 0.0,
+            measured_at: received,
+            origin_utc_ms: None,
+        };
+        s.update(clock, sent, received);
+        s
+    }
+
+    /// Takes a new measurement (see [`ClockSync::measure`]).
+    pub fn update(&mut self, clock: Clock, sent: f64, received: f64) {
+        let mid_ms = 500.0 * (sent + received.max(sent));
+        self.offset_ms = clock.now_utc_ms as f64 - mid_ms;
+        self.measured_at = received;
+        if clock.origin_utc_ms.is_some() {
+            self.origin_utc_ms = clock.origin_utc_ms;
+        }
+    }
+
+    /// The hub's now at the local monotonic time `local`, seconds, in UTC
+    /// milliseconds.
+    pub fn now_utc_ms(&self, local: f64) -> i64 {
+        (local * 1000.0 + self.offset_ms).floor() as i64
+    }
+
+    /// The origin, once the hub has reported one.
+    pub fn origin_utc_ms(&self) -> Option<i64> {
+        self.origin_utc_ms
+    }
+
+    /// `true` when the latest measurement is [`CLOCK_SYNC_SECONDS`] or
+    /// more before the local monotonic time `local`.
+    pub fn due(&self, local: f64) -> bool {
+        local - self.measured_at >= CLOCK_SYNC_SECONDS
+    }
+}
+
 /// `GET /space/{spaceId}/build/active`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -590,6 +655,33 @@ mod tests {
             r.ready("b"),
             "ws://hub.invalid/space/s/build/b/sections/ready"
         );
+    }
+
+    #[test]
+    fn clock_sync_takes_the_midpoint_and_follows_the_local_clock() {
+        let clock = Clock {
+            origin_utc_ms: None,
+            now_utc_ms: 1_000_000,
+        };
+        // Sent at 10 s, answered at 10.2 s: the hub read its clock at 10.1 s.
+        let mut s = ClockSync::measure(clock, 10.0, 10.2);
+        assert_eq!(s.now_utc_ms(10.1), 1_000_000);
+        assert_eq!(s.now_utc_ms(12.1), 1_002_000);
+        assert_eq!(s.origin_utc_ms(), None);
+        assert!(!s.due(10.2 + CLOCK_SYNC_SECONDS - 0.5));
+        assert!(s.due(10.2 + CLOCK_SYNC_SECONDS));
+        // The hub's clock ran 30 ms ahead of the local one meanwhile.
+        s.update(
+            Clock {
+                origin_utc_ms: Some(5),
+                now_utc_ms: 1_060_030,
+            },
+            70.1,
+            70.1,
+        );
+        assert_eq!(s.now_utc_ms(70.1), 1_060_030);
+        assert_eq!(s.origin_utc_ms(), Some(5));
+        assert!(!s.due(70.2));
     }
 
     #[test]

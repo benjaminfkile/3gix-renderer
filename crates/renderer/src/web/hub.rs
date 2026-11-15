@@ -17,7 +17,7 @@
 use crate::config::ApiKey;
 use crate::protocol::{
     parse_ready_frame, status_problem, subscribe_frame, ActiveBuild, BuildDescription, Clock,
-    DirectionsRequest, DirectionsResponse, Routes, API_KEY_HEADER, CLAIM_HEADER,
+    ClockSync, DirectionsRequest, DirectionsResponse, Routes, API_KEY_HEADER, CLAIM_HEADER,
     MAX_DIRECTION_KEYS,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -57,8 +57,7 @@ pub struct WebHub {
     routes: Routes,
     api_key: ApiKey,
     build: BuildDescription,
-    clock: Clock,
-    clock_read_at: f64,
+    clock: Cell<ClockSync>,
 }
 
 impl WebHub {
@@ -73,16 +72,16 @@ impl WebHub {
                 build_id: String::new(),
                 layers: Vec::new(),
             },
-            clock: Clock {
-                origin_utc_ms: None,
-                now_utc_ms: 0,
-            },
-            clock_read_at: now_seconds(),
+            clock: Cell::new(ClockSync::measure(
+                Clock {
+                    origin_utc_ms: None,
+                    now_utc_ms: 0,
+                },
+                0.0,
+                0.0,
+            )),
         };
-        hub.clock = hub
-            .get_json(&hub.routes.clock(), "reading the clock")
-            .await?;
-        hub.clock_read_at = now_seconds();
+        hub.sync_clock().await?;
         let build_id = match build_id {
             Some(b) => b.to_string(),
             None => {
@@ -134,11 +133,44 @@ impl WebHub {
         &self.build
     }
 
-    /// The hub's now, UTC milliseconds: the clock read at connect time
-    /// advanced by the page's time since.
+    /// The hub's now, UTC milliseconds: the latest measurement of the
+    /// hub's clock advanced by `performance.now()` since ([`ClockSync`]).
     pub fn now_utc_ms(&self) -> i64 {
-        let elapsed_ms = ((now_seconds() - self.clock_read_at) * 1000.0).max(0.0);
-        self.clock.now_utc_ms.saturating_add(elapsed_ms as i64)
+        self.clock.get().now_utc_ms(now_seconds())
+    }
+
+    /// Measures the offset from the hub's clock again with `GET
+    /// /space/{s}/clock`. Done at connect time and, by
+    /// [`WebHub::keep_clock`], every
+    /// [`crate::protocol::CLOCK_SYNC_SECONDS`].
+    pub async fn sync_clock(&self) -> Result<()> {
+        let sent = now_seconds();
+        let clock: Clock = self
+            .get_json(&self.routes.clock(), "reading the clock")
+            .await?;
+        let mut sync = self.clock.get();
+        sync.update(clock, sent, now_seconds());
+        self.clock.set(sync);
+        Ok(())
+    }
+
+    /// Keeps the clock measured: a task on the page's event loop that
+    /// measures it again every [`crate::protocol::CLOCK_SYNC_SECONDS`] for
+    /// as long as the hub lives. A failed measurement keeps the previous
+    /// one and is logged.
+    pub fn keep_clock(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                sleep(crate::protocol::CLOCK_SYNC_SECONDS).await;
+                let Some(hub) = weak.upgrade() else {
+                    return;
+                };
+                if let Err(e) = hub.sync_clock().await {
+                    web_sys::console::warn_1(&format!("gx-renderer: {e:#}").into());
+                }
+            }
+        });
     }
 
     /// Asks for directions for at most 512 keys at `t_utc_ms`.
