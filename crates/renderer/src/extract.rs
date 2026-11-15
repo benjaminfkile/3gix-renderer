@@ -3,8 +3,9 @@
 //! Implements the renderer's step "extracts surfaces" of `space-model.md`
 //! section 2 over one composited section (`matter-format.md` sections 3.3
 //! and 3.5). The renderer knows nothing about what the matter is: a dense
-//! sample is inside a surface, and the surface is where the density crosses
-//! half the largest density in the section.
+//! sample is inside a surface, and the surface is where the density falls
+//! to half that of the matter just inside the boundary with vacuum ("The
+//! isovalue" below).
 //!
 //! Only solid and fluid samples form surfaces ([`forms_surface`]). Gas and
 //! plasma have no hard surface; they count as vacuum here and are drawn as a
@@ -54,8 +55,17 @@
 //!
 //! # The isovalue
 //!
-//! Half the largest density of the section's solid and fluid samples, per
-//! section; gas and plasma samples take no part. A cell at a
+//! The drawn surface is the boundary between matter and vacuum, so the
+//! isovalue is half the density of the matter just inside it: half the
+//! smallest density of the section's solid and fluid samples that lie at
+//! least two samples in from any boundary of that matter or of the
+//! section ([`surface_isovalue`]).
+//! A partly filled sample on the boundary has a density between that and
+//! 0, so the surface passes through it about where its matter ends. Denser
+//! matter further in (a body's layers grow denser toward its center) stays
+//! above the isovalue and draws no surface inside. A section with no such
+//! sample (a thin shell) uses half its largest solid or fluid density. Gas
+//! and plasma samples take no part. A cell at a
 //! coarse depth gives a coarse mesh: that is the compiler's chosen
 //! complexity, and nothing here smooths it.
 //!
@@ -113,7 +123,8 @@ pub struct SurfaceVertex {
     pub albedo: [f32; 3],
     /// Microfacet roughness, 0 to 1.
     pub roughness: f32,
-    /// Temperature, kelvin.
+    /// Radiating temperature of the surface's outermost matter, kelvin:
+    /// what the surface glows at (`matter-format.md` section 3.3).
     pub temperature: f32,
     /// State as its format integer (`matter-format.md` section 3.3).
     pub state: u32,
@@ -128,8 +139,8 @@ pub struct SurfaceMesh {
     pub key: CellKey,
     /// Minimum corner of the cell, meters, frame coordinates.
     pub origin: Vec3,
-    /// The density the surface follows, kilograms per cubic meter: half the
-    /// largest density of the solid and fluid samples.
+    /// The density the surface follows, kilograms per cubic meter
+    /// ([`surface_isovalue`]).
     pub isovalue: f64,
     /// Vertex positions, meters, frame coordinates.
     pub positions: Vec<[f64; 3]>,
@@ -472,6 +483,60 @@ pub fn extract(section: &Section) -> SurfaceMesh {
     extract_with(section, &FaceNeighbors::none())
 }
 
+/// The isovalue of a section's surface (module docs, "The isovalue"), or
+/// `None` without solid or fluid matter.
+pub fn surface_isovalue(section: &Section) -> Option<f64> {
+    let samples = section.samples()?;
+    let n = usize::from(section.resolution());
+    let count = n * n * n;
+    let mut inside: Vec<bool> = (0..count)
+        .map(|i| forms_surface(samples.state(i)) && samples.density(i).value() > 0.0)
+        .collect();
+    let max = (0..count)
+        .filter(|&i| inside[i])
+        .map(|i| samples.density(i).value())
+        .fold(0.0f64, f64::max);
+    if max <= 0.0 {
+        return None;
+    }
+    // Erode twice: a sample survives a pass when it and all 26 samples
+    // around it in the section were inside. What survives both is matter
+    // at least two samples in from any boundary in every direction, past
+    // the partly filled ones.
+    for _ in 0..INNER_DEPTH {
+        let prev = inside.clone();
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    let i = x + n * (y + n * z);
+                    if !prev[i] {
+                        continue;
+                    }
+                    let edge = x == 0 || y == 0 || z == 0 || x + 1 == n || y + 1 == n || z + 1 == n;
+                    inside[i] = !edge
+                        && (0..27).all(|k| {
+                            let (dx, dy, dz) = (k % 3, (k / 3) % 3, k / 9);
+                            prev[(x + dx - 1) + n * ((y + dy - 1) + n * (z + dz - 1))]
+                        });
+                }
+            }
+        }
+    }
+    let inner = (0..count)
+        .filter(|&i| inside[i])
+        .map(|i| samples.density(i).value())
+        .fold(f64::INFINITY, f64::min);
+    Some(if inner.is_finite() {
+        inner / 2.0
+    } else {
+        max / 2.0
+    })
+}
+
+/// How many samples in from every boundary the matter that sets the
+/// isovalue lies ([`surface_isovalue`]).
+const INNER_DEPTH: usize = 2;
+
 /// Extracts the surface of the solid and fluid samples of a composited
 /// section, padding each face with the neighbor's samples where `neighbors`
 /// holds one (vacuum for an empty one) and by clamping elsewhere. A
@@ -496,16 +561,9 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         return empty(0.0);
     };
     let n = usize::from(section.resolution());
-    let mut max = 0.0f64;
-    for i in 0..n * n * n {
-        if forms_surface(samples.state(i)) {
-            max = max.max(samples.density(i).value());
-        }
-    }
-    let isovalue = max / 2.0;
-    if max <= 0.0 {
-        return empty(isovalue);
-    }
+    let Some(isovalue) = surface_isovalue(section) else {
+        return empty(0.0);
+    };
     let usable: [Option<Pad<'_>>; 6] = core::array::from_fn(|f| {
         let neighbor = neighbors.faces[f].as_ref()?;
         if !is_face_neighbor(&key, &neighbor.key(), f) {
@@ -650,22 +708,31 @@ fn edge_vertex(
     let total = wa + wb;
     let mut albedo = [0.0f64; 3];
     let mut roughness = 0.0;
-    let mut temperature = 0.0;
     for (s, w) in [(sa, wa), (sb, wb)] {
         if let (Some(s), true) = (s, w > 0.0) {
             for (acc, al) in albedo.iter_mut().zip(s.albedo) {
                 *acc += w * al.value();
             }
             roughness += w * s.roughness.value();
-            temperature += w * s.radiating_temperature.value();
         }
     }
-    let inside = if da > db { sa } else { sb };
+    let (inside, outside) = if da > db { (sa, sb) } else { (sb, sa) };
+    // A surface radiates from its outermost matter: the outer sample's
+    // radiating temperature when it holds solid or fluid matter, else the
+    // inner one's. The inner sample's own outer side faces the outer
+    // sample's matter, so its light does not leave there.
+    let temperature = match (outside, inside) {
+        (Some(o), _) if o.density.value() > 0.0 && forms_surface(o.state) => {
+            o.radiating_temperature.value()
+        }
+        (_, Some(i)) => i.radiating_temperature.value(),
+        _ => 0.0,
+    };
     let vertex = SurfaceVertex {
         normal,
         albedo: albedo.map(|v| (v / total) as f32),
         roughness: (roughness / total) as f32,
-        temperature: (temperature / total) as f32,
+        temperature: temperature as f32,
         state: u32::from(inside.map_or(State::Vacuum, |s| s.state).as_u8()),
         density: (da + t * (db - da)) as f32,
     };
@@ -826,6 +893,43 @@ mod tests {
             samples,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_body_denser_inside_draws_only_its_outer_surface() {
+        // A dense core inside a lighter mantle: the surface is the
+        // boundary with vacuum, not where the density falls to half the
+        // core's.
+        let res = 32u8;
+        let step = EDGE / f64::from(res);
+        let radius = 3.5;
+        let samples = Samples::from_fn(res, |x, y, z| {
+            let c = |i: u32| (f64::from(i) + 0.5) * step - EDGE / 2.0;
+            let r = (c(x) * c(x) + c(y) * c(y) + c(z) * c(z)).sqrt();
+            if r < 0.5 * radius {
+                solid(13000.0)
+            } else if r < radius {
+                solid(3000.0)
+            } else {
+                Sample::VACUUM
+            }
+        });
+        let section = Section::new(
+            CellKey::new(2, 0, 0, 0, 0).unwrap(),
+            Vec3::new(-EDGE / 2.0, -EDGE / 2.0, -EDGE / 2.0),
+            Meters::new(EDGE),
+            res,
+            samples,
+        )
+        .unwrap();
+        assert_eq!(surface_isovalue(&section), Some(1500.0));
+        let mesh = extract(&section);
+        assert!(!mesh.positions.is_empty());
+        for p in &mesh.positions {
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!(r > radius - step, "a vertex at radius {r}");
+        }
+        assert_closed(&mesh);
     }
 
     /// Every undirected edge is shared by exactly two triangles, and they

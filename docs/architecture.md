@@ -276,8 +276,11 @@ a light, a dense sample is a surface.
    (step 5).
 4. **Extraction** (`extract`) runs on a pool of `std::thread` workers fed by
    a channel: marching cubes over the composited density of the solid and
-   fluid samples at the sample centers, at half the largest of those
-   densities. Gas and plasma samples count as vacuum here. The grid is
+   fluid samples at the sample centers, at half the density of the matter
+   just inside the boundary with vacuum: the smallest density of the solid
+   and fluid samples at least two samples in from any boundary, halved (half
+   the largest when no sample is that deep). A body denser toward its
+   center draws only its outer surface. Gas and plasma samples count as vacuum here. The grid is
    padded on each face with the first layer of the face neighbor when that
    cell is `Ready` at the same depth (`CellCache::face_neighbors`), with
    vacuum when it is `Empty` at the same depth, and by clamping otherwise
@@ -347,8 +350,8 @@ however many times:
   faces (`extract::case_table`).
 - Every value is plain `f64` arithmetic with `sqrt`, both correctly rounded
   in IEEE 754; attributes are narrowed to `f32` last.
-- The isovalue is half the largest density of the section's solid and
-  fluid samples, found in the same walk.
+- The isovalue (`extract::surface_isovalue`) comes from two fixed erosion
+  passes over the section's solid and fluid samples, in index order.
 - A mesh depends only on its own section and the sections of its `Ready`
   face neighbors at the same depth, so the order the pool finishes jobs in
   changes only which frame a mesh first appears in. Once every cell has

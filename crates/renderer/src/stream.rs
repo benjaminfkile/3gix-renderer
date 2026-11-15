@@ -127,9 +127,9 @@ pub struct ReadyCell {
     /// still no matter; such a cell counts as empty for
     /// [`CellCache::known_empty`].
     pub has_matter: bool,
-    /// The density of the drawn surface, kilograms per cubic meter: half
-    /// the largest density of the solid and fluid samples, the isovalue of
-    /// [`crate::extract`]; `None` without solid or fluid samples. The
+    /// The density of the drawn surface, kilograms per cubic meter, the
+    /// isovalue of [`crate::extract`] ([`crate::extract::surface_isovalue`]);
+    /// `None` without solid or fluid samples. The
     /// observer's matter probe ([`crate::probe`]) puts the solid boundary
     /// at the same isovalue, so the observer stands on what is drawn.
     pub surface_isovalue: Option<f64>,
@@ -150,13 +150,7 @@ impl ReadyCell {
             has_matter: section.samples().is_some_and(|s| {
                 (0..s.len()).any(|i| s.get(i).is_some_and(|x| x.density.value() > 0.0))
             }),
-            surface_isovalue: section.samples().and_then(|s| {
-                let max = (0..s.len())
-                    .filter(|&i| crate::extract::forms_surface(s.state(i)))
-                    .map(|i| s.density(i).value())
-                    .fold(0.0, f64::max);
-                (max > 0.0).then_some(max / 2.0)
-            }),
+            surface_isovalue: crate::extract::surface_isovalue(&section),
             section: Arc::new(section),
         }
     }

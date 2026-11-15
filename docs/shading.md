@@ -64,7 +64,7 @@ The state of a sample decides how it is drawn:
 
 | State | Drawn as |
 |---|---|
-| solid, fluid | a surface: marching cubes at half the largest solid or fluid density of the cell, padded at each face by the neighbor's samples or by clamping (`docs/architecture.md`, the padding rule) |
+| solid, fluid | a surface: marching cubes at half the density of the matter just inside the boundary with vacuum (`docs/architecture.md`, step 4), padded at each face by the neighbor's samples or by clamping (`docs/architecture.md`, the padding rule) |
 | gas, plasma | a volume: ray marched |
 
 Extraction counts gas and plasma as vacuum and the volume counts solid and
