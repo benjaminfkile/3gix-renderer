@@ -43,7 +43,9 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every simulated day, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
 | `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
-| `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
+| `walk` | Fly and walk modes: the observer as a `gx-core` body stepped with `step_observer`, the camera at its eye, walking intent, jumps, holding until matter arrives, spawning onto any frame with matter, the toggle that keeps eye and velocity | `space-model.md` 3 (rule 3), 6.3 |
+| `probe` | The `MatterProbe` over the loaded cells of one frame: finest loaded depth, trilinear density, nearest state split at the drawn surface, the frame's rotation as the matter's velocity; the cells around the feet | `space-model.md` 6.3, `matter-format.md` 3.3, 3.5 |
+| `stream` | Cell selection, the cell cache (with priority cells around a walking observer's feet), decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
 | `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
@@ -107,8 +109,18 @@ package builds for that target.
    fine `gx_core::history::History` that is rebuilt from a coarse one
    (checkpoints every simulated day from the origin) whenever the time
    leaves it. A jump anywhere costs at most one coarse interval.
-3. Free flight moves the camera; then, if `FrameSystem::nearest_frame` of the
-   camera position differs from its frame, the camera re-parents.
+3. The observer moves (`walk::Observer::update`). In fly mode free flight
+   moves the camera, which also coasts at any velocity it kept from walk
+   mode; then, if `FrameSystem::nearest_frame` of the camera position
+   differs from its frame, the camera re-parents. In walk mode the steps
+   are reordered as the core asks: the observer body is stepped with
+   `gx_core::observer::step_observer` by the simulation time about to pass
+   (at most 0.25 s, the rest carries it with its frame) with the frames at
+   the current time, then the frames are integrated (step 2), then the
+   observer is put back in its frame's turned axes and the camera placed
+   at its eye. The cells around its feet at every depth become priority
+   requests, and it is held in place until those at the deepest depth are
+   loaded.
 4. Light time: `seen::Seen` solves the light-time equation of every frame
    for the camera's position against the fine history
    (`gx_core::light::retarded_state`) and builds the frame system of

@@ -154,6 +154,18 @@ pub fn selectable_frames(tree: &FrameTree) -> Vec<u64> {
         .collect()
 }
 
+/// The unit direction of the held movement keys in camera axes, or `None`
+/// with none held (or opposite keys cancelling).
+fn flight_direction(input: &FlightInput) -> Option<Vec3> {
+    let axis = |plus: bool, minus: bool| f64::from(u8::from(plus)) - f64::from(u8::from(minus));
+    Vec3::new(
+        axis(input.right, input.left),
+        axis(input.up, input.down),
+        axis(input.back, input.forward),
+    )
+    .normalized()
+}
+
 impl Camera {
     /// The camera position in root coordinates. Large values lose
     /// precision; use [`Camera::relative`] for anything drawn.
@@ -197,16 +209,32 @@ impl Camera {
         let k = 1.0 - (-dt / SPEED_GLIDE_SECONDS).exp();
         let (now, to) = (self.cruise.clamp(lo, hi).ln(), target.ln());
         self.cruise = (now + (to - now) * k).exp();
-        let axis = |plus: bool, minus: bool| f64::from(u8::from(plus)) - f64::from(u8::from(minus));
-        let local = Vec3::new(
-            axis(input.right, input.left),
-            axis(input.up, input.down),
-            axis(input.back, input.forward),
-        );
-        if let Some(dir) = local.normalized() {
+        if let Some(dir) = flight_direction(input) {
             let step = self.orientation.rotate(dir).scale(self.cruise * dt);
             self.position = self.position + step;
         }
+    }
+
+    /// The velocity the held movement keys fly the camera at, at the
+    /// current flight speed, meters per second, root axes; zero with no key
+    /// held.
+    pub fn flight_velocity(&self, system: &FrameSystem, input: &FlightInput) -> Vec3 {
+        flight_direction(input).map_or(Vec3::zero(), |dir| {
+            self.root_orientation(system).rotate(dir).scale(self.cruise)
+        })
+    }
+
+    /// Lets the camera coast for `dt` seconds of simulation time at
+    /// `velocity` (root axes, meters per second), on top of wherever the
+    /// controls put it: the motion it keeps from walk mode
+    /// ([`crate::walk::Observer`]). Nothing acts on it, so the velocity
+    /// does not change.
+    pub fn coast(&mut self, system: &FrameSystem, velocity: Vec3, dt: f64) {
+        if velocity == Vec3::zero() || dt == 0.0 {
+            return;
+        }
+        let to_frame = system.root_orientation(self.frame_id).conjugate();
+        self.position = self.position + to_frame.rotate(velocity.scale(dt));
     }
 
     /// Re-expresses the camera in `frame_id` without moving it: the same

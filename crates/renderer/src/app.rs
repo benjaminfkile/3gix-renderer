@@ -5,8 +5,13 @@
 //! 1. advance the [`SimClock`] by the wall-clock delta, clamped to the
 //!    hub's now, and integrate every frame to the simulation time
 //!    ([`crate::sim`], `space-model.md` sections 6 and 7),
-//! 2. apply free flight to the [`Camera`] and re-parent it to its nearest
-//!    frame ([`crate::camera`], `space-model.md` section 5),
+//! 2. move the observer through that step ([`Observer::update`]): in fly
+//!    mode the camera keeps its place, flies, coasts, and re-parents to its
+//!    nearest frame ([`crate::camera`], `space-model.md` section 5); in walk
+//!    mode the observer body is stepped by the same time before the
+//!    integration and the camera is put at its eye ([`crate::walk`],
+//!    `space-model.md` section 6.3), and the cells around its feet become
+//!    the streaming priority,
 //! 3. solve the light time of every frame for the camera's position
 //!    ([`Seen`], `space-model.md` section 6.4); everything after this
 //!    reads the retarded states,
@@ -35,6 +40,7 @@ use crate::render::scene::Scene;
 use crate::seen::Seen;
 use crate::sim::{SimClock, Simulation};
 use crate::stream::{FetchEvent, Fetcher};
+use crate::walk::{mode_lines, spawn_by_index, Observer};
 use crate::world::World;
 use anyhow::{anyhow, Context, Result};
 use gx_core::frames::FrameSystem;
@@ -509,6 +515,7 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     let mut app = App {
         sim,
         camera,
+        observer: Observer::new(),
         world: World::new(default_threads()),
         fetcher,
         started: Instant::now(),
@@ -627,6 +634,7 @@ impl Gfx {
 struct App {
     sim: Simulation,
     camera: Camera,
+    observer: Observer,
     world: World,
     fetcher: Fetcher,
     started: Instant,
@@ -655,12 +663,21 @@ impl App {
         let fps = self.fps.frame(now);
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
-        let held = self.camera.hold(self.sim.system());
-        self.sim.update(Seconds::new(dt), hub_now);
-        self.camera.keep(self.sim.system(), held);
+        if let Some(index) = self.controls.take_spawn() {
+            let (system, cache) = (self.sim.system(), self.world.cache());
+            spawn_by_index(&mut self.observer, system, cache, index, &mut self.camera);
+        }
         let input = self.controls.take_flight();
-        self.camera.fly(&input, dt);
-        self.camera.update_parent(self.sim.system());
+        let jump = self.controls.take_jump();
+        self.observer.update(
+            &mut self.sim,
+            dt,
+            hub_now,
+            self.world.cache(),
+            &input,
+            jump,
+            &mut self.camera,
+        );
 
         let Some(gfx) = self.gfx.as_mut() else {
             return;
@@ -671,6 +688,11 @@ impl App {
         let seen = self.sim.seen(&self.camera);
         self.world
             .select(seen.system(), seen.camera(), size, t, false);
+        self.world
+            .set_priority(&self.observer.priority_cells(self.sim.system()), t);
+        if self.controls.spawning {
+            self.world.survey(self.sim.system(), t);
+        }
         set_fetch_time(&mut self.fetcher, &self.sim);
         let events = self.fetcher.drain();
         stream_step(&mut self.world, &mut self.fetcher, seen.system(), events, t);
@@ -681,7 +703,7 @@ impl App {
             scene.lines.clear();
         }
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
-        let overlay = OverlayInfo {
+        let mut overlay = OverlayInfo {
             ..overlay_info(
                 &self.sim,
                 &seen,
@@ -692,6 +714,15 @@ impl App {
             )
         }
         .text();
+        for line in mode_lines(
+            &self.observer,
+            self.sim.system(),
+            self.world.cache(),
+            self.controls.spawning,
+        ) {
+            overlay.push('\n');
+            overlay.push_str(&line);
+        }
         let exposure = self.controls.exposure(Some(dt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -740,7 +771,7 @@ impl ApplicationHandler for App {
             other => {
                 if self
                     .controls
-                    .handle(&other, &mut self.sim, &mut self.camera)
+                    .handle(&other, &mut self.sim, &mut self.camera, &mut self.observer)
                 {
                     event_loop.exit();
                 }

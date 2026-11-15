@@ -15,8 +15,10 @@ In the browser, click the canvas first so it has the keyboard focus.
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
 | Mouse wheel | Set the flight speed: each notch multiplies or divides it by 1.25 (about ten notches per factor of ten) |
 | `Shift` (held) | Boost: fly at ten times the set speed while held |
-| `1` to `9`, `0` | Jump to a view of the frame with that index (see below) |
+| `1` to `9`, `0` | Jump to a view of the frame with that index (see below); with the spawn chooser open, spawn instead (see Walk) |
 | `Home` | Jump to a view of the whole system from above the root frame |
+| `Tab` | Switch between fly and walk (see Walk) |
+| `G` | Open or close the spawn chooser (see Spawning) |
 | `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
 
 The camera behaves like an observer floating free in space: simulation time
@@ -38,7 +40,8 @@ tenfold while held. The flight speed glides to a new setting with a 0.15 s
 time constant (evenly per factor of ten), so a burst of notches or a Shift
 press does not jump. Matter, gravity, and the frame the
 camera happens to be parented to play no part: it flies through the densest matter
-the same way it flies through empty space. The overlay's camera line
+the same way it flies through empty space. After leaving walk mode it also coasts at the
+velocity it had there, since nothing acts on it to change that (see Walk). The overlay's camera line
 shows the current flight speed.
 
 The number keys index the frames in registry order: frame ids sorted
@@ -50,6 +53,78 @@ frame shows a lit side and a dark side, and the lit side turns as the light
 moves over simulation time. The camera floats free where it lands, and the
 body moves on along its orbit. A key past the last frame does nothing.
 
+## Walk
+
+| Input | Action in walk mode |
+|---|---|
+| `W` / `S` | Walk forward / backward along the ground, in the view's heading |
+| `A` / `D` | Walk left / right |
+| `Shift` (held) | Run: twice the walking speed, so twice the push from rest |
+| `Space` | Jump: 3 m/s along up, only while standing on solid matter |
+| Right mouse drag | Look around: yaw about up, pitch up and down, never past straight up or down |
+| `Tab` | Back to fly mode |
+
+`Tab` switches between the two modes. In fly mode nothing acts on the
+camera (above). In walk mode the camera is a body the laws act on: an 80
+kg, 1.75 m observer with a density of 985 kg/m^3 (the core's default
+observer), pulled by the gravity of every massive frame, held up by solid
+matter and carried along with it by friction (so it turns and orbits with
+whatever it stands on), slowed by drag in fluid, gas, and plasma, and
+pushed up by their buoyancy. The camera sits at eye height, 0.94 times the
+observer's height, above its feet along the local up (against gravity), and
+mouse look is relative to that up. Its heading turns with the matter it
+stands on.
+
+The walking keys push along the surface the observer stands on, toward
+1.4 m/s over the ground (2.8 m/s running), reaching it in about a quarter
+of a second; friction stops the observer when they are released. Off the
+ground (falling, jumping, or floating in gas) the walking keys do nothing.
+`E`, `Q`, and the wheel do nothing in walk mode. `Space` jumps instead of
+pausing; the other time keys work as in fly mode, and the observer stays
+where it is on its frame across any jump in time. At a fast playback rate
+the observer is stepped by at most 0.25 s of simulation time per frame and
+carried with its frame for the rest.
+
+Switching keeps the eye where it is and keeps the velocity: going to walk,
+the camera's velocity (what it kept from an earlier walk plus the held
+flight keys at the flight speed) becomes the observer's; going back to fly,
+the observer's velocity becomes the camera's, and the camera coasts at it
+over simulation time (the overlay's mode line shows it as `drift`). A
+camera placed by a view key (`Home`, a number key) is at rest. Those keys
+also leave walk mode.
+
+The observer belongs to the frame the camera was parented to when walk
+mode began, or the frame it spawned onto, and only that frame's matter
+holds it up. The cells around its feet are fetched first, at every depth
+down to the deepest any layer offers there. Until the deepest of them have
+arrived the observer is held in place on its frame, neither falling nor
+walking, and the overlay says `waiting for matter under the observer`.
+
+The overlay's last lines show the mode: `mode fly`, or `mode walk frame
+<id>` with `contact` (standing on solid matter) or `no contact`, and the
+speed over the matter.
+
+## Spawning
+
+| Input | Action |
+|---|---|
+| `G` | Open or close the spawn chooser |
+| `1` to `9`, `0` (chooser open) | Spawn onto the frame with that number in the chooser |
+
+`G` lists the frames that have matter, in ascending frame id, with their
+number keys, on the overlay's last line: `spawn: 1 frame 3  2 frame 5`. A
+frame is listed once any of its depth 0 or depth 1 cells has arrived with
+matter in it; opening the chooser fetches those cells for every frame.
+Choosing a frame closes the chooser and puts the observer, in walk mode,
+on the line from that frame's origin to the camera, 2 m above the outermost
+matter on that line, moving with that matter. If finer cells arrive while
+it waits for them, the point is found again with them, so it starts above
+the finest matter available. Then the laws take over: on solid matter the
+observer comes to rest on the surface; in fluid, gas, or plasma it sinks
+until buoyancy holds it, where the surrounding density is its own.
+
+With the chooser closed the number keys are the fly views described above.
+
 ## Simulation time
 
 | Input | Action |
@@ -60,7 +135,7 @@ body moves on along its orbit. A key past the last frame does nothing.
 | `[` | Halve the playback rate |
 | `]` | Double the playback rate (does nothing at now) |
 | `Backspace` | Play backwards at the current rate, or forwards again (a toggle) |
-| `Space` | Pause or resume |
+| `Space` | Pause or resume (in walk mode `Space` jumps instead) |
 
 Time runs between the origin of the space (the moment its universe began)
 and now (the hub's clock, measured at start and every minute so it does not

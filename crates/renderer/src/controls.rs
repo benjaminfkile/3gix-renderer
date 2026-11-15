@@ -1,8 +1,10 @@
 //! Keyboard and mouse controls, shared by the desktop window and the
 //! browser canvas.
 //!
-//! Turns `winit` window events into flight input for the [`Camera`],
-//! actions on the simulation clock ([`crate::sim::ClockAction`]), view jumps, and the
+//! Turns `winit` window events into flight or walking input for the
+//! [`Camera`] and the [`Observer`] (fly and walk, `Tab`), the spawn chooser
+//! (`G`), actions on the simulation clock ([`crate::sim::ClockAction`]),
+//! view jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -11,6 +13,7 @@
 use crate::camera::{Camera, FlightInput};
 use crate::render::gpu::{Exposure, EXPOSURE_STEP_STOPS};
 use crate::sim::{ClockAction, Simulation};
+use crate::walk::Observer;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -38,6 +41,13 @@ pub struct Controls {
     /// `true` while frame markers and frame-to-parent lines are hidden
     /// (`M`): they are drawing aids, not matter.
     pub hide_guides: bool,
+    /// `true` while the spawn chooser is open (`G`): the number keys pick a
+    /// frame to spawn onto ([`crate::walk::spawn_frames`]).
+    pub spawning: bool,
+    /// The spawn chooser index picked since the last frame.
+    spawn: Option<usize>,
+    /// Space pressed in walk mode since the last frame.
+    jump: bool,
 }
 
 impl Controls {
@@ -69,6 +79,19 @@ impl Controls {
         out
     }
 
+    /// Whether Space was pressed in walk mode since the last frame; clears
+    /// it.
+    pub fn take_jump(&mut self) -> bool {
+        std::mem::take(&mut self.jump)
+    }
+
+    /// The spawn chooser index (`0` for key `1`, up to `9` for key `0`)
+    /// picked since the last frame; clears it. The frame loop resolves it
+    /// against [`crate::walk::spawn_frames`].
+    pub fn take_spawn(&mut self) -> Option<usize> {
+        self.spawn.take()
+    }
+
     /// Applies one window event. Returns `true` when the user asked to
     /// quit (`Escape`). Events that are not input are ignored.
     pub fn handle(
@@ -76,12 +99,13 @@ impl Controls {
         event: &WindowEvent,
         sim: &mut Simulation,
         camera: &mut Camera,
+        observer: &mut Observer,
     ) -> bool {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
-                    return self.key(code, pressed, event.repeat, sim, camera);
+                    return self.key(code, pressed, event.repeat, sim, camera, observer);
                 }
             }
             WindowEvent::MouseInput {
@@ -118,7 +142,12 @@ impl Controls {
         repeat: bool,
         sim: &mut Simulation,
         camera: &mut Camera,
+        observer: &mut Observer,
     ) -> bool {
+        if code == KeyCode::Space && pressed && !repeat && observer.walking() {
+            self.jump = true;
+            return false;
+        }
         let f = &mut self.flight;
         match code {
             KeyCode::KeyW => f.forward = pressed,
@@ -129,21 +158,33 @@ impl Controls {
             KeyCode::KeyQ => f.down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => f.boost = pressed,
             _ if !pressed || repeat => {}
-            KeyCode::Space => clock(sim, camera, ClockAction::TogglePause),
-            KeyCode::BracketLeft => clock(sim, camera, ClockAction::HalveRate),
-            KeyCode::BracketRight => clock(sim, camera, ClockAction::DoubleRate),
-            KeyCode::Comma => clock(sim, camera, ClockAction::StepBack),
-            KeyCode::Period => clock(sim, camera, ClockAction::StepForward),
-            KeyCode::Backspace => clock(sim, camera, ClockAction::ToggleRewind),
-            KeyCode::KeyN => clock(sim, camera, ClockAction::JumpToNow),
-            KeyCode::Home => *camera = Camera::home(sim.system()),
+            KeyCode::Space => observer.apply_clock(sim, camera, ClockAction::TogglePause),
+            KeyCode::BracketLeft => observer.apply_clock(sim, camera, ClockAction::HalveRate),
+            KeyCode::BracketRight => observer.apply_clock(sim, camera, ClockAction::DoubleRate),
+            KeyCode::Comma => observer.apply_clock(sim, camera, ClockAction::StepBack),
+            KeyCode::Period => observer.apply_clock(sim, camera, ClockAction::StepForward),
+            KeyCode::Backspace => observer.apply_clock(sim, camera, ClockAction::ToggleRewind),
+            KeyCode::KeyN => observer.apply_clock(sim, camera, ClockAction::JumpToNow),
+            KeyCode::Tab => {
+                let v = camera.flight_velocity(sim.system(), &self.flight);
+                observer.toggle(sim.system(), camera, v);
+            }
+            KeyCode::KeyG => self.spawning = !self.spawning,
+            KeyCode::Home => {
+                observer.stop();
+                *camera = Camera::home(sim.system());
+            }
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
             other => {
                 if let Some(index) = digit_index(other) {
-                    if let Some(cam) = Camera::view_of_index(sim.system(), index) {
+                    if self.spawning {
+                        self.spawning = false;
+                        self.spawn = Some(index);
+                    } else if let Some(cam) = Camera::view_of_index(sim.system(), index) {
+                        observer.stop();
                         *camera = Camera {
                             speed: camera.speed,
                             cruise: camera.cruise,
@@ -170,15 +211,6 @@ impl Controls {
             }
         }
     }
-}
-
-/// Applies a clock action and integrates to the new time, keeping the
-/// camera where it was in space, as the frame loop does for every
-/// simulation step ([`Camera::hold`], [`Camera::keep`]).
-fn clock(sim: &mut Simulation, camera: &mut Camera, action: ClockAction) {
-    let held = camera.hold(sim.system());
-    sim.apply(action);
-    camera.keep(sim.system(), held);
 }
 
 /// Number keys: `1` to `9` select indices 0 to 8, `0` selects index 9.
