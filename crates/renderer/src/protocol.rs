@@ -1,133 +1,474 @@
-//! The hub's wire protocol for clients, without any I/O: chunk statuses,
-//! readiness socket frames, URLs, the builds listing, and the registry
-//! chunk.
+//! The hub's client routes, without any I/O: URLs, the clock, builds and
+//! layer configs, directions, the readiness socket's frames, and the frame
+//! registry built from every layer's registry section.
 //!
-//! Shared by the native client ([`crate::hub`]) and the browser client
-//! (`crate::web`), which differ only in how they send requests. The
-//! protocol is the hub's chunk flow (`compiler-pipeline.md` section 4, "The
-//! 202 / Poll Cycle") and the registry, the renderer's first request
-//! (`space-model.md` section 7, `matter-format.md` sections 5 and 6).
+//! Implements the wire side of `client-compute.md` sections 2.2 (layer
+//! config), 2.3 (client routes), and 2.4 (directions), and the readiness
+//! socket keyed by address. Shared by the native client ([`crate::hub`])
+//! and the browser client (`crate::web`), which differ only in how they
+//! send requests.
+//!
+//! The registry is just another key (`matter-format.md` section 5): every
+//! layer contributes a registry section, and [`frame_system_from_registries`]
+//! validates each, takes their union, and raises every frame's depth to the
+//! deepest any layer config declares for it (`space-model.md` section 8).
 
-use anyhow::{anyhow, Result};
-use gx_core::container::decode_registry_chunk;
+use anyhow::{anyhow, bail, Result};
 use gx_core::frames::FrameSystem;
-use gx_core::registry::FrameTree;
+use gx_core::key::{ChunkKey, REGISTRY_KEY};
+use gx_core::module_io::ModuleRequest;
+use gx_core::registry::{self, FrameTree, Registry};
+use gx_worker::job::parse_hash;
+use gx_worker::{BlobKind, ComputeJob};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The header that carries the API key.
 pub const API_KEY_HEADER: &str = "X-API-Key";
 
-/// The outcome of one chunk request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChunkFetch {
-    /// `200 OK`: the assembled chunk container.
-    Ready(Arc<[u8]>),
-    /// `202 Accepted`: compilation was dispatched; ask again when ready.
-    Pending,
-    /// `404 Not Found`: the build has no layers to compile it.
-    NotFound,
-    /// `410 Gone`: a required compiler is retired; it can never be produced.
-    Gone,
-    /// Anything else: transport failure or an unexpected status.
-    Error(String),
+/// The header that carries the claim on an upload.
+pub const CLAIM_HEADER: &str = "X-Claim";
+
+/// Most keys one directions request may carry (`client-compute.md`
+/// section 2.3).
+pub const MAX_DIRECTION_KEYS: usize = 512;
+
+/// The deepest cell depth a chunk key can have (`matter-format.md`
+/// section 2).
+pub const DEEPEST_DEPTH: u8 = 31;
+
+/// `GET /space/{spaceId}/clock`.
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Clock {
+    /// The universe's origin, UTC milliseconds, or `None` before the first
+    /// directions request.
+    pub origin_utc_ms: Option<i64>,
+    /// The hub's current time, UTC milliseconds.
+    pub now_utc_ms: i64,
 }
 
-/// The outcome for an HTTP status of the chunk endpoint. A `200` needs its
-/// body, so it maps to `None` here and is handled by the caller.
-pub fn classify_status(status: u16) -> Option<ChunkFetch> {
-    match status {
-        200 => None,
-        202 => Some(ChunkFetch::Pending),
-        404 => Some(ChunkFetch::NotFound),
-        410 => Some(ChunkFetch::Gone),
-        401 => Some(ChunkFetch::Error(
-            "hub refused the API key (401 Unauthorized)".into(),
-        )),
-        403 => Some(ChunkFetch::Error(
-            "the API key lacks the fetch:chunks capability (403 Forbidden)".into(),
-        )),
-        other => Some(ChunkFetch::Error(format!("unexpected status {other}"))),
+/// `GET /space/{spaceId}/build/active`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveBuild {
+    /// The active build id.
+    pub build_id: String,
+}
+
+/// Where a layer is attached (`space-model.md` section 8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attachment {
+    /// Every frame.
+    All,
+    /// These frame ids, ascending.
+    Frames(Vec<u64>),
+}
+
+impl Attachment {
+    /// `true` when the layer is directed for matter cells of `frame_id`.
+    pub fn contains(&self, frame_id: u64) -> bool {
+        match self {
+            Attachment::All => true,
+            Attachment::Frames(f) => f.binary_search(&frame_id).is_ok(),
+        }
     }
 }
 
-/// One frame the client sends on the readiness socket.
+impl<'de> Deserialize<'de> for Attachment {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Attachment, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Word(String),
+            Frames(Vec<u64>),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Word(w) if w == "all" => Ok(Attachment::All),
+            Raw::Word(w) => Err(serde::de::Error::custom(format!(
+                "attachment {w:?} is neither \"all\" nor a frame list"
+            ))),
+            Raw::Frames(mut f) => {
+                f.sort_unstable();
+                f.dedup();
+                Ok(Attachment::Frames(f))
+            }
+        }
+    }
+}
+
+impl Serialize for Attachment {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Attachment::All => s.serialize_str("all"),
+            Attachment::Frames(f) => f.serialize(s),
+        }
+    }
+}
+
+/// One layer of a build (`client-compute.md` section 2.2), as `GET
+/// /space/{spaceId}/build/{buildId}` lists it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerConfig {
+    /// The layer id. An opaque identifier, never shown.
+    pub layer: String,
+    /// SHA-256 of the module the layer runs, lowercase hex.
+    pub module: String,
+    /// SHA-256 of the layer's source manifest, or `None`.
+    #[serde(default)]
+    pub source_manifest: Option<String>,
+    /// The frames the layer is directed for.
+    pub attachment: Attachment,
+    /// The layer owns its frames exclusively.
+    #[serde(default)]
+    pub exclusive: bool,
+    /// Deepest cell per frame id (decimal), or `"*"` for the default of a
+    /// layer attached to all frames.
+    #[serde(default)]
+    pub max_depth: BTreeMap<String, u8>,
+    /// Span length in seconds; 0 for matter that never changes.
+    #[serde(default)]
+    pub span_seconds: u64,
+    /// The module's output depends on the origin.
+    #[serde(default)]
+    pub uses_origin: bool,
+}
+
+impl LayerConfig {
+    /// The depth this layer's config declares for `frame_id`: the frame's
+    /// own entry, else the `"*"` default, else `None` (the config says
+    /// nothing, and the registry's `max_depth` stands).
+    pub fn declared_depth(&self, frame_id: u64) -> Option<u8> {
+        self.max_depth
+            .get(&frame_id.to_string())
+            .or_else(|| self.max_depth.get("*"))
+            .map(|&d| d.min(DEEPEST_DEPTH))
+    }
+}
+
+/// `GET /space/{spaceId}/build/{buildId}`: the build's layers, ordered by
+/// layer id.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildDescription {
+    /// The build id.
+    pub build_id: String,
+    /// The layers.
+    pub layers: Vec<LayerConfig>,
+}
+
+impl BuildDescription {
+    /// `true` when `layer` is directed for matter cells of `frame_id`:
+    /// attached, and no exclusive layer of another id owns the frame
+    /// (`space-model.md` section 8).
+    pub fn directs(&self, layer: &LayerConfig, frame_id: u64) -> bool {
+        layer.attachment.contains(frame_id)
+            && !self.layers.iter().any(|other| {
+                other.layer != layer.layer && other.exclusive && other.attachment.contains(frame_id)
+            })
+    }
+
+    /// The deepest depth any layer directed for `frame_id` declares for it,
+    /// or `None` when no config declares one.
+    pub fn layer_depth(&self, frame_id: u64) -> Option<u8> {
+        self.layers
+            .iter()
+            .filter(|l| self.directs(l, frame_id))
+            .filter_map(|l| l.declared_depth(frame_id))
+            .max()
+    }
+}
+
+/// `POST /space/{spaceId}/build/{buildId}/directions` body.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectionsRequest {
+    /// The moment the cells are drawn at, UTC milliseconds.
+    pub t_utc_ms: i64,
+    /// Chunk keys, at most [`MAX_DIRECTION_KEYS`].
+    pub keys: Vec<String>,
+}
+
+/// One layer's answer for one key, as sent. See [`Direction`] for the
+/// checked form.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawDirection {
+    /// The layer id.
+    pub layer: String,
+    /// `empty`, `ready`, `compute`, or `pending`.
+    pub state: String,
+    /// The section's address (all but `empty`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// The claim token (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
+    /// The claim's lease, milliseconds (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// The module hash (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// The source manifest hash or `null` (`compute`).
+    #[serde(default)]
+    pub source_manifest: Option<String>,
+    /// The origin the module receives, 0 when the layer does not use it
+    /// (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_utc_ms: Option<i64>,
+    /// The span index (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_index: Option<u64>,
+    /// The span length, seconds (`compute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_seconds: Option<u64>,
+    /// When to ask again, milliseconds (`pending`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_ms: Option<u64>,
+}
+
+/// One key's answers.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDirections {
+    /// The chunk key.
+    pub key: String,
+    /// One answer per layer, in the build's layer order.
+    pub layers: Vec<RawDirection>,
+}
+
+/// The directions response.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectionsResponse {
+    /// The universe's origin, UTC milliseconds.
+    pub origin_utc_ms: i64,
+    /// One entry per key asked.
+    pub results: Vec<KeyDirections>,
+}
+
+/// One layer's answer for one key, checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// The layer contributes nothing to this cell.
+    Empty,
+    /// The section is stored: stream it by its address.
+    Ready {
+        /// The section's address.
+        address: [u8; 32],
+    },
+    /// Nobody has computed it; this client holds the claim.
+    Compute(ComputeJob),
+    /// Another client holds the claim.
+    Pending {
+        /// The section's address.
+        address: [u8; 32],
+        /// Milliseconds after which to ask again.
+        retry_ms: u64,
+    },
+}
+
+impl RawDirection {
+    /// Checks the answer for `key` and turns it into a [`Direction`].
+    pub fn parse(&self, key: &ChunkKey) -> Result<Direction> {
+        let hash = |field: &str, v: &Option<String>| -> Result<[u8; 32]> {
+            let s = v
+                .as_deref()
+                .ok_or_else(|| anyhow!("{} direction without {field}", self.state))?;
+            parse_hash(s).ok_or_else(|| anyhow!("{field} {s:?} is not 64 lowercase hex"))
+        };
+        Ok(match self.state.as_str() {
+            "empty" => Direction::Empty,
+            "ready" => Direction::Ready {
+                address: hash("address", &self.address)?,
+            },
+            "pending" => Direction::Pending {
+                address: hash("address", &self.address)?,
+                retry_ms: self.retry_ms.unwrap_or(1000),
+            },
+            "compute" => {
+                let manifest = match &self.source_manifest {
+                    Some(_) => Some(hash("sourceManifest", &self.source_manifest)?),
+                    None => None,
+                };
+                Direction::Compute(ComputeJob {
+                    address: hash("address", &self.address)?,
+                    claim: self
+                        .claim
+                        .clone()
+                        .filter(|c| !c.is_empty())
+                        .ok_or_else(|| anyhow!("compute direction without a claim"))?,
+                    module: hash("module", &self.module)?,
+                    manifest,
+                    request: ModuleRequest {
+                        origin_utc_ms: self.origin_utc_ms.unwrap_or(0),
+                        span_seconds: self.span_seconds.unwrap_or(0),
+                        span_index: self.span_index.unwrap_or(0),
+                        key: *key,
+                    },
+                })
+            }
+            other => bail!("unknown direction state {other:?}"),
+        })
+    }
+}
+
+/// The readiness socket frame the client sends.
 #[derive(Serialize)]
 struct SubscribeFrame<'a> {
     subscribe: &'a str,
 }
 
-/// One frame the hub pushes on the readiness socket.
+/// The readiness socket frame the hub pushes.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadyFrame {
-    chunk_ready: String,
+    section_ready: String,
 }
 
-/// Parses a readiness push, `{ "chunkReady": "<key>" }`, or returns `None`
+/// The text of a subscription, `{"subscribe":"<address>"}`.
+pub fn subscribe_frame(address: &str) -> String {
+    serde_json::to_string(&SubscribeFrame { subscribe: address }).expect("a string serializes")
+}
+
+/// Parses a readiness notice, `{"sectionReady":"<address>"}`, or `None`
 /// for anything else.
-pub fn parse_ready_frame(text: &str) -> Option<String> {
+pub fn parse_ready_frame(text: &str) -> Option<[u8; 32]> {
     serde_json::from_str::<ReadyFrame>(text)
         .ok()
-        .map(|f| f.chunk_ready)
+        .and_then(|f| parse_hash(&f.section_ready))
 }
 
-/// The text of a subscription frame, `{"subscribe":"<key>"}`.
-pub fn subscribe_frame(key: &str) -> String {
-    serde_json::to_string(&SubscribeFrame { subscribe: key }).expect("a string serializes")
+/// Builds the hub's URLs. Content-addressed reads (sections, modules,
+/// sources, manifests) go to the edge, which is the hub itself unless a
+/// separate edge URL is configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routes {
+    /// Hub base URL, no trailing slash.
+    pub hub: String,
+    /// Edge base URL for immutable reads, no trailing slash.
+    pub edge: String,
+    /// The space.
+    pub space_id: String,
 }
 
-/// One entry of `GET /space/{spaceId}/builds`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildSummary {
-    /// The build id.
-    pub build_id: String,
-    /// `Active` for the build clients should draw, `Archived` for the rest.
-    pub status: String,
+impl Routes {
+    /// Routes for `space_id` on `hub`, reading immutable bytes through
+    /// `edge` (or the hub when `None`).
+    pub fn new(hub: &str, edge: Option<&str>, space_id: &str) -> Routes {
+        let hub = hub.trim().trim_end_matches('/').to_string();
+        let edge = edge
+            .map(|e| e.trim().trim_end_matches('/').to_string())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| hub.clone());
+        Routes {
+            hub,
+            edge,
+            space_id: space_id.trim().to_string(),
+        }
+    }
+
+    fn space(&self) -> String {
+        format!("{}/space/{}", self.hub, self.space_id)
+    }
+
+    /// `GET /space/{spaceId}/clock`.
+    pub fn clock(&self) -> String {
+        format!("{}/clock", self.space())
+    }
+
+    /// `GET /space/{spaceId}/build/active`.
+    pub fn active_build(&self) -> String {
+        format!("{}/build/active", self.space())
+    }
+
+    /// `GET /space/{spaceId}/build/{buildId}`.
+    pub fn build(&self, build_id: &str) -> String {
+        format!("{}/build/{build_id}", self.space())
+    }
+
+    /// `POST /space/{spaceId}/build/{buildId}/directions`.
+    pub fn directions(&self, build_id: &str) -> String {
+        format!("{}/build/{build_id}/directions", self.space())
+    }
+
+    /// `PUT /space/{spaceId}/build/{buildId}/section/{address}`.
+    pub fn upload(&self, build_id: &str, address: &str) -> String {
+        format!("{}/build/{build_id}/section/{address}", self.space())
+    }
+
+    /// `GET /{kind}/{name}` on the edge: `/section/{address}`,
+    /// `/module/{hash}`, `/source/{hash}`, `/source-manifest/{hash}`.
+    pub fn blob(&self, kind: BlobKind, name: &str) -> String {
+        format!("{}/{}/{name}", self.edge, kind.segment())
+    }
+
+    /// The readiness socket: the hub URL with `http` replaced by `ws` (or
+    /// `https` by `wss`), then `/space/{spaceId}/build/{buildId}/sections/ready`.
+    pub fn ready(&self, build_id: &str) -> String {
+        let base = if let Some(rest) = self.hub.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = self.hub.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            self.hub.clone()
+        };
+        format!(
+            "{base}/space/{}/build/{build_id}/sections/ready",
+            self.space_id
+        )
+    }
 }
 
-/// Picks the active build from a builds listing: the first entry whose
-/// status is `Active` (the hub lists newest first).
-pub fn pick_active_build(builds: &[BuildSummary]) -> Option<&str> {
-    builds
-        .iter()
-        .find(|b| b.status.eq_ignore_ascii_case("active"))
-        .map(|b| b.build_id.as_str())
+/// A message for an HTTP status the hub answered with, or `None` for
+/// `200` and `201`.
+pub fn status_problem(status: u16) -> Option<String> {
+    match status {
+        200 | 201 => None,
+        401 => Some("hub refused the API key (401 Unauthorized)".into()),
+        403 => Some("the API key lacks the fetch:chunks capability (403 Forbidden)".into()),
+        other => Some(format!("hub answered {other}")),
+    }
 }
 
-/// `GET /space/{spaceId}/builds` on the hub at `base_url` (no trailing
-/// slash).
-pub fn builds_url(base_url: &str, space_id: &str) -> String {
-    format!("{base_url}/space/{space_id}/builds")
-}
-
-/// `GET /space/{spaceId}/build/{buildId}/chunk/{key}` on the hub at
-/// `base_url` (no trailing slash).
-pub fn chunk_url(base_url: &str, space_id: &str, build_id: &str, key: &str) -> String {
-    format!("{base_url}/space/{space_id}/build/{build_id}/chunk/{key}")
-}
-
-/// The readiness WebSocket URL of `build`: the hub URL with `http` replaced
-/// by `ws` (or `https` by `wss`), then
-/// `/space/{spaceId}/build/{buildId}/chunks/ready`.
-pub fn ready_url(base_url: &str, space_id: &str, build_id: &str) -> String {
-    let ws_base = if let Some(rest) = base_url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = base_url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        base_url.to_string()
-    };
-    format!("{ws_base}/space/{space_id}/build/{build_id}/chunks/ready")
-}
-
-/// Decodes a registry chunk container and builds the frame system at the
-/// epoch. Fails with the validator's code and reason if any registry or the
-/// union of them is invalid.
-pub fn frame_system_from_chunk(bytes: &[u8]) -> Result<FrameSystem> {
-    let registries = decode_registry_chunk(bytes)
-        .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
+/// Builds the frame system from every layer's registry section: validates
+/// each with the library validator, takes their union
+/// ([`FrameTree::from_registries`]), and raises each frame's `max_depth` to
+/// the deepest the layer configs declare for it ([`BuildDescription::layer_depth`]).
+/// Fails with the validator's code and reason if any registry or the union
+/// is invalid.
+pub fn frame_system_from_registries(
+    sections: &[Arc<[u8]>],
+    build: &BuildDescription,
+) -> Result<FrameSystem> {
+    let mut registries = Vec::with_capacity(sections.len());
+    for bytes in sections {
+        gx_core::validate(REGISTRY_KEY, bytes)
+            .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
+        let r = registry::decode(bytes)
+            .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
+        if r.is_empty() {
+            continue;
+        }
+        let frames = r
+            .frames()
+            .iter()
+            .map(|f| {
+                let mut f = *f;
+                if let Some(d) = build.layer_depth(f.frame_id) {
+                    f.max_depth = f.max_depth.max(d);
+                }
+                f
+            })
+            .collect();
+        registries.push(
+            Registry::new(r.epoch(), frames)
+                .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?,
+        );
+    }
     let tree = FrameTree::from_registries(&registries)
         .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
     Ok(FrameSystem::from_tree(tree))
@@ -137,57 +478,129 @@ pub fn frame_system_from_chunk(bytes: &[u8]) -> Result<FrameSystem> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn statuses_map_to_outcomes() {
-        assert_eq!(classify_status(200), None);
-        assert_eq!(classify_status(202), Some(ChunkFetch::Pending));
-        assert_eq!(classify_status(404), Some(ChunkFetch::NotFound));
-        assert_eq!(classify_status(410), Some(ChunkFetch::Gone));
-        assert!(matches!(classify_status(500), Some(ChunkFetch::Error(_))));
-        assert!(matches!(classify_status(401), Some(ChunkFetch::Error(_))));
-    }
-
-    #[test]
-    fn socket_frames() {
-        assert_eq!(subscribe_frame("registry"), r#"{"subscribe":"registry"}"#);
-        assert_eq!(
-            parse_ready_frame(r#"{"chunkReady":"4-1-0-1-0"}"#).as_deref(),
-            Some("4-1-0-1-0")
-        );
-        assert_eq!(parse_ready_frame(r#"{"other":1}"#), None);
-        assert_eq!(parse_ready_frame("not json"), None);
-    }
-
-    #[test]
-    fn active_build_is_the_first_active() {
-        let builds: Vec<BuildSummary> = serde_json::from_str(
-            r#"[{"buildId":"b2","spaceId":"s","createdAt":"t","status":"Archived"},
-                {"buildId":"b1","spaceId":"s","createdAt":"t","status":"Active"}]"#,
+    fn build() -> BuildDescription {
+        serde_json::from_str(
+            r#"{"buildId":"b","layers":[
+                {"layer":"a","module":"00","sourceManifest":null,"attachment":"all",
+                 "exclusive":false,"maxDepth":{"*":3},"spanSeconds":0,"usesOrigin":true},
+                {"layer":"b","module":"00","sourceManifest":null,"attachment":[4],
+                 "exclusive":true,"maxDepth":{"4":21},"spanSeconds":0,"usesOrigin":false},
+                {"layer":"c","module":"00","sourceManifest":null,"attachment":[5,2],
+                 "exclusive":false,"maxDepth":{"2":1,"5":9},"spanSeconds":60,"usesOrigin":false}]}"#,
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn layer_depths_and_exclusivity() {
+        let b = build();
+        assert_eq!(b.layers[2].attachment, Attachment::Frames(vec![2, 5]));
+        // Frame 4: owned by "b", so "a" is not directed there.
+        assert!(!b.directs(&b.layers[0], 4));
+        assert_eq!(b.layer_depth(4), Some(21));
+        assert_eq!(b.layer_depth(5), Some(9));
+        assert_eq!(b.layer_depth(2), Some(3));
+        assert_eq!(b.layer_depth(7), Some(3));
+        let mut none = b.clone();
+        none.layers[0].max_depth.clear();
+        assert_eq!(none.layer_depth(7), None);
+        assert!(serde_json::from_str::<Attachment>(r#""some""#).is_err());
+    }
+
+    #[test]
+    fn directions_parse_and_check() {
+        let key: ChunkKey = "4-12-1024-2048-3071".parse().unwrap();
+        let resp: DirectionsResponse = serde_json::from_str(&format!(
+            r#"{{"originUtcMs":1763130000000,"results":[{{"key":"4-12-1024-2048-3071","layers":[
+                {{"layer":"system","state":"empty"}},
+                {{"layer":"matter","state":"compute","address":"{a}","claim":"tok","leaseMs":120000,
+                  "module":"{m}","sourceManifest":"{s}","originUtcMs":0,"spanIndex":0,"spanSeconds":0}},
+                {{"layer":"x","state":"pending","address":"{a}","retryMs":250}},
+                {{"layer":"y","state":"ready","address":"{a}"}}]}}]}}"#,
+            a = "1".repeat(64),
+            m = "2".repeat(64),
+            s = "3".repeat(64)
+        ))
         .unwrap();
-        assert_eq!(pick_active_build(&builds), Some("b1"));
-        assert_eq!(pick_active_build(&builds[..1]), None);
+        let l = &resp.results[0].layers;
+        assert_eq!(l[0].parse(&key).unwrap(), Direction::Empty);
+        match l[1].parse(&key).unwrap() {
+            Direction::Compute(job) => {
+                assert_eq!(job.claim, "tok");
+                assert_eq!(job.module, [0x22; 32]);
+                assert_eq!(job.manifest, Some([0x33; 32]));
+                assert_eq!(job.request.key, key);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            l[2].parse(&key).unwrap(),
+            Direction::Pending {
+                address: [0x11; 32],
+                retry_ms: 250
+            }
+        );
+        assert!(matches!(l[3].parse(&key).unwrap(), Direction::Ready { .. }));
+        let bad = RawDirection {
+            state: "ready".into(),
+            address: Some("XYZ".into()),
+            ..RawDirection::default()
+        };
+        assert!(bad.parse(&key).is_err());
+        let odd = RawDirection {
+            state: "later".into(),
+            ..RawDirection::default()
+        };
+        assert!(odd.parse(&key).is_err());
     }
 
     #[test]
-    fn invalid_registry_chunk_is_a_clear_error() {
-        let e = frame_system_from_chunk(&[1, 2, 3]).unwrap_err().to_string();
+    fn socket_frames_and_urls() {
+        let a = "ab".repeat(32);
+        assert_eq!(subscribe_frame(&a), format!(r#"{{"subscribe":"{a}"}}"#));
+        assert_eq!(
+            parse_ready_frame(&format!(r#"{{"sectionReady":"{a}"}}"#)),
+            Some([0xab; 32])
+        );
+        assert_eq!(parse_ready_frame(r#"{"chunkReady":"x"}"#), None);
+        let r = Routes::new("https://hub.invalid/", None, "s");
+        assert_eq!(
+            r.ready("b"),
+            "wss://hub.invalid/space/s/build/b/sections/ready"
+        );
+        assert_eq!(r.clock(), "https://hub.invalid/space/s/clock");
+        assert_eq!(
+            r.directions("b"),
+            "https://hub.invalid/space/s/build/b/directions"
+        );
+        assert_eq!(
+            r.upload("b", "x"),
+            "https://hub.invalid/space/s/build/b/section/x"
+        );
+        assert_eq!(
+            r.blob(BlobKind::Manifest, "h"),
+            "https://hub.invalid/source-manifest/h"
+        );
+        let r = Routes::new("http://hub.invalid", Some("http://edge.invalid/"), "s");
+        assert_eq!(
+            r.blob(BlobKind::Section, "a"),
+            "http://edge.invalid/section/a"
+        );
+        assert_eq!(
+            r.ready("b"),
+            "ws://hub.invalid/space/s/build/b/sections/ready"
+        );
+    }
+
+    #[test]
+    fn invalid_registry_is_a_clear_error() {
+        let b = BuildDescription {
+            build_id: "b".into(),
+            layers: Vec::new(),
+        };
+        let e = frame_system_from_registries(&[Arc::from(&[1u8, 2, 3][..])], &b)
+            .unwrap_err()
+            .to_string();
         assert!(e.starts_with("registry is invalid: code"), "{e}");
-    }
-
-    #[test]
-    fn urls() {
-        assert_eq!(
-            ready_url("https://hub.invalid", "s", "b"),
-            "wss://hub.invalid/space/s/build/b/chunks/ready"
-        );
-        assert_eq!(
-            chunk_url("http://hub.invalid", "s", "b", "registry"),
-            "http://hub.invalid/space/s/build/b/chunk/registry"
-        );
-        assert_eq!(
-            builds_url("http://hub.invalid", "s"),
-            "http://hub.invalid/space/s/builds"
-        );
     }
 }

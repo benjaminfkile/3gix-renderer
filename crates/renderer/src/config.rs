@@ -9,8 +9,18 @@
 //!
 //! The variables are `GX_HUB_URL`, `GX_API_KEY` (a key with the
 //! `fetch:chunks` capability), `GX_SPACE_ID`, and the optional
-//! `GX_BUILD_ID`. When no build id is given, the hub client resolves the
-//! active build through `GET /space/{spaceId}/builds` (see [`crate::hub`]).
+//! `GX_BUILD_ID` and `GX_EDGE_URL`. When no build id is given, the hub
+//! client resolves the active build through `GET
+//! /space/{spaceId}/build/active` (see [`crate::hub`]). The edge URL, when
+//! set, serves the immutable reads (sections, modules, source tiles, and
+//! manifests); otherwise the hub serves them.
+//!
+//! The local cache (`client-compute.md` section 6) defaults to a directory
+//! under the platform cache directory ([`gx_worker::cache::default_dir`]
+//! natively) limited to 20 GB; `--cache-dir` moves it, `--cache-max-bytes`
+//! changes the limit, and `--no-cache` turns it off. `--workers` sets the
+//! number of worker threads that run modules (default: cores minus two, at
+//! least one).
 //!
 //! The API key is held in an [`ApiKey`] whose `Debug` output is redacted, so
 //! logging a [`Config`] never prints it.
@@ -33,15 +43,22 @@ pub const ENV_SPACE_ID: &str = "GX_SPACE_ID";
 pub const ENV_BUILD_ID: &str = "GX_BUILD_ID";
 /// Name of the optional variable naming the graphics adapter to use.
 pub const ENV_ADAPTER: &str = "GX_ADAPTER";
+/// Name of the optional variable holding the edge base URL for immutable
+/// reads.
+pub const ENV_EDGE_URL: &str = "GX_EDGE_URL";
 
 /// Every variable the renderer reads, in a fixed order.
-pub const ENV_KEYS: [&str; 5] = [
+pub const ENV_KEYS: [&str; 6] = [
     ENV_HUB_URL,
     ENV_API_KEY,
     ENV_SPACE_ID,
     ENV_BUILD_ID,
     ENV_ADAPTER,
+    ENV_EDGE_URL,
 ];
+
+/// Default size limit of the local cache, bytes: 20 GB.
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 20_000_000_000;
 
 /// Default render width in pixels.
 pub const DEFAULT_WIDTH: u32 = 1280;
@@ -60,6 +77,8 @@ ENVIRONMENT (also read from .env):
     GX_API_KEY      API key with the fetch:chunks capability
     GX_SPACE_ID     space id
     GX_BUILD_ID     build id (optional; defaults to the active build)
+    GX_EDGE_URL     base URL for sections, modules, and source tiles (optional;
+                    defaults to the hub URL)
     GX_ADAPTER      graphics adapter to render with, by a part of its name (optional;
                     defaults to the high performance adapter, so the discrete GPU)
 
@@ -84,6 +103,14 @@ FLAGS:
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
     --adapter <name>               overrides GX_ADAPTER
+    --edge-url <url>               overrides GX_EDGE_URL
+    --cache-dir <path>             local cache directory (default: gx-renderer under the
+                                   platform cache directory)
+    --cache-max-bytes <u64>        local cache size limit in bytes (default 20000000000)
+    --no-cache                     keep no local cache: every section, module, and tile
+                                   comes from the edge or is computed
+    --workers <u32>                threads that run modules (default: cores minus two, at
+                                   least one)
     --max-fps <u32>                cap the window frame rate below the display refresh
                                    (default 0: one frame per refresh)
     --help                         print this text
@@ -170,6 +197,15 @@ pub struct Config {
     /// Window frame rate cap, frames per second; 0 means one frame per
     /// display refresh (the present mode already limits it to that).
     pub max_fps: u32,
+    /// Edge base URL for immutable reads, without a trailing slash; `None`
+    /// reads them from the hub.
+    pub edge_url: Option<String>,
+    /// The local cache directory; `None` keeps no cache.
+    pub cache_dir: Option<PathBuf>,
+    /// Local cache size limit, bytes.
+    pub cache_max_bytes: u64,
+    /// Threads that run modules; `None` for the default.
+    pub workers: Option<usize>,
     /// Simulation seconds per wall-clock second.
     pub time_scale: f64,
     /// Simulation time offset from the registry epoch at launch, seconds.
@@ -238,6 +274,16 @@ pub struct Flags {
     pub adapter: Option<String>,
     /// `--max-fps`.
     pub max_fps: Option<u32>,
+    /// `--edge-url`.
+    pub edge_url: Option<String>,
+    /// `--cache-dir`.
+    pub cache_dir: Option<PathBuf>,
+    /// `--cache-max-bytes`.
+    pub cache_max_bytes: Option<u64>,
+    /// `--no-cache`.
+    pub no_cache: bool,
+    /// `--workers`.
+    pub workers: Option<u32>,
     /// `--help`.
     pub help: bool,
 }
@@ -318,6 +364,18 @@ where
             "--build-id" => flags.build_id = Some(value(&name)?),
             "--adapter" => flags.adapter = Some(value(&name)?),
             "--max-fps" => flags.max_fps = Some(parse_u32(&name, &value(&name)?)?),
+            "--edge-url" => flags.edge_url = Some(value(&name)?),
+            "--cache-dir" => flags.cache_dir = Some(PathBuf::from(value(&name)?)),
+            "--cache-max-bytes" => {
+                let v = value(&name)?;
+                flags.cache_max_bytes = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| err(format!("{name}: {v:?} is not a byte count")))?,
+                )
+            }
+            "--no-cache" => flags.no_cache = true,
+            "--workers" => flags.workers = Some(parse_u32(&name, &value(&name)?)?),
             "--help" | "-h" => flags.help = true,
             other => return Err(err(format!("unknown argument {other:?}, see --help"))),
         }
@@ -404,6 +462,24 @@ impl Config {
         let space_id = pick(&flags.space_id, ENV_SPACE_ID)
             .ok_or_else(|| err(format!("{ENV_SPACE_ID} is not set (or pass --space-id)")))?;
         let build_id = pick(&flags.build_id, ENV_BUILD_ID);
+        let edge_url = pick(&flags.edge_url, ENV_EDGE_URL)
+            .map(|e| e.trim().trim_end_matches('/').to_string())
+            .filter(|e| !e.is_empty());
+        if let Some(e) = &edge_url {
+            if !(e.starts_with("http://") || e.starts_with("https://")) {
+                return Err(err(format!(
+                    "{ENV_EDGE_URL} must start with http:// or https://"
+                )));
+            }
+        }
+        if flags.no_cache && flags.cache_dir.is_some() {
+            return Err(err("--no-cache and --cache-dir contradict each other"));
+        }
+        let cache_dir = if flags.no_cache {
+            None
+        } else {
+            flags.cache_dir.clone().or_else(default_cache_dir)
+        };
         Ok(Config {
             hub_url,
             api_key,
@@ -423,7 +499,24 @@ impl Config {
             exposure_stops: flags.exposure_stops,
             adapter: pick(&flags.adapter, ENV_ADAPTER).filter(|a| !a.trim().is_empty()),
             max_fps: flags.max_fps.unwrap_or(0),
+            edge_url,
+            cache_dir,
+            cache_max_bytes: flags.cache_max_bytes.unwrap_or(DEFAULT_CACHE_MAX_BYTES),
+            workers: flags.workers.map(|w| w as usize),
         })
+    }
+}
+
+/// The default local cache directory: [`gx_worker::cache::default_dir`]
+/// natively, none in the browser (which uses the Cache API instead).
+fn default_cache_dir() -> Option<PathBuf> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        gx_worker::cache::default_dir()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
     }
 }
 
@@ -504,6 +597,42 @@ mod tests {
         assert_eq!(c.exposure_stops, None);
         assert_eq!(c.adapter, None);
         assert_eq!(c.max_fps, 0);
+        assert_eq!(c.edge_url, None);
+        assert_eq!(c.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(c.workers, None);
+    }
+
+    #[test]
+    fn cache_edge_and_worker_flags() {
+        let flags = parse_flags([
+            "--cache-dir",
+            "/tmp/c",
+            "--cache-max-bytes=1000",
+            "--workers",
+            "3",
+            "--edge-url",
+            "https://edge.invalid/",
+        ])
+        .unwrap();
+        let c = Config::resolve(&base_env(), &flags).unwrap();
+        assert_eq!(c.cache_dir, Some(PathBuf::from("/tmp/c")));
+        assert_eq!(c.cache_max_bytes, 1000);
+        assert_eq!(c.workers, Some(3));
+        assert_eq!(c.edge_url.as_deref(), Some("https://edge.invalid"));
+        let c = Config::resolve(&base_env(), &parse_flags(["--no-cache"]).unwrap()).unwrap();
+        assert_eq!(c.cache_dir, None);
+        assert!(Config::resolve(
+            &base_env(),
+            &parse_flags(["--no-cache", "--cache-dir", "x"]).unwrap()
+        )
+        .is_err());
+        assert!(parse_flags(["--cache-max-bytes", "lots"]).is_err());
+        assert!(parse_flags(["--workers", "0"]).is_err());
+        assert!(Config::resolve(
+            &base_env(),
+            &parse_flags(["--edge-url", "ftp://x.invalid"]).unwrap()
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "epoch": {
-    "bits": "0x41c823cf40000000",
-    "decimal": "8.1e8"
+    "bits": "0x0000000000000000",
+    "decimal": "0e0"
   },
   "frame_count": 0,
   "frames": []

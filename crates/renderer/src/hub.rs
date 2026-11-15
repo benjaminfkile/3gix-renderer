@@ -1,201 +1,263 @@
-//! The hub client: chunks, the readiness WebSocket, and the frame registry.
+//! The native hub client, version 2: the clock, the build and its layers,
+//! directions, content-addressed reads through the edge, uploads with a
+//! claim, and the readiness socket keyed by address.
 //!
-//! Implements the client side of the hub's chunk flow
-//! (`compiler-pipeline.md` section 4, "The 202 / Poll Cycle") and the
-//! renderer's first request, the registry (`space-model.md` section 7):
+//! Implements the client side of `client-compute.md` sections 2.3 to 2.5
+//! over [`crate::protocol`]:
 //!
-//! - [`HubClient::fetch_chunk`] issues
-//!   `GET /space/{spaceId}/build/{buildId}/chunk/{key}` and maps `200`,
-//!   `202`, `404`, and `410` to [`ChunkFetch`]. A `200` body is immutable for
-//!   its key (the hub sends `Cache-Control: public, max-age=31536000,
-//!   immutable`), so the client keeps it for the session and never requests
-//!   that key again.
-//! - [`HubClient::subscribe_ready`] opens the readiness WebSocket
-//!   `GET /space/{spaceId}/build/{buildId}/chunks/ready`, sends
-//!   `{ "subscribe": "<key>" }` text frames, and yields the keys of the
-//!   `{ "chunkReady": "<key>" }` frames the hub pushes.
-//! - [`HubClient::wait_for_chunk`] combines the two: it fetches, and while
-//!   the hub answers `202` it waits for a readiness push, falling back to
-//!   polling every 2 s for a key still pending after 10 s, up to a deadline.
-//! - [`load_registry`] fetches the `registry` chunk, decodes it with
-//!   [`gx_core::container::decode_registry_chunk`], and builds the
-//!   [`FrameTree`] and [`FrameSystem`] (`matter-format.md` sections 5 and 6).
+//! - [`HubClient::connect`] reads `GET /space/{s}/clock`, `GET
+//!   /space/{s}/build/active` (unless a build id is configured), and `GET
+//!   /space/{s}/build/{b}`, whose layer configs drive the depth of each
+//!   frame ([`crate::protocol::frame_system_from_registries`]).
+//! - [`HubClient::directions`] posts one batch of at most 512 keys.
+//! - [`HubClient::get_blob`] reads `/section/{address}`, `/module/{hash}`,
+//!   `/source/{hash}`, and `/source-manifest/{hash}` from the edge.
+//! - [`HubClient::upload`] puts a computed section with `X-Claim`.
+//! - [`HubClient::subscribe_ready`] keeps the readiness socket open,
+//!   reconnecting with a backoff and subscribing again to every address
+//!   still awaited.
 //!
-//! Every request carries the API key in the `X-API-Key` header. The key is
-//! never logged.
+//! The batching, retries, and per-layer flow live in
+//! [`crate::directions`]; the fetcher that drives them is
+//! [`crate::stream::Fetcher`]. Every request carries the API key in
+//! `X-API-Key`; the key is never logged.
 
 use crate::config::{ApiKey, Config};
-use crate::protocol::{builds_url, chunk_url, ready_url};
-pub use crate::protocol::{
-    classify_status, frame_system_from_chunk, parse_ready_frame, pick_active_build,
-    subscribe_frame, BuildSummary, ChunkFetch, API_KEY_HEADER,
+pub use crate::protocol::API_KEY_HEADER;
+use crate::protocol::{
+    parse_ready_frame, status_problem, subscribe_frame, ActiveBuild, BuildDescription, Clock,
+    DirectionsRequest, DirectionsResponse, Routes, CLAIM_HEADER, MAX_DIRECTION_KEYS,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use gx_core::frames::FrameSystem;
-use gx_core::key::REGISTRY_KEY;
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use gx_core::key::ChunkKey;
+use gx_core::sha256::to_hex;
+use gx_worker::BlobKind;
+use serde::de::DeserializeOwned;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
-/// How long to wait for a pending chunk, and how to poll for it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ReadyPolicy {
-    /// Rely on the readiness push alone for this long after the first `202`.
-    pub fallback_after: Duration,
-    /// After that, poll the chunk endpoint this often.
-    pub poll_interval: Duration,
-    /// Give up after this long.
-    pub deadline: Duration,
-}
-
-impl Default for ReadyPolicy {
-    /// Push only for 10 s, then poll every 2 s, give up after 60 s.
-    fn default() -> Self {
-        ReadyPolicy {
-            fallback_after: Duration::from_secs(10),
-            poll_interval: Duration::from_secs(2),
-            deadline: Duration::from_secs(60),
-        }
-    }
-}
-
-/// A connection to one build of one space on the hub.
+/// A connection to one build of one space.
 pub struct HubClient {
     http: reqwest::Client,
-    base_url: String,
+    routes: Routes,
     api_key: ApiKey,
-    space_id: String,
-    build_id: String,
-    /// `200` bodies by key, kept for the session.
-    ready: Mutex<BTreeMap<String, Arc<[u8]>>>,
+    build: BuildDescription,
+    clock: Clock,
+    clock_read_at: Instant,
 }
 
 impl HubClient {
-    /// A client for a known build. `base_url` has no trailing slash.
-    pub fn new(
-        base_url: &str,
+    /// Connects to the configured space and build.
+    pub async fn connect(config: &Config) -> Result<HubClient> {
+        HubClient::open(
+            Routes::new(
+                &config.hub_url,
+                config.edge_url.as_deref(),
+                &config.space_id,
+            ),
+            config.api_key.clone(),
+            config.build_id.as_deref(),
+        )
+        .await
+    }
+
+    /// Connects through `routes` with `api_key`: reads the clock, resolves
+    /// the active build when `build_id` is `None`, and reads the build's
+    /// layers.
+    pub async fn open(
+        routes: Routes,
         api_key: ApiKey,
-        space_id: &str,
-        build_id: &str,
+        build_id: Option<&str>,
     ) -> Result<HubClient> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .build()
             .context("building the HTTP client")?;
-        Ok(HubClient {
+        let mut client = HubClient {
             http,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            routes,
             api_key,
-            space_id: space_id.to_string(),
-            build_id: build_id.to_string(),
-            ready: Mutex::new(BTreeMap::new()),
-        })
+            build: BuildDescription {
+                build_id: String::new(),
+                layers: Vec::new(),
+            },
+            clock: Clock {
+                origin_utc_ms: None,
+                now_utc_ms: 0,
+            },
+            clock_read_at: Instant::now(),
+        };
+        client.clock = client
+            .get_json(&client.routes.clock(), "reading the clock")
+            .await?;
+        client.clock_read_at = Instant::now();
+        let build_id = match build_id {
+            Some(b) => b.to_string(),
+            None => {
+                let active: ActiveBuild = client
+                    .get_json(&client.routes.active_build(), "reading the active build")
+                    .await?;
+                active.build_id
+            }
+        };
+        client.build = client
+            .get_json(&client.routes.build(&build_id), "reading the build")
+            .await?;
+        if client.build.build_id.is_empty() {
+            client.build.build_id = build_id;
+        }
+        tracing::info!(
+            build = %client.build.build_id,
+            layers = client.build.layers.len(),
+            "using build"
+        );
+        Ok(client)
     }
 
-    /// A client for the configured build, resolving the active build through
-    /// `GET /space/{spaceId}/builds` when the configuration names none.
-    pub async fn connect(config: &Config) -> Result<HubClient> {
-        let mut client = HubClient::new(
-            &config.hub_url,
-            config.api_key.clone(),
-            &config.space_id,
-            "",
-        )?;
-        client.build_id = match &config.build_id {
-            Some(b) => b.clone(),
-            None => client.active_build().await?,
-        };
-        tracing::info!(build = %client.build_id, "using build");
-        Ok(client)
+    async fn get_json<T: DeserializeOwned>(&self, url: &str, what: &str) -> Result<T> {
+        let resp = self
+            .http
+            .get(url)
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .send()
+            .await
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
+        if let Some(p) = status_problem(resp.status().as_u16()) {
+            bail!("{what}: {p}");
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
+        serde_json::from_slice(&body).with_context(|| format!("{what}: decoding the answer"))
+    }
+
+    /// The routes this client uses.
+    pub fn routes(&self) -> &Routes {
+        &self.routes
     }
 
     /// The build this client reads.
     pub fn build_id(&self) -> &str {
-        &self.build_id
+        &self.build.build_id
     }
 
-    /// Asks the hub for the active build of the space.
-    pub async fn active_build(&self) -> Result<String> {
-        let url = builds_url(&self.base_url, &self.space_id);
+    /// The build's layers.
+    pub fn build(&self) -> &BuildDescription {
+        &self.build
+    }
+
+    /// The clock as read at connect time.
+    pub fn clock(&self) -> Clock {
+        self.clock
+    }
+
+    /// The hub's now, UTC milliseconds: the clock read at connect time
+    /// advanced by the time since.
+    pub fn now_utc_ms(&self) -> i64 {
+        let elapsed = self.clock_read_at.elapsed().as_millis();
+        self.clock
+            .now_utc_ms
+            .saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+    }
+
+    /// Asks for directions for at most 512 keys at `t_utc_ms`.
+    pub async fn directions(&self, t_utc_ms: i64, keys: &[ChunkKey]) -> Result<DirectionsResponse> {
+        if keys.len() > MAX_DIRECTION_KEYS {
+            bail!(
+                "{} keys; at most {MAX_DIRECTION_KEYS} per request",
+                keys.len()
+            );
+        }
+        let body = DirectionsRequest {
+            t_utc_ms,
+            keys: keys.iter().map(ChunkKey::to_string).collect(),
+        };
         let resp = self
             .http
-            .get(&url)
+            .post(self.routes.directions(self.build_id()))
             .header(API_KEY_HEADER, self.api_key.expose())
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&body).context("directions: encoding the request")?)
             .send()
             .await
-            .context("listing builds")?;
+            .map_err(|e| anyhow!("directions: {}", e.without_url()))?;
         let status = resp.status().as_u16();
-        if status != 200 {
-            bail!("listing builds: hub answered {status}");
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("directions: {}", e.without_url()))?;
+        if let Some(p) = status_problem(status) {
+            let detail = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).into_owned();
+            bail!("directions: {p}: {detail}");
         }
-        let body = resp.bytes().await.context("reading the builds listing")?;
-        let builds: Vec<BuildSummary> =
-            serde_json::from_slice(&body).context("decoding the builds listing")?;
-        pick_active_build(&builds)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("the space has no active build; set GX_BUILD_ID"))
+        serde_json::from_slice(&bytes).context("directions: decoding the answer")
     }
 
-    fn chunk_url(&self, key: &str) -> String {
-        chunk_url(&self.base_url, &self.space_id, &self.build_id, key)
-    }
-
-    /// The readiness WebSocket URL for `build`: the hub URL with `http`
-    /// replaced by `ws` (or `https` by `wss`).
-    pub fn ready_url(&self, build: &str) -> String {
-        ready_url(&self.base_url, &self.space_id, build)
-    }
-
-    /// Fetches one chunk. A key that has answered `200` before is served
-    /// from the session cache without a request.
-    pub async fn fetch_chunk(&self, key: &str) -> ChunkFetch {
-        if let Some(bytes) = self.ready.lock().expect("cache lock").get(key) {
-            return ChunkFetch::Ready(bytes.clone());
-        }
-        let outcome = self.fetch_chunk_uncached(key).await;
-        if let ChunkFetch::Ready(bytes) = &outcome {
-            self.ready
-                .lock()
-                .expect("cache lock")
-                .insert(key.to_string(), bytes.clone());
-        }
-        outcome
-    }
-
-    /// Fetches one chunk without the session cache: the request always goes
-    /// out and a `200` body is not kept. For callers with their own cache,
-    /// such as [`crate::stream::CellCache`], which evicts.
-    pub async fn fetch_chunk_uncached(&self, key: &str) -> ChunkFetch {
-        let resp = match self
+    /// Reads `name` of `kind` from the edge: `Some` bytes for `200`, `None`
+    /// for `404`.
+    pub async fn get_blob(&self, kind: BlobKind, name: &str) -> Result<Option<Vec<u8>>> {
+        let resp = self
             .http
-            .get(self.chunk_url(key))
+            .get(self.routes.blob(kind, name))
             .header(API_KEY_HEADER, self.api_key.expose())
             .send()
             .await
-        {
-            Ok(r) => r,
-            Err(e) => return ChunkFetch::Error(format!("request failed: {}", e.without_url())),
-        };
-        if let Some(outcome) = classify_status(resp.status().as_u16()) {
-            return outcome;
+            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
         }
-        match resp.bytes().await {
-            Ok(body) => ChunkFetch::Ready(Arc::from(body.as_ref())),
-            Err(e) => ChunkFetch::Error(format!("reading body failed: {}", e.without_url())),
+        if let Some(p) = status_problem(status) {
+            bail!("{kind} {name}: {p}");
         }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+        Ok(Some(body.to_vec()))
     }
 
-    /// Opens the readiness WebSocket for `build`.
-    pub async fn subscribe_ready(&self, build: &str) -> Result<ReadySubscription> {
+    /// Uploads a computed section with its claim. Returns the status:
+    /// `201` stored, `200` already stored. Anything else is an error with
+    /// the hub's reason.
+    pub async fn upload(&self, address: &[u8; 32], claim: &str, bytes: Vec<u8>) -> Result<u16> {
+        let address = to_hex(address);
+        let resp = self
+            .http
+            .put(self.routes.upload(self.build_id(), &address))
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .header(CLAIM_HEADER, claim)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| anyhow!("upload {address}: {}", e.without_url()))?;
+        let status = resp.status().as_u16();
+        if status == 200 || status == 201 {
+            return Ok(status);
+        }
+        let body = resp.bytes().await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned();
+        bail!("upload {address}: hub answered {status}: {detail}")
+    }
+
+    async fn open_socket(
+        &self,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
         let mut request = self
-            .ready_url(build)
+            .routes
+            .ready(self.build_id())
             .into_client_request()
             .context("readiness URL")?;
         let key = HeaderValue::from_str(self.api_key.expose())
@@ -204,167 +266,103 @@ impl HubClient {
         let (socket, _) = tokio_tungstenite::connect_async(request)
             .await
             .context("opening the readiness socket")?;
-        let (mut write, mut read) = socket.split();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (keys_tx, keys_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    outgoing = out_rx.recv() => match outgoing {
-                        Some(text) => {
-                            if write.send(Message::text(text)).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => {
-                            let _ = write.send(Message::Close(None)).await;
-                            break;
-                        }
-                    },
-                    incoming = read.next() => match incoming {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Some(key) = parse_ready_frame(text.as_str()) {
-                                if keys_tx.send(key).is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                        Some(Ok(_)) => {}
-                    },
-                }
-            }
-        });
-        Ok(ReadySubscription {
-            out: out_tx,
-            keys: keys_rx,
-        })
+        Ok(socket)
     }
 
-    /// Fetches `key`, waiting while the hub answers `202`: for a readiness
-    /// push on `subscription` (if any), and after
-    /// [`ReadyPolicy::fallback_after`] also by polling every
-    /// [`ReadyPolicy::poll_interval`]. Fails on `404`, `410`, an error, or
-    /// when the key is not ready by [`ReadyPolicy::deadline`].
-    pub async fn wait_for_chunk(
-        &self,
-        key: &str,
-        policy: ReadyPolicy,
-        mut subscription: Option<&mut ReadySubscription>,
-    ) -> Result<Arc<[u8]>> {
-        let start = Instant::now();
-        if let Some(sub) = subscription.as_deref_mut() {
-            sub.subscribe(key)?;
-        }
-        loop {
-            match self.fetch_chunk(key).await {
-                ChunkFetch::Ready(bytes) => return Ok(bytes),
-                ChunkFetch::Pending => tracing::debug!(key, "chunk pending"),
-                ChunkFetch::NotFound => {
-                    bail!("chunk {key}: not found (404), the build has no layers")
-                }
-                ChunkFetch::Gone => bail!("chunk {key}: gone (410), it can never be produced"),
-                ChunkFetch::Error(e) => bail!("chunk {key}: {e}"),
-            }
-            // Wait for the push or the next poll, whichever comes first.
+    /// Starts the readiness socket on `runtime`: addresses sent to the
+    /// returned subscription are subscribed to, and `on_ready` is called
+    /// with every address the hub reports stored. The socket reconnects
+    /// with a backoff after it closes, subscribing again to every address
+    /// not yet reported; it stops once `on_ready` returns `false` or the
+    /// subscription is dropped. A client that cannot reach it still completes
+    /// every key, by asking for directions again after each `retryMs`.
+    pub fn subscribe_ready(
+        self: &std::sync::Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+        on_ready: impl Fn([u8; 32]) -> bool + Send + 'static,
+    ) -> ReadySubscription {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<[u8; 32]>();
+        let client = std::sync::Arc::clone(self);
+        runtime.spawn(async move {
+            let mut wanted: BTreeSet<[u8; 32]> = BTreeSet::new();
+            let mut failures = 0u32;
             loop {
-                let elapsed = start.elapsed();
-                if elapsed >= policy.deadline {
-                    bail!(
-                        "chunk {key} did not become ready within {} s",
-                        policy.deadline.as_secs_f64()
-                    );
-                }
-                let poll_wait = if elapsed < policy.fallback_after {
-                    policy.fallback_after - elapsed
-                } else {
-                    policy.poll_interval
-                };
-                let wait = poll_wait.min(policy.deadline - elapsed);
-                let pushed = match subscription.as_deref_mut() {
-                    Some(sub) => tokio::select! {
-                        k = sub.next() => Some(k),
-                        _ = tokio::time::sleep(wait) => None,
-                    },
-                    None => {
-                        tokio::time::sleep(wait).await;
-                        None
-                    }
-                };
-                match pushed {
-                    Some(Some(k)) if k == key => break,
-                    Some(Some(_)) => continue,
-                    Some(None) => {
-                        tracing::warn!("readiness socket closed, polling instead");
-                        subscription = None;
+                let socket = match client.open_socket().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        failures += 1;
+                        if failures == 1 {
+                            tracing::warn!("readiness socket unavailable ({e:#}); asking again after each retryMs");
+                        }
+                        let wait = crate::directions::backoff_seconds(failures).max(1.0);
+                        let sleep = tokio::time::sleep(Duration::from_secs_f64(wait));
+                        tokio::pin!(sleep);
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                a = out_rx.recv() => match a {
+                                    Some(a) => { wanted.insert(a); }
+                                    None => return,
+                                },
+                            }
+                        }
                         continue;
                     }
-                    None if start.elapsed() >= policy.fallback_after => break,
-                    None => continue,
+                };
+                failures = 0;
+                let (mut write, mut read) = socket.split();
+                let mut ok = true;
+                for a in &wanted {
+                    if write.send(Message::text(subscribe_frame(&to_hex(a)))).await.is_err() {
+                        ok = false;
+                        break;
+                    }
                 }
+                while ok {
+                    tokio::select! {
+                        a = out_rx.recv() => match a {
+                            Some(a) => {
+                                if wanted.insert(a)
+                                    && write.send(Message::text(subscribe_frame(&to_hex(&a)))).await.is_err()
+                                {
+                                    ok = false;
+                                }
+                            }
+                            None => {
+                                let _ = write.send(Message::Close(None)).await;
+                                return;
+                            }
+                        },
+                        m = read.next() => match m {
+                            Some(Ok(Message::Text(text))) => {
+                                if let Some(a) = parse_ready_frame(text.as_str()) {
+                                    wanted.remove(&a);
+                                    if !on_ready(a) {
+                                        return;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => ok = false,
+                            Some(Ok(_)) => {}
+                        },
+                    }
+                }
+                tracing::debug!("readiness socket closed, reconnecting");
             }
-        }
+        });
+        ReadySubscription { out: out_tx }
     }
 }
 
-/// An open readiness socket: send subscriptions, receive ready keys.
+/// The readiness socket's subscription side. Dropping it closes the
+/// socket.
 pub struct ReadySubscription {
-    out: mpsc::UnboundedSender<String>,
-    keys: mpsc::UnboundedReceiver<String>,
+    out: mpsc::UnboundedSender<[u8; 32]>,
 }
 
 impl ReadySubscription {
-    /// Registers interest in `key`.
-    pub fn subscribe(&self, key: &str) -> Result<()> {
-        self.out
-            .send(subscribe_frame(key))
-            .map_err(|_| anyhow!("readiness socket is closed"))
-    }
-
-    /// The next key the hub reports ready, or `None` once the socket closes.
-    pub async fn next(&mut self) -> Option<String> {
-        self.keys.recv().await
-    }
-}
-
-/// Loads the frame registry of the client's build: opens the readiness
-/// socket (polling instead if it does not open), fetches the `registry`
-/// chunk with [`HubClient::wait_for_chunk`], then decodes and validates it.
-pub async fn load_registry(client: &HubClient, policy: ReadyPolicy) -> Result<FrameSystem> {
-    let mut sub = match client.subscribe_ready(client.build_id()).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!("readiness socket unavailable ({e:#}), polling instead");
-            None
-        }
-    };
-    let bytes = client
-        .wait_for_chunk(REGISTRY_KEY, policy, sub.as_mut())
-        .await?;
-    let system = frame_system_from_chunk(&bytes)?;
-    tracing::info!(frames = system.tree().frames().len(), "registry loaded");
-    Ok(system)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ready_url_swaps_the_scheme() {
-        let c = HubClient::new("https://hub.invalid/", ApiKey::new("k"), "s", "b").unwrap();
-        assert_eq!(
-            c.ready_url("b"),
-            "wss://hub.invalid/space/s/build/b/chunks/ready"
-        );
-        let c = HubClient::new("http://hub.invalid", ApiKey::new("k"), "s", "b").unwrap();
-        assert_eq!(
-            c.ready_url("x"),
-            "ws://hub.invalid/space/s/build/x/chunks/ready"
-        );
-        assert_eq!(
-            c.chunk_url("registry"),
-            "http://hub.invalid/space/s/build/b/chunk/registry"
-        );
+    /// Registers interest in `address`.
+    pub fn subscribe(&self, address: [u8; 32]) {
+        let _ = self.out.send(address);
     }
 }

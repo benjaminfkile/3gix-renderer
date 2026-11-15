@@ -37,8 +37,8 @@ for a newly placed camera, kept across number-key jumps) and Shift boosts it
 tenfold while held. The flight speed glides to a new setting with a 0.15 s
 time constant (evenly per factor of ten), so a burst of notches or a Shift
 press does not jump. Matter, gravity, and the frame the
-camera happens to be parented to play no part: it flies through a star or a
-planet the same way it flies through empty space. The overlay's camera line
+camera happens to be parented to play no part: it flies through the densest matter
+the same way it flies through empty space. The overlay's camera line
 shows the current flight speed.
 
 The number keys index the frames in registry order: frame ids sorted

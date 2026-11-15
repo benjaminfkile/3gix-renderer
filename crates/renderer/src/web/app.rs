@@ -9,7 +9,8 @@
 //! `performance.now()`, and extraction runs inline because the page has no
 //! threads.
 
-use super::hub::{now_seconds, WebFetcher};
+use super::fetch::WebFetcher;
+use super::hub::now_seconds;
 use crate::camera::Camera;
 use crate::controls::Controls;
 use crate::extract::default_threads;
@@ -112,10 +113,13 @@ impl Gfx {
 /// Starts requests for the cells the world wants and applies every fetch
 /// event that has arrived.
 fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, now: f64) {
+    fetcher.set_time_utc_ms(gx_core::timescale::tdb_seconds_to_utc_ms(
+        sim.system.time().value(),
+    ));
     for event in fetcher.drain() {
         match event {
             FetchEvent::Completed { key, outcome, .. } => world.complete(key, outcome, now),
-            FetchEvent::ChunkReady(key) => world.chunk_ready(&key),
+            FetchEvent::Registry(_) => {}
         }
     }
     for key in world.take_requests(now) {
@@ -247,7 +251,7 @@ impl WebApp {
                 volumes_drawn: scene.volumes.len(),
                 sprites_drawn: scene.sprites.len(),
                 lights_active: scene.lights.len(),
-                ..MatterStats::from_tally(self.fetcher.tally())
+                ..MatterStats::from_stats(self.fetcher.stats())
             },
         }
         .text()

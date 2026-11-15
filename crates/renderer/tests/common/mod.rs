@@ -8,7 +8,6 @@
 
 #![allow(dead_code)]
 
-use gx_core::container::encode_chunk;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::matter::{encode, Compression, Sample, Samples, Section, State};
@@ -47,6 +46,9 @@ fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: [f64; 3]) -> Fr
         velocity: Vec3::zero(),
         orientation: Quat::identity(),
         angular_velocity: Vec3::zero(),
+        j2: 0.0,
+        reference_radius: Meters::new(0.0),
+        principal_moments: Vec3::zero(),
     }
 }
 
@@ -62,9 +64,9 @@ pub fn registry() -> Registry {
     .expect("a valid registry")
 }
 
-/// The registry chunk container, as the hub serves it.
-pub fn registry_chunk() -> Vec<u8> {
-    encode_chunk(&[&registry::encode(&registry())], &["layer-a"])
+/// The registry section, as a layer's module emits it.
+pub fn registry_bytes() -> Vec<u8> {
+    registry::encode(&registry())
 }
 
 /// The frame system at the epoch.
@@ -170,29 +172,26 @@ pub fn solid_section() -> Section {
     )
 }
 
-/// The chunk containers by key, as the hub would serve them. The solid
-/// cell has two layers: the blob and an empty section from another
-/// compiler, which the compositing must ignore.
-pub fn chunks() -> BTreeMap<CellKey, Vec<u8>> {
+/// Each cell's layer sections by key, in layer order, as the fetcher hands
+/// them over. The solid cell has two layers: the blob and an empty section
+/// from another module, which the compositing must ignore.
+pub fn chunks() -> BTreeMap<CellKey, Vec<Vec<u8>>> {
     let mut out = BTreeMap::new();
     let hot = encode(&hot_section(), Compression::Zstd);
-    out.insert(hot_key(), encode_chunk(&[&hot], &["layer-a"]));
+    out.insert(hot_key(), vec![hot]);
     let solid = encode(&solid_section(), Compression::None);
     let g = solid_key().geometry(Meters::new(CHILD_EXTENT));
     let nothing = encode(
         &Section::empty(solid_key(), g.origin, g.edge).unwrap(),
         Compression::None,
     );
-    out.insert(
-        solid_key(),
-        encode_chunk(&[&solid, &nothing], &["layer-a", "layer-b"]),
-    );
+    out.insert(solid_key(), vec![solid, nothing]);
     let g = empty_key().geometry(Meters::new(CHILD_EXTENT));
     let empty = encode(
         &Section::empty(empty_key(), g.origin, g.edge).unwrap(),
         Compression::None,
     );
-    out.insert(empty_key(), encode_chunk(&[&empty], &["layer-a"]));
+    out.insert(empty_key(), vec![empty]);
     out
 }
 
@@ -263,10 +262,10 @@ pub fn gas_section() -> Section {
     )
 }
 
-/// The chunk containers of the full scene: the D2 cells plus the gas cell.
-pub fn full_chunks() -> BTreeMap<CellKey, Vec<u8>> {
+/// The layer sections of the full scene: the D2 cells plus the gas cell.
+pub fn full_chunks() -> BTreeMap<CellKey, Vec<Vec<u8>>> {
     let mut out = chunks();
     let gas = encode(&gas_section(), Compression::Zstd);
-    out.insert(gas_key(), encode_chunk(&[&gas], &["layer-c"]));
+    out.insert(gas_key(), vec![gas]);
     out
 }

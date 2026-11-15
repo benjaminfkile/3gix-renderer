@@ -3,7 +3,7 @@
 //!
 //! The cells go through the same path as on the desktop (selection, the
 //! cell cache, decoding and compositing, extraction on the worker pool,
-//! volumes, lights from hot matter), fed from in-memory chunk containers
+//! volumes, lights from hot matter), fed from in-memory layer sections
 //! instead of the hub. The images are checked by pixel statistics and saved
 //! as `target/tmp/matter-render.png` and `target/tmp/full-scene.png` with
 //! the statistics beside them in `.txt` files of the same name.
@@ -26,7 +26,7 @@ fn luma(p: [u8; 4]) -> f64 {
     0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])
 }
 
-/// Streams every selected cell from the fixture's containers.
+/// Streams every selected cell from the fixture's layer sections.
 fn stream_all(world: &mut World) {
     stream_from(world, &system(), &chunks(), 2);
 }
@@ -36,7 +36,7 @@ fn stream_all(world: &mut World) {
 fn stream_from(
     world: &mut World,
     system: &gx_core::frames::FrameSystem,
-    chunks: &std::collections::BTreeMap<gx_core::key::CellKey, Vec<u8>>,
+    chunks: &std::collections::BTreeMap<gx_core::key::CellKey, Vec<Vec<u8>>>,
     expected: usize,
 ) {
     let camera = camera();
@@ -47,7 +47,7 @@ fn stream_from(
         let extent = system.tree().get(key.frame_id).unwrap().root_extent;
         let outcome = match chunks.get(&key) {
             Some(bytes) => decode_cell(&key, bytes, extent),
-            None => FetchOutcome::NotFound,
+            None => FetchOutcome::Decoded(None),
         };
         world.complete(key, outcome, 0.0);
     }

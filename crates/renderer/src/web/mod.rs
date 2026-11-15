@@ -8,17 +8,26 @@
 //! platform glue lives here:
 //!
 //! - [`hub`]: the hub client over `fetch` and a browser `WebSocket`.
+//! - [`cache`]: the local cache in the Cache API.
+//! - [`worker`]: modules run in a dedicated Web Worker.
+//! - [`fetch`]: the client loop (directions, streams, compute) on the
+//!   page's event loop.
 //! - [`app`]: the canvas frame loop.
 //!
 //! There is no browser in CI. The build is checked there; running it is
 //! verified by hand on a desktop browser (`docs/web.md`).
 
 pub mod app;
+pub mod cache;
+pub mod fetch;
 pub mod hub;
+pub mod worker;
 
 use crate::config::ApiKey;
+use crate::protocol::Routes;
 use crate::sim::{SimClock, Simulation};
-use hub::{load_registry, ReadySocket, WebFetcher, WebHub};
+use fetch::WebFetcher;
+use hub::WebHub;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -65,23 +74,26 @@ pub async fn start(
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .map_err(|_| js_error(format!("{canvas_id} is not a canvas")))?;
     let build = build_id.trim();
-    let hub = WebHub::connect(
-        hub_url.trim(),
+    let hub = WebHub::open(
+        Routes::new(&hub_url, None, &space_id),
         ApiKey::new(api_key),
-        space_id.trim(),
         (!build.is_empty()).then_some(build),
     )
     .await
     .map_err(|e| js_error(format!("{e:#}")))?;
-    let socket = ReadySocket::open(&hub.ready_url());
-    let system = load_registry(&hub, socket.as_ref())
+    let cache = cache::WebCache::open(cache::DEFAULT_MAX_BYTES).await;
+    if cache.is_none() {
+        web_sys::console::warn_1(&"gx-renderer: no Cache API here; nothing is cached".into());
+    }
+    let mut fetcher = WebFetcher::new(Rc::new(hub), cache);
+    let system = fetcher
+        .load_registry()
         .await
         .map_err(|e| js_error(format!("{e:#}")))?;
     let sim = Simulation::new(
         system,
         SimClock::new(gx_core::units::Seconds::new(0.0), time_scale),
     );
-    let fetcher = WebFetcher::new(Rc::new(hub), socket);
     let event_loop = EventLoop::new().map_err(js_error)?;
     // Wait, not Poll: on the web Poll is a busy loop that starves the page.
     // Each frame requests the next redraw, which the browser delivers once

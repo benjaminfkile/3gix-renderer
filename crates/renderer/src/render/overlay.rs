@@ -10,7 +10,7 @@
 //! section 6).
 
 use crate::sim::SECONDS_PER_DAY;
-use crate::stream::FetchTally;
+use crate::stream::FetcherStats;
 use gx_core::units::Seconds;
 
 /// Left and top margin of the overlay, pixels.
@@ -41,27 +41,56 @@ pub struct MatterStats {
     pub sprites_drawn: usize,
     /// Point lights in use.
     pub lights_active: usize,
-    /// Chunk requests finished this session, whatever the hub answered.
+    /// Cell requests finished this session.
     pub requests: u64,
-    /// Chunk requests answered with a body (`200`) this session.
+    /// Cell requests that ended with decoded sections this session.
     pub cells_fetched: u64,
-    /// Chunk body bytes received this session.
+    /// Section bytes received for cells this session.
     pub bytes_fetched: u64,
-    /// Round-trip time of the first chunk request, seconds.
+    /// Time to complete the first cell request, seconds.
     pub first_round_trip: Option<f64>,
-    /// Round-trip time of the latest chunk request, seconds.
+    /// Time to complete the latest cell request, seconds.
     pub last_round_trip: Option<f64>,
+    /// Sections streamed from the edge.
+    pub sections_streamed: u64,
+    /// Sections read from the local cache.
+    pub sections_cached: u64,
+    /// Sections computed here by the worker.
+    pub sections_computed: u64,
+    /// Module calls the worker made.
+    pub module_runs: u64,
+    /// Distinct modules the worker has loaded.
+    pub modules_loaded: u64,
+    /// Uploads started and not yet answered.
+    pub uploads_pending: u64,
+    /// Uploads the hub accepted.
+    pub uploads_done: u64,
+    /// Uploads that failed (logged; drawing never waits for them).
+    pub uploads_failed: u64,
+    /// Directions requests sent.
+    pub directions_requests: u64,
 }
 
 impl MatterStats {
-    /// The fetch values from a fetcher's totals, every other value zero.
-    pub fn from_tally(t: FetchTally) -> MatterStats {
+    /// The fetch and worker values from a fetcher's counts, every other
+    /// value zero.
+    pub fn from_stats(s: FetcherStats) -> MatterStats {
+        let t = s.tally;
         MatterStats {
             requests: t.requests,
             cells_fetched: t.bodies,
             bytes_fetched: t.bytes,
             first_round_trip: t.first_round_trip.map(|d| d.as_secs_f64()),
             last_round_trip: t.last_round_trip.map(|d| d.as_secs_f64()),
+            sections_streamed: s.directions.sections_streamed,
+            sections_cached: s.directions.sections_cached,
+            sections_computed: s.worker.sections_computed,
+            module_runs: s.worker.module_runs,
+            modules_loaded: s.worker.modules_loaded,
+            uploads_pending: s.worker.uploads_pending,
+            uploads_done: s.worker.uploads_done,
+            uploads_failed: s.worker.uploads_failed,
+            directions_requests: s.directions.directions_requests,
             ..MatterStats::default()
         }
     }
@@ -137,13 +166,23 @@ impl OverlayInfo {
             None => "-".to_string(),
         };
         lines.push(format!(
-            "requests {}  fetched {} cells {} B",
+            "cells done {}  with sections {}  {} B",
             m.requests, m.cells_fetched, m.bytes_fetched
         ));
         lines.push(format!(
             "rtt first {}  last {}",
             rtt(m.first_round_trip),
             rtt(m.last_round_trip)
+        ));
+        lines.push(format!(
+            "sections streamed {} (cache {})  computed here {}",
+            m.sections_streamed + m.sections_cached,
+            m.sections_cached,
+            m.sections_computed
+        ));
+        lines.push(format!(
+            "uploads pending {}  modules loaded {}",
+            m.uploads_pending, m.modules_loaded
         ));
         if self.sim_lag {
             lines.push("sim lag".to_string());
@@ -210,6 +249,15 @@ mod tests {
                 bytes_fetched: 1_048_576,
                 first_round_trip: Some(0.25),
                 last_round_trip: Some(0.0425),
+                sections_streamed: 30,
+                sections_cached: 6,
+                sections_computed: 4,
+                module_runs: 8,
+                modules_loaded: 2,
+                uploads_pending: 1,
+                uploads_done: 3,
+                uploads_failed: 0,
+                directions_requests: 5,
             },
         }
     }
@@ -226,9 +274,11 @@ mod tests {
         assert_eq!(l[6], "cells selected 12  ready 9  pending 3");
         assert_eq!(l[7], "meshes 4  triangles 5120  lights 1");
         assert_eq!(l[8], "volumes 2  sprites 7");
-        assert_eq!(l[9], "requests 20  fetched 11 cells 1048576 B");
+        assert_eq!(l[9], "cells done 20  with sections 11  1048576 B");
         assert_eq!(l[10], "rtt first 0.250 s  last 0.043 s");
-        assert_eq!(l.len(), 11);
+        assert_eq!(l[11], "sections streamed 36 (cache 6)  computed here 4");
+        assert_eq!(l[12], "uploads pending 1  modules loaded 2");
+        assert_eq!(l.len(), 13);
     }
 
     #[test]
@@ -246,9 +296,11 @@ mod tests {
         assert_eq!(l[1], "time scale 0.25x (paused)");
         assert_eq!(l[4], "fps -");
         assert_eq!(l[5], "exposure fixed 12.81");
-        assert_eq!(l[9], "requests 0  fetched 0 cells 0 B");
+        assert_eq!(l[9], "cells done 0  with sections 0  0 B");
         assert_eq!(l[10], "rtt first -  last -");
-        assert_eq!(l[11], "sim lag");
+        assert_eq!(l[11], "sections streamed 0 (cache 0)  computed here 0");
+        assert_eq!(l[12], "uploads pending 0  modules loaded 0");
+        assert_eq!(l[13], "sim lag");
         assert_eq!(format_stops(-3.0), "-3");
         assert_eq!(format_stops(0.5), "0.5");
         assert_eq!(format_stops(-0.001), "0");

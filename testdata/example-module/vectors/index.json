@@ -1,0 +1,72 @@
+{
+  "cases": {
+    "01-registry": {
+      "key": "registry",
+      "sha256": "7e57bc1e3d9c540188dcebfc67d5ebc01ccde9cc629d18bfba8f8dc2aa4c3be8",
+      "sources": []
+    },
+    "02-root-cell": {
+      "key": "0-0-0-0-0",
+      "sha256": "0fc29d0a8152897ab857f63cf7fdd6e08d5d98748690e508d82df4fdf424f523",
+      "sources": [
+        "0"
+      ]
+    },
+    "03-depth-one": {
+      "key": "1-1-1-0-1",
+      "sha256": "26937f76d8a2cf43079bc3a4d43b5f324864e66a7c0701ab1a96ada7d68e6b13",
+      "sources": [
+        "33"
+      ]
+    },
+    "04-depth-two": {
+      "key": "7-2-3-1-2",
+      "sha256": "fe0f86fa743a1fbe8177545bc40dc97899a2e22bd7ed6b84080553d8d9b479fb",
+      "sources": [
+        "226"
+      ]
+    },
+    "05-span": {
+      "key": "42-5-17-3-30",
+      "sha256": "b3b159a63f6d105c71c9a31cf612ecd8f35772ffe8ca5a41bc4b6cea2036cd50",
+      "sources": [
+        "1349"
+      ]
+    },
+    "06-origin": {
+      "key": "3-10-1023-0-512",
+      "sha256": "0a6d3626680fc41726163801180f08df48b435a8c7d0c90d7b5e1c9a3c39773c",
+      "sources": [
+        "106"
+      ]
+    },
+    "07-deepest-largest-frame": {
+      "key": "18446744073709551615-31-2147483647-0-1073741824",
+      "sha256": "ccaebfac83c80cb2679b3ae3ff44b028ce10d73ff2aa3492c908aac9c984e12f",
+      "sources": [
+        "18446744073709551615"
+      ]
+    },
+    "08-cold": {
+      "key": "1000-12-4095-4095-4095",
+      "sha256": "0be64d390e75d4da1f74723fd7039ad1e8dc7be06caaf3203113fef84b46e940",
+      "sources": [
+        "32012"
+      ]
+    },
+    "09-small-cube": {
+      "key": "5-3-7-7-7",
+      "sha256": "5fea83ef45e51d3087bcf1394c3c0f662e3ac30894ac4bd113ad26add84fb096",
+      "sources": [
+        "163"
+      ]
+    },
+    "10-dense-hot": {
+      "key": "9-20-524288-1-1048575",
+      "sha256": "4093de8830ef968a8837bee766ab1575b14c31206e7a38f4f0a83bda6d7673bd",
+      "sources": [
+        "308"
+      ]
+    }
+  }
+}

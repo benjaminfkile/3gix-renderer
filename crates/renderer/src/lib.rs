@@ -48,6 +48,7 @@ pub mod camera;
 pub mod config;
 #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
 pub mod controls;
+pub mod directions;
 pub mod extract;
 pub mod farfield;
 pub mod light;

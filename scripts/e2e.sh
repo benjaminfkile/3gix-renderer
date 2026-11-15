@@ -2,6 +2,9 @@
 # End to end run of the renderer against the real hub and the real system
 # compiler, inside one container, with assertions on the screenshots.
 #
+# Out of date: written for the v1 protocol (server-side compilation and the
+# compiler daemon). See docs/e2e/README.md.
+#
 #   1. Copies the hub repository to a writable place and starts it with its
 #      own container harness (scripts/e2e/hub-up.sh in the hub: Redis, a
 #      SeaweedFS S3 gateway, Postgres, the hub, and its seed), then sources

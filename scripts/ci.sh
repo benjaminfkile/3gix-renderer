@@ -2,6 +2,8 @@
 # Full local CI: toolchain versions, format, lint, tests (including the
 # headless renders and the volume comparison on whatever wgpu adapter is
 # present, a software Vulkan driver is enough), the vocabulary lint, the
+# browser worker's module runner under Node (V8, standing in for the
+# browser) against the example module's conformance hashes, the
 # wasm32 builds with the web feature off and on, and the browser package
 # built by web/build.sh (wasm-pack and wasm-opt). There is no browser here:
 # running the browser build is verified by hand, see docs/web.md.
@@ -37,14 +39,18 @@ if [ -n "${GX_CORE_DIR:-}" ]; then
     echo "vocab-lint files match the core library"
 fi
 
-step "6. cargo build wasm32 (library, web feature off)"
+step "6. browser worker under Node"
+node --version
+node scripts/worker-node-check.mjs
+
+step "7. cargo build wasm32 (library, web feature off)"
 cargo build -p renderer --lib --target wasm32-unknown-unknown
 
-step "7. cargo build and clippy wasm32 (web feature on)"
+step "8. cargo build and clippy wasm32 (web feature on)"
 cargo build --target wasm32-unknown-unknown --features web -p renderer
 cargo clippy -p renderer --target wasm32-unknown-unknown --features web -- -D warnings
 
-step "8. web/build.sh"
+step "9. web/build.sh"
 rm -f web/pkg/renderer_bg.wasm web/pkg/renderer.js
 sh web/build.sh
 for f in web/pkg/renderer_bg.wasm web/pkg/renderer.js; do
