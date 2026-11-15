@@ -164,6 +164,21 @@ impl World {
         true
     }
 
+    /// Replaces the priority cells, the ones around the walking observer's
+    /// feet ([`CellCache::set_priority`]).
+    pub fn set_priority(&mut self, keys: &[CellKey], now: f64) {
+        self.cache.set_priority(keys, now);
+    }
+
+    /// Pins the depth-0 and depth-1 cells of every frame
+    /// ([`crate::walk::survey_keys`]), so the spawn chooser learns which
+    /// frames have matter ([`crate::walk::spawn_frames`]).
+    pub fn survey(&mut self, system: &FrameSystem, now: f64) {
+        for k in crate::walk::survey_keys(system.tree()) {
+            self.cache.pin(k, now);
+        }
+    }
+
     /// The cells to request now (see [`CellCache::take_requests`]).
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
         self.cache.take_requests(now)

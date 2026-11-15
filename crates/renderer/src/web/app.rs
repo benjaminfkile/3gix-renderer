@@ -1,8 +1,10 @@
 //! The browser frame loop on a canvas.
 //!
 //! The same steps as the desktop window loop of [`crate::app`]: advance the
-//! simulation clock (clamped to the hub's now) and integrate, fly and
-//! re-parent the camera, solve the light time of every frame
+//! simulation clock (clamped to the hub's now) and integrate, move the
+//! observer in fly or walk mode ([`crate::walk::Observer::update`]) with
+//! the cells around a walking observer's feet as the streaming priority,
+//! solve the light time of every frame
 //! ([`crate::seen`]), stream
 //! matter through [`WebFetcher`], build the camera-relative scene, and draw
 //! it with [`Renderer`]. Differences are only in the platform: `winit`
@@ -22,6 +24,7 @@ use crate::render::scene::{matter_scene, Scene};
 use crate::seen::Seen;
 use crate::sim::Simulation;
 use crate::stream::FetchEvent;
+use crate::walk::{mode_lines, spawn_by_index, Observer};
 use crate::world::World;
 use anyhow::{anyhow, Context, Result};
 use gx_core::units::Seconds;
@@ -138,6 +141,7 @@ fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, no
 pub struct WebApp {
     sim: Simulation,
     camera: Camera,
+    observer: Observer,
     world: World,
     fetcher: WebFetcher,
     controls: Controls,
@@ -157,6 +161,7 @@ impl WebApp {
         WebApp {
             sim,
             camera,
+            observer: Observer::new(),
             world: World::new(default_threads()),
             fetcher,
             controls: Controls::default(),
@@ -192,12 +197,21 @@ impl WebApp {
         let fps = self.fps(now);
 
         let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
-        let held = self.camera.hold(self.sim.system());
-        self.sim.update(Seconds::new(dt), Seconds::new(hub_now));
-        self.camera.keep(self.sim.system(), held);
+        if let Some(index) = self.controls.take_spawn() {
+            let (system, cache) = (self.sim.system(), self.world.cache());
+            spawn_by_index(&mut self.observer, system, cache, index, &mut self.camera);
+        }
         let input = self.controls.take_flight();
-        self.camera.fly(&input, dt);
-        self.camera.update_parent(self.sim.system());
+        let jump = self.controls.take_jump();
+        self.observer.update(
+            &mut self.sim,
+            dt,
+            Seconds::new(hub_now),
+            self.world.cache(),
+            &input,
+            jump,
+            &mut self.camera,
+        );
 
         let mut slot = self.gfx.borrow_mut();
         let Some(gfx) = slot.as_mut() else {
@@ -209,6 +223,11 @@ impl WebApp {
         let seen = self.sim.seen(&self.camera);
         self.world
             .select(seen.system(), seen.camera(), size, t, false);
+        self.world
+            .set_priority(&self.observer.priority_cells(self.sim.system()), t);
+        if self.controls.spawning {
+            self.world.survey(self.sim.system(), t);
+        }
         stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);
         self.world.evict(t);
         let mut scene = matter_scene(&mut self.world, &seen, size, t);
@@ -238,7 +257,7 @@ impl WebApp {
     fn overlay(&self, seen: &Seen, scene: &Scene, fps: Option<f64>) -> String {
         let counts = self.world.counts();
         let clock = self.sim.clock();
-        OverlayInfo {
+        let mut text = OverlayInfo {
             sim_time: self.sim.time(),
             offset_from_now: clock.offset_from_now(),
             at_now: clock.is_at_now(),
@@ -264,7 +283,17 @@ impl WebApp {
                 ..MatterStats::from_stats(self.fetcher.stats())
             },
         }
-        .text()
+        .text();
+        for line in mode_lines(
+            &self.observer,
+            self.sim.system(),
+            self.world.cache(),
+            self.controls.spawning,
+        ) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        text
     }
 }
 
@@ -316,7 +345,7 @@ impl ApplicationHandler for WebApp {
             other => {
                 if self
                     .controls
-                    .handle(&other, &mut self.sim, &mut self.camera)
+                    .handle(&other, &mut self.sim, &mut self.camera, &mut self.observer)
                 {
                     event_loop.exit();
                 }
