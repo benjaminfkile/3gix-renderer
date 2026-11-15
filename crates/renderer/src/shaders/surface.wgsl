@@ -104,6 +104,12 @@ fn vs_surface(in: VsIn) -> VsOut {
     return out;
 }
 
+// Debug drawing of a mesh's vertices or edges: a fixed unlit color.
+@fragment
+fn fs_mesh_debug(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(30.0, 100.0, 60.0, 1.0);
+}
+
 @fragment
 fn fs_surface(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);

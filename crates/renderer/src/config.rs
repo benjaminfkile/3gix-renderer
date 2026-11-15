@@ -105,6 +105,8 @@ FLAGS:
     --exposure-stops <f64>         fixed exposure, stops relative to the automatic exposure of a
                                    scene whose log-average luminance is 1 W m^-2 sr^-1; turns
                                    adaptation off, + and - change it (default: automatic)
+    --mesh-mode <mode>             surfaces (default), vertices, or edges: how surface meshes
+                                   are drawn; X cycles them in the window
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
@@ -274,6 +276,9 @@ pub struct Config {
     /// reference scene ([`crate::render::gpu::fixed_exposure`]); `None`
     /// adapts to the scene.
     pub exposure_stops: Option<f64>,
+    /// How surface meshes are drawn at start (`--mesh-mode`, `X` in the
+    /// window).
+    pub mesh_mode: crate::render::scene::MeshMode,
 }
 
 /// The command line flags, each `None` when not given.
@@ -305,6 +310,8 @@ pub struct Flags {
     pub no_overlay: bool,
     /// `--exposure-stops`.
     pub exposure_stops: Option<f64>,
+    /// `--mesh-mode`.
+    pub mesh_mode: Option<crate::render::scene::MeshMode>,
     /// `--hub-url`.
     pub hub_url: Option<String>,
     /// `--space-id`.
@@ -407,6 +414,19 @@ where
             "--stats-json" => flags.stats_json = Some(PathBuf::from(value(&name)?)),
             "--no-overlay" => flags.no_overlay = true,
             "--exposure-stops" => flags.exposure_stops = Some(parse_f64(&name, &value(&name)?)?),
+            "--mesh-mode" => {
+                let v = value(&name)?;
+                flags.mesh_mode = Some(match v.as_str() {
+                    "surfaces" => crate::render::scene::MeshMode::Surfaces,
+                    "vertices" => crate::render::scene::MeshMode::Vertices,
+                    "edges" => crate::render::scene::MeshMode::Edges,
+                    _ => {
+                        return Err(err(format!(
+                            "{name}: {v:?} is not surfaces, vertices, or edges"
+                        )))
+                    }
+                })
+            }
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
             "--build-id" => flags.build_id = Some(value(&name)?),
@@ -546,6 +566,7 @@ impl Config {
             stats_json: flags.stats_json.clone(),
             overlay: !flags.no_overlay,
             exposure_stops: flags.exposure_stops,
+            mesh_mode: flags.mesh_mode.unwrap_or_default(),
             adapter: pick(&flags.adapter, ENV_ADAPTER).filter(|a| !a.trim().is_empty()),
             max_fps: flags.max_fps.unwrap_or(0),
             edge_url,

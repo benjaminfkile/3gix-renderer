@@ -231,6 +231,7 @@ impl WebApp {
         stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);
         self.world.evict(t);
         let mut scene = matter_scene(&mut self.world, &seen, size, t);
+        scene.mesh_mode = self.controls.mesh_mode;
         if self.controls.hide_guides {
             scene.markers.clear();
             scene.lines.clear();
@@ -293,7 +294,7 @@ impl WebApp {
             text.push('\n');
             text.push_str(&line);
         }
-        if let Some(line) = self.controls.speed_entry_line(&self.observer) {
+        for line in self.controls.status_lines(&self.observer) {
             text.push('\n');
             text.push_str(&line);
         }

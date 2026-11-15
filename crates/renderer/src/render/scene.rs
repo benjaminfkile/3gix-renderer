@@ -119,6 +119,9 @@ pub struct VolumeDraw {
 /// Everything one render pass draws, in camera-relative `f32`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
+    /// How the surface meshes are drawn: as surfaces, or for debugging as
+    /// their vertices or their triangle edges (`X`).
+    pub mesh_mode: MeshMode,
     /// A marker at every frame origin, in ascending frame id order.
     pub markers: Vec<Marker>,
     /// Pairs of vertices: each frame origin to its parent origin.
@@ -137,6 +140,39 @@ pub struct Scene {
     pub near: f32,
     /// Vertical field of view, radians.
     pub fov_y: f32,
+}
+
+/// How surface meshes are drawn. The debug modes show the meshes the
+/// renderer extracted, unlit, so their resolution can be seen.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MeshMode {
+    /// Lit surfaces.
+    #[default]
+    Surfaces,
+    /// Every mesh vertex as a one-pixel point.
+    Vertices,
+    /// Every triangle edge as a one-pixel line.
+    Edges,
+}
+
+impl MeshMode {
+    /// The next mode in the cycle surfaces, vertices, edges.
+    pub fn next(self) -> MeshMode {
+        match self {
+            MeshMode::Surfaces => MeshMode::Vertices,
+            MeshMode::Vertices => MeshMode::Edges,
+            MeshMode::Edges => MeshMode::Surfaces,
+        }
+    }
+
+    /// The overlay name of a debug mode, `None` for surfaces.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            MeshMode::Surfaces => None,
+            MeshMode::Vertices => Some("draw mesh vertices (X)"),
+            MeshMode::Edges => Some("draw mesh edges (X)"),
+        }
+    }
 }
 
 /// Marker diameter in pixels for a frame of edge `root_extent` meters: one
@@ -234,6 +270,7 @@ pub fn build_scene(system: &FrameSystem, camera: &Camera, aspect: f64) -> Scene 
         [0.0, 0.0, 0.0, 1.0],
     ];
     Scene {
+        mesh_mode: MeshMode::Surfaces,
         markers,
         lines,
         surfaces: Vec::new(),

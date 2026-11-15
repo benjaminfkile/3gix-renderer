@@ -12,6 +12,7 @@
 
 use crate::camera::{Camera, FlightInput, SPEED_LIMITS};
 use crate::render::gpu::{Exposure, EXPOSURE_STEP_STOPS};
+use crate::render::scene::MeshMode;
 use crate::sim::{ClockAction, Simulation};
 use crate::walk::Observer;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -51,6 +52,8 @@ pub struct Controls {
     /// The speed being typed after `V`, meters per second, as typed; `None`
     /// when no speed is being typed.
     pub speed_entry: Option<String>,
+    /// How surface meshes are drawn (`X`).
+    pub mesh_mode: MeshMode,
 }
 
 /// Longest typed speed, characters.
@@ -186,6 +189,7 @@ impl Controls {
             }
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::KeyV => self.speed_entry = Some(String::new()),
+            KeyCode::KeyX => self.mesh_mode = self.mesh_mode.next(),
             KeyCode::Equal | KeyCode::NumpadAdd => self.bias_exposure(EXPOSURE_STEP_STOPS),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
@@ -251,13 +255,22 @@ impl Controls {
         }
     }
 
-    /// The overlay line of the speed entry, or `None` when no speed is
-    /// being typed.
-    pub fn speed_entry_line(&self, observer: &Observer) -> Option<String> {
-        self.speed_entry.as_ref().map(|t| {
+    /// The controls' own overlay lines: the mesh debug mode, and the speed
+    /// entry while a speed is being typed.
+    pub fn status_lines(&self, observer: &Observer) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .mesh_mode
+            .label()
+            .map(String::from)
+            .into_iter()
+            .collect();
+        if let Some(t) = &self.speed_entry {
             let what = if observer.walking() { "walk" } else { "flight" };
-            format!("type a {what} speed: {t}_ m/s  (Enter sets, Esc cancels)")
-        })
+            lines.push(format!(
+                "type a {what} speed: {t}_ m/s  (Enter sets, Esc cancels)"
+            ));
+        }
+        lines
     }
 
     /// `+` and `-`: shift the fixed exposure if there is one, the bias of
@@ -327,13 +340,12 @@ mod tests {
             cruise: 1.0,
         };
         let mut observer = Observer::new();
-        let typing =
-            |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera, o: &mut Observer| {
-                c.speed_entry = Some(String::new());
-                for &k in keys {
-                    c.type_speed(k, cam, o);
-                }
-            };
+        let typing = |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera, o: &mut Observer| {
+            c.speed_entry = Some(String::new());
+            for &k in keys {
+                c.type_speed(k, cam, o);
+            }
+        };
         // Fly mode: the flight speed.
         typing(
             &mut c,

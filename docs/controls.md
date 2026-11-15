@@ -21,6 +21,7 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `G` | Open or close the spawn chooser (see Spawning) |
 | `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
 | `V` | Type a speed in meters per second (see Typing a speed) |
+| `X` | Cycle how surfaces are drawn: lit surfaces, then (for debugging) every mesh vertex as a point, then every triangle edge as a line, unlit and seen from both sides. `--mesh-mode surfaces\|vertices\|edges` sets it at start, also headless |
 
 The camera behaves like an observer floating free in space: simulation time
 moves and turns the frames, but not the camera, which keeps its place and

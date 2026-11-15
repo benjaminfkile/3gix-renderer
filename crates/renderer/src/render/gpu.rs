@@ -35,6 +35,7 @@ use super::overlay::{MARGIN_PX, TEXT_COLOR, TEXT_PX};
 use super::scene::Scene;
 use crate::extract::SurfaceMesh;
 use crate::light::{EmissionTable, EMISSION_TABLE_WIDTH, MAX_LIGHTS};
+use crate::render::scene::MeshMode;
 use crate::volume::{VolumeGrid, CUBE_TRIANGLES};
 use bytemuck::{Pod, Zeroable};
 use gx_core::key::CellKey;
@@ -290,8 +291,13 @@ struct LineGpuVertex {
 /// A mesh uploaded to the GPU.
 struct GpuMesh {
     vertices: wgpu::Buffer,
+    vertex_count: u32,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Pairs of indices, the three edges of every triangle, for
+    /// [`MeshMode::Edges`].
+    edges: wgpu::Buffer,
+    edge_count: u32,
     last_drawn: u64,
 }
 
@@ -344,6 +350,8 @@ pub struct Renderer {
     markers: GrowBuffer,
     lines: GrowBuffer,
     surface_pipeline: wgpu::RenderPipeline,
+    vertex_pipeline: wgpu::RenderPipeline,
+    edge_pipeline: wgpu::RenderPipeline,
     surface_globals: wgpu::Buffer,
     surface_layout: wgpu::BindGroupLayout,
     surface_bind: wgpu::BindGroup,
@@ -677,46 +685,69 @@ impl Renderer {
                 bind_group_layouts: &[Some(&surface_layout), Some(&model_layout)],
                 immediate_size: 0,
             });
-        let surface_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("surfaces"),
-            layout: Some(&surface_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &surface_shader,
-                entry_point: Some("vs_surface"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<SurfaceGpuVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3,
-                        1 => Float32x3,
-                        2 => Float32x3,
-                        3 => Float32,
-                        4 => Uint32
-                    ],
-                })],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(depth_test.clone()),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &surface_shader,
-                entry_point: Some("fs_surface"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: RADIANCE_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            cache: None,
-            multiview_mask: None,
-        });
+        let surface_like =
+            |label: &str, fs: &str, topology: wgpu::PrimitiveTopology, cull: Option<wgpu::Face>| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&surface_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &surface_shader,
+                        entry_point: Some("vs_surface"),
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<SurfaceGpuVertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![
+                                0 => Float32x3,
+                                1 => Float32x3,
+                                2 => Float32x3,
+                                3 => Float32,
+                                4 => Uint32
+                            ],
+                        })],
+                        compilation_options: Default::default(),
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: cull,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(depth_test.clone()),
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &surface_shader,
+                        entry_point: Some(fs),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: RADIANCE_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    cache: None,
+                    multiview_mask: None,
+                })
+            };
+        let surface_pipeline = surface_like(
+            "surfaces",
+            "fs_surface",
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::Face::Back),
+        );
+        // Debug drawing of the same meshes (`MeshMode`): their vertices as
+        // points and their triangle edges as lines, unlit.
+        let vertex_pipeline = surface_like(
+            "mesh vertices",
+            "fs_mesh_debug",
+            wgpu::PrimitiveTopology::PointList,
+            None,
+        );
+        let edge_pipeline = surface_like(
+            "mesh edges",
+            "fs_mesh_debug",
+            wgpu::PrimitiveTopology::LineList,
+            None,
+        );
 
         // Volumes and sprites, blended into the radiance target when the
         // device can blend 32-bit floats.
@@ -991,6 +1022,8 @@ impl Renderer {
             markers: GrowBuffer::new(device, "markers"),
             lines: GrowBuffer::new(device, "lines"),
             surface_pipeline,
+            vertex_pipeline,
+            edge_pipeline,
             surface_globals,
             surface_layout,
             surface_bind,
@@ -1222,6 +1255,11 @@ impl Renderer {
                 emission_index: self.emission.index_for(f64::from(v.temperature)),
             })
             .collect();
+        let edges: Vec<u32> = mesh
+            .indices
+            .chunks_exact(3)
+            .flat_map(|t| [t[0], t[1], t[1], t[2], t[2], t[0]])
+            .collect();
         GpuMesh {
             vertices: self
                 .device
@@ -1238,6 +1276,15 @@ impl Renderer {
                     usage: wgpu::BufferUsages::INDEX,
                 }),
             index_count: mesh.indices.len() as u32,
+            vertex_count: vertices.len() as u32,
+            edges: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface edges"),
+                    contents: bytemuck::cast_slice(&edges),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+            edge_count: edges.len() as u32,
             last_drawn: self.frame,
         }
     }
@@ -1542,7 +1589,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.surface_pipeline);
+            pass.set_pipeline(match scene.mesh_mode {
+                MeshMode::Surfaces => &self.surface_pipeline,
+                MeshMode::Vertices => &self.vertex_pipeline,
+                MeshMode::Edges => &self.edge_pipeline,
+            });
             pass.set_bind_group(0, &self.surface_bind, &[]);
             for (i, draw) in scene.surfaces.iter().enumerate() {
                 let Some(m) = self.meshes.get(&draw.mesh.key) else {
@@ -1550,8 +1601,17 @@ impl Renderer {
                 };
                 pass.set_bind_group(1, &self.model_bind, &[(i as u64 * MODEL_STRIDE) as u32]);
                 pass.set_vertex_buffer(0, m.vertices.slice(..));
-                pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..m.index_count, 0, 0..1);
+                match scene.mesh_mode {
+                    MeshMode::Surfaces => {
+                        pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..m.index_count, 0, 0..1);
+                    }
+                    MeshMode::Vertices => pass.draw(0..m.vertex_count, 0..1),
+                    MeshMode::Edges => {
+                        pass.set_index_buffer(m.edges.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..m.edge_count, 0, 0..1);
+                    }
+                }
                 stats.meshes += 1;
                 stats.triangles += m.index_count as usize / 3;
             }

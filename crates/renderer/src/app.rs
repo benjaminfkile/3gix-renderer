@@ -208,6 +208,8 @@ pub struct HeadlessRun {
     /// A fixed exposure, stops ([`crate::render::gpu::fixed_exposure`]);
     /// `None` exposes for the frame's own log-average luminance.
     pub exposure_stops: Option<f64>,
+    /// How surface meshes are drawn.
+    pub mesh_mode: crate::render::scene::MeshMode,
     /// A part of the graphics adapter's name ([`crate::render::gpu::pick_adapter`]).
     pub adapter: Option<String>,
 }
@@ -224,6 +226,7 @@ impl HeadlessRun {
             wait_ready_seconds: None,
             overlay: true,
             exposure_stops: None,
+            mesh_mode: crate::render::scene::MeshMode::Surfaces,
             adapter: None,
         }
     }
@@ -238,6 +241,7 @@ impl HeadlessRun {
             wait_ready_seconds: config.wait_ready_seconds,
             overlay: config.overlay,
             exposure_stops: config.exposure_stops,
+            mesh_mode: config.mesh_mode,
             adapter: config.adapter.clone(),
         }
     }
@@ -429,6 +433,7 @@ pub fn render_headless_view(
     world.finish_extraction();
     let stream_seconds = start.elapsed().as_secs_f64();
     let mut scene = matter_scene(&mut world, &seen, (width, height), stream_seconds);
+    scene.mesh_mode = run.mesh_mode;
     if !run.overlay {
         // The markers and lines are visual aids like the text: only matter
         // remains.
@@ -519,7 +524,11 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
         world: World::new(default_threads()),
         fetcher,
         started: Instant::now(),
-        controls: Controls::new(config.exposure_stops),
+        controls: {
+            let mut c = Controls::new(config.exposure_stops);
+            c.mesh_mode = config.mesh_mode;
+            c
+        },
         adapter: config.adapter.clone(),
         frame_interval: (config.max_fps > 0)
             .then(|| Duration::from_secs_f64(1.0 / f64::from(config.max_fps))),
@@ -698,6 +707,7 @@ impl App {
         stream_step(&mut self.world, &mut self.fetcher, seen.system(), events, t);
         self.world.evict(t);
         let mut scene = matter_scene(&mut self.world, &seen, size, t);
+        scene.mesh_mode = self.controls.mesh_mode;
         if self.controls.hide_guides {
             scene.markers.clear();
             scene.lines.clear();
@@ -723,7 +733,7 @@ impl App {
             overlay.push('\n');
             overlay.push_str(&line);
         }
-        if let Some(line) = self.controls.speed_entry_line(&self.observer) {
+        for line in self.controls.status_lines(&self.observer) {
             overlay.push('\n');
             overlay.push_str(&line);
         }
