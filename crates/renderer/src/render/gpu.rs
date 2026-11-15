@@ -1257,7 +1257,9 @@ impl Renderer {
             .collect();
         let edges: Vec<u32> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|t| [t[0], t[1], t[1], t[2], t[2], t[0]])
             .collect();
         GpuMesh {
