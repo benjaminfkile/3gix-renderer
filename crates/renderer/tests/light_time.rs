@@ -243,17 +243,26 @@ fn the_day_side_faces_the_emitters_retarded_position() {
 }
 
 #[test]
-fn at_the_origin_retarded_times_stop_at_the_origin() {
-    let mut sim = Simulation::at_now(system(), Seconds::new(EPOCH + 600.0));
+fn just_after_the_origin_frames_are_seen_from_before_it() {
+    let t = EPOCH + 600.0;
+    let mut sim = Simulation::at_now(system(), Seconds::new(t));
     let camera = camera();
     sim.prepare_light(&camera);
     let seen = sim.seen(&camera);
-    // The light now arriving left before the universe began: the frame is
-    // drawn at its state at the origin.
+    // The light now arriving left about an hour before the origin. The
+    // origin only starts the recorded time, so the frame is drawn where it
+    // was then, not clamped to the origin.
     let f = seen.frame(FAR).unwrap();
-    assert!(f.light.clamped);
-    assert_eq!(f.light.time, Seconds::new(EPOCH));
-    assert!((seen.root_position(FAR) - far_at(EPOCH)).length() < 1e-3);
+    assert!(!f.light.clamped);
+    let tr = f.light.time.value();
+    assert!(
+        tr < EPOCH - 2900.0 && tr > EPOCH - 3100.0,
+        "retarded time {tr}"
+    );
+    // The distance the light crossed is the one to where the frame was then.
+    let d = far_at(tr).length(); // the camera is at the root origin
+    assert!((t - tr - d / C).abs() < 1e-6);
+    assert!((seen.root_position(FAR) - far_at(tr)).length() < 1e-3);
 }
 
 #[test]

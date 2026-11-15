@@ -47,7 +47,7 @@ use crate::seen::Seen;
 use gx_core::frames::FrameSystem;
 use gx_core::gravity::C;
 use gx_core::history::History;
-use gx_core::integrate::Scheme;
+use gx_core::integrate::{advance, Scheme};
 use gx_core::units::{Seconds, Vec3};
 
 /// The integration scheme: post-Newtonian gravity, oblateness, and
@@ -71,6 +71,14 @@ pub const RECENT_CAPACITY: usize = 1024;
 /// How far the fine history reaches before the earliest retarded time it
 /// is built for, seconds.
 pub const RECENT_SLACK_SECONDS: f64 = 21_600.0;
+
+/// How far before the origin the histories reach, seconds: two days. The
+/// origin starts the recorded time a client can go back to, not the
+/// universe: light reaching an observer just after the origin left its
+/// frames before it. The registry is integrated backwards this far (the
+/// laws allow it), which covers the light-travel time across the whole root
+/// frame (its far corner is about 16 light-hours from its center).
+pub const BEFORE_ORIGIN_SECONDS: f64 = 172_800.0;
 
 /// Relative margin on the light-travel time the fine history covers:
 /// frames move at a small fraction of the speed of light, so their
@@ -301,8 +309,11 @@ impl Simulation {
     /// The simulation of `system`, a frame system at the registry epoch
     /// (the origin), on `clock`.
     pub fn new(system: FrameSystem, clock: SimClock) -> Simulation {
+        let mut early = system.clone();
+        let start = early.time() - Seconds::new(BEFORE_ORIGIN_SECONDS);
+        advance(&mut early, start, Seconds::new(MAX_STEP_SECONDS), SCHEME);
         let history = History::new(
-            system.clone(),
+            early,
             Seconds::new(CHECKPOINT_SECONDS),
             Seconds::new(MAX_STEP_SECONDS),
             SCHEME,
@@ -425,8 +436,8 @@ impl Simulation {
     /// rebuilding it from the coarse history when it does not, or when its
     /// checkpoints are much farther apart than the span needs.
     fn cover(&mut self, lo: Seconds, t: Seconds) {
-        let origin = self.origin();
-        let lo = if lo < origin { origin } else { lo };
+        let first = self.history.epoch();
+        let lo = if lo < first { first } else { lo };
         let wanted = |span: Seconds| {
             Seconds::new(MAX_STEP_SECONDS.max(span.value() / (RECENT_CAPACITY / 4) as f64))
         };
@@ -440,7 +451,7 @@ impl Simulation {
             && (t - epoch).value() <= (RECENT_CAPACITY / 2) as f64 * interval;
         if !fits {
             let start = lo - Seconds::new(RECENT_SLACK_SECONDS);
-            let start = if start < origin { origin } else { start };
+            let start = if start < first { first } else { start };
             let interval = wanted(t - start + Seconds::new(RECENT_SLACK_SECONDS));
             self.recent = History::new(
                 self.history.state_at(start),
@@ -617,9 +628,11 @@ mod tests {
             }
         };
         close(sim.system(), &direct);
-        // Back to the origin: the registry state itself.
+        // Back to the origin: the registry state, reached through the
+        // checkpoints that start before it.
         sim.set_clock(SimClock::starting_at(s(EPOCH), s(now), s(EPOCH), 1.0));
-        assert_eq!(sim.system(), &system());
+        assert_eq!(sim.time(), s(EPOCH));
+        close(sim.system(), &system());
         sim.apply(ClockAction::JumpToNow);
         assert_eq!(sim.time(), s(now));
         close(sim.system(), &direct);
@@ -640,13 +653,19 @@ mod tests {
         let h = sim.light_history(far);
         assert!(h.epoch() <= s(now - 36_000.0 * (1.0 + LIGHT_TIME_MARGIN)));
         assert!(h.latest() <= s(now) && h.latest() + h.interval() > s(now));
-        // Near the origin it starts at the origin.
+        // Just after the origin the light left before it: the fine history
+        // reaches back before the origin, as far as the light needs.
         sim.set_clock(SimClock::starting_at(
             s(EPOCH),
             s(now),
             s(EPOCH + 60.0),
             1.0,
         ));
-        assert_eq!(sim.light_history(far).epoch(), s(EPOCH));
+        let h = sim.light_history(far);
+        assert!(h.epoch() <= s(EPOCH + 60.0 - 36_000.0 * (1.0 + LIGHT_TIME_MARGIN)));
+        assert!(h.epoch() >= s(EPOCH - BEFORE_ORIGIN_SECONDS));
+        // The clock itself never goes before the origin.
+        sim.apply(ClockAction::StepBack);
+        assert_eq!(sim.time(), s(EPOCH));
     }
 }
