@@ -160,11 +160,6 @@ impl World {
         self.cache.complete(key, outcome, now);
     }
 
-    /// Applies a `chunkReady` push.
-    pub fn chunk_ready(&mut self, key: &CellKey) {
-        self.cache.notify_ready(key);
-    }
-
     /// Collects finished meshes and queues extraction, in key order, for
     /// every `Ready` cell without a mesh or whose mesh was extracted with
     /// other face neighbors than it has now. A cell already being extracted
@@ -404,7 +399,7 @@ mod tests {
         // The -x neighbor turns out to hold no matter: its vacuum is data,
         // so `a` is extracted again with a wall on that face, x = -4.
         let c = CellKey::new(3, 2, 0, 0, 0).unwrap();
-        world.complete(c, FetchOutcome::NotFound, 0.0);
+        world.complete(c, FetchOutcome::Decoded(None), 0.0);
         world.finish_extraction();
         assert_eq!(world.mesh_neighbors(&a).unwrap().count(), 2);
         let walled = world.mesh(&a).unwrap();

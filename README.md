@@ -11,7 +11,7 @@ Nothing in this repository knows what any piece of matter is. There is no code p
 ## What it does
 
 - Fetches the frame registry for a build and integrates every frame forward from the epoch under Newtonian gravity.
-- Fetches matter cells near the camera at a depth chosen by distance, through the hub's chunk endpoint and readiness WebSocket.
+- Asks the hub for directions for the cells near the camera, at a depth chosen by distance, and for each layer streams the finished section from the edge or the local cache, or computes it here: the worker runs the layer's compiler module (WebAssembly, by hash) on its source tiles, hands the section to the renderer at once, and uploads it with the claim. The registry is just another key.
 - Composites overlapping sections, relaxes fluid matter toward the local equipotential, derives emission from temperature.
 - Extracts surfaces from solid and fluid matter, ray marches gas and plasma as volumes, and draws with camera-relative single precision over a floating origin.
 - Draws frames too far away for cells as point sprites of the right brightness, so hot matter is visible from anywhere.
@@ -19,7 +19,8 @@ Nothing in this repository knows what any piece of matter is. There is no code p
 
 ## What it depends on
 
-- `gx-core`, the shared library: matter format decoder and validator, units, laws, chunk keys, the frame registry.
+- `gx-core`, the shared library: matter format decoder and validator, units, laws, chunk keys, section addresses, the module request and tile formats, source manifests, the frame registry.
+- `gx-module-host` (native) to run modules; the browser uses its own `WebAssembly` in a Web Worker.
 - `wgpu` and `winit` for graphics and windowing. Headless tests run on a software Vulkan driver with no window.
 
 ## Running
@@ -67,6 +68,12 @@ on that view's distance from its frame origin), `--wait-ready-seconds <f64>`
 longer), `--stats-json <path.json>` (the overlay statistics: cells selected
 and fetched, bytes, the first and last round trip), and `--no-overlay`
 (matter only: no overlay text, frame markers, or lines).
+`GX_EDGE_URL` or `--edge-url` reads sections, modules, and tiles from an
+edge instead of the hub. The local cache is a directory under the platform
+cache directory by default; `--cache-dir <path>` moves it,
+`--cache-max-bytes <u64>` limits it (default 20 GB), and `--no-cache` turns
+it off. `--workers <u32>` sets the threads that run modules (default: cores
+minus two, at least one).
 `--exposure-stops <f64>`, in the window too, fixes the exposure instead of
 adapting it, in stops relative to the automatic exposure of a scene whose
 log-average luminance is 1 W m^-2 sr^-1 (`docs/shading.md`):
@@ -76,9 +83,11 @@ cargo run --release --bin gx-renderer -- --screenshot frame-3.png --view 3 \
     --wait-ready-seconds 300 --stats-json frame-3.json --no-overlay
 ```
 
-Without a hub, `gx-mock-hub` serves a registry the way the hub does and prints
-the variables to use. `--cell <key>=<file>` adds a matter cell from a hub
-chunk container file:
+Without a hub, `gx-mock-hub` serves a whole space the way the hub does (a
+layer declaring the frames of a registry file, and the core library's
+example module on every frame up to `--depth`) and prints the variables to
+use. The first client computes and uploads what it sees; the next streams
+it:
 
 ```sh
 cargo run --bin gx-mock-hub &          # prints GX_HUB_URL, GX_API_KEY, GX_SPACE_ID
@@ -111,7 +120,10 @@ sh scripts/ci.sh
 ```
 
 Runs format, clippy with `-D warnings`, the tests (including the headless
-renders and the GPU volume against its CPU reference), the vocabulary lint,
+renders, the GPU volume against its CPU reference, the client against the
+mock hub with the example module, and the worker against the example
+module's conformance hashes), the vocabulary lint, the browser worker's
+module runner under Node against the same hashes,
 the wasm32 builds with the `web` feature off and on, and `web/build.sh`. The
 matter render tests save their images as `target/tmp/matter-render.png` and
 `target/tmp/full-scene.png` with pixel statistics beside them in `.txt`
@@ -131,7 +143,8 @@ statistics are in `docs/e2e/`.
 
 ## Specification
 
-- Architecture: `3GIXHub/docs/architecture/space-model.md`
+- Architecture: `3GIXHub/docs/architecture/space-model.md` (v2)
+- Hub, client, and module contract: `3GIXHub/docs/architecture/client-compute.md`
 - Matter format v1: `3GIXHub/docs/architecture/matter-format.md`
 
 ## Contributing rules

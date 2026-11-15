@@ -1,0 +1,17 @@
+[package]
+name = "gx-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The client's worker: runs compiler modules on requests and source tiles and returns validated sections."
+
+[lib]
+name = "gx_worker"
+path = "src/lib.rs"
+
+[dependencies]
+gx-core = { git = "https://github.com/benjaminfkile/3gix-core", branch = "grunt" }
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gx-module-host = { git = "https://github.com/benjaminfkile/3gix-core", branch = "grunt" }

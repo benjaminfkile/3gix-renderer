@@ -8,8 +8,9 @@
 //! 2. apply free flight to the [`Camera`] and re-parent it to its nearest
 //!    frame ([`crate::camera`], `space-model.md` section 5),
 //! 3. stream matter: select cells (every 100 ms), start requests, apply
-//!    fetch results and readiness pushes, collect extracted meshes, and
-//!    evict ([`crate::world`], [`crate::stream`]),
+//!    what the fetcher brought in (streamed from the edge or the local
+//!    cache, or computed here by the worker), collect extracted meshes, and
+//!    evict ([`crate::world`], [`crate::stream`], [`crate::directions`]),
 //! 4. build the camera-relative scene with the drawn cells and their lights
 //!    and draw it with the overlay ([`crate::render`]).
 //!
@@ -21,7 +22,6 @@ use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
 use crate::farfield::focal_px;
-use crate::hub::HubClient;
 use crate::render::gpu::{
     describe_adapter, pick_adapter, present_mode, wanted_features, Exposure, Renderer,
 };
@@ -67,7 +67,8 @@ pub fn stream_step(
     for event in events {
         match event {
             FetchEvent::Completed { key, outcome, .. } => world.complete(key, outcome, now),
-            FetchEvent::ChunkReady(key) => world.chunk_ready(&key),
+            // Loaded once at startup, before the integrator.
+            FetchEvent::Registry(_) => {}
         }
     }
     for key in world.take_requests(now) {
@@ -75,6 +76,7 @@ pub fn stream_step(
             fetcher.request(key, frame.root_extent);
         }
     }
+    fetcher.flush();
     world.pump();
 }
 
@@ -90,8 +92,16 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         volumes_drawn: scene.volumes.len(),
         sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),
-        ..MatterStats::from_tally(fetcher.map(Fetcher::tally).unwrap_or_default())
+        ..MatterStats::from_stats(fetcher.map(Fetcher::stats).unwrap_or_default())
     }
+}
+
+/// Tells the fetcher which moment is drawn, so directions are asked for it
+/// (`client-compute.md` section 2.4): the simulation time converted from
+/// TDB to UTC milliseconds.
+pub fn set_fetch_time(fetcher: &mut Fetcher, sim: &Simulation) {
+    let t = gx_core::timescale::tdb_seconds_to_utc_ms(sim.system.time().value());
+    fetcher.set_time_utc_ms(t);
 }
 
 /// A simulation at the configured launch offset and time scale, with the
@@ -256,6 +266,15 @@ impl HeadlessStats {
             "requests": m.requests,
             "cells_fetched": m.cells_fetched,
             "bytes_fetched": m.bytes_fetched,
+            "sections_streamed": m.sections_streamed,
+            "sections_cached": m.sections_cached,
+            "sections_computed": m.sections_computed,
+            "module_runs": m.module_runs,
+            "modules_loaded": m.modules_loaded,
+            "uploads_pending": m.uploads_pending,
+            "uploads_done": m.uploads_done,
+            "uploads_failed": m.uploads_failed,
+            "directions_requests": m.directions_requests,
             "first_round_trip_seconds": m.first_round_trip,
             "last_round_trip_seconds": m.last_round_trip,
             "meshes_drawn": m.meshes_drawn,
@@ -334,6 +353,7 @@ pub fn render_headless_view(
         None => world.settled(),
     };
     if let Some(f) = fetcher.as_deref_mut() {
+        set_fetch_time(f, sim);
         loop {
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
@@ -392,17 +412,10 @@ pub fn render_headless_view(
 
 /// The `--headless` run: one frame offscreen, written to the screenshot path
 /// if one was given, with its statistics written to the `--stats-json`
-/// path. Cells are fetched through `client` on `runtime`. With
-/// `--wait-ready-seconds`, fails after writing both when the selection was
-/// not ready in time.
-pub fn run_headless(
-    config: &Config,
-    system: FrameSystem,
-    client: Arc<HubClient>,
-    runtime: tokio::runtime::Handle,
-) -> Result<()> {
+/// path. Cells come through `fetcher`. With `--wait-ready-seconds`, fails
+/// after writing both when the selection was not ready in time.
+pub fn run_headless(config: &Config, system: FrameSystem, mut fetcher: Fetcher) -> Result<()> {
     let mut sim = launch_simulation(system, config);
-    let mut fetcher = Fetcher::new(runtime, client);
     let run = HeadlessRun::from_config(config);
     let frame = render_headless_view(&mut sim, Some(&mut fetcher), &run)?;
     match &config.screenshot {
@@ -431,14 +444,9 @@ pub fn run_headless(
     Ok(())
 }
 
-/// The desktop run: a window, the frame loop, and the controls. Cells are
-/// fetched through `client` on `runtime`.
-pub fn run_windowed(
-    config: &Config,
-    system: FrameSystem,
-    client: Arc<HubClient>,
-    runtime: tokio::runtime::Handle,
-) -> Result<()> {
+/// The desktop run: a window, the frame loop, and the controls. Cells come
+/// through `fetcher`.
+pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> Result<()> {
     let event_loop = EventLoop::new().context("opening the window system")?;
     // Wait, not Poll: each frame asks for the next redraw, so the loop
     // still runs continuously, but paced by the surface's present mode (one
@@ -450,7 +458,7 @@ pub fn run_windowed(
         sim,
         camera,
         world: World::new(default_threads()),
-        fetcher: Fetcher::new(runtime, client),
+        fetcher,
         started: Instant::now(),
         controls: Controls::new(config.exposure_stops),
         adapter: config.adapter.clone(),
@@ -608,6 +616,7 @@ impl App {
         let t = self.started.elapsed().as_secs_f64();
         let system = &self.sim.system;
         self.world.select(system, &self.camera, size, t, false);
+        set_fetch_time(&mut self.fetcher, &self.sim);
         let events = self.fetcher.drain();
         stream_step(&mut self.world, &mut self.fetcher, system, events, t);
         self.world.evict(t);

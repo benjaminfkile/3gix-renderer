@@ -8,10 +8,28 @@ from one codebase). The browser-only code is the `web` module
 
 - `winit` draws on a canvas element instead of a window, and wgpu runs on
   the browser's WebGPU.
-- The hub client uses `reqwest`'s wasm client (the browser's `fetch`) for
-  chunks and the builds listing, and a `web_sys::WebSocket` for readiness
-  pushes. Futures run on the page's event loop through
-  `wasm-bindgen-futures`.
+- The hub client (`web::hub`) uses `reqwest`'s wasm client (the browser's
+  `fetch`) for the clock, the build, directions, edge reads, and uploads,
+  and a `web_sys::WebSocket` for readiness notices. Futures run on the
+  page's event loop through `wasm-bindgen-futures`.
+- The client loop (`web::fetch`) is the same `directions::Coordinator` the
+  desktop drives, so batching, deduplication, retries, and compositing are
+  identical.
+- The worker (`web::worker`) runs modules with the browser's own
+  `WebAssembly` in a dedicated Web Worker, `web/module-worker.js`, which
+  uses `web/module-runner.js`. Modules are instantiated with an empty
+  import object, so a module that imports anything fails; the 1 GiB memory
+  limit is checked there. The page side does every other step through the
+  same `gx-worker::job` checks as the desktop: the address, the module,
+  manifest, and tiles by hash, request and tile bytes from `gx-core` built
+  for WebAssembly, and the library validator on the output. A call over the
+  60 s time limit terminates the Web Worker, which starts again for the
+  next call. Jobs run one at a time.
+- The local cache (`web::cache`) is the Cache API (cache `gx-renderer`,
+  keys `/gx-cache/{kind}/{hash or address}`), with the same keys as the
+  desktop's cache directory, evicted least recently used by size (20 GB,
+  or less if the browser's quota is smaller). It needs a secure context;
+  without one nothing is cached and everything still works.
 - `console_error_panic_hook` sends panics to the browser console.
 - The page has no threads, so surface extraction runs inline in the frame
   loop. Everything else (selection, the cell cache, volumes, the far field,
@@ -54,7 +72,7 @@ secure context, which `localhost` is; from another machine, serve over
 HTTPS.
 
 The page is one canvas filling the window and a small settings panel: hub
-URL, API key (with the `fetch:chunks` capability), space id, build id
+URL, API key, space id, build id
 (empty for the active build of the space), and time scale (simulation
 seconds per wall-clock second). The values are stored in the browser's
 `localStorage`, the API key included, so use a key meant for this purpose.
@@ -65,15 +83,15 @@ keyboard focus. `Escape` stops the frame loop.
 
 ## What the hub must allow
 
-- **CORS.** The page sends `GET` requests with the `X-API-Key` header from
-  its own origin, so the hub must answer the preflight and allow that
-  origin and header.
+- **CORS.** The page sends `GET`, `POST` (directions), and `PUT`
+  (uploads) requests with the `X-API-Key` and `X-Claim` headers from its
+  own origin, so the hub (and the edge) must answer the preflight and allow
+  that origin, those methods, and those headers.
 - **The readiness socket.** A browser cannot set headers on a WebSocket
   upgrade, so the socket opens without the API key. If the hub refuses it,
-  the renderer uses the polling fallback the chunk protocol allows
-  (`compiler-pipeline.md` section 4): the registry is polled every 2 s, and
-  a pending cell is polled every 2 s once it has waited 10 s. Everything
-  still arrives, more slowly.
+  a `pending` key is still asked about again after the hub's `retryMs`, so
+  everything still arrives, more slowly. A closed socket is opened again
+  every 5 s and subscribes again to every address still awaited.
 
 ## Browsers
 
@@ -95,13 +113,21 @@ page for the current state.
 
 There is no browser in CI. CI verifies that the crate builds for
 `wasm32-unknown-unknown` with the `web` feature, that clippy passes on that
-build, and that `web/build.sh` produces the package. Running it is verified
+build, and that `web/build.sh` produces the package. Node (V8) stands in
+for the browser's `WebAssembly`: `node scripts/worker-node-check.mjs` runs
+`web/module-runner.js`, then `web/module-worker.js` in a worker thread
+through its message protocol, against the core example module's
+conformance vectors (`testdata/example-module/`), and fails unless every
+section's SHA-256 matches. The native worker checks the same vectors
+(`crates/worker/tests/determinism.rs`), so the two runtimes give
+byte-identical sections. `scripts/ci.sh` runs it. Running it is verified
 by hand on a desktop browser, against a hub:
 
 1. `sh web/build.sh`, serve `web/`, open the page.
 2. Fill in the panel and press `Start`; the overlay appears and the frame
    markers of the registry are drawn.
-3. Matter streams in (the overlay's cell counts rise), surfaces are lit,
+3. Matter streams in or is computed here (the overlay's cell counts,
+   sections streamed, and sections computed here rise), surfaces are lit,
    hot gas glows as a volume, and far frames show as dots.
 4. Fly with the desktop controls, change the time scale with `[` and `]`,
    reload the page and see the panel come back filled in.

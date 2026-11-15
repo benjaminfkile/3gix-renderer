@@ -21,6 +21,10 @@
         }
       ],
       "frame_id": 1,
+      "j2": {
+        "bits": "0x3e8ad7f29abcaf48",
+        "decimal": "2e-7"
+      },
       "mass": {
         "bits": "0x46391ace3d05aef4",
         "decimal": "1.989e30"
@@ -59,6 +63,24 @@
           "decimal": "0e0"
         }
       ],
+      "principal_moments": [
+        {
+          "bits": "0x49a3f7efd1fbfe7d",
+          "decimal": "5.7e46"
+        },
+        {
+          "bits": "0x49a3f7efd1fbfe7d",
+          "decimal": "5.7e46"
+        },
+        {
+          "bits": "0x49a4519eb1bd0bf0",
+          "decimal": "5.8e46"
+        }
+      ],
+      "reference_radius": {
+        "bits": "0x41c4bbc510000000",
+        "decimal": "6.957e8"
+      },
       "root_extent": {
         "bits": "0x42a5d3ef79800000",
         "decimal": "1.2e13"

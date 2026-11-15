@@ -359,6 +359,9 @@ mod tests {
             velocity: Vec3::zero(),
             orientation,
             angular_velocity: Vec3::zero(),
+            j2: 0.0,
+            reference_radius: Meters::new(0.0),
+            principal_moments: Vec3::zero(),
         }
     }
 
@@ -562,24 +565,24 @@ mod tests {
     }
 
     /// The camera is not affected by anything in space: holding W flies a
-    /// straight line at the set speed through a star and past it, no matter
+    /// straight line at the set speed through a massive frame and past it, no matter
     /// what frame it is parented to, how near matter is, or how the frames
     /// move while the simulation runs.
     #[test]
     fn flight_is_a_straight_line_at_the_set_speed_through_matter() {
         let mut root = frame(1, ROOT_PARENT, 2.0e13, Vec3::zero(), Quat::identity());
         root.max_depth = 0;
-        let star_radius = 6.957e8;
-        let mut star = frame(
+        let body_radius = 6.957e8;
+        let mut heavy = frame(
             2,
             1,
-            8.0 * star_radius,
+            8.0 * body_radius,
             Vec3::new(1.0e9, 0.0, 0.0),
             Quat::identity(),
         );
-        star.velocity = Vec3::new(0.0, 4.5e4, 0.0);
-        star.angular_velocity = Vec3::new(0.0, 0.0, 1.0e-3);
-        let reg = Registry::new(Seconds::new(0.0), vec![root, star]).unwrap();
+        heavy.velocity = Vec3::new(0.0, 4.5e4, 0.0);
+        heavy.angular_velocity = Vec3::new(0.0, 0.0, 1.0e-3);
+        let reg = Registry::new(Seconds::new(0.0), vec![root, heavy]).unwrap();
         let mut s = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
         let start = Vec3::new(-1.0e11, 0.0, 0.0);
         let mut cam = Camera {
@@ -606,7 +609,7 @@ mod tests {
             cam.update_parent(&s);
             parents.insert(cam.frame_id);
         }
-        assert_eq!(parents.len(), 2, "re-parented to the star and back");
+        assert_eq!(parents.len(), 2, "re-parented to the heavy frame and back");
         let flown = cam.root_position(&s) - start;
         assert!(
             close(flown, Vec3::new(2.0e11, 0.0, 0.0), 1.0e2),

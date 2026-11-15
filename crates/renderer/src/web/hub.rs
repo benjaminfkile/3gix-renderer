@@ -1,44 +1,35 @@
-//! The hub client in the browser: chunks over `fetch`, readiness over a
-//! `WebSocket`, the registry, and the cell fetcher of the frame loop.
+//! The hub client in the browser, version 2: the clock, the build, and
+//! directions over `fetch`, content-addressed reads through the edge,
+//! uploads with a claim, and the readiness socket keyed by address.
 //!
-//! The same protocol as the native client ([`crate::hub`], built on
-//! [`crate::protocol`]): `GET /space/{s}/build/{b}/chunk/{key}` with the
-//! `X-API-Key` header, `200` / `202` / `404` / `410`, and `chunkReady` pushes
-//! on `/space/{s}/build/{b}/chunks/ready` (`compiler-pipeline.md` section
-//! 4). Requests go through `reqwest`'s wasm client (the browser's `fetch`);
-//! the socket is a `web_sys::WebSocket`; futures run on the page's event
-//! loop through `wasm-bindgen-futures`.
+//! The same routes as the native client ([`crate::hub`], both built on
+//! [`crate::protocol`]; `client-compute.md` sections 2.3 to 2.5). Requests
+//! go through `reqwest`'s wasm client (the browser's `fetch`); the socket
+//! is a `web_sys::WebSocket`; futures run on the page's event loop through
+//! `wasm-bindgen-futures`.
 //!
 //! A browser cannot set headers on a WebSocket upgrade, so the socket opens
 //! without the API key. A hub that refuses it leaves the client on the
-//! polling fallback the protocol allows: the cell cache polls a pending
-//! cell every 2 s once it has waited 10 s, and the registry is polled every
-//! 2 s. The hub must also allow the page's origin (CORS) for the `X-API-Key`
-//! header.
+//! fallback the protocol allows: a `pending` key is asked about again after
+//! the hub's `retryMs`. The hub must also allow the page's origin (CORS)
+//! for the `X-API-Key` and `X-Claim` headers.
 
 use crate::config::ApiKey;
 use crate::protocol::{
-    builds_url, chunk_url, classify_status, frame_system_from_chunk, parse_ready_frame,
-    pick_active_build, ready_url, subscribe_frame, BuildSummary, ChunkFetch, API_KEY_HEADER,
+    parse_ready_frame, status_problem, subscribe_frame, ActiveBuild, BuildDescription, Clock,
+    DirectionsRequest, DirectionsResponse, Routes, API_KEY_HEADER, CLAIM_HEADER,
+    MAX_DIRECTION_KEYS,
 };
-use crate::stream::{decode_cell, FetchEvent, FetchOutcome, FetchTally};
 use anyhow::{anyhow, bail, Context, Result};
-use gx_core::frames::FrameSystem;
-use gx_core::key::{CellKey, ChunkKey, REGISTRY_KEY};
-use gx_core::units::Meters;
+use gx_core::key::ChunkKey;
+use gx_core::sha256::to_hex;
+use gx_worker::BlobKind;
+use serde::de::DeserializeOwned;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-
-/// Seconds between polls of the registry while the hub answers `202`.
-pub const REGISTRY_POLL_SECONDS: f64 = 2.0;
-
-/// Longest wait for the registry, seconds.
-pub const REGISTRY_DEADLINE_SECONDS: f64 = 60.0;
 
 /// Seconds since the page loaded, from `performance.now()`.
 pub fn now_seconds() -> f64 {
@@ -63,102 +54,182 @@ pub async fn sleep(seconds: f64) {
 /// A connection to one build of one space on the hub.
 pub struct WebHub {
     http: reqwest::Client,
-    base_url: String,
+    routes: Routes,
     api_key: ApiKey,
-    space_id: String,
-    build_id: String,
+    build: BuildDescription,
+    clock: Clock,
+    clock_read_at: f64,
 }
 
 impl WebHub {
-    /// A client for `build_id`, or for the active build of the space
-    /// (`GET /space/{spaceId}/builds`) when `build_id` is `None`.
-    pub async fn connect(
-        base_url: &str,
-        api_key: ApiKey,
-        space_id: &str,
-        build_id: Option<&str>,
-    ) -> Result<WebHub> {
+    /// Connects through `routes`: reads the clock, resolves the active
+    /// build when `build_id` is `None`, and reads the build's layers.
+    pub async fn open(routes: Routes, api_key: ApiKey, build_id: Option<&str>) -> Result<WebHub> {
         let mut hub = WebHub {
             http: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            routes,
             api_key,
-            space_id: space_id.to_string(),
-            build_id: String::new(),
+            build: BuildDescription {
+                build_id: String::new(),
+                layers: Vec::new(),
+            },
+            clock: Clock {
+                origin_utc_ms: None,
+                now_utc_ms: 0,
+            },
+            clock_read_at: now_seconds(),
         };
-        hub.build_id = match build_id {
+        hub.clock = hub
+            .get_json(&hub.routes.clock(), "reading the clock")
+            .await?;
+        hub.clock_read_at = now_seconds();
+        let build_id = match build_id {
             Some(b) => b.to_string(),
-            None => hub.active_build().await?,
+            None => {
+                let a: ActiveBuild = hub
+                    .get_json(&hub.routes.active_build(), "reading the active build")
+                    .await?;
+                a.build_id
+            }
         };
+        hub.build = hub
+            .get_json(&hub.routes.build(&build_id), "reading the build")
+            .await?;
+        if hub.build.build_id.is_empty() {
+            hub.build.build_id = build_id;
+        }
         Ok(hub)
     }
 
-    /// The build this client reads.
-    pub fn build_id(&self) -> &str {
-        &self.build_id
-    }
-
-    /// The readiness WebSocket URL of the build.
-    pub fn ready_url(&self) -> String {
-        ready_url(&self.base_url, &self.space_id, &self.build_id)
-    }
-
-    async fn active_build(&self) -> Result<String> {
+    async fn get_json<T: DeserializeOwned>(&self, url: &str, what: &str) -> Result<T> {
         let resp = self
             .http
-            .get(builds_url(&self.base_url, &self.space_id))
+            .get(url)
             .header(API_KEY_HEADER, self.api_key.expose())
             .send()
             .await
-            .map_err(|e| anyhow!("listing builds: {}", e.without_url()))?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            bail!("listing builds: hub answered {status}");
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
+        if let Some(p) = status_problem(resp.status().as_u16()) {
+            bail!("{what}: {p}");
         }
         let body = resp
             .bytes()
             .await
-            .map_err(|e| anyhow!("reading the builds listing: {}", e.without_url()))?;
-        let builds: Vec<BuildSummary> =
-            serde_json::from_slice(&body).context("decoding the builds listing")?;
-        pick_active_build(&builds)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("the space has no active build; enter a build id"))
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
+        serde_json::from_slice(&body).with_context(|| format!("{what}: decoding the answer"))
     }
 
-    /// Fetches one chunk.
-    pub async fn fetch_chunk(&self, key: &str) -> ChunkFetch {
-        let resp = match self
+    /// The routes this client uses.
+    pub fn routes(&self) -> &Routes {
+        &self.routes
+    }
+
+    /// The build this client reads.
+    pub fn build_id(&self) -> &str {
+        &self.build.build_id
+    }
+
+    /// The build's layers.
+    pub fn build(&self) -> &BuildDescription {
+        &self.build
+    }
+
+    /// The hub's now, UTC milliseconds: the clock read at connect time
+    /// advanced by the page's time since.
+    pub fn now_utc_ms(&self) -> i64 {
+        let elapsed_ms = ((now_seconds() - self.clock_read_at) * 1000.0).max(0.0);
+        self.clock.now_utc_ms.saturating_add(elapsed_ms as i64)
+    }
+
+    /// Asks for directions for at most 512 keys at `t_utc_ms`.
+    pub async fn directions(&self, t_utc_ms: i64, keys: &[ChunkKey]) -> Result<DirectionsResponse> {
+        if keys.len() > MAX_DIRECTION_KEYS {
+            bail!(
+                "{} keys; at most {MAX_DIRECTION_KEYS} per request",
+                keys.len()
+            );
+        }
+        let body = DirectionsRequest {
+            t_utc_ms,
+            keys: keys.iter().map(ChunkKey::to_string).collect(),
+        };
+        let resp = self
             .http
-            .get(chunk_url(
-                &self.base_url,
-                &self.space_id,
-                &self.build_id,
-                key,
-            ))
+            .post(self.routes.directions(self.build_id()))
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&body).context("directions: encoding the request")?)
+            .send()
+            .await
+            .map_err(|e| anyhow!("directions: {}", e.without_url()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("directions: {}", e.without_url()))?;
+        if let Some(p) = status_problem(status) {
+            let detail = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).into_owned();
+            bail!("directions: {p}: {detail}");
+        }
+        serde_json::from_slice(&bytes).context("directions: decoding the answer")
+    }
+
+    /// Reads `name` of `kind` from the edge: `Some` bytes for `200`, `None`
+    /// for `404`.
+    pub async fn get_blob(&self, kind: BlobKind, name: &str) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(self.routes.blob(kind, name))
             .header(API_KEY_HEADER, self.api_key.expose())
             .send()
             .await
-        {
-            Ok(r) => r,
-            Err(e) => return ChunkFetch::Error(format!("request failed: {}", e.without_url())),
-        };
-        if let Some(outcome) = classify_status(resp.status().as_u16()) {
-            return outcome;
+            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
         }
-        match resp.bytes().await {
-            Ok(body) => ChunkFetch::Ready(Arc::from(body.as_ref())),
-            Err(e) => ChunkFetch::Error(format!("reading body failed: {}", e.without_url())),
+        if let Some(p) = status_problem(status) {
+            bail!("{kind} {name}: {p}");
         }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+        Ok(Some(body.to_vec()))
+    }
+
+    /// Uploads a computed section with its claim: `201` stored, `200`
+    /// already stored, anything else an error with the hub's reason.
+    pub async fn upload(&self, address: &[u8; 32], claim: &str, bytes: Vec<u8>) -> Result<u16> {
+        let address = to_hex(address);
+        let resp = self
+            .http
+            .put(self.routes.upload(self.build_id(), &address))
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .header(CLAIM_HEADER, claim)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| anyhow!("upload {address}: {}", e.without_url()))?;
+        let status = resp.status().as_u16();
+        if status == 200 || status == 201 {
+            return Ok(status);
+        }
+        let body = resp.bytes().await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned();
+        bail!("upload {address}: hub answered {status}: {detail}")
     }
 }
 
-/// The readiness socket: subscriptions out, ready keys in. Subscriptions
-/// made before the socket opens are sent when it does.
+/// The readiness socket: subscriptions out, stored addresses in.
+/// Subscriptions made before the socket opens are sent when it does.
 pub struct ReadySocket {
     socket: web_sys::WebSocket,
     open: Rc<Cell<bool>>,
+    closed: Rc<Cell<bool>>,
     queued: Rc<RefCell<Vec<String>>>,
-    ready: Rc<RefCell<VecDeque<String>>>,
+    ready: Rc<RefCell<VecDeque<[u8; 32]>>>,
     _on_open: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
     _on_close: Closure<dyn FnMut()>,
@@ -169,8 +240,9 @@ impl ReadySocket {
     pub fn open(url: &str) -> Option<ReadySocket> {
         let socket = web_sys::WebSocket::new(url).ok()?;
         let open = Rc::new(Cell::new(false));
+        let closed = Rc::new(Cell::new(false));
         let queued: Rc<RefCell<Vec<String>>> = Rc::default();
-        let ready: Rc<RefCell<VecDeque<String>>> = Rc::default();
+        let ready: Rc<RefCell<VecDeque<[u8; 32]>>> = Rc::default();
         let on_open = {
             let (open, queued, socket) = (open.clone(), queued.clone(), socket.clone());
             Closure::<dyn FnMut()>::new(move || {
@@ -183,14 +255,17 @@ impl ReadySocket {
         let on_message = {
             let ready = ready.clone();
             Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
-                if let Some(key) = e.data().as_string().and_then(|t| parse_ready_frame(&t)) {
-                    ready.borrow_mut().push_back(key);
+                if let Some(a) = e.data().as_string().and_then(|t| parse_ready_frame(&t)) {
+                    ready.borrow_mut().push_back(a);
                 }
             })
         };
         let on_close = {
-            let open = open.clone();
-            Closure::<dyn FnMut()>::new(move || open.set(false))
+            let (open, closed) = (open.clone(), closed.clone());
+            Closure::<dyn FnMut()>::new(move || {
+                open.set(false);
+                closed.set(true);
+            })
         };
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -198,6 +273,7 @@ impl ReadySocket {
         Some(ReadySocket {
             socket,
             open,
+            closed,
             queued,
             ready,
             _on_open: on_open,
@@ -206,9 +282,9 @@ impl ReadySocket {
         })
     }
 
-    /// Registers interest in `key`.
-    pub fn subscribe(&self, key: &str) {
-        let text = subscribe_frame(key);
+    /// Registers interest in `address`.
+    pub fn subscribe(&self, address: &[u8; 32]) {
+        let text = subscribe_frame(&to_hex(address));
         if self.open.get() {
             let _ = self.socket.send_with_str(&text);
         } else {
@@ -216,8 +292,13 @@ impl ReadySocket {
         }
     }
 
-    /// The keys the hub has reported ready since the last call.
-    pub fn take_ready(&self) -> Vec<String> {
+    /// `true` once the socket has closed (or failed to open).
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// The addresses the hub has reported stored since the last call.
+    pub fn take_ready(&self) -> Vec<[u8; 32]> {
         self.ready.borrow_mut().drain(..).collect()
     }
 }
@@ -228,109 +309,5 @@ impl Drop for ReadySocket {
         self.socket.set_onmessage(None);
         self.socket.set_onclose(None);
         let _ = self.socket.close();
-    }
-}
-
-/// Fetches the registry, waiting while the hub answers `202` for a
-/// readiness push or the next poll every [`REGISTRY_POLL_SECONDS`], up to
-/// [`REGISTRY_DEADLINE_SECONDS`], then decodes and validates it.
-pub async fn load_registry(hub: &WebHub, socket: Option<&ReadySocket>) -> Result<FrameSystem> {
-    if let Some(s) = socket {
-        s.subscribe(REGISTRY_KEY);
-    }
-    let start = now_seconds();
-    loop {
-        match hub.fetch_chunk(REGISTRY_KEY).await {
-            ChunkFetch::Ready(bytes) => return frame_system_from_chunk(&bytes),
-            ChunkFetch::Pending => {}
-            ChunkFetch::NotFound => bail!("registry: not found (404), the build has no layers"),
-            ChunkFetch::Gone => bail!("registry: gone (410), it can never be produced"),
-            ChunkFetch::Error(e) => bail!("registry: {e}"),
-        }
-        let asked = now_seconds();
-        loop {
-            if now_seconds() - start > REGISTRY_DEADLINE_SECONDS {
-                bail!("registry did not become ready within {REGISTRY_DEADLINE_SECONDS} s");
-            }
-            let pushed = socket.is_some_and(|s| s.take_ready().iter().any(|k| k == REGISTRY_KEY));
-            if pushed || now_seconds() - asked >= REGISTRY_POLL_SECONDS {
-                break;
-            }
-            sleep(0.1).await;
-        }
-    }
-}
-
-/// Fetches cells for the frame loop. Each request runs as a future on the
-/// page's event loop and leaves its result, decoded, in a queue the frame
-/// loop drains; readiness pushes arrive the same way.
-pub struct WebFetcher {
-    hub: Rc<WebHub>,
-    socket: Option<Rc<ReadySocket>>,
-    events: Rc<RefCell<Vec<FetchEvent>>>,
-    tally: FetchTally,
-}
-
-impl WebFetcher {
-    /// A fetcher over `hub`, with the readiness socket if it opened.
-    pub fn new(hub: Rc<WebHub>, socket: Option<ReadySocket>) -> WebFetcher {
-        WebFetcher {
-            hub,
-            socket: socket.map(Rc::new),
-            events: Rc::default(),
-            tally: FetchTally::default(),
-        }
-    }
-
-    /// Starts a request for `key`, a cell of a frame of edge `root_extent`.
-    pub fn request(&self, key: CellKey, root_extent: Meters) {
-        let hub = self.hub.clone();
-        let socket = self.socket.clone();
-        let events = self.events.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let name = key.to_string();
-            let start = now_seconds();
-            let fetched = hub.fetch_chunk(&name).await;
-            let round_trip = Duration::from_secs_f64((now_seconds() - start).max(0.0));
-            let (outcome, bytes) = match fetched {
-                ChunkFetch::Ready(body) => {
-                    (decode_cell(&key, &body, root_extent), body.len() as u64)
-                }
-                ChunkFetch::Pending => {
-                    if let Some(s) = &socket {
-                        s.subscribe(&name);
-                    }
-                    (FetchOutcome::Pending, 0)
-                }
-                ChunkFetch::NotFound => (FetchOutcome::NotFound, 0),
-                ChunkFetch::Gone => (FetchOutcome::Gone, 0),
-                ChunkFetch::Error(e) => (FetchOutcome::Failed(e), 0),
-            };
-            events.borrow_mut().push(FetchEvent::Completed {
-                key,
-                outcome,
-                bytes,
-                round_trip,
-            });
-        });
-    }
-
-    /// Every event so far: finished requests, then readiness pushes.
-    pub fn drain(&mut self) -> Vec<FetchEvent> {
-        let mut events: Vec<FetchEvent> = self.events.borrow_mut().drain(..).collect();
-        if let Some(s) = &self.socket {
-            for k in s.take_ready() {
-                if let Ok(ChunkKey::Cell(cell)) = k.parse::<ChunkKey>() {
-                    events.push(FetchEvent::ChunkReady(cell));
-                }
-            }
-        }
-        self.tally.record(&events);
-        events
-    }
-
-    /// The totals over every finished request this session.
-    pub fn tally(&self) -> FetchTally {
-        self.tally
     }
 }

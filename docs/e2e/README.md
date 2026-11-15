@@ -1,5 +1,13 @@
 # End to end run against the real hub and compiler
 
+**Out of date.** This run and its recordings are from the v1 protocol
+(server-side compilation, the compiler's `serve` daemon, the `chunk`
+route). The client now speaks v2 only (`client-compute.md`): directions,
+modules run by the client's worker, and sections streamed by address. The
+script needs the v2 hub and the system compiler as a module before it can
+run again; until then the v2 client is covered against the mock hub
+(`crates/renderer/tests/mock_hub.rs`).
+
 `scripts/e2e.sh` runs the renderer against the real hub and the real system
 compiler inside one container. It copies the hub repository to `/tmp/hub`
 and starts it with the hub's own harness (`scripts/e2e/hub-up.sh`: Redis, a

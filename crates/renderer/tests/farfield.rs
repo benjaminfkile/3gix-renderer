@@ -5,7 +5,6 @@
 //! projects to well under 2 pixels, so its cells are not selected and it is
 //! drawn as one point sprite worked out from its depth-0 cell.
 
-use gx_core::container::encode_chunk;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::matter::{encode, Compression, Sample, Samples, Section, State};
@@ -37,6 +36,9 @@ fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: Vec3) -> Frame 
         velocity: Vec3::zero(),
         orientation: Quat::identity(),
         angular_velocity: Vec3::zero(),
+        j2: 0.0,
+        reference_radius: Meters::new(0.0),
+        principal_moments: Vec3::zero(),
     }
 }
 
@@ -52,7 +54,7 @@ fn system(far: &[Vec3]) -> FrameSystem {
 }
 
 /// A depth-0 cell filled at its center with one kind of matter.
-fn cell(frame_id: u64, sample: Sample) -> Vec<u8> {
+fn cell(frame_id: u64, sample: Sample) -> Vec<Vec<u8>> {
     let key = depth_zero_key(frame_id);
     let g = key.geometry(Meters::new(EXTENT));
     let samples = Samples::from_fn(4, |x, y, z| {
@@ -63,7 +65,7 @@ fn cell(frame_id: u64, sample: Sample) -> Vec<u8> {
         }
     });
     let s = Section::new(key, g.origin, g.edge, 4, samples).unwrap();
-    encode_chunk(&[&encode(&s, Compression::None)], &["layer-a"])
+    vec![encode(&s, Compression::None)]
 }
 
 fn hot() -> Sample {
@@ -100,9 +102,9 @@ fn camera() -> Camera {
 }
 
 /// Runs selection and fetching until every selected and pinned cell is
-/// resolved, serving `chunks` and `404` for anything else, and returns the
+/// resolved, serving `chunks` and no matter for anything else, and returns the
 /// matter-only scene and the keys that were requested.
-fn stream(system: &FrameSystem, chunks: &BTreeMap<CellKey, Vec<u8>>) -> (Scene, Vec<CellKey>) {
+fn stream(system: &FrameSystem, chunks: &BTreeMap<CellKey, Vec<Vec<u8>>>) -> (Scene, Vec<CellKey>) {
     let camera = camera();
     let mut world = World::new(0);
     world.select(system, &camera, (WIDTH, HEIGHT), 0.0, true);
@@ -113,7 +115,7 @@ fn stream(system: &FrameSystem, chunks: &BTreeMap<CellKey, Vec<u8>>) -> (Scene, 
             let extent = system.tree().get(key.frame_id).unwrap().root_extent;
             let outcome = match chunks.get(&key) {
                 Some(bytes) => decode_cell(&key, bytes, extent),
-                None => FetchOutcome::NotFound,
+                None => FetchOutcome::Decoded(None),
             };
             world.complete(key, outcome, f64::from(round));
             requested.push(key);
@@ -139,7 +141,7 @@ fn far_hot_frame_is_a_sprite_where_it_projects() {
     assert!(far[0].sprite_only(), "{far:?}");
     assert!(far[0].projected_px < 2.0);
 
-    let chunks: BTreeMap<CellKey, Vec<u8>> = [(depth_zero_key(2), cell(2, hot()))].into();
+    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, hot()))].into();
     let (scene, requested) = stream(&system, &chunks);
     // The far frame's depth-0 cell was fetched for its brightness, and no
     // other cell of that frame was selected.
@@ -187,7 +189,7 @@ fn far_hot_frame_is_a_sprite_where_it_projects() {
 #[test]
 fn fixed_exposure_is_relative_to_the_reference_scene() {
     let system = system(&[Vec3::new(30.0, 2000.0, 15.0)]);
-    let chunks: BTreeMap<CellKey, Vec<u8>> = [(depth_zero_key(2), cell(2, hot()))].into();
+    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, hot()))].into();
     let (mut scene, _) = stream(&system, &chunks);
     let (x, y) = scene
         .project(scene.sprites[0].position, WIDTH, HEIGHT)
@@ -235,7 +237,7 @@ fn fixed_exposure_is_relative_to_the_reference_scene() {
 #[test]
 fn far_cold_frame_needs_light_from_its_side() {
     let cold_at = Vec3::new(0.0, 2000.0, 0.0);
-    let chunks: BTreeMap<CellKey, Vec<u8>> = [(depth_zero_key(2), cell(2, cold()))].into();
+    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, cold()))].into();
 
     // No light anywhere: nothing at all.
     let system_dark = system(&[cold_at]);
@@ -282,7 +284,7 @@ fn transition_blends_the_sprite_out_as_the_cells_blend_in() {
     let w = far[0].sprite_weight;
     assert!(!far[0].sprite_only() && w > 0.4 && w < 0.6, "{far:?}");
 
-    let chunks: BTreeMap<CellKey, Vec<u8>> = [(depth_zero_key(2), cell(2, hot()))].into();
+    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, hot()))].into();
     let (scene, _) = stream(&system, &chunks);
     assert_eq!(scene.volumes.len(), 1);
     assert_eq!(scene.sprites.len(), 1);

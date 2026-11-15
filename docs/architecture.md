@@ -1,8 +1,10 @@
 # Architecture
 
-The renderer applies the laws to compiled matter and draws whatever is near
-the camera. The specification is `space-model.md` and `matter-format.md` in
-the hub repository's `docs/architecture/`.
+The client applies the laws to compiled matter and draws whatever is near
+the camera. It is one program with two parts that share nothing but section
+bytes: the worker, which runs compiler modules, and the renderer, which
+draws. The specification is `space-model.md` (v2), `client-compute.md`, and
+`matter-format.md` in the hub repository's `docs/architecture/`.
 
 ## The one rule
 
@@ -17,17 +19,30 @@ A banned word anywhere in a tracked file or file name fails the build.
 ## Module map
 
 All engine code is in the library crate `renderer` (`crates/renderer`), so the
-desktop binary, the headless tests, and the browser build share it.
+desktop binary, the headless tests, and the browser build share it. The
+worker is its own crate, `gx-worker` (`crates/worker`), so its boundary is a
+crate boundary: it only ever sees modules, requests, tile bytes, and section
+bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
+
+| `gx-worker` module | What it does | Spec |
+|---|---|---|
+| `job` | The job (`compute` direction), the address check, blob hash checks, manifest and tile resolution, section validation; shared by both platforms | `client-compute.md` 1, 3, 4, 5.2 |
+| `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then uploading | `client-compute.md` 1, 4 |
+| `cache` | The native local cache directory, keyed by kind and hash or address, evicted least recently used by size (default 20 GB) | `client-compute.md` 6 |
+| `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, done, failed | |
+
+`renderer` modules:
 
 | Module | What it does | Spec |
 |---|---|---|
 | `config` | Environment, `.env`, and command line flags, flags winning | |
-| `protocol` | The hub protocol without I/O: statuses, socket frames, URLs, registry decode | `compiler-pipeline.md` 4, `matter-format.md` 5 and 6 |
-| `hub` | Chunk fetch (`200/202/404/410`), readiness WebSocket, registry load | `compiler-pipeline.md` 4, `matter-format.md` 5 and 6 |
-| `mock_hub` | A small hub for tests and `gx-mock-hub` | same |
+| `protocol` | The hub protocol without I/O: clock, builds and layer configs, directions, statuses, socket frames, URLs, the frame system from the union of the layers' registries | `client-compute.md` 2.2 to 2.5, `matter-format.md` 5 and 6 |
+| `hub` | The native hub client v2: clock, active build, build, directions, edge reads, uploads with `X-Claim`, the readiness socket keyed by address | `client-compute.md` 2.3 to 2.5 |
+| `directions` | The client loop as a state machine without I/O: batches of at most 512 keys, deduplication in flight, `ready`/`compute`/`pending`/`empty` per layer, retries with backoff, readiness notices | `client-compute.md` 1, 2.4 |
+| `mock_hub` | A small v2 hub for tests and `gx-mock-hub` | `client-compute.md` 2 |
 | `sim` | `SimClock` and integration of every frame to the simulation time | `space-model.md` 6 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
-| `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the fetcher | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
+| `stream` | Cell selection, the cell cache, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
 | `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
@@ -39,7 +54,7 @@ desktop binary, the headless tests, and the browser build share it.
 | `render::headless` | Offscreen RGBA8 target, readback of it and of the float radiance, PNG | |
 | `controls` | Keyboard and mouse bindings for the window and the canvas | |
 | `app` | Desktop window loop and the headless run | |
-| `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, `start` | `space-model.md` 10 |
+| `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, the Cache API cache, the Web Worker driver, the browser fetcher, `start` | `space-model.md` 2 and 10, `client-compute.md` 4 and 6 |
 
 Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/volume.wgsl`
 (the ray march), `src/shaders/sprite.wgsl` (far field sprites),
@@ -65,8 +80,11 @@ is not ready) and the binary exits non-zero after writing the image when
 the time runs out; without it the run renders whatever has settled within
 60 s. `--stats-json` writes the overlay statistics of the rendered frame
 (`app::HeadlessStats`), including the request totals of the fetcher
-(`stream::FetchTally`): requests, cells fetched (answered `200`), bytes,
-and the round trips of the first and the latest request. `--no-overlay`
+(`stream::FetchTally`): cells requested, cells decoded, bytes, and the
+round trips of the first and the latest cell; and the counts of
+`directions` and the worker: directions requests, sections streamed from
+the edge and read from the local cache, sections computed here, module
+runs, modules loaded, and uploads pending, done, and failed. `--no-overlay`
 leaves out the text, the frame markers, and the lines, so only matter is
 in the image.
 
@@ -86,8 +104,9 @@ package builds for that target.
    never skipped.
 3. Free flight moves the camera; then, if `FrameSystem::nearest_frame` of the
    camera position differs from its frame, the camera re-parents.
-4. Matter streams: selection (every 100 ms), requests, fetch results,
-   readiness pushes, finished meshes, eviction. See "From selection to
+4. Matter streams: selection (every 100 ms), requests, directions,
+   streamed and computed sections, readiness notices, finished meshes,
+   eviction. See "From selection to
    pixels" below.
 5. The scene is built camera-relative with the drawn cells and their lights
    and drawn with the overlay.
@@ -143,18 +162,59 @@ same glyphs and headless images are reproducible. `glyphon` would bring
 `cosmic-text` with system font lookup and shaping, which this overlay does not
 need.
 
-## Hub client
+## Hub client and the client loop
 
-- `fetch_chunk(key)` maps `200`, `202`, `404`, `410` to `Ready`, `Pending`,
-  `NotFound`, `Gone`, and everything else to `Error`. A `200` body is kept for
-  the session and the key is never requested again.
-- `subscribe_ready(build)` opens `GET /space/{s}/build/{b}/chunks/ready` with
-  the `X-API-Key` header, sends `{"subscribe":"<key>"}` text frames, and yields
-  the keys of `{"chunkReady":"<key>"}` pushes.
-- `wait_for_chunk` waits for the push and polls every 2 s for a key still
-  pending after 10 s. The registry load gives up after 60 s with a clear
-  error, and an invalid registry fails with the validator's code and reason.
-- Without `GX_BUILD_ID` the active build comes from `GET /space/{s}/builds`.
+At start (`hub::HubClient::connect`, and `web::hub::WebHub::open` in the
+browser) the client reads `GET /space/{s}/clock`, `GET
+/space/{s}/build/active` unless `GX_BUILD_ID` names a build, and `GET
+/space/{s}/build/{b}`. The layer configs drive the depth limit of each
+frame: the deepest of the registry's `max_depth` and every attached
+layer's `maxDepth` (`protocol::frame_system_from_registries`).
+
+Every key, the registry included, goes through `directions::Coordinator`:
+
+1. Keys are asked about in `POST .../directions` batches of at most 512
+   keys, at most two batches in flight; a key already in flight is not
+   asked about again. The time asked for is the drawn moment, clamped to
+   the hub's now and the space's origin.
+2. Per layer: `empty` contributes nothing. `ready` is streamed from `GET
+   /section/{address}` (through the edge when `GX_EDGE_URL` is set), or
+   read from the local cache; the bytes are validated, then cached.
+   `compute` goes to the worker. `pending` is subscribed to on the
+   readiness socket (`WS .../sections/ready`, `{"subscribe": address}`
+   out, `{"sectionReady": address}` in) and asked about again after the
+   hub's `retryMs`, or streamed as soon as its notice arrives.
+3. A failed directions request, a failed stream, a `404` for a stored
+   address, or a transient worker failure is retried after a backoff of
+   0.25 s doubling to at most 8 s. A permanent worker failure (the module
+   failed, or its output fails validation) fails the key, which becomes
+   `Gone`.
+4. Once every layer has its section, the key completes with the sections
+   in the build's layer order and is composited (`matter-format.md` 3.5).
+
+The registry is just another key. The renderer waits for the union of all
+layers' registries before starting the integrator; the registry load gives
+up after 300 s natively and 120 s in the browser with a clear error.
+
+The worker (`gx-worker`), for each `compute` direction: checks that the
+address is the address of the job's inputs (`client-compute.md` 3), fetches
+the module by hash (local cache first, every byte checked against its
+hash), runs `gx_sources`, resolves the ids through the layer's manifest
+(fetched by hash), fetches and checks each tile, runs `gx_compile`,
+validates the section with the library validator, hands it to the renderer
+at once, caches it, and uploads it with `PUT .../section/{address}` and
+`X-Claim`. Upload failures are logged and counted and never block drawing.
+Natively the modules run on a pool of threads with `gx-module-host`
+(1 GiB and 60 s per call); in the browser in a dedicated Web Worker with
+the browser's `WebAssembly` (`docs/web.md`).
+
+The local cache (`client-compute.md` 6) holds modules, manifests, tiles,
+and sections keyed by kind and hash or address. Natively it is a
+directory, by default `gx-renderer` under the platform cache directory,
+moved with `--cache-dir`, limited with `--cache-max-bytes` (default 20 GB),
+and turned off with `--no-cache`. In the browser it is the Cache API under
+the same keys. Everything in it is immutable, so it is evicted by size
+alone, least recently used first. A hit never touches the network.
 
 ## From selection to pixels
 
@@ -173,21 +233,19 @@ a light, a dense sample is a surface.
 
    | State | Meaning |
    |---|---|
-   | `Missing` | Selected, not requested yet (or a failed request waiting 2 s to retry) |
-   | `Requested` | A request is in flight; at most 16 at once, largest projected size first |
-   | `Pending(since)` | The hub answered `202`; subscribed to `chunkReady` for the key |
-   | `Ready(cell)` | `200`, decoded and composited |
-   | `Empty` | The composite holds no matter, or `404` (no layers for the key) |
-   | `Gone` | `410`, or bytes that fail validation |
+   | `Missing` | Selected, not requested yet |
+   | `Requested` | The client loop is resolving it (directions, streams, or a module run); at most 512 at once, largest projected size first |
+   | `Ready(cell)` | Every layer's section, decoded and composited |
+   | `Empty` | Every layer is `empty`, or the composite holds no matter |
+   | `Gone` | Sections that fail validation, or a module that failed |
 
-   A `chunkReady` push sends a `Pending` cell back to `Missing`; a push that
-   arrives while the request is still in flight makes the `202` ask again at
-   once. A cell still pending after 10 s is also polled every 2 s. Cells not
+   A request stays `Requested` however long the hub keeps it `pending`;
+   the client loop retries on its own. Cells not
    selected (or drawn as a stand-in) for 60 s are evicted, and beyond 4096
    cached cells the least recently used go first. Selected cells and
    requests in flight are never evicted.
 3. **Decode and composite** (`stream::decode_cell`).
-   `gx_core::container::decode_chunk` validates every section; each
+   `gx_core::matter::decode` validates every layer's section; each
    section's `cell_origin` and `cell_edge` must also match the registry's
    geometry for the key (`matter-format.md` 3.1); then
    `gx_core::matter::composite` combines the layers. The composited

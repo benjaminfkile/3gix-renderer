@@ -41,6 +41,9 @@ fn system() -> FrameSystem {
         velocity: Vec3::zero(),
         orientation: Quat::identity(),
         angular_velocity: Vec3::zero(),
+        j2: 0.0,
+        reference_radius: Meters::new(0.0),
+        principal_moments: Vec3::zero(),
     };
     let reg = Registry::new(Seconds::new(0.0), vec![root]).unwrap();
     FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap())

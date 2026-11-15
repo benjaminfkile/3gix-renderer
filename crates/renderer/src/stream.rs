@@ -1,13 +1,12 @@
-//! Cell streaming: which cells to fetch, the cache of fetched cells, and
-//! which cells to draw.
+//! Cell streaming: which cells to fetch, the cache of fetched cells, which
+//! cells to draw, and the native fetcher that brings sections in.
 //!
-//! Implements the renderer's steps "fetches matter cells near the camera at
-//! a depth chosen by distance" and "composites overlapping sections from
-//! different layers" of `space-model.md` section 2, over the octree cells of
-//! section 5 and the chunk keys of section 7, with the compositing rule of
-//! section 8 and `matter-format.md` section 3.5. The hub side of a fetch is
-//! the `200` / `202` / `chunkReady` cycle of `compiler-pipeline.md`
-//! section 4.
+//! Implements the renderer's steps "asks the hub what exists near the
+//! camera, streams finished sections from the CDN, receives freshly
+//! computed ones from the worker, composites layers" of `space-model.md`
+//! section 2, over the octree cells of section 5, with the compositing rule
+//! of section 8 and `matter-format.md` section 3.5. The hub side is the
+//! loop of `client-compute.md` section 1, run by [`crate::directions`].
 //!
 //! # Selection
 //!
@@ -15,20 +14,22 @@
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
 //! of 4, the viewport height, the vertical field of view, and at most 512
-//! cells ([`select_all`]), except frames drawn as a sprite only.
+//! cells ([`select_all`]), except frames drawn as a sprite only. A frame's
+//! depth limit is the deepest of its registry `max_depth` and its layers'
+//! configs ([`crate::protocol::frame_system_from_registries`]).
 //!
 //! # The cache
 //!
 //! [`CellCache`] holds one [`CellState`] per cell key. Selected cells start
-//! `Missing`; at most 16 are `Requested` at a time, largest projected size
-//! first; a `202` makes a cell `Pending` and the renderer subscribes to its
-//! readiness; a `chunkReady` push (or, after 10 s, a poll every 2 s) asks
-//! again; a `200` is decoded with [`gx_core::container::decode_chunk`] and
-//! composited with [`gx_core::matter::composite`] into `Ready` or, when the
-//! composite holds no matter, `Empty`. `410` and sections that fail
-//! validation are `Gone`; `404` (the build has no layers for the key) is
-//! `Empty`. Cells not selected for 60 s are evicted, and the cache never
-//! holds more than 4096 cells it could drop.
+//! `Missing`; at most [`MAX_IN_FLIGHT`] (one directions batch) are
+//! `Requested` at a time, largest projected size first. A request stays
+//! `Requested` until the fetcher has every layer's section, however long the
+//! hub keeps it `pending`; the fetcher retries on its own. The sections are
+//! decoded and validated per layer and composited with
+//! [`gx_core::matter::composite`] into `Ready` or, when the composite holds
+//! no matter, `Empty`. Sections that fail validation, or a module that
+//! fails, make a cell `Gone`. Cells not selected for 60 s are evicted, and
+//! the cache never holds more than 4096 cells it could drop.
 //!
 //! A frame that is a sprite only in the far field ([`crate::farfield`]) has
 //! no cells selected. The depth-0 cell of every frame that may need a sprite
@@ -42,18 +43,28 @@
 //! drawn, or else by its nearest drawable ancestor. A drawn ancestor hides
 //! every drawn cell below it, so a parent keeps drawing while any of its
 //! children is not ready, and stops once all of them are.
+//!
+//! # The fetcher
+//!
+//! [`Fetcher`] (native) runs [`crate::directions::Coordinator`] on the
+//! frame loop's thread and carries out its actions on a tokio runtime:
+//! directions through [`crate::hub::HubClient`], sections from the local
+//! cache ([`gx_worker::DiskCache`]) or the edge, `compute` jobs on the
+//! worker pool ([`gx_worker::WorkerPool`]), which hands each section over
+//! at once and uploads it with its claim in the background, and readiness
+//! notices from the socket. The browser has its own fetcher with the same
+//! coordinator (`crate::web`).
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::farfield::focal_px;
 use crate::farfield::{far_frames, mean_albedo, FarFieldCell};
 use crate::light::cell_emitter;
 use crate::volume::VolumeGrid;
-use gx_core::container::decode_chunk;
 use gx_core::emission::Emitter;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::lod::{select_cells, SelectionParams};
-use gx_core::matter::{composite, Section};
+use gx_core::matter::{self, composite, Section};
 use gx_core::units::{Meters, Vec3};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -67,24 +78,15 @@ pub const PIXEL_ERROR: f64 = 4.0;
 /// Most cells selected per frame.
 pub const MAX_CELLS_PER_FRAME: usize = 512;
 
-/// Most requests in flight at once.
-pub const MAX_IN_FLIGHT: usize = 16;
+/// Most cells requested at once: one directions batch
+/// ([`crate::protocol::MAX_DIRECTION_KEYS`]).
+pub const MAX_IN_FLIGHT: usize = crate::protocol::MAX_DIRECTION_KEYS;
 
 /// Seconds a cell may go unselected before it is evicted.
 pub const EVICT_AFTER_SECONDS: f64 = 60.0;
 
 /// Most cells the cache keeps once eviction has dropped what it can.
 pub const MAX_CACHED_CELLS: usize = 4096;
-
-/// Seconds a cell stays `Pending` on the readiness push alone before the
-/// cache also polls for it.
-pub const PENDING_POLL_AFTER_SECONDS: f64 = 10.0;
-
-/// Seconds between polls of a long `Pending` cell.
-pub const PENDING_POLL_INTERVAL_SECONDS: f64 = 2.0;
-
-/// Seconds before a failed request is tried again.
-pub const RETRY_AFTER_SECONDS: f64 = 2.0;
 
 /// How far below a selected cell [`CellCache::draw_set`] looks for loaded
 /// descendants to cover it.
@@ -148,16 +150,14 @@ impl ReadyCell {
 pub enum CellState {
     /// Selected, not yet requested.
     Missing,
-    /// A request is in flight.
+    /// The fetcher is resolving it: directions, streams, or a module run.
     Requested,
-    /// The hub answered `202`; waiting for readiness since this session
-    /// time, seconds.
-    Pending(f64),
     /// Fetched and composited.
     Ready(Arc<ReadyCell>),
-    /// No matter: an empty composite or `404`. Draws nothing.
+    /// No matter: every layer is empty, or the composite holds none. Draws
+    /// nothing.
     Empty,
-    /// `410`, or bytes that fail validation. Never drawn.
+    /// Sections that fail validation, or a module that failed. Never drawn.
     Gone,
 }
 
@@ -174,30 +174,35 @@ pub enum NeighborMatter<'a> {
 /// The result of one fetch, decoded.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchOutcome {
-    /// `200`, decoded and composited; `None` when there is no matter.
+    /// Every layer's section, decoded and composited; `None` when there is
+    /// no matter.
     Decoded(Option<Arc<ReadyCell>>),
-    /// `202`: compilation is under way.
-    Pending,
-    /// `404`: the build has no layers for the key.
-    NotFound,
-    /// `410`: the key can never be produced.
-    Gone,
-    /// The bytes failed validation, with the reason.
+    /// A section failed validation or the module failed, with the reason.
+    /// Never asked for again in this session.
     Invalid(String),
-    /// Transport failure or an unexpected status; tried again later.
-    Failed(String),
 }
 
-/// Decodes a chunk container for `key` (`matter-format.md` section 6),
-/// checks each section's geometry against the registry's `root_extent`
-/// (section 3.1), and composites the sections (section 3.5).
-pub fn decode_cell(key: &CellKey, bytes: &[u8], root_extent: Meters) -> FetchOutcome {
-    let sections = match decode_chunk(key, bytes) {
-        Ok(s) => s,
-        Err(e) => return FetchOutcome::Invalid(format!("code {}: {}", e.code, e.reason)),
-    };
+/// Decodes and validates each layer's section for `key` (`matter-format.md`
+/// section 4), checks each section's geometry against the registry's
+/// `root_extent` (section 3.1), and composites them (section 3.5). The
+/// sections are the non-empty layers' in the build's layer order; none at
+/// all is a cell without matter.
+pub fn decode_cell<S: AsRef<[u8]>>(
+    key: &CellKey,
+    sections: &[S],
+    root_extent: Meters,
+) -> FetchOutcome {
+    let mut decoded = Vec::with_capacity(sections.len());
+    for (i, bytes) in sections.iter().enumerate() {
+        match matter::decode(key, bytes.as_ref()) {
+            Ok(s) => decoded.push(s),
+            Err(e) => {
+                return FetchOutcome::Invalid(format!("section {i}: code {}: {}", e.code, e.reason))
+            }
+        }
+    }
     let g = key.geometry(root_extent);
-    if let Some(i) = sections
+    if let Some(i) = decoded
         .iter()
         .position(|s| s.origin() != g.origin || s.edge() != g.edge)
     {
@@ -205,10 +210,10 @@ pub fn decode_cell(key: &CellKey, bytes: &[u8], root_extent: Meters) -> FetchOut
             "section {i}: cell geometry does not match the registry"
         ));
     }
-    if sections.is_empty() {
+    if decoded.is_empty() {
         return FetchOutcome::Decoded(None);
     }
-    let refs: Vec<&Section> = sections.iter().collect();
+    let refs: Vec<&Section> = decoded.iter().collect();
     match composite(&refs) {
         Ok(c) if c.is_empty() => FetchOutcome::Decoded(None),
         Ok(c) => FetchOutcome::Decoded(Some(Arc::new(ReadyCell::new(c)))),
@@ -310,12 +315,6 @@ pub struct CellEntry {
     pub projected_px: f64,
     /// Session time of the latest request, seconds.
     pub requested_at: f64,
-    /// Session time of the first `202`, seconds.
-    pub pending_since: Option<f64>,
-    /// A readiness push arrived while a request was in flight.
-    pub ready_hint: bool,
-    /// Do not request before this session time, seconds.
-    pub retry_at: f64,
 }
 
 impl CellEntry {
@@ -327,9 +326,6 @@ impl CellEntry {
             last_used: now,
             projected_px: 0.0,
             requested_at: f64::NEG_INFINITY,
-            pending_since: None,
-            ready_hint: false,
-            retry_at: f64::NEG_INFINITY,
         }
     }
 }
@@ -341,7 +337,7 @@ pub struct CacheCounts {
     pub selected: usize,
     /// Selected cells that are `Ready` or `Empty`.
     pub ready: usize,
-    /// Selected cells that are `Requested` or `Pending`.
+    /// Selected cells that are `Requested`.
     pub pending: usize,
     /// Requests in flight.
     pub in_flight: usize,
@@ -483,10 +479,9 @@ impl CellCache {
             .map(|(k, _)| k)
     }
 
-    /// Picks the next requests: selected or pinned `Missing` cells, and
-    /// `Pending` cells due for a poll, largest projected size first (ties in
-    /// key order), up to [`MAX_IN_FLIGHT`] in flight. Marks them
-    /// `Requested`.
+    /// Picks the next requests: selected or pinned `Missing` cells,
+    /// largest projected size first (ties in key order), up to
+    /// [`MAX_IN_FLIGHT`] in flight. Marks them `Requested`.
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
         let in_flight = self
             .entries
@@ -500,17 +495,7 @@ impl CellCache {
         let mut due: Vec<(f64, CellKey)> = self
             .entries
             .iter()
-            .filter(|(_, e)| {
-                (e.selected || e.pinned)
-                    && match e.state {
-                        CellState::Missing => now >= e.retry_at,
-                        CellState::Pending(since) => {
-                            now - since >= PENDING_POLL_AFTER_SECONDS
-                                && now - e.requested_at >= PENDING_POLL_INTERVAL_SECONDS
-                        }
-                        _ => false,
-                    }
-            })
+            .filter(|(_, e)| (e.selected || e.pinned) && e.state == CellState::Missing)
             .map(|(k, e)| (e.projected_px, *k))
             .collect();
         due.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -520,7 +505,6 @@ impl CellCache {
                 let e = self.entries.get_mut(&k).expect("listed above");
                 e.state = CellState::Requested;
                 e.requested_at = now;
-                e.ready_hint = false;
                 k
             })
             .collect()
@@ -534,52 +518,12 @@ impl CellCache {
             .or_insert_with(|| CellEntry::new(now));
         e.state = match outcome {
             FetchOutcome::Decoded(Some(cell)) => CellState::Ready(cell),
-            FetchOutcome::Decoded(None) | FetchOutcome::NotFound => CellState::Empty,
-            FetchOutcome::Gone => CellState::Gone,
+            FetchOutcome::Decoded(None) => CellState::Empty,
             FetchOutcome::Invalid(reason) => {
                 tracing::warn!(key = %key, "cell is invalid: {reason}");
                 CellState::Gone
             }
-            FetchOutcome::Pending => {
-                let since = *e.pending_since.get_or_insert(now);
-                if e.ready_hint {
-                    // The push beat the 202 here; ask again right away.
-                    e.ready_hint = false;
-                    e.retry_at = now;
-                    CellState::Missing
-                } else {
-                    CellState::Pending(since)
-                }
-            }
-            FetchOutcome::Failed(reason) => {
-                tracing::debug!(key = %key, "cell request failed: {reason}");
-                e.retry_at = now + RETRY_AFTER_SECONDS;
-                CellState::Missing
-            }
         };
-        if !matches!(e.state, CellState::Pending(_) | CellState::Missing) {
-            e.pending_since = None;
-        }
-    }
-
-    /// Handles a `chunkReady` push: a `Pending` cell is asked for again.
-    /// Returns `true` if the push changed anything.
-    pub fn notify_ready(&mut self, key: &CellKey) -> bool {
-        let Some(e) = self.entries.get_mut(key) else {
-            return false;
-        };
-        match e.state {
-            CellState::Pending(_) => {
-                e.state = CellState::Missing;
-                e.retry_at = f64::NEG_INFINITY;
-                true
-            }
-            CellState::Requested => {
-                e.ready_hint = true;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Marks cells as used now (drawn as stand-ins), so eviction keeps them.
@@ -644,7 +588,7 @@ impl CellCache {
             }
             match e.state {
                 CellState::Ready(_) | CellState::Empty => c.ready += 1,
-                CellState::Requested | CellState::Pending(_) => c.pending += 1,
+                CellState::Requested => c.pending += 1,
                 _ => {}
             }
         }
@@ -735,34 +679,36 @@ fn cover_below(
 /// Something a fetcher reports back to the frame loop.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchEvent {
-    /// A request finished.
+    /// A cell request finished.
     Completed {
         /// The cell.
         key: CellKey,
         /// What came back, decoded.
         outcome: FetchOutcome,
-        /// Body bytes received.
+        /// Section bytes received, streamed or computed.
         bytes: u64,
-        /// Time from sending the request to having the body.
+        /// Time from the request to having every layer's section.
         round_trip: std::time::Duration,
     },
-    /// The hub pushed `chunkReady` for a cell.
-    ChunkReady(CellKey),
+    /// The registry key finished: every non-empty layer's registry section
+    /// in layer order, or why it never can.
+    Registry(Result<Vec<Arc<[u8]>>, String>),
 }
 
-/// Running totals over finished requests, for the overlay and the
+/// Running totals over finished cell requests, for the overlay and the
 /// headless statistics. Shared by the desktop and the browser fetchers.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct FetchTally {
-    /// Requests finished, whatever the hub answered.
+    /// Cell requests finished.
     pub requests: u64,
-    /// Requests answered with a chunk body (`200`): the cells fetched.
+    /// Cell requests that ended with decoded sections (with or without
+    /// matter).
     pub bodies: u64,
-    /// Chunk body bytes received.
+    /// Section bytes received for cells.
     pub bytes: u64,
-    /// Round-trip time of the first finished request.
+    /// Time to complete the first finished request.
     pub first_round_trip: Option<std::time::Duration>,
-    /// Round-trip time of the latest finished request.
+    /// Time to complete the latest finished request.
     pub last_round_trip: Option<std::time::Duration>,
 }
 
@@ -778,7 +724,7 @@ impl FetchTally {
             } = e
             {
                 self.requests += 1;
-                if matches!(outcome, FetchOutcome::Decoded(_) | FetchOutcome::Invalid(_)) {
+                if matches!(outcome, FetchOutcome::Decoded(_)) {
                     self.bodies += 1;
                 }
                 self.bytes += bytes;
@@ -789,159 +735,522 @@ impl FetchTally {
     }
 }
 
+/// Everything a fetcher counts: finished cells, the directions loop, and
+/// the worker.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct FetcherStats {
+    /// Finished cell requests.
+    pub tally: FetchTally,
+    /// The directions loop ([`crate::directions::DirectionStats`]).
+    pub directions: crate::directions::DirectionStats,
+    /// The worker ([`gx_worker::WorkerSnapshot`]).
+    pub worker: gx_worker::WorkerSnapshot,
+}
+
+/// The moment to ask for directions at, UTC milliseconds: `wanted` (the
+/// drawn moment) clamped to the hub's now and, once known, the origin.
+/// Before anything is drawn, the hub's now.
+pub fn directions_time(wanted: Option<i64>, origin: Option<i64>, now: i64) -> i64 {
+    let t = wanted.unwrap_or(now).min(now);
+    match origin {
+        Some(o) => t.max(o),
+        None => t,
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::Fetcher;
+pub use native::{Fetcher, FetcherOptions};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{decode_cell, FetchEvent, FetchOutcome, FetchTally};
-    use crate::hub::{ChunkFetch, HubClient};
+    use super::{decode_cell, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats};
+    use crate::directions::{Action, Coordinator, Origin, StreamResult};
+    use crate::hub::{HubClient, ReadySubscription};
+    use crate::protocol::DirectionsResponse;
+    use anyhow::{anyhow, Result};
+    use gx_core::frames::FrameSystem;
     use gx_core::key::{CellKey, ChunkKey};
+    use gx_core::sha256::to_hex;
     use gx_core::units::Meters;
+    use gx_module_host::HostConfig;
+    use gx_worker::{
+        BlobKind, Blobs, ComputeJob, DiskCache, UploadTicket, Uploader, WorkerError, WorkerPool,
+    };
+    use std::collections::BTreeMap;
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::sync::mpsc as tokio_mpsc;
 
-    /// Fetches cells through the hub client on a tokio runtime and reports
-    /// back over a channel the frame loop drains without blocking.
-    ///
-    /// The readiness WebSocket is opened once; a cell answering `202` is
-    /// subscribed to on it. If the socket cannot be opened the cache's
-    /// polling fallback still brings every cell in.
+    /// How the fetcher's worker and cache are set up.
+    #[derive(Clone, Debug)]
+    pub struct FetcherOptions {
+        /// The local cache, or `None` to keep nothing on disk.
+        pub cache: Option<Arc<DiskCache>>,
+        /// Worker threads ([`gx_worker::default_threads`] by default).
+        pub worker_threads: usize,
+        /// Memory and time limits of each module call.
+        pub host: HostConfig,
+    }
+
+    impl Default for FetcherOptions {
+        fn default() -> FetcherOptions {
+            FetcherOptions {
+                cache: None,
+                worker_threads: gx_worker::default_threads(),
+                host: HostConfig::default(),
+            }
+        }
+    }
+
+    /// The worker's view of the edge: blocking reads on the runtime.
+    struct EdgeBlobs {
+        handle: tokio::runtime::Handle,
+        client: Arc<HubClient>,
+    }
+
+    impl Blobs for EdgeBlobs {
+        fn fetch(&self, kind: BlobKind, hash: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+            let name = to_hex(hash);
+            match self.handle.block_on(self.client.get_blob(kind, &name)) {
+                Ok(Some(b)) => Ok(b),
+                Ok(None) => Err(WorkerError::transient(format!("{kind} {name}: not found"))),
+                Err(e) => Err(WorkerError::transient(format!("{e:#}"))),
+            }
+        }
+    }
+
+    /// Uploads on the runtime; failures are logged and never wait.
+    struct HubUploader {
+        handle: tokio::runtime::Handle,
+        client: Arc<HubClient>,
+    }
+
+    impl Uploader for HubUploader {
+        fn upload(&self, job: &ComputeJob, section: Arc<[u8]>, ticket: UploadTicket) {
+            let client = self.client.clone();
+            let (address, claim, key) = (job.address, job.claim.clone(), job.key());
+            self.handle.spawn(async move {
+                match client.upload(&address, &claim, section.to_vec()).await {
+                    Ok(status) => {
+                        tracing::debug!(key = %key, status, "section uploaded");
+                        ticket.finish(true);
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %key, "upload failed: {e:#}");
+                        ticket.finish(false);
+                    }
+                }
+            });
+        }
+    }
+
+    /// What the fetcher's tasks report back.
+    enum Internal {
+        Directions(Vec<ChunkKey>, Result<DirectionsResponse, String>),
+        Stream {
+            key: ChunkKey,
+            layer: usize,
+            address: [u8; 32],
+            result: StreamResult,
+        },
+        Compute {
+            key: ChunkKey,
+            layer: usize,
+            address: [u8; 32],
+            result: Result<Arc<[u8]>, WorkerError>,
+        },
+        Ready([u8; 32]),
+        Event(FetchEvent),
+    }
+
+    /// Fetches cells and the registry through the hub on a tokio runtime,
+    /// computing what nobody has computed yet, and reports back over a
+    /// queue the frame loop drains without blocking.
     pub struct Fetcher {
         handle: tokio::runtime::Handle,
         client: Arc<HubClient>,
-        events_tx: mpsc::Sender<FetchEvent>,
-        events: mpsc::Receiver<FetchEvent>,
-        subscribe: tokio_mpsc::UnboundedSender<String>,
+        cache: Option<Arc<DiskCache>>,
+        pool: WorkerPool,
+        coordinator: Coordinator,
+        socket: ReadySubscription,
+        tx: mpsc::Sender<Internal>,
+        rx: mpsc::Receiver<Internal>,
+        extents: BTreeMap<CellKey, Meters>,
+        out: Vec<FetchEvent>,
+        decoding: usize,
+        started: Instant,
+        wanted_utc_ms: Option<i64>,
         tally: FetchTally,
     }
 
     impl Fetcher {
-        /// Starts a fetcher on `handle` and opens the readiness socket.
-        pub fn new(handle: tokio::runtime::Handle, client: Arc<HubClient>) -> Fetcher {
-            let (events_tx, events) = mpsc::channel();
-            let (subscribe, mut keys) = tokio_mpsc::unbounded_channel::<String>();
-            let socket_client = client.clone();
-            let ready_tx = events_tx.clone();
-            handle.spawn(async move {
-                let build = socket_client.build_id().to_string();
-                let mut sub = match socket_client.subscribe_ready(&build).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("readiness socket unavailable ({e:#}), polling instead");
-                        while keys.recv().await.is_some() {}
-                        return;
-                    }
-                };
-                loop {
-                    tokio::select! {
-                        key = keys.recv() => match key {
-                            Some(k) => {
-                                if sub.subscribe(&k).is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        },
-                        ready = sub.next() => match ready {
-                            Some(k) => {
-                                if let Ok(ChunkKey::Cell(cell)) = k.parse::<ChunkKey>() {
-                                    if ready_tx.send(FetchEvent::ChunkReady(cell)).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::warn!("readiness socket closed, polling instead");
-                                while keys.recv().await.is_some() {}
-                                break;
-                            }
-                        },
-                    }
-                }
-            });
-            Fetcher {
+        /// Starts a fetcher on `handle`: the worker pool, and the readiness
+        /// socket.
+        pub fn new(
+            handle: tokio::runtime::Handle,
+            client: Arc<HubClient>,
+            options: FetcherOptions,
+        ) -> Result<Fetcher> {
+            let pool = WorkerPool::new(
+                options.worker_threads,
+                options.host,
+                Arc::new(EdgeBlobs {
+                    handle: handle.clone(),
+                    client: client.clone(),
+                }),
+                options.cache.clone(),
+                Arc::new(HubUploader {
+                    handle: handle.clone(),
+                    client: client.clone(),
+                }),
+            )
+            .map_err(|e| anyhow!("starting the worker: {e}"))?;
+            tracing::info!(threads = pool.size(), "worker started");
+            let (tx, rx) = mpsc::channel();
+            let notices = tx.clone();
+            let socket =
+                client.subscribe_ready(&handle, move |a| notices.send(Internal::Ready(a)).is_ok());
+            Ok(Fetcher {
                 handle,
                 client,
-                events_tx,
-                events,
-                subscribe,
+                cache: options.cache,
+                pool,
+                coordinator: Coordinator::new(),
+                socket,
+                tx,
+                rx,
+                extents: BTreeMap::new(),
+                out: Vec::new(),
+                decoding: 0,
+                started: Instant::now(),
+                wanted_utc_ms: None,
                 tally: FetchTally::default(),
+            })
+        }
+
+        /// The hub client.
+        pub fn client(&self) -> &Arc<HubClient> {
+            &self.client
+        }
+
+        fn now(&self) -> f64 {
+            self.started.elapsed().as_secs_f64()
+        }
+
+        /// Sets the moment being drawn, UTC milliseconds; directions are
+        /// asked for it, clamped between the origin and the hub's now.
+        pub fn set_time_utc_ms(&mut self, t: i64) {
+            self.wanted_utc_ms = Some(t);
+        }
+
+        /// Queues a request for `key`, a cell of a frame of edge
+        /// `root_extent`. Requests queued before the next
+        /// [`Fetcher::flush`], [`Fetcher::drain`], or [`Fetcher::wait`] go
+        /// out together, in batches of at most 512 keys. The result arrives
+        /// through [`Fetcher::drain`]. A key already in flight is not asked
+        /// for twice.
+        pub fn request(&mut self, key: CellKey, root_extent: Meters) {
+            self.extents.insert(key, root_extent);
+            let now = self.now();
+            self.coordinator.request(ChunkKey::Cell(key), now);
+        }
+
+        /// Sends what is queued and applies what has arrived, without
+        /// waiting.
+        pub fn flush(&mut self) {
+            self.pump();
+        }
+
+        /// Starts a request for the registry key. The result arrives as
+        /// [`FetchEvent::Registry`].
+        pub fn request_registry(&mut self) {
+            let now = self.now();
+            self.coordinator.request(ChunkKey::Registry, now);
+            self.pump();
+        }
+
+        fn apply(&mut self, msg: Internal) -> Vec<Action> {
+            let now = self.now();
+            match msg {
+                Internal::Directions(keys, r) => self.coordinator.directions_done(&keys, r, now),
+                Internal::Stream {
+                    key,
+                    layer,
+                    address,
+                    result,
+                } => self
+                    .coordinator
+                    .stream_done(&key, layer, address, result, now),
+                Internal::Compute {
+                    key,
+                    layer,
+                    address,
+                    result,
+                } => self
+                    .coordinator
+                    .compute_done(&key, layer, address, result, now),
+                Internal::Ready(a) => self.coordinator.ready_notice(&a),
+                Internal::Event(e) => {
+                    self.decoding = self.decoding.saturating_sub(1);
+                    self.out.push(e);
+                    Vec::new()
+                }
             }
         }
 
-        /// Starts a request for `key`, a cell of a frame of edge
-        /// `root_extent`. The result arrives through [`Fetcher::drain`].
-        pub fn request(&self, key: CellKey, root_extent: Meters) {
-            let client = self.client.clone();
-            let tx = self.events_tx.clone();
-            let subscribe = self.subscribe.clone();
-            self.handle.spawn(async move {
-                let name = key.to_string();
-                let start = Instant::now();
-                let fetched = client.fetch_chunk_uncached(&name).await;
-                let round_trip = start.elapsed();
-                let (outcome, bytes) = match fetched {
-                    ChunkFetch::Ready(body) => {
-                        let len = body.len() as u64;
-                        let decoded = tokio::task::spawn_blocking(move || {
-                            decode_cell(&key, &body, root_extent)
-                        })
-                        .await
-                        .unwrap_or_else(|e| FetchOutcome::Failed(format!("decode task: {e}")));
-                        (decoded, len)
-                    }
-                    ChunkFetch::Pending => {
-                        let _ = subscribe.send(name);
-                        (FetchOutcome::Pending, 0)
-                    }
-                    ChunkFetch::NotFound => (FetchOutcome::NotFound, 0),
-                    ChunkFetch::Gone => (FetchOutcome::Gone, 0),
-                    ChunkFetch::Error(e) => (FetchOutcome::Failed(e), 0),
-                };
-                let _ = tx.send(FetchEvent::Completed {
-                    key,
-                    outcome,
-                    bytes,
-                    round_trip,
-                });
-            });
+        /// Applies every report so far and carries out what is due.
+        fn pump(&mut self) {
+            let mut actions = Vec::new();
+            while let Ok(msg) = self.rx.try_recv() {
+                actions.extend(self.apply(msg));
+            }
+            let now = self.now();
+            actions.extend(self.coordinator.poll(now));
+            while !actions.is_empty() {
+                for a in std::mem::take(&mut actions) {
+                    self.execute(a);
+                }
+                actions = self.coordinator.poll(self.now());
+            }
         }
 
-        /// Every event so far, without waiting. Updates the byte count and
-        /// the last round-trip time.
-        pub fn drain(&mut self) -> Vec<FetchEvent> {
-            let events: Vec<FetchEvent> = self.events.try_iter().collect();
+        fn execute(&mut self, action: Action) {
+            match action {
+                Action::Directions(keys) => {
+                    let t = directions_time(
+                        self.wanted_utc_ms,
+                        self.coordinator.origin_utc_ms(),
+                        self.client.now_utc_ms(),
+                    );
+                    let client = self.client.clone();
+                    let tx = self.tx.clone();
+                    self.handle.spawn(async move {
+                        let r = client
+                            .directions(t, &keys)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Internal::Directions(keys, r));
+                    });
+                }
+                Action::Stream {
+                    key,
+                    layer,
+                    address,
+                } => {
+                    let client = self.client.clone();
+                    let cache = self.cache.clone();
+                    let tx = self.tx.clone();
+                    self.handle.spawn(async move {
+                        let result = stream_section(&client, cache, key, address).await;
+                        let _ = tx.send(Internal::Stream {
+                            key,
+                            layer,
+                            address,
+                            result,
+                        });
+                    });
+                }
+                Action::Compute { key, layer, job } => {
+                    let tx = self.tx.clone();
+                    let address = job.address;
+                    self.pool.submit(job, move |result| {
+                        let _ = tx.send(Internal::Compute {
+                            key,
+                            layer,
+                            address,
+                            result,
+                        });
+                    });
+                }
+                Action::Subscribe(address) => self.socket.subscribe(address),
+                Action::Complete(done) => match done.key {
+                    ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done.sections))),
+                    ChunkKey::Cell(key) => {
+                        let Some(extent) = self.extents.remove(&key) else {
+                            return;
+                        };
+                        let round_trip =
+                            Duration::from_secs_f64((self.now() - done.requested_at).max(0.0));
+                        let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
+                        let tx = self.tx.clone();
+                        self.decoding += 1;
+                        self.handle.spawn_blocking(move || {
+                            let outcome = decode_cell(&key, &done.sections, extent);
+                            let _ = tx.send(Internal::Event(FetchEvent::Completed {
+                                key,
+                                outcome,
+                                bytes,
+                                round_trip,
+                            }));
+                        });
+                    }
+                },
+                Action::Failed { key, reason } => match key {
+                    ChunkKey::Registry => self.out.push(FetchEvent::Registry(Err(reason))),
+                    ChunkKey::Cell(key) => {
+                        self.extents.remove(&key);
+                        self.out.push(FetchEvent::Completed {
+                            key,
+                            outcome: FetchOutcome::Invalid(reason),
+                            bytes: 0,
+                            round_trip: Duration::ZERO,
+                        });
+                    }
+                },
+            }
+        }
+
+        fn take_events(&mut self) -> Vec<FetchEvent> {
+            let events = std::mem::take(&mut self.out);
             self.tally.record(&events);
             events
+        }
+
+        /// Every event so far, without waiting.
+        pub fn drain(&mut self) -> Vec<FetchEvent> {
+            self.pump();
+            self.take_events()
         }
 
         /// Waits up to `timeout` for at least one event, then drains.
         pub fn wait(&mut self, timeout: Duration) -> Vec<FetchEvent> {
-            let mut events = Vec::new();
-            if let Ok(e) = self.events.recv_timeout(timeout) {
-                events.push(e);
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.pump();
+                if !self.out.is_empty() {
+                    return self.take_events();
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Vec::new();
+                }
+                let mut wait = deadline - now;
+                if let Some(t) = self.coordinator.next_wake() {
+                    let due = Duration::from_secs_f64((t - self.now()).max(0.0));
+                    wait = wait.min(due.max(Duration::from_millis(1)));
+                }
+                if let Ok(msg) = self.rx.recv_timeout(wait) {
+                    let actions = self.apply(msg);
+                    for a in actions {
+                        self.execute(a);
+                    }
+                }
             }
-            events.extend(self.events.try_iter());
-            self.tally.record(&events);
-            events
         }
 
-        /// The totals over every finished request this session.
+        /// `true` while any key is in flight or being decoded.
+        pub fn busy(&self) -> bool {
+            self.coordinator.in_flight() > 0 || self.decoding > 0
+        }
+
+        /// The totals over every finished request this session, the
+        /// directions loop, and the worker.
+        pub fn stats(&self) -> FetcherStats {
+            FetcherStats {
+                tally: self.tally,
+                directions: self.coordinator.stats(),
+                worker: self.pool.stats(),
+            }
+        }
+
+        /// The totals over every finished cell request this session.
         pub fn tally(&self) -> FetchTally {
             self.tally
         }
 
-        /// Body bytes received this session.
+        /// Section bytes received for cells this session.
         pub fn bytes_fetched(&self) -> u64 {
             self.tally.bytes
         }
 
-        /// Round-trip time of the latest finished request.
+        /// Time to complete the latest finished cell request.
         pub fn last_round_trip(&self) -> Option<Duration> {
             self.tally.last_round_trip
+        }
+
+        /// Loads the frame registry (`client-compute.md`, the registry is
+        /// just another key): asks for it like any key, waits up to
+        /// `deadline` for every layer's registry section, and builds the
+        /// frame system from their union with the build's layer depths. The
+        /// integrator starts only after this.
+        pub fn load_registry(&mut self, deadline: Duration) -> Result<FrameSystem> {
+            self.request_registry();
+            let start = Instant::now();
+            loop {
+                let left = deadline.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return Err(anyhow!(
+                        "the registry did not arrive within {} s",
+                        deadline.as_secs_f64()
+                    ));
+                }
+                for e in self.wait(left.min(Duration::from_millis(200))) {
+                    if let FetchEvent::Registry(r) = e {
+                        let sections = r.map_err(|e| anyhow!("registry: {e}"))?;
+                        let system = crate::protocol::frame_system_from_registries(
+                            &sections,
+                            self.client.build(),
+                        )?;
+                        tracing::info!(frames = system.tree().frames().len(), "registry loaded");
+                        return Ok(system);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gets a stored section: the local cache if it holds a valid copy,
+    /// else the edge, validating and caching what comes back.
+    async fn stream_section(
+        client: &HubClient,
+        cache: Option<Arc<DiskCache>>,
+        key: ChunkKey,
+        address: [u8; 32],
+    ) -> StreamResult {
+        let name = to_hex(&address);
+        let name_for_cache = name.clone();
+        let cached = match &cache {
+            Some(c) => {
+                let c = c.clone();
+                tokio::task::spawn_blocking(move || {
+                    let bytes = c.get(BlobKind::Section, &name_for_cache)?;
+                    if gx_core::validate(&key.to_string(), &bytes).is_ok() {
+                        Some(bytes)
+                    } else {
+                        c.remove(BlobKind::Section, &name_for_cache);
+                        None
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            None => None,
+        };
+        if let Some(bytes) = cached {
+            return StreamResult::Bytes(Arc::from(bytes), Origin::Cache);
+        }
+        match client.get_blob(BlobKind::Section, &name).await {
+            Ok(Some(bytes)) => {
+                let checked = tokio::task::spawn_blocking(move || {
+                    gx_core::validate(&key.to_string(), &bytes)
+                        .map_err(|e| format!("section {name} from the edge is invalid: {e}"))?;
+                    if let Some(c) = &cache {
+                        if let Err(e) = c.put(BlobKind::Section, &name, &bytes) {
+                            tracing::warn!(name, "could not cache the section: {e}");
+                        }
+                    }
+                    Ok::<_, String>(bytes)
+                })
+                .await;
+                match checked {
+                    Ok(Ok(bytes)) => StreamResult::Bytes(Arc::from(bytes), Origin::Edge),
+                    Ok(Err(e)) => StreamResult::Failed(e),
+                    Err(e) => StreamResult::Failed(format!("validation task: {e}")),
+                }
+            }
+            Ok(None) => StreamResult::NotFound,
+            Err(e) => StreamResult::Failed(format!("{e:#}")),
         }
     }
 }
@@ -991,64 +1300,88 @@ mod tests {
     #[test]
     fn requests_are_capped_and_prioritized() {
         let mut c = CellCache::new();
-        let keys: Vec<CellKey> = (0..20).map(|i| key(5, i, 0, 0)).collect();
+        let n = MAX_IN_FLIGHT as u32 + 8;
+        let keys: Vec<CellKey> = (0..n).map(|i| key(10, i, 0, 0)).collect();
         c.set_selection(sel(&keys), 0.0);
         let first = c.take_requests(0.0);
         assert_eq!(first.len(), MAX_IN_FLIGHT);
         // Largest projected size first: the last keys had the largest.
-        assert_eq!(first[0], keys[19]);
+        assert_eq!(first[0], keys[n as usize - 1]);
         assert!(c.take_requests(0.0).is_empty());
-        c.complete(first[0], FetchOutcome::NotFound, 0.1);
+        c.complete(first[0], FetchOutcome::Decoded(None), 0.1);
         assert_eq!(c.take_requests(0.1).len(), 1);
         assert_eq!(c.counts().in_flight, MAX_IN_FLIGHT);
     }
 
     #[test]
-    fn pending_waits_for_push_then_polls() {
+    fn invalid_cells_are_gone_and_not_asked_again() {
         let mut c = CellCache::new();
-        let k = key(1, 0, 0, 0);
-        c.set_selection(sel(&[k]), 0.0);
-        assert_eq!(c.take_requests(0.0), vec![k]);
-        c.complete(k, FetchOutcome::Pending, 0.2);
-        assert_eq!(c.state(&k), Some(&CellState::Pending(0.2)));
+        let (a, b) = (key(1, 0, 0, 0), key(1, 1, 0, 0));
+        c.set_selection(sel(&[a, b]), 0.0);
+        assert_eq!(c.take_requests(0.0).len(), 2);
+        c.complete(a, FetchOutcome::Invalid("x".into()), 0.0);
+        c.complete(b, FetchOutcome::Decoded(None), 0.0);
         assert!(c.take_requests(5.0).is_empty());
-        assert!(c.notify_ready(&k));
-        assert_eq!(c.take_requests(5.0), vec![k]);
-        c.complete(k, FetchOutcome::Pending, 5.1);
-        // Still pending since the first 202; polled after 10 s, every 2 s.
-        assert_eq!(c.state(&k), Some(&CellState::Pending(0.2)));
-        assert!(c.take_requests(6.0).is_empty());
-        assert_eq!(c.take_requests(10.3), vec![k]);
-        c.complete(k, FetchOutcome::Pending, 10.4);
-        assert!(c.take_requests(11.0).is_empty());
-        assert_eq!(c.take_requests(12.4), vec![k]);
-        c.complete(k, ready(), 12.5);
-        assert!(matches!(c.state(&k), Some(CellState::Ready(_))));
+        assert_eq!(c.state(&a), Some(&CellState::Gone));
+        assert_eq!(c.state(&b), Some(&CellState::Empty));
         assert_eq!(c.counts().ready, 1);
     }
 
     #[test]
-    fn push_during_request_asks_again() {
-        let mut c = CellCache::new();
-        let k = key(1, 1, 0, 0);
-        c.set_selection(sel(&[k]), 0.0);
-        c.take_requests(0.0);
-        assert!(c.notify_ready(&k));
-        c.complete(k, FetchOutcome::Pending, 0.1);
-        assert_eq!(c.take_requests(0.1), vec![k]);
+    fn tally_counts_requests_bodies_and_round_trips() {
+        use std::time::Duration;
+        let done = |outcome: FetchOutcome, bytes: u64, ms: u64| FetchEvent::Completed {
+            key: key(1, 0, 0, 0),
+            outcome,
+            bytes,
+            round_trip: Duration::from_millis(ms),
+        };
+        let mut t = FetchTally::default();
+        t.record(&[
+            done(FetchOutcome::Invalid("x".into()), 0, 30),
+            FetchEvent::Registry(Ok(Vec::new())),
+            done(ready(), 100, 5),
+        ]);
+        t.record(&[done(FetchOutcome::Decoded(None), 72, 2)]);
+        assert_eq!(t.requests, 3);
+        assert_eq!(t.bodies, 2);
+        assert_eq!(t.bytes, 172);
+        assert_eq!(t.first_round_trip, Some(Duration::from_millis(30)));
+        assert_eq!(t.last_round_trip, Some(Duration::from_millis(2)));
     }
 
     #[test]
-    fn failures_retry_and_gone_stays() {
-        let mut c = CellCache::new();
-        let (a, b) = (key(1, 0, 0, 0), key(1, 1, 0, 0));
-        c.set_selection(sel(&[a, b]), 0.0);
-        c.take_requests(0.0);
-        c.complete(a, FetchOutcome::Failed("x".into()), 0.0);
-        c.complete(b, FetchOutcome::Gone, 0.0);
-        assert!(c.take_requests(1.0).is_empty());
-        assert_eq!(c.take_requests(2.0), vec![a]);
-        assert_eq!(c.state(&b), Some(&CellState::Gone));
+    fn directions_time_is_clamped_to_origin_and_now() {
+        assert_eq!(directions_time(None, None, 50), 50);
+        assert_eq!(directions_time(Some(80), Some(10), 50), 50);
+        assert_eq!(directions_time(Some(5), Some(10), 50), 10);
+        assert_eq!(directions_time(Some(20), Some(10), 50), 20);
+    }
+
+    #[test]
+    fn decode_rejects_geometry_that_disagrees_with_the_registry() {
+        use gx_core::matter::{encode, Compression};
+        let k = key(1, 1, 0, 0);
+        let g = k.geometry(Meters::new(8.0));
+        let empty = Section::empty(k, g.origin, g.edge).unwrap();
+        let bytes = encode(&empty, Compression::None);
+        assert_eq!(
+            decode_cell(&k, &[&bytes], Meters::new(8.0)),
+            FetchOutcome::Decoded(None)
+        );
+        assert!(matches!(
+            decode_cell(&k, &[&bytes], Meters::new(16.0)),
+            FetchOutcome::Invalid(_)
+        ));
+        assert!(matches!(
+            decode_cell(&k, &[&[1u8, 2][..]], Meters::new(8.0)),
+            FetchOutcome::Invalid(_)
+        ));
+        let none: [&[u8]; 0] = [];
+        assert_eq!(
+            decode_cell(&k, &none, Meters::new(8.0)),
+            FetchOutcome::Decoded(None)
+        );
     }
 
     #[test]
@@ -1066,7 +1399,7 @@ mod tests {
             .map(|i| CellKey::new(5, 13, i % 8192, i / 8192, 0).unwrap())
             .collect();
         for (i, k) in many.iter().enumerate() {
-            c.complete(*k, FetchOutcome::NotFound, i as f64 * 1e-3);
+            c.complete(*k, FetchOutcome::Decoded(None), i as f64 * 1e-3);
         }
         let gone = c.evict(10.0);
         assert_eq!(gone.len(), 10);
@@ -1118,56 +1451,6 @@ mod tests {
     }
 
     #[test]
-    fn tally_counts_requests_bodies_and_round_trips() {
-        use std::time::Duration;
-        let done = |outcome: FetchOutcome, bytes: u64, ms: u64| FetchEvent::Completed {
-            key: key(1, 0, 0, 0),
-            outcome,
-            bytes,
-            round_trip: Duration::from_millis(ms),
-        };
-        let mut t = FetchTally::default();
-        t.record(&[
-            done(FetchOutcome::Pending, 0, 30),
-            FetchEvent::ChunkReady(key(1, 0, 0, 0)),
-            done(ready(), 100, 5),
-        ]);
-        t.record(&[done(FetchOutcome::Decoded(None), 72, 2)]);
-        assert_eq!(t.requests, 3);
-        assert_eq!(t.bodies, 2);
-        assert_eq!(t.bytes, 172);
-        assert_eq!(t.first_round_trip, Some(Duration::from_millis(30)));
-        assert_eq!(t.last_round_trip, Some(Duration::from_millis(2)));
-    }
-
-    #[test]
-    fn decode_rejects_geometry_that_disagrees_with_the_registry() {
-        use gx_core::container::encode_chunk;
-        use gx_core::matter::{encode, Compression};
-        let k = key(1, 1, 0, 0);
-        let g = k.geometry(Meters::new(8.0));
-        let empty = Section::empty(k, g.origin, g.edge).unwrap();
-        let bytes = encode(&empty, Compression::None);
-        let chunk = encode_chunk(&[&bytes], &["a"]);
-        assert_eq!(
-            decode_cell(&k, &chunk, Meters::new(8.0)),
-            FetchOutcome::Decoded(None)
-        );
-        assert!(matches!(
-            decode_cell(&k, &chunk, Meters::new(16.0)),
-            FetchOutcome::Invalid(_)
-        ));
-        assert!(matches!(
-            decode_cell(&k, &[1, 2], Meters::new(8.0)),
-            FetchOutcome::Invalid(_)
-        ));
-        assert_eq!(
-            decode_cell(&k, &encode_chunk(&[], &[]), Meters::new(8.0)),
-            FetchOutcome::Decoded(None)
-        );
-    }
-
-    #[test]
     fn face_neighbors_at_the_same_depth() {
         let k = key(2, 0, 1, 3);
         assert_eq!(
@@ -1186,7 +1469,7 @@ mod tests {
         let mut c = CellCache::new();
         c.set_selection(sel(&[k, key(2, 1, 1, 3), key(2, 0, 0, 3)]), 0.0);
         c.complete(key(2, 1, 1, 3), ready(), 0.0);
-        c.complete(key(2, 0, 0, 3), FetchOutcome::NotFound, 0.0);
+        c.complete(key(2, 0, 0, 3), FetchOutcome::Decoded(None), 0.0);
         // A Ready cell one depth down touching the +y face is not a neighbor.
         c.complete(key(3, 1, 4, 6), ready(), 0.0);
         let n = c.face_neighbors(&k);
@@ -1198,16 +1481,16 @@ mod tests {
         // is fetched and empty: known empty. One child unknown: not.
         let below = key(2, 0, 1, 2).children().unwrap();
         for child in &below[1..] {
-            c.complete(*child, FetchOutcome::NotFound, 0.0);
+            c.complete(*child, FetchOutcome::Decoded(None), 0.0);
         }
         assert!(c.face_neighbors(&k)[4].is_none());
-        c.complete(below[0], FetchOutcome::NotFound, 0.0);
+        c.complete(below[0], FetchOutcome::Decoded(None), 0.0);
         assert_eq!(
             c.face_neighbors(&k)[4],
             Some((key(2, 0, 1, 2), NeighborMatter::Empty))
         );
         // An empty ancestor covers everything under it.
-        c.complete(key(1, 0, 0, 1), FetchOutcome::NotFound, 0.0);
+        c.complete(key(1, 0, 0, 1), FetchOutcome::Decoded(None), 0.0);
         assert!(c.known_empty(&key(3, 1, 2, 5)));
         assert!(!c.known_empty(&key(3, 1, 2, 3)));
     }
