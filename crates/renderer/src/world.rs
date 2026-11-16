@@ -229,6 +229,20 @@ impl World {
             return false;
         }
         self.last_selection = Some(now);
+        // Each frame's body hides what lies beyond its horizon: the drawn
+        // surface under the camera, a little lower, as the occluder.
+        let mut occluders = BTreeMap::new();
+        for f in system.tree().frames() {
+            let cam = crate::stream::camera_in_frame(system, camera, f.frame_id);
+            let Some(dir) = cam.normalized() else {
+                continue;
+            };
+            if let Some(r) = self.surface_along(f.frame_id, dir) {
+                if cam.length() > r {
+                    occluders.insert(f.frame_id, r * crate::stream::OCCLUDER_FRACTION);
+                }
+            }
+        }
         let cache = &self.cache;
         let cells = select_all(
             system,
@@ -236,6 +250,7 @@ impl World {
             f64::from(view_px.0.max(1)),
             f64::from(view_px.1.max(1)),
             |k| cache.refinable(&k),
+            &occluders,
         );
         self.cache.set_selection(cells, now);
         for f in system

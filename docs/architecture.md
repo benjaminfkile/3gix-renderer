@@ -242,7 +242,7 @@ a light, a dense sample is a surface.
    `4 * root_extent` of the camera. For each such frame,
    `gx_core::lod::select_cells` runs with the camera in the frame's
    coordinates, a pixel error of 4, the viewport height, the vertical field
-   of view, and at most 4096 cells. Each selected cell keeps its projected
+   of view, at most 4096 cells, a pixel error of 384, and only cells in view and above the horizon refined. Each selected cell keeps its projected
    size in pixels as its request priority.
 2. **The cell cache** (`stream::CellCache`), keyed by
    `(frame_id, depth, x, y, z)`:

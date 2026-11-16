@@ -13,13 +13,18 @@
 //! Every 100 ms ([`SELECT_INTERVAL_SECONDS`]), every frame whose
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
-//! of 4, the viewport height, the vertical field of view, and at most 4096
+//! of 384 ([`PIXEL_ERROR`]), the viewport height, the vertical field of view, and at most 4096
 //! cells ([`select_all`]), except frames drawn as a sprite only. Only cells
 //! loaded and [`ReadyCell::refinable`] are refined
 //! ([`gx_core::lod::select_cells_with`]): ones the drawn surface crosses,
 //! or that hold a volume. Empty space and solid interiors stay coarse, so
 //! the budget goes to the surfaces, and the selection deepens toward them
-//! one level per arrival. A frame's
+//! one level per arrival. Only cells inside the view (a cone around the
+//! view's diagonal, [`VIEW_CONE_MARGIN`] wider) or holding the camera are
+//! refined: what is behind or beside the camera stays coarse until it
+//! turns. Nor are cells hidden behind the body itself, beyond the horizon
+//! of a sphere just under the drawn surface below the camera
+//! ([`OCCLUDER_FRACTION`]). A frame's
 //! depth limit is the deepest of its registry `max_depth` and its layers'
 //! configs ([`crate::protocol::frame_system_from_registries`]).
 //!
@@ -77,8 +82,25 @@ use std::sync::Arc;
 /// Seconds between two selections.
 pub const SELECT_INTERVAL_SECONDS: f64 = 0.1;
 
-/// Largest projected cell edge, pixels, that is not refined further.
-pub const PIXEL_ERROR: f64 = 4.0;
+/// Largest projected cell edge, pixels, that is not refined further: 384,
+/// so a cell of 32 samples per axis (the modules' resolution) draws its
+/// samples at most about 12 pixels apart, and the ones near the camera
+/// finer. Every refinement selects all eight children of a cell, about
+/// half of them air or rock on flat ground, so the selection grows by a
+/// few hundred cells per depth: refining until a whole cell was a few
+/// pixels put the selection at its limit with millions of triangles
+/// smaller than a pixel.
+pub const PIXEL_ERROR: f64 = 384.0;
+
+/// Factor on the half angle of the view cone inside which cells are
+/// refined ([`select_all`]): cells outside the view stay coarse until the
+/// camera turns toward them.
+pub const VIEW_CONE_MARGIN: f64 = 1.15;
+
+/// The occluding sphere for horizon culling ([`select_all`]), as a fraction
+/// of the radius of the drawn surface under the camera: a little lower, so
+/// relief rising over the horizon still counts as visible.
+pub const OCCLUDER_FRACTION: f64 = 0.995;
 
 /// Most cells selected per frame.
 pub const MAX_CELLS_PER_FRAME: usize = 4096;
@@ -307,6 +329,7 @@ pub fn select_all(
     view_width_px: f64,
     view_height_px: f64,
     may_refine: impl Fn(CellKey) -> bool,
+    occluders: &BTreeMap<u64, f64>,
 ) -> Vec<SelectedCell> {
     let aspect = view_width_px / view_height_px.max(1.0);
     let params = SelectionParams {
@@ -329,7 +352,54 @@ pub fn select_all(
             continue;
         }
         let cam = camera_in_frame(system, camera, frame.frame_id);
-        for key in select_cells_with(frame, cam, &params, &may_refine).cells {
+        // The view direction in the frame's axes, and the half angle of a
+        // cone holding the whole view (its diagonal), a little wider.
+        let forward = system.root_orientation(frame.frame_id).conjugate().rotate(
+            camera
+                .root_orientation(system)
+                .rotate(Vec3::new(0.0, 0.0, -1.0)),
+        );
+        let half_y = 0.5 * FIELD_OF_VIEW_Y;
+        let half_x = (half_y.tan() * aspect).atan();
+        let cone = (half_x.tan().hypot(half_y.tan())).atan() * VIEW_CONE_MARGIN;
+        let extent = frame.root_extent;
+        let in_view = |key: CellKey| -> bool {
+            let g = key.geometry(extent);
+            let half = 0.5 * g.edge.value();
+            let center = g.origin + Vec3::new(half, half, half);
+            let to = center - cam;
+            let d = to.length();
+            let radius = half * 3.0f64.sqrt();
+            if d <= radius {
+                return true;
+            }
+            let angle = (to.dot(forward) / d).clamp(-1.0, 1.0).acos();
+            angle <= cone + (radius / d).asin()
+        };
+        // Beyond the horizon of the frame's body (a sphere of radius
+        // `occluders[frame]` about its origin): a cell whose nearest point
+        // is farther than the camera's horizon plus that of the cell's
+        // highest point is hidden behind the body.
+        let occluder = occluders.get(&frame.frame_id).copied();
+        let r_cam = cam.length();
+        let visible = |key: CellKey| -> bool {
+            let Some(r) = occluder.filter(|&r| r < r_cam) else {
+                return true;
+            };
+            let g = key.geometry(extent);
+            let half = 0.5 * g.edge.value();
+            let center = g.origin + Vec3::new(half, half, half);
+            let radius = half * 3.0f64.sqrt();
+            let top = center.length() + radius;
+            if top <= r {
+                return false;
+            }
+            let near = ((center - cam).length() - radius).max(0.0);
+            let horizon = (r_cam * r_cam - r * r).sqrt() + (top * top - r * r).sqrt();
+            near <= horizon
+        };
+        let refine = |key: CellKey| may_refine(key) && in_view(key) && visible(key);
+        for key in select_cells_with(frame, cam, &params, refine).cells {
             let g = key.geometry(frame.root_extent);
             let e = g.edge.value();
             let gap = |c: f64, o: f64| (o - c).max(c - (o + e)).max(0.0);
