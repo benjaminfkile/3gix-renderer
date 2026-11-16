@@ -198,7 +198,7 @@ impl WebApp {
         let input = self.controls.take_flight();
         self.spawner.frame(
             self.sim.system(),
-            self.world.cache(),
+            &self.world,
             &mut self.camera,
             &mut self.controls,
             &input,
@@ -220,7 +220,8 @@ impl WebApp {
         let size = gfx.renderer.size();
         let t = now - self.started;
         self.sim.prepare_light(&self.camera);
-        let seen = self.sim.seen(&self.camera);
+        let near = self.world.matter_distances(self.sim.system(), &self.camera);
+        let seen = self.sim.seen_near(&self.camera, &near);
         self.world
             .select(seen.system(), seen.camera(), size, t, false);
         stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);

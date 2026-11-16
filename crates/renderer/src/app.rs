@@ -429,13 +429,14 @@ pub fn render_headless_view(
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
             {
-                let seen = sim.seen(&camera);
+                let near = world.matter_distances(sim.system(), &camera);
+                let seen = sim.seen_near(&camera, &near);
                 stream_step(&mut world, f, seen.system(), events, now);
             }
             let placed = (camera.frame_id, camera.position);
             spawner.frame(
                 sim.system(),
-                world.cache(),
+                &world,
                 &mut camera,
                 &mut controls,
                 &crate::camera::FlightInput::default(),
@@ -448,7 +449,8 @@ pub fn render_headless_view(
             // The selection deepens toward surfaces as cells arrive
             // (`stream` module docs): select again, and finish only once
             // that changes nothing and the camera has stopped moving.
-            let seen = sim.seen(&camera);
+            let near = world.matter_distances(sim.system(), &camera);
+            let seen = sim.seen_near(&camera, &near);
             let before: Vec<gx_core::key::CellKey> =
                 world.cache().selection().iter().map(|c| c.key).collect();
             world.select(seen.system(), seen.camera(), (width, height), now, true);
@@ -467,8 +469,9 @@ pub fn render_headless_view(
             }
         }
     }
+    let near = world.matter_distances(sim.system(), &camera);
     let sim = &*sim;
-    let seen = sim.seen(&camera);
+    let seen = sim.seen_near(&camera, &near);
     world.finish_extraction();
     let stream_seconds = start.elapsed().as_secs_f64();
     let mut scene = matter_scene(&mut world, &seen, (width, height), stream_seconds);
@@ -720,7 +723,7 @@ impl App {
         let input = self.controls.take_flight();
         self.spawner.frame(
             self.sim.system(),
-            self.world.cache(),
+            &self.world,
             &mut self.camera,
             &mut self.controls,
             &input,
@@ -741,7 +744,8 @@ impl App {
         let size = gfx.renderer.size();
         let t = self.started.elapsed().as_secs_f64();
         self.sim.prepare_light(&self.camera);
-        let seen = self.sim.seen(&self.camera);
+        let near = self.world.matter_distances(self.sim.system(), &self.camera);
+        let seen = self.sim.seen_near(&self.camera, &near);
         self.world
             .select(seen.system(), seen.camera(), size, t, false);
         set_fetch_time(&mut self.fetcher, &self.sim);

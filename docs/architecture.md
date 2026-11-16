@@ -112,7 +112,10 @@ package builds for that target.
    moves it, and if `FrameSystem::nearest_frame` of its position differs
    from its frame, it re-parents.
 4. Light time: `seen::Seen` solves the light-time equation of every frame
-   for the camera's position against the fine history
+   for the camera's position (for a frame with drawn meshes, over the
+   distance to the nearest of them, so a camera at a large body's surface
+   sees the surface with its own light time, not its center's) against the
+   fine history
    (`gx_core::light::retarded_state`) and builds the frame system of
    retarded states, with the camera at the same place in space among them.
    Everything below reads it.
@@ -239,7 +242,7 @@ a light, a dense sample is a surface.
    `4 * root_extent` of the camera. For each such frame,
    `gx_core::lod::select_cells` runs with the camera in the frame's
    coordinates, a pixel error of 4, the viewport height, the vertical field
-   of view, and at most 512 cells. Each selected cell keeps its projected
+   of view, and at most 4096 cells. Each selected cell keeps its projected
    size in pixels as its request priority.
 2. **The cell cache** (`stream::CellCache`), keyed by
    `(frame_id, depth, x, y, z)`:

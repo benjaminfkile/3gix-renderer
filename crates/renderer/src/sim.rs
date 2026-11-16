@@ -422,6 +422,16 @@ impl Simulation {
         Seen::retarded(&self.recent, &self.system, camera)
     }
 
+    /// [`Simulation::seen`] with each frame in `near` seen over that
+    /// distance to its matter ([`Seen::retarded_near`]).
+    pub fn seen_near(
+        &self,
+        camera: &Camera,
+        near: &std::collections::BTreeMap<u64, f64>,
+    ) -> Seen<'_> {
+        Seen::retarded_near(&self.recent, &self.system, camera, near)
+    }
+
     /// Integrates every frame to the clock's time.
     fn sync(&mut self) {
         let t = self.clock.time();

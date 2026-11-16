@@ -5,9 +5,10 @@
 //! matter in it ([`spawn_frames`]); a number key picks one. The camera is put
 //! on the line from that frame's origin toward where the camera was (or
 //! along the `--start-on` direction), [`SPAWN_HEIGHT`] above the outermost
-//! matter the loaded cells show on that line ([`surface_along`]), looking
-//! level. While finer cells arrive the point is found again with them, for
-//! at most [`REFINE_SECONDS`] and only until the camera is flown.
+//! surface drawn on that line ([`crate::world::World::surface_along`]),
+//! looking level. While finer meshes replace coarser ones the point is
+//! found again on what is drawn, for at most [`REFINE_SECONDS`] and only
+//! until the camera is flown.
 //!
 //! A spawned camera is attached to its frame: it moves and turns with it
 //! ([`crate::camera::advance`] with `attached`), so the ground stays under
@@ -15,9 +16,8 @@
 //! gravity, no collision. `Home` and the number-key views detach it.
 
 use gx_core::frames::FrameSystem;
-use gx_core::key::CellKey;
 use gx_core::registry::FrameTree;
-use gx_core::units::{Meters, Vec3};
+use gx_core::units::Vec3;
 
 use crate::camera::{look_rotation, Camera};
 use crate::farfield::depth_zero_key;
@@ -60,85 +60,23 @@ pub fn chooser_line(frames: &[u64]) -> String {
     format!("spawn: {}  (G closes)", choices.join("  "))
 }
 
-/// The distance from `frame_id`'s origin along the unit `direction` (frame
-/// axes) of the outermost matter the loaded cells show, meters: in the
-/// deepest loaded cells the line crosses that hold matter on it, the
-/// farthest point whose nearest sample is at or above the frame's surface
-/// isovalue ([`CellCache::frame_isovalue`]; any matter without one). `None` when no loaded cell
-/// shows matter on the line.
-pub fn surface_along(
-    cache: &CellCache,
-    tree: &FrameTree,
-    frame_id: u64,
-    direction: Vec3,
-) -> Option<f64> {
-    let extent = Meters::new(tree.get(frame_id)?.root_extent.value());
-    let frame_iso = cache.frame_isovalue(frame_id);
-    let mut best: Option<(u8, f64)> = None;
-    for (key, entry) in cache.entries() {
-        if key.frame_id != frame_id {
-            continue;
-        }
-        let CellState::Ready(cell) = &entry.state else {
-            continue;
-        };
-        if best.is_some_and(|(d, _)| d > key.depth) {
-            continue;
-        }
-        let Some(samples) = cell.section.samples() else {
-            continue;
-        };
-        let Some((t0, t1)) = ray_box(key, extent, direction) else {
-            continue;
-        };
-        let iso = frame_iso
-            .or(cell.surface_isovalue)
-            .unwrap_or(f64::MIN_POSITIVE);
-        let g = key.geometry(extent);
-        let n = usize::from(cell.section.resolution());
-        let e = g.edge.value() / n as f64;
-        let index = |p: Vec3| -> usize {
-            let c = |v: f64, o: f64| (((v - o) / e).floor() as i64).clamp(0, n as i64 - 1) as usize;
-            c(p.x, g.origin.x) + n * (c(p.y, g.origin.y) + n * c(p.z, g.origin.z))
-        };
-        // From the far end inward, a quarter sample at a time.
-        let step = e / 4.0;
-        let mut t = t1;
-        while t >= t0 {
-            if samples.density(index(direction.scale(t))).value() >= iso {
-                let better = match best {
-                    None => true,
-                    Some((d, r)) => key.depth > d || t > r,
-                };
-                if better {
-                    best = Some((key.depth, t));
-                }
-                break;
-            }
-            t -= step;
-        }
-    }
-    best.map(|(_, r)| r)
-}
-
-/// Where the ray `t * direction`, `t >= 0`, crosses the cell's box: the
-/// entering and leaving `t`, or `None` if it misses.
-fn ray_box(key: &CellKey, extent: Meters, direction: Vec3) -> Option<(f64, f64)> {
-    let g = key.geometry(extent);
-    let e = g.edge.value();
+/// Where the ray `t * direction`, `t >= 0`, from the origin crosses the box
+/// from `min` to `max`: the entering and leaving `t`, or `None` if it
+/// misses.
+pub fn ray_box(min: [f64; 3], max: [f64; 3], direction: Vec3) -> Option<(f64, f64)> {
     let (mut lo, mut hi) = (0.0f64, f64::INFINITY);
-    for (o, d) in [
-        (g.origin.x, direction.x),
-        (g.origin.y, direction.y),
-        (g.origin.z, direction.z),
-    ] {
+    for (k, d) in [direction.x, direction.y, direction.z]
+        .into_iter()
+        .enumerate()
+    {
+        let (a0, a1) = (min[k], max[k]);
         if d == 0.0 {
-            if 0.0 < o || 0.0 > o + e {
+            if 0.0 < a0 || 0.0 > a1 {
                 return None;
             }
             continue;
         }
-        let (a, b) = (o / d, (o + e) / d);
+        let (a, b) = (a0 / d, a1 / d);
         lo = lo.max(a.min(b));
         hi = hi.min(a.max(b));
     }
@@ -162,7 +100,7 @@ pub struct Spawn {
 /// shows no matter on that line yet.
 pub fn spawn(
     system: &FrameSystem,
-    cache: &CellCache,
+    world: &crate::world::World,
     frame_id: u64,
     direction: Option<Vec3>,
     camera: &mut Camera,
@@ -172,7 +110,7 @@ pub fn spawn(
         Some(d) => d,
         None => crate::stream::camera_in_frame(system, camera, frame_id).normalized()?,
     };
-    let r = surface_along(cache, system.tree(), frame_id, direction)?;
+    let r = world.surface_along(frame_id, direction)?;
     place(camera, frame_id, direction, r);
     Some(Spawn {
         frame_id,
@@ -183,17 +121,11 @@ pub fn spawn(
 
 /// Finds the point of `spawn` again with the cells loaded now and moves the
 /// camera there. Returns `false` once the spawn is over (its time is up).
-pub fn refine(
-    system: &FrameSystem,
-    cache: &CellCache,
-    spawn: &Spawn,
-    camera: &mut Camera,
-    now: f64,
-) -> bool {
+pub fn refine(world: &crate::world::World, spawn: &Spawn, camera: &mut Camera, now: f64) -> bool {
     if now > spawn.until {
         return false;
     }
-    if let Some(r) = surface_along(cache, system.tree(), spawn.frame_id, spawn.direction) {
+    if let Some(r) = world.surface_along(spawn.frame_id, spawn.direction) {
         let want = spawn.direction.scale(r + SPAWN_HEIGHT);
         if (camera.position - want).length() > 0.01 || camera.frame_id != spawn.frame_id {
             place(camera, spawn.frame_id, spawn.direction, r);
@@ -222,7 +154,7 @@ impl Spawner {
     pub fn frame(
         &mut self,
         system: &FrameSystem,
-        cache: &CellCache,
+        world: &crate::world::World,
         camera: &mut Camera,
         controls: &mut crate::controls::Controls,
         input: &crate::camera::FlightInput,
@@ -235,16 +167,16 @@ impl Spawner {
         }
         if let Some(i) = picked {
             self.pending = None;
-            if let Some(&f) = spawn_frames(cache, system.tree()).get(i) {
-                if let Some(s) = spawn(system, cache, f, None, camera, now) {
+            if let Some(&f) = spawn_frames(world.cache(), system.tree()).get(i) {
+                if let Some(s) = spawn(system, world, f, None, camera, now) {
                     self.active = Some(s);
                     attached = true;
                 }
             }
         }
         if let Some(p) = self.pending {
-            if spawn_frames(cache, system.tree()).contains(&p.frame_id) {
-                if let Some(s) = spawn(system, cache, p.frame_id, Some(p.direction), camera, now) {
+            if spawn_frames(world.cache(), system.tree()).contains(&p.frame_id) {
+                if let Some(s) = spawn(system, world, p.frame_id, Some(p.direction), camera, now) {
                     self.active = Some(s);
                     self.pending = None;
                     attached = true;
@@ -257,7 +189,7 @@ impl Spawner {
             self.active = None;
         }
         if let Some(s) = self.active {
-            if !refine(system, cache, &s, camera, now) {
+            if !refine(world, &s, camera, now) {
                 self.active = None;
             }
         }
@@ -292,16 +224,13 @@ mod tests {
 
     #[test]
     fn rays_cross_boxes() {
-        let k = CellKey::new(1, 1, 1, 1, 1).unwrap();
-        let extent = Meters::new(8.0);
-        // Depth 1, cell (1,1,1): from the origin to (4,4,4).
+        // The box from the origin to (4,4,4).
         let d = Vec3::new(1.0, 1.0, 1.0).normalized().unwrap();
-        let (a, b) = ray_box(&k, extent, d).unwrap();
+        let (a, b) = ray_box([0.0; 3], [4.0; 3], d).unwrap();
         assert!(a.abs() < 1e-12 && (b - 48.0f64.sqrt()).abs() < 1e-9);
-        // Depth 2, cell (3,3,3): (2,2,2) to (4,4,4), behind a ray along -x.
-        let far = CellKey::new(1, 2, 3, 3, 3).unwrap();
-        assert!(ray_box(&far, extent, Vec3::new(-1.0, 0.0, 0.0)).is_none());
-        let (a, b) = ray_box(&far, extent, d).unwrap();
+        // The box from (2,2,2) to (4,4,4), behind a ray along -x.
+        assert!(ray_box([2.0; 3], [4.0; 3], Vec3::new(-1.0, 0.0, 0.0)).is_none());
+        let (a, b) = ray_box([2.0; 3], [4.0; 3], d).unwrap();
         assert!((a - 12.0f64.sqrt()).abs() < 1e-9 && (b - 48.0f64.sqrt()).abs() < 1e-9);
     }
 }

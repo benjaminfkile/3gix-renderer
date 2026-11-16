@@ -55,9 +55,12 @@
 //! from one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
-//! At a depth transition the coarser cell's own straddling cubes still
-//! reach half a coarse sample beyond its face, so the two meshes overlap
-//! there with a small offset. Every cell of a frame is drawn at one
+//! A cube straddling a face is drawn once: by the cell on the face's low
+//! side when the cells are at the same depth (two copies from two mesh
+//! origins would fight in the depth buffer), and by the finer cell at a
+//! depth transition: a cell with finer cells selected across a face cuts
+//! its mesh at that face ([`FaceNeighbors::clip`]), and the finer side,
+//! padded from it, reaches half a sample past the face to meet it. Every cell of a frame is drawn at one
 //! isovalue (below), so neighbors put the surface at the same density.
 //!
 //! # The isovalue
@@ -227,6 +230,14 @@ pub struct FaceNeighbors {
     /// neighbors put the surface at the same density; `None` uses the
     /// section's own ([`surface_isovalue`]).
     pub isovalue: Option<f64>,
+    /// Faces the mesh stops at, by [`face_index`]: finer cells are drawn
+    /// across them, so this cell's cubes straddling the face are cut at
+    /// the face plane instead of reaching half a sample beyond it.
+    pub clip: [bool; 6],
+    /// The cells across the 12 edges and 8 corners, in the order of
+    /// [`crate::stream::diagonal_offsets`] (empty when not gathered):
+    /// padding points beyond two or three faces read them.
+    pub diagonal: Vec<Option<FaceNeighbor>>,
 }
 
 impl FaceNeighbors {
@@ -239,7 +250,19 @@ impl FaceNeighbors {
     /// the same section objects (pointer identity, not a comparison of
     /// samples) or the same empty cells.
     pub fn same_as(&self, other: &FaceNeighbors) -> bool {
+        let same = |a: &Option<FaceNeighbor>, b: &Option<FaceNeighbor>| match (a, b) {
+            (Some(a), Some(b)) => a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        };
         self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
+            && self.clip == other.clip
+            && self.diagonal.len() == other.diagonal.len()
+            && self
+                .diagonal
+                .iter()
+                .zip(&other.diagonal)
+                .all(|(a, b)| same(a, b))
             && self
                 .faces
                 .iter()
@@ -298,6 +321,128 @@ fn is_face_neighbor(key: &CellKey, neighbor: &CellKey, face: usize) -> bool {
 /// only feeds the gradient of the vertices in the cubes straddling the
 /// faces.
 const PAD: usize = 2;
+
+/// The density of `section`'s solid and fluid samples at frame coordinates
+/// `p`, trilinear over its sample centers, clamped into them.
+fn trilinear(p: [f64; 3], section: &Section, samples: &Samples) -> f64 {
+    let r = usize::from(section.resolution());
+    let u = coarse_coords(p, section);
+    let mut i0 = [0usize; 3];
+    let mut f = [0.0f64; 3];
+    for b in 0..3 {
+        let c = u[b].clamp(0.0, (r - 1) as f64);
+        let lo = (c.floor() as usize).min(r.saturating_sub(2));
+        i0[b] = lo;
+        f[b] = if r > 1 { c - lo as f64 } else { 0.0 };
+    }
+    let d = |x: usize, y: usize, z: usize| -> f64 {
+        let (x, y, z) = (x.min(r - 1), y.min(r - 1), z.min(r - 1));
+        let i = x + r * (y + r * z);
+        if forms_surface(samples.state(i)) {
+            samples.density(i).value()
+        } else {
+            0.0
+        }
+    };
+    let mut acc = 0.0;
+    for c in 0..8 {
+        let o = corner_offset(c);
+        let w: f64 = (0..3)
+            .map(|b| if o[b] == 1 { f[b] } else { 1.0 - f[b] })
+            .product();
+        if w > 0.0 {
+            acc += w * d(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
+        }
+    }
+    acc
+}
+
+/// Cuts the mesh at the plane where coordinate `axis` equals `plane`,
+/// keeping the side below it (`keep_below`) or above it. Triangles across
+/// the plane are cut along it, with new vertices interpolated linearly
+/// (normals renormalized; state and density from the kept end).
+fn clip_mesh(
+    positions: &mut Vec<[f64; 3]>,
+    vertices: &mut Vec<SurfaceVertex>,
+    indices: &mut Vec<u32>,
+    axis: usize,
+    plane: f64,
+    keep_below: bool,
+) {
+    let inside = |p: &[f64; 3]| {
+        if keep_below {
+            p[axis] <= plane
+        } else {
+            p[axis] >= plane
+        }
+    };
+    let mut cut: std::collections::BTreeMap<(u32, u32), u32> = std::collections::BTreeMap::new();
+    let mut split =
+        |a: u32, b: u32, positions: &mut Vec<[f64; 3]>, vertices: &mut Vec<SurfaceVertex>| -> u32 {
+            let k = (a.min(b), a.max(b));
+            if let Some(&i) = cut.get(&k) {
+                return i;
+            }
+            let (pa, pb) = (positions[a as usize], positions[b as usize]);
+            let t = (plane - pa[axis]) / (pb[axis] - pa[axis]);
+            let p: [f64; 3] = core::array::from_fn(|c| pa[c] + t * (pb[c] - pa[c]));
+            let (va, vb) = (vertices[a as usize], vertices[b as usize]);
+            let tf = t as f32;
+            let lerp3 = |x: [f32; 3], y: [f32; 3]| -> [f32; 3] {
+                core::array::from_fn(|c| x[c] + tf * (y[c] - x[c]))
+            };
+            let n = lerp3(va.normal, vb.normal);
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            let kept = if inside(&pa) { va } else { vb };
+            let v = SurfaceVertex {
+                normal: if len > 0.0 {
+                    n.map(|x| x / len)
+                } else {
+                    va.normal
+                },
+                albedo: lerp3(va.albedo, vb.albedo),
+                roughness: va.roughness + tf * (vb.roughness - va.roughness),
+                temperature: va.temperature + tf * (vb.temperature - va.temperature),
+                ..kept
+            };
+            let i = positions.len() as u32;
+            positions.push(p);
+            vertices.push(v);
+            cut.insert(k, i);
+            i
+        };
+    let mut out = Vec::with_capacity(indices.len());
+    for tri in indices.as_chunks::<3>().0 {
+        let ins: Vec<bool> = tri
+            .iter()
+            .map(|&i| inside(&positions[i as usize]))
+            .collect();
+        let count = ins.iter().filter(|&&b| b).count();
+        if count == 3 {
+            out.extend_from_slice(tri);
+            continue;
+        }
+        if count == 0 {
+            continue;
+        }
+        // Sutherland-Hodgman over the triangle's three edges.
+        let mut poly: Vec<u32> = Vec::with_capacity(4);
+        for e in 0..3 {
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            let (ia, ib) = (ins[e], ins[(e + 1) % 3]);
+            if ia {
+                poly.push(a);
+            }
+            if ia != ib {
+                poly.push(split(a, b, positions, vertices));
+            }
+        }
+        for k in 1..poly.len().saturating_sub(1) {
+            out.extend_from_slice(&[poly[0], poly[k], poly[k + 1]]);
+        }
+    }
+    *indices = out;
+}
 
 /// Frame coordinates `p` in `section`'s sample units: 0 at the first
 /// sample center, 1 at the next.
@@ -416,6 +561,8 @@ struct Grid<'a> {
     n: usize,
     /// Usable neighbors, per face.
     neighbors: [Option<Pad<'a>>; 6],
+    /// Usable edge and corner neighbors, by offset.
+    diagonal: Vec<([i8; 3], Pad<'a>)>,
     /// Points per axis: resolution plus two.
     m: usize,
     /// Density at every grid point, solid and fluid only.
@@ -453,8 +600,54 @@ impl<'a> Grid<'a> {
     /// from: the section's own sample inside, a neighbor's first layer or
     /// the clamped own sample in the padding (see the module docs). `None`
     /// for a neighbor known to hold no matter.
+    /// The edge or corner neighbor grid point `p` lies in, when it lies
+    /// beyond two or three faces and that neighbor was gathered.
+    fn diagonal_pad(&self, p: [usize; 3]) -> Option<Pad<'a>> {
+        let n = self.n;
+        let o: [i8; 3] = core::array::from_fn(|a| {
+            if p[a] < PAD {
+                -1
+            } else if p[a] >= n + PAD {
+                1
+            } else {
+                0
+            }
+        });
+        if o.iter().filter(|&&d| d != 0).count() < 2 {
+            return None;
+        }
+        self.diagonal
+            .iter()
+            .find(|(d, _)| *d == o)
+            .map(|(_, pad)| *pad)
+    }
+
     fn source(&self, p: [usize; 3]) -> Option<(&'a Samples, usize)> {
         let n = self.n;
+        match self.diagonal_pad(p) {
+            Some(Pad::Empty) => return None,
+            Some(Pad::Coarse(section, samples)) => {
+                let r = usize::from(section.resolution());
+                let u = coarse_coords(self.position(p), section);
+                let q: [usize; 3] = core::array::from_fn(|b| {
+                    (u[b] + 0.5).floor().clamp(0.0, (r - 1) as f64) as usize
+                });
+                return Some((samples, q[0] + r * (q[1] + r * q[2])));
+            }
+            Some(Pad::Samples(samples, r)) => {
+                let q: [usize; 3] = core::array::from_fn(|b| {
+                    if p[b] < PAD {
+                        (r + p[b]).saturating_sub(PAD)
+                    } else if p[b] >= n + PAD {
+                        (p[b] - (n + PAD)).min(r - 1)
+                    } else {
+                        remap(p[b] - PAD, n, r)
+                    }
+                });
+                return Some((samples, q[0] + r * (q[1] + r * q[2])));
+            }
+            None => {}
+        }
         let beyond = |axis: usize| -> Option<Pad<'a>> {
             let (low, high) = (p[axis] < PAD, p[axis] >= n + PAD);
             if low || high {
@@ -508,6 +701,14 @@ impl<'a> Grid<'a> {
     /// centers, clamped into them. `None` otherwise.
     fn coarse_density(&self, p: [usize; 3]) -> Option<f64> {
         let n = self.n;
+        if let Some(pad) = self.diagonal_pad(p) {
+            return match pad {
+                Pad::Coarse(section, samples) => {
+                    Some(trilinear(self.position(p), section, samples))
+                }
+                _ => None,
+            };
+        }
         let beyond = |axis: usize| -> Option<Pad<'a>> {
             if p[axis] < PAD || p[axis] >= n + PAD {
                 self.neighbors[face_index(axis, p[axis] >= n + PAD)]
@@ -523,36 +724,7 @@ impl<'a> Grid<'a> {
             Some(Pad::Samples(..)) => Some(None),
             _ => None,
         })??;
-        let r = usize::from(section.resolution());
-        let u = coarse_coords(self.position(p), section);
-        let mut i0 = [0usize; 3];
-        let mut f = [0.0f64; 3];
-        for b in 0..3 {
-            let c = u[b].clamp(0.0, (r - 1) as f64);
-            let lo = (c.floor() as usize).min(r.saturating_sub(2));
-            i0[b] = lo;
-            f[b] = if r > 1 { c - lo as f64 } else { 0.0 };
-        }
-        let d = |x: usize, y: usize, z: usize| -> f64 {
-            let (x, y, z) = (x.min(r - 1), y.min(r - 1), z.min(r - 1));
-            let i = x + r * (y + r * z);
-            if forms_surface(samples.state(i)) {
-                samples.density(i).value()
-            } else {
-                0.0
-            }
-        };
-        let mut acc = 0.0;
-        for c in 0..8 {
-            let o = corner_offset(c);
-            let w: f64 = (0..3)
-                .map(|b| if o[b] == 1 { f[b] } else { 1.0 - f[b] })
-                .product();
-            if w > 0.0 {
-                acc += w * d(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
-            }
-        }
-        Some(acc)
+        Some(trilinear(self.position(p), section, samples))
     }
 
     fn d(&self, p: [usize; 3]) -> f64 {
@@ -625,6 +797,21 @@ pub fn extract(section: &Section) -> SurfaceMesh {
 /// The isovalue of a section's surface (module docs, "The isovalue"), or
 /// `None` without solid or fluid matter.
 pub fn surface_isovalue(section: &Section) -> Option<f64> {
+    isovalues(section).map(|(own, _)| own)
+}
+
+/// Half the smallest density of the section's matter at least two samples
+/// in from every boundary, or `None` when it has none (a thin shell, whose
+/// own isovalue falls back to half its largest density). Only these set
+/// the isovalue shared by a frame
+/// ([`crate::stream::CellCache::frame_isovalue`]): a sliver of matter in a
+/// cell says nothing about how dense the matter under the surface is.
+pub fn inner_isovalue(section: &Section) -> Option<f64> {
+    isovalues(section).and_then(|(_, inner)| inner)
+}
+
+/// The section's own isovalue, and the inner one when it has inner matter.
+fn isovalues(section: &Section) -> Option<(f64, Option<f64>)> {
     let samples = section.samples()?;
     let n = usize::from(section.resolution());
     let count = n * n * n;
@@ -666,9 +853,9 @@ pub fn surface_isovalue(section: &Section) -> Option<f64> {
         .map(|i| samples.density(i).value())
         .fold(f64::INFINITY, f64::min);
     Some(if inner.is_finite() {
-        inner / 2.0
+        (inner / 2.0, Some(inner / 2.0))
     } else {
-        max / 2.0
+        (max / 2.0, None)
     })
 }
 
@@ -704,6 +891,34 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         return empty(0.0);
     };
     let isovalue = neighbors.isovalue.unwrap_or(own_isovalue);
+    let diagonal: Vec<([i8; 3], Pad<'_>)> = crate::stream::diagonal_offsets()
+        .into_iter()
+        .zip(&neighbors.diagonal)
+        .filter_map(|(o, n)| {
+            let n = n.as_ref()?;
+            let at = crate::stream::offset_key(&key, o)?;
+            let k = n.key();
+            let same = k == at;
+            let mut up = at;
+            while up.depth > k.depth {
+                up = up.parent()?;
+            }
+            if up != k || k.frame_id != key.frame_id {
+                return None;
+            }
+            Some((
+                o,
+                match n {
+                    FaceNeighbor::Ready(s) => match s.samples() {
+                        Some(samples) if same => Pad::Samples(samples, usize::from(s.resolution())),
+                        Some(samples) => Pad::Coarse(s, samples),
+                        None => Pad::Empty,
+                    },
+                    FaceNeighbor::Empty(_) => Pad::Empty,
+                },
+            ))
+        })
+        .collect();
     let usable: [Option<Pad<'_>>; 6] = core::array::from_fn(|f| {
         let neighbor = neighbors.faces[f].as_ref()?;
         let same = is_face_neighbor(&key, &neighbor.key(), f);
@@ -724,6 +939,7 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         own: samples,
         n,
         neighbors: usable,
+        diagonal,
         m,
         density: Vec::new(),
         step: section.edge().value() / n as f64,
@@ -757,10 +973,24 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
     let mut indices: Vec<u32> = Vec::new();
 
     // Cubes between grid points PAD - 1 and n + PAD: the cell's own cubes
-    // and those straddling its faces, half a sample beyond them.
+    // and those straddling its faces, half a sample beyond them. A cube
+    // straddling a low face whose same-depth neighbor is loaded is that
+    // neighbor's to draw (it straddles the neighbor's high face, from the
+    // same samples): drawing it twice, from two mesh origins, would make
+    // two copies of one surface fight in the depth buffer.
+    let shared_low: [bool; 3] = core::array::from_fn(|a| {
+        matches!(grid.neighbors[face_index(a, false)], Some(Pad::Samples(..)))
+    });
     for z in PAD - 1..n + PAD {
         for y in PAD - 1..n + PAD {
             for x in PAD - 1..n + PAD {
+                if [x, y, z]
+                    .iter()
+                    .zip(shared_low)
+                    .any(|(&c, shared)| shared && c == PAD - 1)
+                {
+                    continue;
+                }
                 let base = [x, y, z];
                 let at = |c: usize| {
                     let o = corner_offset(c);
@@ -793,6 +1023,23 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
                     }
                 }
             }
+        }
+    }
+
+    let edge = section.edge().value();
+    for f in 0..6 {
+        if neighbors.clip[f] {
+            let (axis, high) = (f / 2, f % 2 == 1);
+            let o = [origin.x, origin.y, origin.z][axis];
+            let plane = if high { o + edge } else { o };
+            clip_mesh(
+                &mut positions,
+                &mut vertices,
+                &mut indices,
+                axis,
+                plane,
+                high,
+            );
         }
     }
 

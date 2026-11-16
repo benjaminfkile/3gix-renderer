@@ -23,6 +23,7 @@ use crate::stream::{
 use crate::volume::VolumeGrid;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
+use gx_core::units::Vec3;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -94,6 +95,34 @@ pub struct World {
     last_selection: Option<f64>,
 }
 
+/// The latest selection as extraction needs it: the selected cells, and
+/// every cell with a selected cell strictly below it.
+struct SelectionLayout {
+    selected: std::collections::BTreeSet<CellKey>,
+    above_selected: std::collections::BTreeSet<CellKey>,
+}
+
+impl SelectionLayout {
+    fn of(selection: &[crate::stream::SelectedCell]) -> SelectionLayout {
+        let selected: std::collections::BTreeSet<CellKey> =
+            selection.iter().map(|c| c.key).collect();
+        let mut above_selected = std::collections::BTreeSet::new();
+        for k in &selected {
+            let mut up = k.parent();
+            while let Some(p) = up {
+                if !above_selected.insert(p) {
+                    break;
+                }
+                up = p.parent();
+            }
+        }
+        SelectionLayout {
+            selected,
+            above_selected,
+        }
+    }
+}
+
 impl World {
     /// A world extracting on `threads` worker threads (zero: inline).
     pub fn new(threads: usize) -> World {
@@ -123,13 +152,60 @@ impl World {
 
     /// The `Ready` and known empty face neighbors of a cell now, as
     /// extraction takes them.
-    fn neighbors_of(&self, key: &CellKey, isovalue: Option<f64>) -> FaceNeighbors {
-        FaceNeighbors {
-            faces: self.cache.face_neighbors(key).map(|n| match n? {
+    fn neighbors_of(
+        &self,
+        key: &CellKey,
+        isovalue: Option<f64>,
+        layout: &SelectionLayout,
+    ) -> FaceNeighbors {
+        let across = crate::stream::face_neighbor_keys(key);
+        let mut clip = [false; 6];
+        let mut faces: [Option<FaceNeighbor>; 6] =
+            self.cache.face_neighbors(key).map(|n| match n? {
                 (_, NeighborMatter::Ready(cell)) => Some(FaceNeighbor::Ready(cell.section.clone())),
                 (k, NeighborMatter::Empty) => Some(FaceNeighbor::Empty(k)),
-            }),
+            });
+        for f in 0..6 {
+            let Some(k) = across[f] else {
+                continue;
+            };
+            if layout.selected.contains(&k) {
+                continue;
+            }
+            // Finer cells are selected across this face: they draw that
+            // side, so this cell's mesh stops at the face.
+            if layout.above_selected.contains(&k) {
+                clip[f] = true;
+                continue;
+            }
+            // A coarser cell is selected across this face: pad from it,
+            // so the surface meets what is drawn there.
+            let mut up = k.parent();
+            while let Some(a) = up {
+                if layout.selected.contains(&a) {
+                    if let Some(CellState::Ready(cell)) = self.cache.state(&a) {
+                        faces[f] = Some(FaceNeighbor::Ready(cell.section.clone()));
+                    }
+                    break;
+                }
+                up = a.parent();
+            }
+        }
+        FaceNeighbors {
+            faces,
+            clip,
             isovalue,
+            diagonal: self
+                .cache
+                .diagonal_neighbors(key)
+                .into_iter()
+                .map(|n| match n? {
+                    (_, NeighborMatter::Ready(cell)) => {
+                        Some(FaceNeighbor::Ready(cell.section.clone()))
+                    }
+                    (k, NeighborMatter::Empty) => Some(FaceNeighbor::Empty(k)),
+                })
+                .collect(),
         }
     }
 
@@ -196,18 +272,20 @@ impl World {
         let mut isovalues: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
         for (k, e) in self.cache.entries() {
             if let CellState::Ready(cell) = &e.state {
-                if let Some(iso) = cell.surface_isovalue {
+                if let Some(iso) = cell.inner_isovalue {
                     let v = isovalues.entry(k.frame_id).or_insert(iso);
                     *v = v.min(iso);
                 }
             }
         }
+        let layout = SelectionLayout::of(self.cache.selection());
         let todo: Vec<(CellKey, Arc<gx_core::matter::Section>, FaceNeighbors)> = self
             .cache
             .entries()
             .filter_map(|(k, e)| match &e.state {
                 CellState::Ready(cell) if !self.extracting.contains_key(k) => {
-                    let neighbors = self.neighbors_of(k, isovalues.get(&k.frame_id).copied());
+                    let neighbors =
+                        self.neighbors_of(k, isovalues.get(&k.frame_id).copied(), &layout);
                     match self.meshes.get(k) {
                         Some(held) if held.neighbors.same_as(&neighbors) => None,
                         _ => Some((*k, cell.section.clone(), neighbors)),
@@ -251,6 +329,65 @@ impl World {
     }
 
     /// Whether a cell can be drawn now: `Empty`, or `Ready` with its mesh.
+    /// For every frame with a drawn mesh, the distance from `camera` to
+    /// the nearest of their bounding boxes, meters: how far the light from
+    /// that frame's nearest matter travels ([`crate::seen::Seen::retarded_near`]).
+    /// A camera inside a box is at 0.
+    pub fn matter_distances(&self, system: &FrameSystem, camera: &Camera) -> BTreeMap<u64, f64> {
+        let mut out: BTreeMap<u64, f64> = BTreeMap::new();
+        let mut cams: BTreeMap<u64, Vec3> = BTreeMap::new();
+        for (key, e) in &self.meshes {
+            let m = &e.mesh;
+            if m.indices.is_empty() || system.tree().get(key.frame_id).is_none() {
+                continue;
+            }
+            let cam = *cams
+                .entry(key.frame_id)
+                .or_insert_with(|| crate::stream::camera_in_frame(system, camera, key.frame_id));
+            let gap = |c: f64, l: f64, h: f64| (l - c).max(c - h).max(0.0);
+            let d = Vec3::new(
+                gap(cam.x, m.bounds_min[0], m.bounds_max[0]),
+                gap(cam.y, m.bounds_min[1], m.bounds_max[1]),
+                gap(cam.z, m.bounds_min[2], m.bounds_max[2]),
+            )
+            .length();
+            let v = out.entry(key.frame_id).or_insert(d);
+            *v = v.min(d);
+        }
+        out
+    }
+
+    /// The distance from `frame_id`'s origin along the unit `direction`
+    /// (frame axes) of the outermost drawn surface on that line, meters:
+    /// the line against the triangles of the meshes in the draw set. `None`
+    /// when no drawn mesh of the frame crosses it.
+    pub fn surface_along(&self, frame_id: u64, direction: Vec3) -> Option<f64> {
+        let d = [direction.x, direction.y, direction.z];
+        let mut best: Option<f64> = None;
+        for key in self.cache.draw_set(|k| self.drawable(k)) {
+            if key.frame_id != frame_id {
+                continue;
+            }
+            let Some(m) = self.meshes.get(&key).map(|e| &e.mesh) else {
+                continue;
+            };
+            if m.indices.is_empty()
+                || crate::spawn::ray_box(m.bounds_min, m.bounds_max, direction).is_none()
+            {
+                continue;
+            }
+            for tri in m.indices.as_chunks::<3>().0 {
+                let [a, b, c] = tri.map(|i| m.positions[i as usize]);
+                if let Some(t) = ray_triangle(d, a, b, c) {
+                    if best.is_none_or(|r| t > r) {
+                        best = Some(t);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     fn drawable(&self, key: &CellKey) -> bool {
         match self.cache.state(key) {
             Some(CellState::Empty) => true,
@@ -370,6 +507,39 @@ impl World {
             extracting: self.extracting.len(),
         }
     }
+}
+
+/// Where the ray `t * d`, `t > 0`, from the origin crosses triangle
+/// `a b c` (Moller-Trumbore), or `None`.
+fn ray_triangle(d: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<f64> {
+    let sub = |x: [f64; 3], y: [f64; 3]| [x[0] - y[0], x[1] - y[1], x[2] - y[2]];
+    let cross = |x: [f64; 3], y: [f64; 3]| {
+        [
+            x[1] * y[2] - x[2] * y[1],
+            x[2] * y[0] - x[0] * y[2],
+            x[0] * y[1] - x[1] * y[0],
+        ]
+    };
+    let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let (e1, e2) = (sub(b, a), sub(c, a));
+    let p = cross(d, e2);
+    let det = dot(e1, p);
+    if det.abs() < 1e-30 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = sub([0.0; 3], a);
+    let u = dot(s, p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = cross(s, e1);
+    let v = dot(d, q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = dot(e2, q) * inv;
+    (t > 0.0).then_some(t)
 }
 
 #[cfg(test)]

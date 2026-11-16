@@ -13,7 +13,7 @@
 //! Every 100 ms ([`SELECT_INTERVAL_SECONDS`]), every frame whose
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
-//! of 4, the viewport height, the vertical field of view, and at most 512
+//! of 4, the viewport height, the vertical field of view, and at most 4096
 //! cells ([`select_all`]), except frames drawn as a sprite only. Only cells
 //! loaded and [`ReadyCell::refinable`] are refined
 //! ([`gx_core::lod::select_cells_with`]): ones the drawn surface crosses,
@@ -81,7 +81,7 @@ pub const SELECT_INTERVAL_SECONDS: f64 = 0.1;
 pub const PIXEL_ERROR: f64 = 4.0;
 
 /// Most cells selected per frame.
-pub const MAX_CELLS_PER_FRAME: usize = 512;
+pub const MAX_CELLS_PER_FRAME: usize = 4096;
 
 /// Most cells requested at once: one directions batch
 /// ([`crate::protocol::MAX_DIRECTION_KEYS`]).
@@ -131,6 +131,10 @@ pub struct ReadyCell {
     /// isovalue of [`crate::extract`] ([`crate::extract::surface_isovalue`]);
     /// `None` without solid or fluid samples.
     pub surface_isovalue: Option<f64>,
+    /// [`crate::extract::inner_isovalue`]: the isovalue from matter well
+    /// inside the cell, `None` for a thin shell. The frame's shared
+    /// isovalue is the smallest of these ([`CellCache::frame_isovalue`]).
+    pub inner_isovalue: Option<f64>,
     /// The cell's children can show more than it does: its drawn surface
     /// crosses it (some sample below [`ReadyCell::surface_isovalue`] and
     /// some at or above it), or it holds gas or plasma drawn as a volume.
@@ -174,6 +178,7 @@ impl ReadyCell {
                 (0..s.len()).any(|i| s.get(i).is_some_and(|x| x.density.value() > 0.0))
             }),
             surface_isovalue,
+            inner_isovalue: crate::extract::inner_isovalue(&section),
             refinable,
             section: Arc::new(section),
         }
@@ -426,8 +431,23 @@ impl CellCache {
     /// the root cube, or whose neighbor is neither, is `None`. Extraction
     /// pads with these ([`crate::extract`]).
     pub fn face_neighbors(&self, key: &CellKey) -> [Option<(CellKey, NeighborMatter<'_>)>; 6] {
-        face_neighbor_keys(key).map(|k| {
-            let k = k?;
+        face_neighbor_keys(key).map(|k| self.neighbor_at(k?))
+    }
+
+    /// The cells across the 12 edges and 8 corners of `key`, in the order
+    /// of [`diagonal_offsets`], found the same way as
+    /// [`CellCache::face_neighbors`].
+    pub fn diagonal_neighbors(&self, key: &CellKey) -> Vec<Option<(CellKey, NeighborMatter<'_>)>> {
+        diagonal_offsets()
+            .iter()
+            .map(|&o| self.neighbor_at(offset_key(key, o)?))
+            .collect()
+    }
+
+    /// What is known of cell `k` for padding: `Ready`, known empty, or the
+    /// nearest `Ready` coarser cell holding it.
+    fn neighbor_at(&self, k: CellKey) -> Option<(CellKey, NeighborMatter<'_>)> {
+        {
             match self.state(&k) {
                 Some(CellState::Ready(cell)) => Some((k, NeighborMatter::Ready(cell))),
                 _ if self.known_empty(&k) => Some((k, NeighborMatter::Empty)),
@@ -445,11 +465,11 @@ impl CellCache {
                     None
                 }
             }
-        })
+        }
     }
 
     /// The isovalue every surface of `frame_id` is drawn at: the smallest
-    /// of its loaded cells' own ([`ReadyCell::surface_isovalue`]), so
+    /// of its loaded cells' inner ones ([`ReadyCell::inner_isovalue`]), so
     /// neighboring cells put the surface at the same density. `None`
     /// before any cell of the frame with a surface has arrived.
     pub fn frame_isovalue(&self, frame_id: u64) -> Option<f64> {
@@ -457,7 +477,7 @@ impl CellCache {
             .iter()
             .filter(|(k, _)| k.frame_id == frame_id)
             .filter_map(|(_, e)| match &e.state {
-                CellState::Ready(c) => c.surface_isovalue,
+                CellState::Ready(c) => c.inner_isovalue,
                 _ => None,
             })
             .reduce(f64::min)
@@ -717,6 +737,38 @@ impl CellCache {
         }
         set.into_iter().collect()
     }
+}
+
+/// The offsets of the 12 edge and 8 corner neighbors of a cell: every
+/// `(dx, dy, dz)` in `{-1, 0, 1}^3` with two or three nonzero, in
+/// ascending order of `dz`, then `dy`, then `dx`.
+pub fn diagonal_offsets() -> Vec<[i8; 3]> {
+    let mut out = Vec::new();
+    for dz in -1i8..=1 {
+        for dy in -1i8..=1 {
+            for dx in -1i8..=1 {
+                if [dx, dy, dz].iter().filter(|&&d| d != 0).count() >= 2 {
+                    out.push([dx, dy, dz]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The cell at offset `o` from `key` at the same depth, or `None` past the
+/// root cube.
+pub fn offset_key(key: &CellKey, o: [i8; 3]) -> Option<CellKey> {
+    let c = [key.x, key.y, key.z];
+    let mut n = [0u32; 3];
+    for a in 0..3 {
+        n[a] = match o[a] {
+            0 => c[a],
+            d if d > 0 => c[a].checked_add(1)?,
+            _ => c[a].checked_sub(1)?,
+        };
+    }
+    CellKey::new(key.frame_id, key.depth, n[0], n[1], n[2]).ok()
 }
 
 /// The keys of the cells across the six faces of `key` at the same depth,

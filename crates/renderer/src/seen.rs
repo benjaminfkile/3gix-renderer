@@ -14,6 +14,13 @@
 //!   one light-travel time before the lit frame's own retarded time
 //!   ([`gx_core::light::retarded_emitter`]): [`Seen::emitter_shift`].
 //!
+//! The light of a frame travels from its matter nearest the camera when the
+//! draw loop knows that distance ([`Seen::retarded_near`], from the drawn
+//! meshes' boxes, [`crate::world::World::matter_distances`]), and from its
+//! origin otherwise. From the center of a body the size of Earth the light
+//! takes 0.02 s, in which the body moves hundreds of meters; a camera at
+//! its surface would see the ground drawn that far from where it is.
+//!
 //! The observer is the camera's position in root coordinates at the
 //! simulation time. Only its position enters, so the solution holds at any
 //! flight speed.
@@ -105,6 +112,23 @@ impl<'a> Seen<'a> {
     /// position, solved against `history`, which must cover every retarded
     /// time ([`crate::sim::Simulation::light_history`]).
     pub fn retarded(history: &'a History, system: &FrameSystem, camera: &Camera) -> Seen<'a> {
+        Seen::retarded_near(history, system, camera, &BTreeMap::new())
+    }
+
+    /// [`Seen::retarded`], with the light of each frame in `near` measured
+    /// over that distance instead of the distance to its origin: `near`
+    /// maps a frame id to the distance, meters, from the camera to the
+    /// frame's matter nearest it. A camera close to a
+    /// large body sees its near surface with the light time of that
+    /// surface, not of the body's center (6400 km away on Earth, 0.02 s, in
+    /// which the body moves hundreds of meters). An error `e` in a distance
+    /// moves the drawn body by about `e v / c`.
+    pub fn retarded_near(
+        history: &'a History,
+        system: &FrameSystem,
+        camera: &Camera,
+        near: &BTreeMap<u64, f64>,
+    ) -> Seen<'a> {
         let t = system.time();
         let observer = camera.root_position(system);
         let view = camera.root_orientation(system);
@@ -113,7 +137,23 @@ impl<'a> Seen<'a> {
             .frames()
             .iter()
             .map(|f| {
-                let r = retarded_state(observer, t, history, f.frame_id);
+                // The light-time equation measures from `from` to the frame
+                // origin: put `from` `d` from the origin, on the line to the
+                // camera, so the light travels `d`.
+                let from = match near.get(&f.frame_id) {
+                    Some(&d) => {
+                        let origin = system.root_position(f.frame_id);
+                        let to_camera = observer - origin;
+                        let full = to_camera.length();
+                        if full > d && full > 0.0 {
+                            origin + to_camera.scale(d / full)
+                        } else {
+                            observer
+                        }
+                    }
+                    None => observer,
+                };
+                let r = retarded_state(from, t, history, f.frame_id);
                 SeenFrame {
                     frame_id: f.frame_id,
                     state: r.state,
