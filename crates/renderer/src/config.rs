@@ -98,9 +98,9 @@ FLAGS:
     --view <home|0-9>              headless view: home (default) or the number key's view
     --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
     --start-on <frame>:<x>,<y>,<z>[@<m>]
-                                   start the camera over frame <frame> along the direction
-                                   x, y, z of its axes, <m> meters from its origin (default
-                                   3/8 of its root extent), looking at the origin
+                                   spawn the camera onto frame <frame> along the direction
+                                   x, y, z of its axes (as G does); with @<m>, only place it
+                                   <m> meters from the frame origin, looking at the origin
     --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
                                    with a non-zero status after this many seconds
     --stats-json <path.json>       headless: write the overlay statistics as JSON

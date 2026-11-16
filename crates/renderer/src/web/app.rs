@@ -139,6 +139,7 @@ fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, no
 pub struct WebApp {
     sim: Simulation,
     camera: Camera,
+    spawner: crate::spawn::Spawner,
     world: World,
     fetcher: WebFetcher,
     controls: Controls,
@@ -158,6 +159,7 @@ impl WebApp {
         WebApp {
             sim,
             camera,
+            spawner: crate::spawn::Spawner::default(),
             world: World::new(default_threads()),
             fetcher,
             controls: Controls::default(),
@@ -194,12 +196,21 @@ impl WebApp {
 
         let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
         let input = self.controls.take_flight();
+        self.spawner.frame(
+            self.sim.system(),
+            self.world.cache(),
+            &mut self.camera,
+            &mut self.controls,
+            &input,
+            now - self.started,
+        );
         crate::camera::advance(
             &mut self.sim,
             &mut self.camera,
             dt,
             Seconds::new(hub_now),
             &input,
+            self.controls.attached,
         );
 
         let mut slot = self.gfx.borrow_mut();
@@ -269,6 +280,17 @@ impl WebApp {
             },
         }
         .text();
+        if self.controls.attached {
+            text.push('\n');
+            text.push_str(&crate::spawn::Spawner::status_line(&self.camera));
+        }
+        if self.controls.spawning {
+            text.push('\n');
+            text.push_str(&crate::spawn::chooser_line(&crate::spawn::spawn_frames(
+                self.world.cache(),
+                self.sim.system().tree(),
+            )));
+        }
         for line in self.controls.status_lines() {
             text.push('\n');
             text.push_str(&line);

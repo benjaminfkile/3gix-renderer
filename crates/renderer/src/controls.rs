@@ -1,9 +1,9 @@
 //! Keyboard and mouse controls, shared by the desktop window and the
 //! browser canvas.
 //!
-//! Turns `winit` window events into flight input for the free [`Camera`],
-//! actions on the simulation clock ([`crate::sim::ClockAction`]), view
-//! jumps, and the
+//! Turns `winit` window events into flight input for the [`Camera`], the
+//! spawn chooser (`G`, [`crate::spawn`]), actions on the simulation clock
+//! ([`crate::sim::ClockAction`]), view jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -40,6 +40,14 @@ pub struct Controls {
     /// `true` while frame markers and frame-to-parent lines are hidden
     /// (`M`): they are drawing aids, not matter.
     pub hide_guides: bool,
+    /// `true` while the spawn chooser is open (`G`): the number keys pick a
+    /// frame to spawn onto ([`crate::spawn::spawn_frames`]).
+    pub spawning: bool,
+    /// The chooser index picked since the last frame.
+    spawn: Option<usize>,
+    /// The camera is attached to the frame it spawned onto
+    /// ([`crate::camera::advance`]); `Home` and the view keys detach it.
+    pub attached: bool,
     /// The speed being typed after `V`, meters per second, as typed; `None`
     /// when no speed is being typed.
     pub speed_entry: Option<String>,
@@ -77,6 +85,13 @@ impl Controls {
         self.flight.look = (0.0, 0.0);
         self.flight.wheel = 0.0;
         out
+    }
+
+    /// The chooser index (`0` for key `1`, up to `9` for key `0`) picked
+    /// since the last frame; clears it. The frame loop resolves it against
+    /// [`crate::spawn::spawn_frames`].
+    pub fn take_spawn(&mut self) -> Option<usize> {
+        self.spawn.take()
     }
 
     /// Applies one window event. Returns `true` when the user asked to
@@ -133,8 +148,9 @@ impl Controls {
             self.type_speed(code, camera);
             return false;
         }
+        let attached = self.attached;
         let clock = |sim: &mut Simulation, camera: &mut Camera, a: ClockAction| {
-            crate::camera::apply_clock(sim, camera, a)
+            crate::camera::apply_clock(sim, camera, a, attached)
         };
         let f = &mut self.flight;
         match code {
@@ -153,7 +169,11 @@ impl Controls {
             KeyCode::Period => clock(sim, camera, ClockAction::StepForward),
             KeyCode::Backspace => clock(sim, camera, ClockAction::ToggleRewind),
             KeyCode::KeyN => clock(sim, camera, ClockAction::JumpToNow),
-            KeyCode::Home => *camera = Camera::home(sim.system()),
+            KeyCode::Home => {
+                self.attached = false;
+                *camera = Camera::home(sim.system());
+            }
+            KeyCode::KeyG => self.spawning = !self.spawning,
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::KeyV => self.speed_entry = Some(String::new()),
             KeyCode::KeyX => self.mesh_mode = self.mesh_mode.next(),
@@ -161,14 +181,18 @@ impl Controls {
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
             other => {
-                if let Some(cam) =
-                    digit_index(other).and_then(|i| Camera::view_of_index(sim.system(), i))
-                {
-                    *camera = Camera {
-                        speed: camera.speed,
-                        cruise: camera.cruise,
-                        ..cam
-                    };
+                if let Some(index) = digit_index(other) {
+                    if self.spawning {
+                        self.spawning = false;
+                        self.spawn = Some(index);
+                    } else if let Some(cam) = Camera::view_of_index(sim.system(), index) {
+                        self.attached = false;
+                        *camera = Camera {
+                            speed: camera.speed,
+                            cruise: camera.cruise,
+                            ..cam
+                        };
+                    }
                 }
             }
         }

@@ -372,16 +372,25 @@ impl Camera {
 }
 
 /// One rendered frame of `wall_dt` seconds: advances the simulation and
-/// flies the camera by `input`. The camera floats free in space: it keeps
-/// its place and view direction in root coordinates while the frames move
-/// and turn, then flies, then re-parents to the nearest frame.
+/// flies the camera by `input`. A free camera floats in space: it keeps its
+/// place and view direction in root coordinates while the frames move and
+/// turn, then flies, then re-parents to the nearest frame. An `attached`
+/// camera (spawned onto its frame, [`crate::spawn`]) keeps its place in
+/// its frame instead, so it moves and turns with it, and flies relative to
+/// it.
 pub fn advance(
     sim: &mut crate::sim::Simulation,
     camera: &mut Camera,
     wall_dt: f64,
     hub_now: gx_core::units::Seconds,
     input: &FlightInput,
+    attached: bool,
 ) {
+    if attached {
+        sim.update(gx_core::units::Seconds::new(wall_dt), hub_now);
+        camera.fly(input, wall_dt);
+        return;
+    }
     let held = camera.hold(sim.system());
     sim.update(gx_core::units::Seconds::new(wall_dt), hub_now);
     camera.keep(sim.system(), held);
@@ -389,13 +398,19 @@ pub fn advance(
     camera.update_parent(sim.system());
 }
 
-/// Applies a clock action, keeping the camera at the same place and view
-/// direction in root coordinates across the jump in time.
+/// Applies a clock action, keeping a free camera at the same place and
+/// view direction in root coordinates across the jump in time (an attached
+/// camera keeps its place on its frame).
 pub fn apply_clock(
     sim: &mut crate::sim::Simulation,
     camera: &mut Camera,
     action: crate::sim::ClockAction,
+    attached: bool,
 ) {
+    if attached {
+        sim.apply(action);
+        return;
+    }
     let held = camera.hold(sim.system());
     sim.apply(action);
     camera.keep(sim.system(), held);

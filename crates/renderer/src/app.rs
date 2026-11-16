@@ -402,11 +402,22 @@ pub fn render_headless_view(
     let mut camera = view_camera(sim.system(), run.view, run.view_distance_scale)?;
     camera.update_parent(sim.system());
     sim.prepare_light(&camera);
-    let sim = &*sim;
-    let seen = sim.seen(&camera);
+    // A `--start-on` without a distance spawns the camera onto the frame's
+    // matter, as in the window ([`crate::spawn`]).
+    let mut spawner = crate::spawn::Spawner {
+        active: None,
+        pending: match run.view {
+            View::Over(s) if s.distance.is_none() => Some(s),
+            _ => None,
+        },
+    };
+    let mut controls = Controls::new(None);
     let mut world = World::new(default_threads());
     let start = Instant::now();
-    world.select(seen.system(), seen.camera(), (width, height), 0.0, true);
+    {
+        let seen = sim.seen(&camera);
+        world.select(seen.system(), seen.camera(), (width, height), 0.0, true);
+    }
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
     let done = |world: &World| match run.wait_ready_seconds {
         Some(_) => world.ready(),
@@ -417,10 +428,27 @@ pub fn render_headless_view(
         loop {
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
-            stream_step(&mut world, f, seen.system(), events, now);
+            {
+                let seen = sim.seen(&camera);
+                stream_step(&mut world, f, seen.system(), events, now);
+            }
+            let placed = (camera.frame_id, camera.position);
+            spawner.frame(
+                sim.system(),
+                world.cache(),
+                &mut camera,
+                &mut controls,
+                &crate::camera::FlightInput::default(),
+                now,
+            );
+            let moved = placed != (camera.frame_id, camera.position);
+            if moved {
+                sim.prepare_light(&camera);
+            }
             // The selection deepens toward surfaces as cells arrive
             // (`stream` module docs): select again, and finish only once
-            // that changes nothing.
+            // that changes nothing and the camera has stopped moving.
+            let seen = sim.seen(&camera);
             let before: Vec<gx_core::key::CellKey> =
                 world.cache().selection().iter().map(|c| c.key).collect();
             world.select(seen.system(), seen.camera(), (width, height), now, true);
@@ -430,7 +458,7 @@ pub fn render_headless_view(
                 .iter()
                 .map(|c| c.key)
                 .eq(before.iter().copied());
-            if same && done(&world) {
+            if same && !moved && spawner.pending.is_none() && done(&world) {
                 break;
             }
             if now > limit {
@@ -439,6 +467,8 @@ pub fn render_headless_view(
             }
         }
     }
+    let sim = &*sim;
+    let seen = sim.seen(&camera);
     world.finish_extraction();
     let stream_seconds = start.elapsed().as_secs_f64();
     let mut scene = matter_scene(&mut world, &seen, (width, height), stream_seconds);
@@ -532,6 +562,10 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     let mut app = App {
         sim,
         camera,
+        spawner: crate::spawn::Spawner {
+            active: None,
+            pending: config.start_on.filter(|s| s.distance.is_none()),
+        },
         world: World::new(default_threads()),
         fetcher,
         started: Instant::now(),
@@ -654,6 +688,7 @@ impl Gfx {
 struct App {
     sim: Simulation,
     camera: Camera,
+    spawner: crate::spawn::Spawner,
     world: World,
     fetcher: Fetcher,
     started: Instant,
@@ -683,7 +718,22 @@ impl App {
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
         let input = self.controls.take_flight();
-        crate::camera::advance(&mut self.sim, &mut self.camera, dt, hub_now, &input);
+        self.spawner.frame(
+            self.sim.system(),
+            self.world.cache(),
+            &mut self.camera,
+            &mut self.controls,
+            &input,
+            self.started.elapsed().as_secs_f64(),
+        );
+        crate::camera::advance(
+            &mut self.sim,
+            &mut self.camera,
+            dt,
+            hub_now,
+            &input,
+            self.controls.attached,
+        );
 
         let Some(gfx) = self.gfx.as_mut() else {
             return;
@@ -716,6 +766,17 @@ impl App {
             )
         }
         .text();
+        if self.controls.attached {
+            overlay.push('\n');
+            overlay.push_str(&crate::spawn::Spawner::status_line(&self.camera));
+        }
+        if self.controls.spawning {
+            overlay.push('\n');
+            overlay.push_str(&crate::spawn::chooser_line(&crate::spawn::spawn_frames(
+                self.world.cache(),
+                self.sim.system().tree(),
+            )));
+        }
         for line in self.controls.status_lines() {
             overlay.push('\n');
             overlay.push_str(&line);

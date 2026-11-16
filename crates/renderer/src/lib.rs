@@ -24,6 +24,8 @@
 //!   6.4).
 //! - [`camera`]: the free camera parented to its nearest frame, the floating
 //!   origin of `space-model.md` section 5.
+//! - [`spawn`]: spawning the camera just above a frame's matter and
+//!   carrying it with that frame.
 //! - [`controls`]: keyboard and mouse bindings, shared by the window and the
 //!   browser canvas (native, or with the `web` feature).
 //! - [`stream`]: cell selection, the cell cache, decoding and compositing,
@@ -60,6 +62,7 @@ pub mod protocol;
 pub mod render;
 pub mod seen;
 pub mod sim;
+pub mod spawn;
 pub mod stream;
 pub mod volume;
 pub mod world;

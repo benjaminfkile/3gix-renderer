@@ -15,7 +15,8 @@ In the browser, click the canvas first so it has the keyboard focus.
 | Right mouse drag | Look around (yaw and pitch about the camera's own axes) |
 | Mouse wheel | Set the flight speed: each notch multiplies or divides it by 1.25 (about ten notches per factor of ten) |
 | `Shift` (held) | Boost: fly at ten times the set speed while held |
-| `1` to `9`, `0` | Jump to a view of the frame with that index (see below) |
+| `1` to `9`, `0` | Jump to a view of the frame with that index (see below); with the spawn chooser open, spawn instead (see Spawning) |
+| `G` | Open or close the spawn chooser (see Spawning) |
 | `Home` | Jump to a view of the whole system from above the root frame |
 | `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
 | `V` | Type a speed in meters per second (see Typing a speed) |
@@ -60,14 +61,34 @@ point), `Backspace` to correct, `Enter` to set it, `Escape` to cancel.
 It sets the flight speed (clamped to 1e-3 to 1e15 m/s). While the entry
 is open every other key waits.
 
-## Starting place
+## Spawning
 
-`--start-on <frame>:<x>,<y>,<z>[@<m>]` starts the camera over that frame
-instead of at `Home`: `<m>` meters from the frame origin (default
-`3 * root_extent / 8`) along the direction `x, y, z` of the frame's axes,
-looking back at the origin with the frame's `+z` as up. A headless run with
-`--start-on` renders the view from there (`--view-distance-scale` moves it
-along the line).
+| Input | Action |
+|---|---|
+| `G` | Open or close the spawn chooser |
+| `1` to `9`, `0` (chooser open) | Spawn the camera onto the frame with that number in the chooser |
+| `Home`, or a number key with the chooser closed | Free the camera from the frame again |
+
+`G` lists the frames that have matter, in ascending frame id, with their
+number keys, on the overlay's last line: `spawn: 1 frame 3  2 frame 5`. A
+frame is listed once its depth-0 cell has arrived with matter in it.
+Choosing one puts the camera on the line from that frame's origin toward
+where the camera was, 2 m above the outermost matter the loaded cells show
+on that line, looking level. As finer cells arrive (for up to 20 s, until
+you fly) the point is found again with them.
+
+A spawned camera is attached to its frame: it moves and turns with it, so
+the ground stays under it, and the flight keys fly it relative to the
+frame. Nothing else acts on it: no gravity, no collision, it flies through
+matter like the free camera. The overlay says `camera on frame <id>`.
+`Home` or a number-key view frees it, and it floats free in space again.
+
+`--start-on <frame>:<x>,<y>,<z>` spawns the camera onto that frame along
+the direction `x, y, z` of its axes as soon as the frame is listed. With
+a distance, `--start-on <frame>:<x>,<y>,<z>@<m>`, it only places the free
+camera `<m>` meters from the frame origin on that line, looking back at the
+origin. A headless run does the same (`--view-distance-scale` moves a
+placed camera along the line).
 
 ## Simulation time
 
