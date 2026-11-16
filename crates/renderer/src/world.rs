@@ -597,11 +597,11 @@ mod tests {
         assert!(!mesh.is_empty());
         // The wall lies on the face, x = 0, and the top of the neighbor's
         // matter reaches half a sample (0.5 m) into the straddling cubes.
-        assert!(mesh
-            .positions
+        let surface = &mesh.positions[..mesh.skirt_from];
+        assert!(surface
             .iter()
             .all(|p| (0.0..=0.5).contains(&p[0]) && p[2] >= -6.0));
-        assert!(mesh.positions.iter().any(|p| p[0] == 0.0 && p[2] > -6.0));
+        assert!(surface.iter().any(|p| p[0] == 0.0 && p[2] > -6.0));
         assert_eq!(world.mesh_neighbors(&b).unwrap().count(), 1);
 
         // Nothing changed: nothing is extracted again.

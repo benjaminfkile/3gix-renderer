@@ -60,7 +60,11 @@
 //! origins would fight in the depth buffer), and by the finer cell at a
 //! depth transition: a cell with finer cells selected across a face cuts
 //! its mesh at that face ([`FaceNeighbors::clip`]), and the finer side,
-//! padded from it, reaches half a sample past the face to meet it. Every cell of a frame is drawn at one
+//! padded from it, reaches half a sample past the face to meet it. Where
+//! two meshes still meet at slightly different heights (across a depth
+//! transition), a skirt hung from every open edge of a mesh, one sample
+//! down into the matter and drawn from both sides, fills the crack
+//! ([`add_skirts`]). Every cell of a frame is drawn at one
 //! isovalue (below), so neighbors put the surface at the same density.
 //!
 //! # The isovalue
@@ -121,7 +125,7 @@
 use gx_core::key::CellKey;
 use gx_core::matter::{Sample, Samples, Section, State};
 use gx_core::units::Vec3;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -169,6 +173,9 @@ pub struct SurfaceMesh {
     pub bounds_min: [f64; 3],
     /// Largest corner of the box around every position, frame coordinates.
     pub bounds_max: [f64; 3],
+    /// The first position (and vertex) of the skirts ([`add_skirts`]):
+    /// the ones before it lie on the surface.
+    pub skirt_from: usize,
 }
 
 impl SurfaceMesh {
@@ -357,6 +364,56 @@ fn trilinear(p: [f64; 3], section: &Section, samples: &Samples) -> f64 {
     acc
 }
 
+/// Hangs a skirt from every open edge of the mesh (an edge of one
+/// triangle only: where the mesh ends at its cell's faces): a strip down
+/// into the matter, `depth` meters along the inward normal (one sample),
+/// drawn from both sides. Where a neighbor's surface meets this one a
+/// little higher or lower (a depth transition, two isovalue crossings a
+/// sample apart) the strip fills the crack; where they meet exactly it lies
+/// under the ground and never shows. The strip takes the edge's vertex
+/// attributes, so it shades like the ground above it.
+fn add_skirts(
+    positions: &mut Vec<[f64; 3]>,
+    vertices: &mut Vec<SurfaceVertex>,
+    indices: &mut Vec<u32>,
+    depth: f64,
+) {
+    let mut uses: BTreeMap<(u32, u32), (u32, u32, u32)> = BTreeMap::new();
+    for tri in indices.as_chunks::<3>().0 {
+        for e in 0..3 {
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            let k = (a.min(b), a.max(b));
+            uses.entry(k).and_modify(|u| u.2 += 1).or_insert((a, b, 1));
+        }
+    }
+    let mut lowered: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut lower =
+        |v: u32, positions: &mut Vec<[f64; 3]>, vertices: &mut Vec<SurfaceVertex>| -> u32 {
+            if let Some(&i) = lowered.get(&v) {
+                return i;
+            }
+            let p = positions[v as usize];
+            let attr = vertices[v as usize];
+            let n = attr.normal;
+            let q = core::array::from_fn(|c| p[c] - f64::from(n[c]) * depth);
+            let i = positions.len() as u32;
+            positions.push(q);
+            vertices.push(attr);
+            lowered.insert(v, i);
+            i
+        };
+    let open: Vec<(u32, u32)> = uses
+        .values()
+        .filter(|u| u.2 == 1)
+        .map(|u| (u.0, u.1))
+        .collect();
+    for (a, b) in open {
+        let (la, lb) = (lower(a, positions, vertices), lower(b, positions, vertices));
+        // Both windings: the strip is seen from either side of the crack.
+        indices.extend_from_slice(&[a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+    }
+}
+
 /// Cuts the mesh at the plane where coordinate `axis` equals `plane`,
 /// keeping the side below it (`keep_below`) or above it. Triangles across
 /// the plane are cut along it, with new vertices interpolated linearly
@@ -376,7 +433,7 @@ fn clip_mesh(
             p[axis] >= plane
         }
     };
-    let mut cut: std::collections::BTreeMap<(u32, u32), u32> = std::collections::BTreeMap::new();
+    let mut cut: BTreeMap<(u32, u32), u32> = BTreeMap::new();
     let mut split =
         |a: u32, b: u32, positions: &mut Vec<[f64; 3]>, vertices: &mut Vec<SurfaceVertex>| -> u32 {
             let k = (a.min(b), a.max(b));
@@ -882,6 +939,7 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         indices: Vec::new(),
         bounds_min: [origin.x, origin.y, origin.z],
         bounds_max: [origin.x, origin.y, origin.z],
+        skirt_from: 0,
     };
     let Some(samples) = section.samples() else {
         return empty(0.0);
@@ -1043,6 +1101,9 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         }
     }
 
+    let skirt_from = positions.len();
+    add_skirts(&mut positions, &mut vertices, &mut indices, edge / n as f64);
+
     let mut bounds_min = [f64::INFINITY; 3];
     let mut bounds_max = [f64::NEG_INFINITY; 3];
     for p in &positions {
@@ -1063,6 +1124,7 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         indices,
         bounds_min,
         bounds_max,
+        skirt_from,
     }
 }
 
@@ -1528,7 +1590,7 @@ mod tests {
             assert_eq!(triangles_on_plane(&mesh, axis, lo + 4.0), 0);
         }
         // The surface is the plane between the second and third layers.
-        for p in &mesh.positions {
+        for p in &mesh.positions[..mesh.skirt_from] {
             assert_eq!(p[2], -6.0);
         }
     }
@@ -1563,7 +1625,7 @@ mod tests {
         let mesh = extract_with(&a, &na);
         assert!(!mesh.is_empty());
         assert!(triangles_on_plane(&mesh, 0, 0.0) > 0);
-        for (p, v) in mesh.positions.iter().zip(&mesh.vertices) {
+        for (p, v) in mesh.positions[..mesh.skirt_from].iter().zip(&mesh.vertices) {
             assert_eq!(p[0], 0.0);
             assert!(v.normal[0] > 0.999, "normal {:?}", v.normal);
         }
