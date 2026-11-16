@@ -423,7 +423,19 @@ pub fn render_headless_view(
             let now = start.elapsed().as_secs_f64();
             let events = f.wait(Duration::from_millis(50));
             stream_step(&mut world, f, seen.system(), events, now);
-            if done(&world) {
+            // The selection deepens toward surfaces as cells arrive
+            // (`stream` module docs): select again, and finish only once
+            // that changes nothing.
+            let before: Vec<gx_core::key::CellKey> =
+                world.cache().selection().iter().map(|c| c.key).collect();
+            world.select(seen.system(), seen.camera(), (width, height), now, true);
+            let same = world
+                .cache()
+                .selection()
+                .iter()
+                .map(|c| c.key)
+                .eq(before.iter().copied());
+            if same && done(&world) {
                 break;
             }
             if now > limit {

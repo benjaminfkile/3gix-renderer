@@ -14,7 +14,12 @@
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
 //! of 4, the viewport height, the vertical field of view, and at most 512
-//! cells ([`select_all`]), except frames drawn as a sprite only. A frame's
+//! cells ([`select_all`]), except frames drawn as a sprite only. Only cells
+//! loaded and [`ReadyCell::refinable`] are refined
+//! ([`gx_core::lod::select_cells_with`]): ones the drawn surface crosses,
+//! or that hold a volume. Empty space and solid interiors stay coarse, so
+//! the budget goes to the surfaces, and the selection deepens toward them
+//! one level per arrival. A frame's
 //! depth limit is the deepest of its registry `max_depth` and its layers'
 //! configs ([`crate::protocol::frame_system_from_registries`]).
 //!
@@ -68,7 +73,7 @@ use crate::volume::VolumeGrid;
 use gx_core::emission::Emitter;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
-use gx_core::lod::{select_cells, SelectionParams};
+use gx_core::lod::{select_cells_with, SelectionParams};
 use gx_core::matter::{self, composite, Section};
 use gx_core::units::{Meters, Vec3};
 use std::collections::{BTreeMap, BTreeSet};
@@ -133,24 +138,50 @@ pub struct ReadyCell {
     /// observer's matter probe ([`crate::probe`]) puts the solid boundary
     /// at the same isovalue, so the observer stands on what is drawn.
     pub surface_isovalue: Option<f64>,
+    /// The cell's children can show more than it does: its drawn surface
+    /// crosses it (some sample below [`ReadyCell::surface_isovalue`] and
+    /// some at or above it), or it holds gas or plasma drawn as a volume.
+    /// Only such cells are refined ([`select_all`]).
+    pub refinable: bool,
 }
 
 impl ReadyCell {
     /// Derives everything the renderer keeps about a composited section:
     /// its emitter, its volume, and its mean albedo.
     pub fn new(section: Section) -> ReadyCell {
+        let surface_isovalue = crate::extract::surface_isovalue(&section);
+        let volume = VolumeGrid::from_section(&section).map(Arc::new);
+        let refinable = volume.is_some()
+            || surface_isovalue.is_some_and(|iso| {
+                section.samples().is_some_and(|s| {
+                    let (mut below, mut above) = (false, false);
+                    for i in 0..s.len() {
+                        let d = s.get(i).map_or(0.0, |x| x.density.value());
+                        if d < iso {
+                            below = true;
+                        } else {
+                            above = true;
+                        }
+                        if below && above {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            });
         ReadyCell {
             emitter: if section.key().depth == 0 {
                 cell_emitter(&section)
             } else {
                 None
             },
-            volume: VolumeGrid::from_section(&section).map(Arc::new),
+            volume,
             mean_albedo: mean_albedo(&section),
             has_matter: section.samples().is_some_and(|s| {
                 (0..s.len()).any(|i| s.get(i).is_some_and(|x| x.density.value() > 0.0))
             }),
-            surface_isovalue: crate::extract::surface_isovalue(&section),
+            surface_isovalue,
+            refinable,
             section: Arc::new(section),
         }
     }
@@ -277,6 +308,7 @@ pub fn select_all(
     camera: &Camera,
     view_width_px: f64,
     view_height_px: f64,
+    may_refine: impl Fn(CellKey) -> bool,
 ) -> Vec<SelectedCell> {
     let aspect = view_width_px / view_height_px.max(1.0);
     let params = SelectionParams {
@@ -299,7 +331,7 @@ pub fn select_all(
             continue;
         }
         let cam = camera_in_frame(system, camera, frame.frame_id);
-        for key in select_cells(frame, cam, &params).cells {
+        for key in select_cells_with(frame, cam, &params, &may_refine).cells {
             let g = key.geometry(frame.root_extent);
             let e = g.edge.value();
             let gap = |c: f64, o: f64| (o - c).max(c - (o + e)).max(0.0);
@@ -413,6 +445,14 @@ impl CellCache {
                 _ => None,
             }
         })
+    }
+
+    /// Returns `true` when `key` is `Ready` and its children can show more
+    /// than it does ([`ReadyCell::refinable`]). A cell not loaded yet is not
+    /// refined: the selection refines toward surfaces one level per
+    /// arrival.
+    pub fn refinable(&self, key: &CellKey) -> bool {
+        matches!(self.state(key), Some(CellState::Ready(c)) if c.refinable)
     }
 
     /// Returns `true` when the cache knows that `key` holds no matter: it

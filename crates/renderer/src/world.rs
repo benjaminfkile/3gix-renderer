@@ -152,11 +152,13 @@ impl World {
             return false;
         }
         self.last_selection = Some(now);
+        let cache = &self.cache;
         let cells = select_all(
             system,
             camera,
             f64::from(view_px.0.max(1)),
             f64::from(view_px.1.max(1)),
+            |k| cache.refinable(&k),
         );
         self.cache.set_selection(cells, now);
         for f in system
