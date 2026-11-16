@@ -431,9 +431,36 @@ impl CellCache {
             match self.state(&k) {
                 Some(CellState::Ready(cell)) => Some((k, NeighborMatter::Ready(cell))),
                 _ if self.known_empty(&k) => Some((k, NeighborMatter::Empty)),
-                _ => None,
+                _ => {
+                    // The nearest loaded coarser cell holding the region
+                    // across the face: extraction reads it at the grid
+                    // points' positions, so a depth transition joins.
+                    let mut up = k.parent();
+                    while let Some(a) = up {
+                        if let Some(CellState::Ready(cell)) = self.state(&a) {
+                            return Some((a, NeighborMatter::Ready(cell)));
+                        }
+                        up = a.parent();
+                    }
+                    None
+                }
             }
         })
+    }
+
+    /// The isovalue every surface of `frame_id` is drawn at: the smallest
+    /// of its loaded cells' own ([`ReadyCell::surface_isovalue`]), so
+    /// neighboring cells put the surface at the same density. `None`
+    /// before any cell of the frame with a surface has arrived.
+    pub fn frame_isovalue(&self, frame_id: u64) -> Option<f64> {
+        self.entries
+            .iter()
+            .filter(|(k, _)| k.frame_id == frame_id)
+            .filter_map(|(_, e)| match &e.state {
+                CellState::Ready(c) => c.surface_isovalue,
+                _ => None,
+            })
+            .reduce(f64::min)
     }
 
     /// Returns `true` when `key` is `Ready` and its children can show more

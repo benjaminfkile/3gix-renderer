@@ -63,8 +63,8 @@ pub fn chooser_line(frames: &[u64]) -> String {
 /// The distance from `frame_id`'s origin along the unit `direction` (frame
 /// axes) of the outermost matter the loaded cells show, meters: in the
 /// deepest loaded cells the line crosses that hold matter on it, the
-/// farthest point whose nearest sample is at or above the cell's surface
-/// isovalue (any matter for cells without one). `None` when no loaded cell
+/// farthest point whose nearest sample is at or above the frame's surface
+/// isovalue ([`CellCache::frame_isovalue`]; any matter without one). `None` when no loaded cell
 /// shows matter on the line.
 pub fn surface_along(
     cache: &CellCache,
@@ -73,6 +73,7 @@ pub fn surface_along(
     direction: Vec3,
 ) -> Option<f64> {
     let extent = Meters::new(tree.get(frame_id)?.root_extent.value());
+    let frame_iso = cache.frame_isovalue(frame_id);
     let mut best: Option<(u8, f64)> = None;
     for (key, entry) in cache.entries() {
         if key.frame_id != frame_id {
@@ -90,7 +91,9 @@ pub fn surface_along(
         let Some((t0, t1)) = ray_box(key, extent, direction) else {
             continue;
         };
-        let iso = cell.surface_isovalue.unwrap_or(f64::MIN_POSITIVE);
+        let iso = frame_iso
+            .or(cell.surface_isovalue)
+            .unwrap_or(f64::MIN_POSITIVE);
         let g = key.geometry(extent);
         let n = usize::from(cell.section.resolution());
         let e = g.edge.value() / n as f64;

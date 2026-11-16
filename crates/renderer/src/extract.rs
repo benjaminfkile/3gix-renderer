@@ -16,10 +16,11 @@
 //!
 //! The samples of a section of resolution `n` are values at the sample
 //! centers, `origin + (i + 1/2) * e / n` per axis. Extraction runs over those
-//! points padded with one layer on every side, so the grid has `n + 2`
-//! points per axis and the cubes of the outer layer straddle the cell
-//! faces. The padding is never a vacuum default; it always comes from the
-//! hub's data. Per face:
+//! points padded with two layers on every side, so the grid has `n + 4`
+//! points per axis; the cubes between the inner padding layer and the
+//! cell's own samples straddle the cell faces, and the outer layer only
+//! feeds the gradient there. The padding is never a vacuum default; it
+//! always comes from the hub's data. Per face:
 //!
 //! - **Neighbor.** When the cell across the face is `Ready` at the same
 //!   depth ([`FaceNeighbors`], gathered from
@@ -29,9 +30,15 @@
 //!   cell across the face was fetched and holds no matter (`Empty`), its
 //!   samples are vacuum, and that is what the padding holds: this is the
 //!   hub's data for that cell, not a default.
-//! - **Clamp.** Otherwise (the neighbor is not fetched yet, is `Gone`, or is
-//!   at another depth) the cell's own boundary samples are repeated
-//!   outward.
+//! - **Coarser cell.** When the cell across the face at the same depth is
+//!   not loaded but a coarser cell holding that region is
+//!   ([`crate::stream::CellCache::face_neighbors`]), the padding is that
+//!   cell read at the padding points' positions: the density trilinear over
+//!   its solid and fluid sample centers, the other values from the nearest
+//!   sample. A depth transition then joins the coarser surface instead of
+//!   ending at the face.
+//! - **Clamp.** Otherwise (nothing across the face is loaded, or it is
+//!   `Gone`) the cell's own boundary samples are repeated outward.
 //!
 //! Points beyond two or three faces at once (the padding's edges and
 //! corners) are vacuum if any of those faces has an `Empty` neighbor;
@@ -48,10 +55,10 @@
 //! from one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
-//! Neighbors of different depths are not used (they clamp), so a depth
-//! transition still shows a step of up to half a coarse sample. The
-//! isovalue is per section, so where two neighbors' isovalues differ the
-//! surfaces meet with a small offset.
+//! At a depth transition the coarser cell's own straddling cubes still
+//! reach half a coarse sample beyond its face, so the two meshes overlap
+//! there with a small offset. Every cell of a frame is drawn at one
+//! isovalue (below), so neighbors put the surface at the same density.
 //!
 //! # The isovalue
 //!
@@ -65,7 +72,12 @@
 //! matter further in (a body's layers grow denser toward its center) stays
 //! above the isovalue and draws no surface inside. A section with no such
 //! sample (a thin shell) uses half its largest solid or fluid density. Gas
-//! and plasma samples take no part. A cell at a
+//! and plasma samples take no part. That is each section's own isovalue;
+//! the world draws every cell of a frame at the smallest of its loaded
+//! cells' ([`FaceNeighbors::isovalue`],
+//! [`crate::stream::CellCache::frame_isovalue`]), so cells that hold
+//! different depths of matter do not draw the boundary at different
+//! densities. A cell at a
 //! coarse depth gives a coarse mesh: that is the compiler's chosen
 //! complexity, and nothing here smooths it.
 //!
@@ -84,7 +96,9 @@
 //!
 //! Positions are linear interpolations along cube edges, in `f64`, in the
 //! frame's coordinates. Normals are the negated density gradient (central
-//! differences, one-sided at the outer layer), interpolated along the edge
+//! differences averaged over the 3 x 3 points across each axis with
+//! weights 1, 2, 1, the Sobel kernel, so a surface oblique to the grid does
+//! not shade in bands at every sample layer), interpolated along the edge
 //! and normalized, so they point from dense to thin. Albedo, roughness, and
 //! temperature are density-weighted along the edge, the same rule the
 //! compositing uses, so vacuum on one side never dims or cools the surface;
@@ -209,6 +223,10 @@ impl FaceNeighbor {
 pub struct FaceNeighbors {
     /// One entry per face, in the order of [`face_index`].
     pub faces: [Option<FaceNeighbor>; 6],
+    /// The isovalue to draw at, shared by every cell of the frame so
+    /// neighbors put the surface at the same density; `None` uses the
+    /// section's own ([`surface_isovalue`]).
+    pub isovalue: Option<f64>,
 }
 
 impl FaceNeighbors {
@@ -221,20 +239,40 @@ impl FaceNeighbors {
     /// the same section objects (pointer identity, not a comparison of
     /// samples) or the same empty cells.
     pub fn same_as(&self, other: &FaceNeighbors) -> bool {
-        self.faces
-            .iter()
-            .zip(&other.faces)
-            .all(|(a, b)| match (a, b) {
-                (Some(a), Some(b)) => a.same_as(b),
-                (None, None) => true,
-                _ => false,
-            })
+        self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
+            && self
+                .faces
+                .iter()
+                .zip(&other.faces)
+                .all(|(a, b)| match (a, b) {
+                    (Some(a), Some(b)) => a.same_as(b),
+                    (None, None) => true,
+                    _ => false,
+                })
     }
 
     /// Number of faces with a neighbor.
     pub fn count(&self) -> usize {
         self.faces.iter().filter(|f| f.is_some()).count()
     }
+}
+
+/// Returns `true` when `neighbor` is the cell across face `face` of `key`
+/// at the same depth, or a coarser cell holding it.
+fn covers_face(key: &CellKey, neighbor: &CellKey, face: usize) -> bool {
+    if neighbor.depth > key.depth || neighbor.frame_id != key.frame_id {
+        return false;
+    }
+    let Some(mut c) = crate::stream::face_neighbor_keys(key)[face] else {
+        return false;
+    };
+    while c.depth > neighbor.depth {
+        match c.parent() {
+            Some(p) => c = p,
+            None => return false,
+        }
+    }
+    c == *neighbor
 }
 
 /// Returns `true` when `neighbor` is the cell across face `face` of `key`:
@@ -254,6 +292,20 @@ fn is_face_neighbor(key: &CellKey, neighbor: &CellKey, face: usize) -> bool {
                 a[k].checked_sub(1) == Some(b[k])
             }
         })
+}
+
+/// Layers of padding on every side of the extraction grid: the outer one
+/// only feeds the gradient of the vertices in the cubes straddling the
+/// faces.
+const PAD: usize = 2;
+
+/// Frame coordinates `p` in `section`'s sample units: 0 at the first
+/// sample center, 1 at the next.
+fn coarse_coords(p: [f64; 3], section: &Section) -> [f64; 3] {
+    let o = section.origin();
+    let step = section.edge().value() / f64::from(section.resolution());
+    let o = [o.x, o.y, o.z];
+    core::array::from_fn(|b| (p[b] - o[b]) / step - 0.5)
 }
 
 /// Corner `c` of a cube is offset `(c & 1, (c >> 1) & 1, (c >> 2) & 1)`.
@@ -378,6 +430,9 @@ struct Grid<'a> {
 enum Pad<'a> {
     /// A neighbor's samples and resolution.
     Samples(&'a Samples, usize),
+    /// A coarser cell holding the region across the face: read at the
+    /// grid point's position, the density trilinear.
+    Coarse(&'a Section, &'a Samples),
     /// A neighbor known to hold no matter.
     Empty,
 }
@@ -401,7 +456,7 @@ impl<'a> Grid<'a> {
     fn source(&self, p: [usize; 3]) -> Option<(&'a Samples, usize)> {
         let n = self.n;
         let beyond = |axis: usize| -> Option<Pad<'a>> {
-            let (low, high) = (p[axis] == 0, p[axis] > n);
+            let (low, high) = (p[axis] < PAD, p[axis] >= n + PAD);
             if low || high {
                 self.neighbors[face_index(axis, high)]
             } else {
@@ -415,28 +470,89 @@ impl<'a> Grid<'a> {
             return None;
         }
         for axis in 0..3 {
+            if let Some(Pad::Coarse(section, samples)) = beyond(axis) {
+                let r = usize::from(section.resolution());
+                let u = coarse_coords(self.position(p), section);
+                let q: [usize; 3] = core::array::from_fn(|b| {
+                    (u[b] + 0.5).floor().clamp(0.0, (r - 1) as f64) as usize
+                });
+                return Some((samples, q[0] + r * (q[1] + r * q[2])));
+            }
             if let Some(Pad::Samples(samples, r)) = beyond(axis) {
-                let high = p[axis] > n;
+                let high = p[axis] >= n + PAD;
                 let q: [usize; 3] = core::array::from_fn(|b| {
                     if b == axis {
                         if high {
-                            0
+                            (p[axis] - (n + PAD)).min(r - 1)
                         } else {
-                            r - 1
+                            (r + p[axis]).saturating_sub(PAD)
                         }
                     } else {
-                        remap(p[b].clamp(1, n) - 1, n, r)
+                        remap(p[b].clamp(PAD, n + PAD - 1) - PAD, n, r)
                     }
                 });
                 return Some((samples, q[0] + r * (q[1] + r * q[2])));
             }
         }
-        let q: [usize; 3] = core::array::from_fn(|b| p[b].clamp(1, n) - 1);
+        let q: [usize; 3] = core::array::from_fn(|b| p[b].clamp(PAD, n + PAD - 1) - PAD);
         Some((self.own, q[0] + n * (q[1] + n * q[2])))
     }
 
     fn index(&self, p: [usize; 3]) -> usize {
         p[0] + self.m * (p[1] + self.m * p[2])
+    }
+
+    /// The density at grid point `p` when the first face it lies beyond
+    /// with a `Ready` neighbor has a coarser one there (the same rule as
+    /// [`Grid::source`]): trilinear over that cell's solid and fluid sample
+    /// centers, clamped into them. `None` otherwise.
+    fn coarse_density(&self, p: [usize; 3]) -> Option<f64> {
+        let n = self.n;
+        let beyond = |axis: usize| -> Option<Pad<'a>> {
+            if p[axis] < PAD || p[axis] >= n + PAD {
+                self.neighbors[face_index(axis, p[axis] >= n + PAD)]
+            } else {
+                None
+            }
+        };
+        if (0..3).any(|axis| matches!(beyond(axis), Some(Pad::Empty))) {
+            return None;
+        }
+        let (section, samples) = (0..3).find_map(|axis| match beyond(axis) {
+            Some(Pad::Coarse(s, x)) => Some(Some((s, x))),
+            Some(Pad::Samples(..)) => Some(None),
+            _ => None,
+        })??;
+        let r = usize::from(section.resolution());
+        let u = coarse_coords(self.position(p), section);
+        let mut i0 = [0usize; 3];
+        let mut f = [0.0f64; 3];
+        for b in 0..3 {
+            let c = u[b].clamp(0.0, (r - 1) as f64);
+            let lo = (c.floor() as usize).min(r.saturating_sub(2));
+            i0[b] = lo;
+            f[b] = if r > 1 { c - lo as f64 } else { 0.0 };
+        }
+        let d = |x: usize, y: usize, z: usize| -> f64 {
+            let (x, y, z) = (x.min(r - 1), y.min(r - 1), z.min(r - 1));
+            let i = x + r * (y + r * z);
+            if forms_surface(samples.state(i)) {
+                samples.density(i).value()
+            } else {
+                0.0
+            }
+        };
+        let mut acc = 0.0;
+        for c in 0..8 {
+            let o = corner_offset(c);
+            let w: f64 = (0..3)
+                .map(|b| if o[b] == 1 { f[b] } else { 1.0 - f[b] })
+                .product();
+            if w > 0.0 {
+                acc += w * d(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
+            }
+        }
+        Some(acc)
     }
 
     fn d(&self, p: [usize; 3]) -> f64 {
@@ -446,23 +562,46 @@ impl<'a> Grid<'a> {
     /// Frame coordinates of grid point `p`: sample `p - 1`'s center.
     fn position(&self, p: [usize; 3]) -> [f64; 3] {
         let o = [self.origin.x, self.origin.y, self.origin.z];
-        core::array::from_fn(|a| o[a] + (p[a] as f64 - 0.5) * self.step)
+        core::array::from_fn(|a| o[a] + (p[a] as f64 - PAD as f64 + 0.5) * self.step)
     }
 
     /// Density gradient at grid point `p`, kilograms per cubic meter per
-    /// meter.
+    /// meter: along each axis the central difference, averaged over the
+    /// 3 x 3 points around `p` across that axis with weights 1, 2, 1 per
+    /// direction (the Sobel kernel). The average keeps the normal from
+    /// swinging from one sample layer to the next where a surface runs
+    /// oblique to the grid. Points at the grid's border take one-sided
+    /// differences; vertices never sit there (the padding is two deep).
     fn gradient(&self, p: [usize; 3]) -> [f64; 3] {
+        let m = self.m;
         core::array::from_fn(|a| {
-            let mut lo = p;
-            let mut hi = p;
-            if p[a] > 0 {
-                lo[a] -= 1;
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            let mut acc = 0.0;
+            let mut weight = 0.0;
+            for ob in [-1i64, 0, 1] {
+                for oc in [-1i64, 0, 1] {
+                    let mut q = p;
+                    let (qb, qc) = (p[b] as i64 + ob, p[c] as i64 + oc);
+                    if qb < 0 || qc < 0 || qb >= m as i64 || qc >= m as i64 {
+                        continue;
+                    }
+                    q[b] = qb as usize;
+                    q[c] = qc as usize;
+                    let w = (2 - ob.abs()) as f64 * (2 - oc.abs()) as f64;
+                    let mut lo = q;
+                    let mut hi = q;
+                    if q[a] > 0 {
+                        lo[a] -= 1;
+                    }
+                    if q[a] + 1 < m {
+                        hi[a] += 1;
+                    }
+                    let span = (hi[a] - lo[a]) as f64 * self.step;
+                    acc += w * (self.d(hi) - self.d(lo)) / span;
+                    weight += w;
+                }
             }
-            if p[a] + 1 < self.m {
-                hi[a] += 1;
-            }
-            let span = (hi[a] - lo[a]) as f64 * self.step;
-            (self.d(hi) - self.d(lo)) / span
+            acc / weight
         })
     }
 
@@ -561,23 +700,26 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         return empty(0.0);
     };
     let n = usize::from(section.resolution());
-    let Some(isovalue) = surface_isovalue(section) else {
+    let Some(own_isovalue) = surface_isovalue(section) else {
         return empty(0.0);
     };
+    let isovalue = neighbors.isovalue.unwrap_or(own_isovalue);
     let usable: [Option<Pad<'_>>; 6] = core::array::from_fn(|f| {
         let neighbor = neighbors.faces[f].as_ref()?;
-        if !is_face_neighbor(&key, &neighbor.key(), f) {
+        let same = is_face_neighbor(&key, &neighbor.key(), f);
+        if !same && !covers_face(&key, &neighbor.key(), f) {
             return None;
         }
         Some(match neighbor {
             FaceNeighbor::Ready(s) => match s.samples() {
-                Some(samples) => Pad::Samples(samples, usize::from(s.resolution())),
+                Some(samples) if same => Pad::Samples(samples, usize::from(s.resolution())),
+                Some(samples) => Pad::Coarse(s, samples),
                 None => Pad::Empty,
             },
             FaceNeighbor::Empty(_) => Pad::Empty,
         })
     });
-    let m = n + 2;
+    let m = n + 2 * PAD;
     let mut grid = Grid {
         own: samples,
         n,
@@ -591,6 +733,10 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
     for z in 0..m {
         for y in 0..m {
             for x in 0..m {
+                if let Some(d) = grid.coarse_density([x, y, z]) {
+                    density[x + m * (y + m * z)] = d;
+                    continue;
+                }
                 let Some((s, i)) = grid.source([x, y, z]) else {
                     continue;
                 };
@@ -610,9 +756,11 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
     let mut vertices: Vec<SurfaceVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    for z in 0..m - 1 {
-        for y in 0..m - 1 {
-            for x in 0..m - 1 {
+    // Cubes between grid points PAD - 1 and n + PAD: the cell's own cubes
+    // and those straddling its faces, half a sample beyond them.
+    for z in PAD - 1..n + PAD {
+        for y in PAD - 1..n + PAD {
+            for x in PAD - 1..n + PAD {
                 let base = [x, y, z];
                 let at = |c: usize| {
                     let o = corner_offset(c);

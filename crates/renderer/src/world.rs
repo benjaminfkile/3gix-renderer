@@ -123,12 +123,13 @@ impl World {
 
     /// The `Ready` and known empty face neighbors of a cell now, as
     /// extraction takes them.
-    fn neighbors_of(&self, key: &CellKey) -> FaceNeighbors {
+    fn neighbors_of(&self, key: &CellKey, isovalue: Option<f64>) -> FaceNeighbors {
         FaceNeighbors {
             faces: self.cache.face_neighbors(key).map(|n| match n? {
                 (_, NeighborMatter::Ready(cell)) => Some(FaceNeighbor::Ready(cell.section.clone())),
                 (k, NeighborMatter::Empty) => Some(FaceNeighbor::Empty(k)),
             }),
+            isovalue,
         }
     }
 
@@ -190,12 +191,23 @@ impl World {
         for (key, mesh) in self.pool.try_results() {
             self.accept(key, mesh);
         }
+        // One isovalue per frame, so neighboring cells draw the surface at
+        // the same density ([`crate::stream::CellCache::frame_isovalue`]).
+        let mut isovalues: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+        for (k, e) in self.cache.entries() {
+            if let CellState::Ready(cell) = &e.state {
+                if let Some(iso) = cell.surface_isovalue {
+                    let v = isovalues.entry(k.frame_id).or_insert(iso);
+                    *v = v.min(iso);
+                }
+            }
+        }
         let todo: Vec<(CellKey, Arc<gx_core::matter::Section>, FaceNeighbors)> = self
             .cache
             .entries()
             .filter_map(|(k, e)| match &e.state {
                 CellState::Ready(cell) if !self.extracting.contains_key(k) => {
-                    let neighbors = self.neighbors_of(k);
+                    let neighbors = self.neighbors_of(k, isovalues.get(&k.frame_id).copied());
                     match self.meshes.get(k) {
                         Some(held) if held.neighbors.same_as(&neighbors) => None,
                         _ => Some((*k, cell.section.clone(), neighbors)),
