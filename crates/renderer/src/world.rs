@@ -159,7 +159,6 @@ impl World {
         layout: &SelectionLayout,
     ) -> FaceNeighbors {
         let across = crate::stream::face_neighbor_keys(key);
-        let mut clip = [false; 6];
         let mut faces: [Option<FaceNeighbor>; 6] =
             self.cache.face_neighbors(key).map(|n| match n? {
                 (_, NeighborMatter::Ready(cell)) => Some(FaceNeighbor::Ready(cell.section.clone())),
@@ -172,10 +171,9 @@ impl World {
             if layout.selected.contains(&k) {
                 continue;
             }
-            // Finer cells are selected across this face: they draw that
-            // side, so this cell's mesh stops at the face.
+            // Finer cells are selected across this face: pad from what
+            // is loaded there.
             if layout.above_selected.contains(&k) {
-                clip[f] = true;
                 continue;
             }
             // A coarser cell is selected across this face: pad from it,
@@ -193,7 +191,6 @@ impl World {
         }
         FaceNeighbors {
             faces,
-            clip,
             isovalue,
             diagonal: self
                 .cache

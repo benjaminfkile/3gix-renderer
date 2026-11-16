@@ -55,11 +55,11 @@
 //! from one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
-//! Same-depth neighbors both draw the cubes straddling their shared face,
-//! from the same samples, so their meshes overlap there and never part. At
-//! a depth transition a cell with finer cells selected across a face cuts
-//! its mesh at that face ([`FaceNeighbors::clip`]), and the finer side,
-//! padded from it, reaches half a sample past the face to meet it. Where
+//! Every mesh is cut at its cell's six faces: the cubes straddling a face
+//! are drawn by both neighbors from the same samples, and each keeps the
+//! half on its own side, so same-depth neighbors meet edge to edge at the
+//! face with no overlap (two copies would fight in the depth buffer) and
+//! no gap. Where
 //! two meshes still meet at slightly different heights (across a depth
 //! transition), a skirt hung from every open edge of a mesh, one sample
 //! down into the matter and drawn from both sides, fills the crack
@@ -236,10 +236,6 @@ pub struct FaceNeighbors {
     /// neighbors put the surface at the same density; `None` uses the
     /// section's own ([`surface_isovalue`]).
     pub isovalue: Option<f64>,
-    /// Faces the mesh stops at, by [`face_index`]: finer cells are drawn
-    /// across them, so this cell's cubes straddling the face are cut at
-    /// the face plane instead of reaching half a sample beyond it.
-    pub clip: [bool; 6],
     /// The cells across the 12 edges and 8 corners, in the order of
     /// [`crate::stream::diagonal_offsets`] (empty when not gathered):
     /// padding points beyond two or three faces read them.
@@ -262,7 +258,6 @@ impl FaceNeighbors {
             _ => false,
         };
         self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
-            && self.clip == other.clip
             && self.diagonal.len() == other.diagonal.len()
             && self
                 .diagonal
@@ -474,11 +469,11 @@ fn clip_mesh(
             .map(|&i| inside(&positions[i as usize]))
             .collect();
         let count = ins.iter().filter(|&&b| b).count();
-        if count == 3 {
-            out.extend_from_slice(tri);
+        if count == 0 {
             continue;
         }
-        if count == 0 {
+        if count == 3 {
+            out.extend_from_slice(tri);
             continue;
         }
         // Sutherland-Hodgman over the triangle's three edges.
@@ -494,7 +489,25 @@ fn clip_mesh(
             }
         }
         for k in 1..poly.len().saturating_sub(1) {
-            out.extend_from_slice(&[poly[0], poly[k], poly[k + 1]]);
+            let t = [poly[0], poly[k], poly[k + 1]];
+            // A cut can leave a sliver of no area along the plane (a
+            // corner exactly on it): no surface, so not drawn.
+            let [p0, p1, p2] = t.map(|i| positions[i as usize]);
+            let (u, w) = (
+                [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
+                [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]],
+            );
+            let c = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let area2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+            let scale = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2])
+                * (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            if area2 > 1e-18 * scale && area2 > 0.0 {
+                out.extend_from_slice(&t);
+            }
         }
     }
     *indices = out;
@@ -1071,7 +1084,7 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
 
     let edge = section.edge().value();
     for f in 0..6 {
-        if neighbors.clip[f] {
+        {
             let (axis, high) = (f / 2, f % 2 == 1);
             let o = [origin.x, origin.y, origin.z][axis];
             let plane = if high { o + edge } else { o };
@@ -1532,9 +1545,11 @@ mod tests {
     }
 
     /// Triangles whose three vertices all lie on the plane `axis = at`.
+    /// Surface triangles (not skirts) lying in the plane `axis = at`.
     fn triangles_on_plane(mesh: &SurfaceMesh, axis: usize, at: f64) -> usize {
         mesh.indices
             .chunks(3)
+            .filter(|t| t.iter().all(|&i| (i as usize) < mesh.skirt_from))
             .filter(|t| {
                 t.iter()
                     .all(|&i| (mesh.positions[i as usize][axis] - at).abs() < 1e-9)

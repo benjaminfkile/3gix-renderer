@@ -13,7 +13,7 @@
 //! Every 100 ms ([`SELECT_INTERVAL_SECONDS`]), every frame whose
 //! `root_extent / 8` region is in the view or within `4 * root_extent` of
 //! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
-//! of 384 ([`PIXEL_ERROR`]), the viewport height, the vertical field of view, and at most 4096
+//! of 512 ([`PIXEL_ERROR`]), the viewport height, the vertical field of view, and at most 4096
 //! cells ([`select_all`]), except frames drawn as a sprite only. Only cells
 //! loaded and [`ReadyCell::refinable`] are refined
 //! ([`gx_core::lod::select_cells_with`]): ones the drawn surface crosses,
@@ -24,7 +24,8 @@
 //! refined: what is behind or beside the camera stays coarse until it
 //! turns. Nor are cells hidden behind the body itself, beyond the horizon
 //! of a sphere just under the drawn surface below the camera
-//! ([`OCCLUDER_FRACTION`]). A frame's
+//! ([`OCCLUDER_FRACTION`]). The selection is then balanced ([`balance`]):
+//! cells sharing a face differ by at most one depth. A frame's
 //! depth limit is the deepest of its registry `max_depth` and its layers'
 //! configs ([`crate::protocol::frame_system_from_registries`]).
 //!
@@ -82,15 +83,15 @@ use std::sync::Arc;
 /// Seconds between two selections.
 pub const SELECT_INTERVAL_SECONDS: f64 = 0.1;
 
-/// Largest projected cell edge, pixels, that is not refined further: 384,
+/// Largest projected cell edge, pixels, that is not refined further: 512,
 /// so a cell of 32 samples per axis (the modules' resolution) draws its
-/// samples at most about 12 pixels apart, and the ones near the camera
+/// samples at most about 16 pixels apart, and the ones near the camera
 /// finer. Every refinement selects all eight children of a cell, about
-/// half of them air or rock on flat ground, so the selection grows by a
-/// few hundred cells per depth: refining until a whole cell was a few
-/// pixels put the selection at its limit with millions of triangles
-/// smaller than a pixel.
-pub const PIXEL_ERROR: f64 = 384.0;
+/// half of them air or rock on flat ground, and [`balance`] adds more, so
+/// the selection grows by a few hundred cells per depth: refining until a
+/// whole cell was a few pixels put the selection at its limit with
+/// millions of triangles smaller than a pixel.
+pub const PIXEL_ERROR: f64 = 512.0;
 
 /// Factor on the half angle of the view cone inside which cells are
 /// refined ([`select_all`]): cells outside the view stay coarse until the
@@ -399,7 +400,8 @@ pub fn select_all(
             near <= horizon
         };
         let refine = |key: CellKey| may_refine(key) && in_view(key) && visible(key);
-        for key in select_cells_with(frame, cam, &params, refine).cells {
+        let selected = balance(select_cells_with(frame, cam, &params, refine).cells);
+        for key in selected {
             let g = key.geometry(frame.root_extent);
             let e = g.edge.value();
             let gap = |c: f64, o: f64| (o - c).max(c - (o + e)).max(0.0);
@@ -417,6 +419,51 @@ pub fn select_all(
     }
     out
 }
+
+/// Splits selected cells until no two cells sharing a face differ by more
+/// than one depth: a cell with a face neighbor region selected two or more
+/// depths finer is replaced by its eight children, until nothing changes
+/// (at most [`BALANCE_PASSES`] passes). Detail then steps by one level at a
+/// time across the ground instead of jumping several, which is what made
+/// patches of fine and coarse terrain sit side by side. Returns the cells in
+/// `(depth, x, y, z)` order.
+pub fn balance(cells: Vec<CellKey>) -> Vec<CellKey> {
+    let mut set: BTreeSet<CellKey> = cells.into_iter().collect();
+    for _ in 0..BALANCE_PASSES {
+        let mut split: BTreeSet<CellKey> = BTreeSet::new();
+        for k in &set {
+            for across in face_neighbor_keys(k).into_iter().flatten() {
+                // The selected cell holding the region across this face, if
+                // it is coarser.
+                let mut up = across.parent();
+                while let Some(c) = up {
+                    if set.contains(&c) {
+                        if k.depth > c.depth + 1 {
+                            split.insert(c);
+                        }
+                        break;
+                    }
+                    up = c.parent();
+                }
+            }
+        }
+        if split.is_empty() {
+            break;
+        }
+        for c in split {
+            if let Some(children) = c.children() {
+                set.remove(&c);
+                set.extend(children);
+            }
+        }
+    }
+    let mut out: Vec<CellKey> = set.into_iter().collect();
+    out.sort_by_key(|k| (k.depth, k.x, k.y, k.z));
+    out
+}
+
+/// Most passes of [`balance`].
+pub const BALANCE_PASSES: usize = 24;
 
 /// One cache entry.
 #[derive(Clone, Debug, PartialEq)]
