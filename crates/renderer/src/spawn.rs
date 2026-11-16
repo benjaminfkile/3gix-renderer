@@ -295,6 +295,10 @@ mod tests {
         let d = Vec3::new(1.0, 1.0, 1.0).normalized().unwrap();
         let (a, b) = ray_box(&k, extent, d).unwrap();
         assert!(a.abs() < 1e-12 && (b - 48.0f64.sqrt()).abs() < 1e-9);
-        assert!(ray_box(&k, extent, Vec3::new(-1.0, 0.0, 0.0)).is_none());
+        // Depth 2, cell (3,3,3): (2,2,2) to (4,4,4), behind a ray along -x.
+        let far = CellKey::new(1, 2, 3, 3, 3).unwrap();
+        assert!(ray_box(&far, extent, Vec3::new(-1.0, 0.0, 0.0)).is_none());
+        let (a, b) = ray_box(&far, extent, d).unwrap();
+        assert!((a - 12.0f64.sqrt()).abs() < 1e-9 && (b - 48.0f64.sqrt()).abs() < 1e-9);
     }
 }
