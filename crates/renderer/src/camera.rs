@@ -215,28 +215,6 @@ impl Camera {
         }
     }
 
-    /// The velocity the held movement keys fly the camera at, at the
-    /// current flight speed, meters per second, root axes; zero with no key
-    /// held.
-    pub fn flight_velocity(&self, system: &FrameSystem, input: &FlightInput) -> Vec3 {
-        flight_direction(input).map_or(Vec3::zero(), |dir| {
-            self.root_orientation(system).rotate(dir).scale(self.cruise)
-        })
-    }
-
-    /// Lets the camera coast for `dt` seconds of simulation time at
-    /// `velocity` (root axes, meters per second), on top of wherever the
-    /// controls put it: the motion it keeps from walk mode
-    /// ([`crate::walk::Observer`]). Nothing acts on it, so the velocity
-    /// does not change.
-    pub fn coast(&mut self, system: &FrameSystem, velocity: Vec3, dt: f64) {
-        if velocity == Vec3::zero() || dt == 0.0 {
-            return;
-        }
-        let to_frame = system.root_orientation(self.frame_id).conjugate();
-        self.position = self.position + to_frame.rotate(velocity.scale(dt));
-    }
-
     /// Re-expresses the camera in `frame_id` without moving it: the same
     /// place and view direction in space, a new parent.
     pub fn reparent_to(&mut self, system: &FrameSystem, frame_id: u64) {
@@ -354,12 +332,18 @@ impl Camera {
     }
 
     /// A view of `frame_id` from along `direction` (unit, frame axes):
-    /// parented to the frame, `3 * root_extent / 8` from its origin along
-    /// `direction`, looking back at the origin with the frame's `+z` as the
-    /// up hint. `None` if the id is not in the tree.
-    pub fn over(system: &FrameSystem, frame_id: u64, direction: Vec3) -> Option<Camera> {
+    /// parented to the frame, `distance` meters from its origin along
+    /// `direction` (default `3 * root_extent / 8`), looking back at the
+    /// origin with the frame's `+z` as the up hint. `None` if the id is not
+    /// in the tree.
+    pub fn over(
+        system: &FrameSystem,
+        frame_id: u64,
+        direction: Vec3,
+        distance: Option<f64>,
+    ) -> Option<Camera> {
         let frame = system.tree().get(frame_id)?;
-        let distance = 3.0 * frame.root_extent.value() / 8.0;
+        let distance = distance.unwrap_or(3.0 * frame.root_extent.value() / 8.0);
         let look = look_rotation(direction.scale(-1.0), Vec3::new(0.0, 0.0, 1.0));
         Some(Camera {
             frame_id,
@@ -385,6 +369,37 @@ impl Camera {
         let id = *selectable_frames(system.tree()).get(index)?;
         Camera::view_of(system, id)
     }
+}
+
+/// One rendered frame of `wall_dt` seconds: advances the simulation and
+/// flies the camera by `input`. The camera floats free in space: it keeps
+/// its place and view direction in root coordinates while the frames move
+/// and turn, then flies, then re-parents to the nearest frame.
+pub fn advance(
+    sim: &mut crate::sim::Simulation,
+    camera: &mut Camera,
+    wall_dt: f64,
+    hub_now: gx_core::units::Seconds,
+    input: &FlightInput,
+) {
+    let held = camera.hold(sim.system());
+    sim.update(gx_core::units::Seconds::new(wall_dt), hub_now);
+    camera.keep(sim.system(), held);
+    camera.fly(input, wall_dt);
+    camera.update_parent(sim.system());
+}
+
+/// Applies a clock action, keeping the camera at the same place and view
+/// direction in root coordinates across the jump in time.
+pub fn apply_clock(
+    sim: &mut crate::sim::Simulation,
+    camera: &mut Camera,
+    action: crate::sim::ClockAction,
+) {
+    let held = camera.hold(sim.system());
+    sim.apply(action);
+    camera.keep(sim.system(), held);
+    camera.update_parent(sim.system());
 }
 
 #[cfg(test)]

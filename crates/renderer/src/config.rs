@@ -97,9 +97,10 @@ FLAGS:
     --height <u32>                 render height in pixels (default 720)
     --view <home|0-9>              headless view: home (default) or the number key's view
     --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
-    --start-on <frame>:<x>,<y>,<z> start over frame <frame> along the direction x, y, z of its
-                                   axes; the window spawns walking there once the frame's
-                                   matter is loaded, a headless run renders the view from there
+    --start-on <frame>:<x>,<y>,<z>[@<m>]
+                                   start the camera over frame <frame> along the direction
+                                   x, y, z of its axes, <m> meters from its origin (default
+                                   3/8 of its root extent), looking at the origin
     --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
                                    with a non-zero status after this many seconds
     --stats-json <path.json>       headless: write the overlay statistics as JSON
@@ -290,25 +291,38 @@ pub struct Config {
     /// How surface meshes are drawn at start (`--mesh-mode`, `X` in the
     /// window).
     pub mesh_mode: crate::render::scene::MeshMode,
-    /// `--start-on`: a place to start over (and, in the window, to spawn
-    /// walking on) instead of the `Home` view.
+    /// `--start-on`: where the camera starts instead of the `Home` view.
     pub start_on: Option<StartOn>,
 }
 
-/// A frame and a direction from its origin, in its axes (`--start-on`).
-/// The direction is a unit vector.
+/// A frame, a direction from its origin in its axes, and optionally a
+/// distance from the origin (`--start-on`). The direction is a unit
+/// vector.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct StartOn {
     /// The frame.
     pub frame_id: u64,
     /// Unit direction from the frame origin, frame axes.
     pub direction: gx_core::units::Vec3,
+    /// Distance from the frame origin, meters; `None` for the default.
+    pub distance: Option<f64>,
 }
 
 impl StartOn {
-    /// Parses `<frame>:<x>,<y>,<z>`; the direction must not be zero.
+    /// Parses `<frame>:<x>,<y>,<z>[@<meters>]`; the direction must not be
+    /// zero and the distance must be above zero.
     pub fn parse(s: &str) -> Option<StartOn> {
-        let (frame, dir) = s.split_once(':')?;
+        let (place, distance) = match s.split_once('@') {
+            Some((p, d)) => {
+                let d: f64 = d.trim().parse().ok()?;
+                if !(d.is_finite() && d > 0.0) {
+                    return None;
+                }
+                (p, Some(d))
+            }
+            None => (s, None),
+        };
+        let (frame, dir) = place.split_once(':')?;
         let frame_id = frame.trim().parse().ok()?;
         let v: Vec<f64> = dir
             .split(',')
@@ -325,6 +339,7 @@ impl StartOn {
         Some(StartOn {
             frame_id,
             direction,
+            distance,
         })
     }
 }
@@ -823,6 +838,7 @@ mod tests {
         assert!(parse_flags(["--start-on", "4:0,0,0"]).is_err());
         assert!(parse_flags(["--start-on", "4:1,2"]).is_err());
         assert!(parse_flags(["--start-on", "x:1,0,0"]).is_err());
+        assert!(parse_flags(["--start-on", "4:1,0,0@0"]).is_err());
     }
 
     #[test]
@@ -831,6 +847,12 @@ mod tests {
         let s = flags.start_on.unwrap();
         assert_eq!(s.frame_id, 4);
         assert!((s.direction.y - 0.6).abs() < 1e-12 && (s.direction.z - 0.8).abs() < 1e-12);
+        assert_eq!(s.distance, None);
+        let s = parse_flags(["--start-on", "4:1,0,0@6.37e6"])
+            .unwrap()
+            .start_on
+            .unwrap();
+        assert_eq!(s.distance, Some(6.37e6));
     }
 
     #[test]

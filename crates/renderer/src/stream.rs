@@ -36,11 +36,6 @@
 //! fails, make a cell `Gone`. Cells not selected for 60 s are evicted, and
 //! the cache never holds more than 4096 cells it could drop.
 //!
-//! While the observer walks, the cells around its feet at every depth of
-//! its frame are priority cells ([`CellCache::set_priority`], chosen by
-//! [`crate::probe::feet_cells`]): requested before anything else, coarsest
-//! first, so contact soon uses the finest matter any layer offers there.
-//!
 //! A frame that is a sprite only in the far field ([`crate::farfield`]) has
 //! no cells selected. The depth-0 cell of every frame that may need a sprite
 //! is pinned ([`CellCache::pin`]): fetched once like a selected cell and
@@ -134,9 +129,7 @@ pub struct ReadyCell {
     pub has_matter: bool,
     /// The density of the drawn surface, kilograms per cubic meter, the
     /// isovalue of [`crate::extract`] ([`crate::extract::surface_isovalue`]);
-    /// `None` without solid or fluid samples. The
-    /// observer's matter probe ([`crate::probe`]) puts the solid boundary
-    /// at the same isovalue, so the observer stands on what is drawn.
+    /// `None` without solid or fluid samples.
     pub surface_isovalue: Option<f64>,
     /// The cell's children can show more than it does: its drawn surface
     /// crosses it (some sample below [`ReadyCell::surface_isovalue`] and
@@ -360,9 +353,6 @@ pub struct CellEntry {
     /// Kept for the far field: requested like a selected cell, never
     /// evicted.
     pub pinned: bool,
-    /// Around the walking observer's feet ([`CellCache::set_priority`]):
-    /// requested before every other cell, never evicted while it is.
-    pub priority: bool,
     /// Session time the cell was last selected or drawn, seconds.
     pub last_used: f64,
     /// Projected size at the latest selection, pixels.
@@ -377,7 +367,6 @@ impl CellEntry {
             state: CellState::Missing,
             selected: false,
             pinned: false,
-            priority: false,
             last_used: now,
             projected_px: 0.0,
             requested_at: f64::NEG_INFINITY,
@@ -519,29 +508,8 @@ impl CellCache {
             e.projected_px = c.projected_px;
         }
         self.entries
-            .retain(|_, e| e.selected || e.pinned || e.priority || e.state != CellState::Missing);
+            .retain(|_, e| e.selected || e.pinned || e.state != CellState::Missing);
         self.selection = cells;
-    }
-
-    /// Replaces the priority cells: the cells around the walking observer's
-    /// feet ([`crate::probe::feet_cells`]). They are requested before any
-    /// other cell, whatever their projected size, and kept while they are
-    /// priority cells. `Missing` keys that are no longer wanted at all are
-    /// dropped, as in [`CellCache::set_selection`].
-    pub fn set_priority(&mut self, keys: &[CellKey], now: f64) {
-        for e in self.entries.values_mut() {
-            e.priority = false;
-        }
-        for k in keys {
-            let e = self
-                .entries
-                .entry(*k)
-                .or_insert_with(|| CellEntry::new(now));
-            e.priority = true;
-            e.last_used = now;
-        }
-        self.entries
-            .retain(|_, e| e.selected || e.pinned || e.priority || e.state != CellState::Missing);
     }
 
     /// Pins a cell: it is requested like a selected cell (if it is not
@@ -563,8 +531,7 @@ impl CellCache {
             .map(|(k, _)| k)
     }
 
-    /// Picks the next requests: priority `Missing` cells first, from the
-    /// coarsest depth down, then selected or pinned `Missing` cells,
+    /// Picks the next requests: selected or pinned `Missing` cells,
     /// largest projected size first (ties in key order), up to
     /// [`MAX_IN_FLIGHT`] in flight. Marks them `Requested`.
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
@@ -577,26 +544,16 @@ impl CellCache {
         if room == 0 {
             return Vec::new();
         }
-        // Priority cells sort ahead of everything, coarsest first.
-        let rank = |e: &CellEntry| {
-            if e.priority {
-                f64::INFINITY
-            } else {
-                e.projected_px
-            }
-        };
-        let mut due: Vec<(f64, u8, CellKey)> = self
+        let mut due: Vec<(f64, CellKey)> = self
             .entries
             .iter()
-            .filter(|(_, e)| {
-                (e.selected || e.pinned || e.priority) && e.state == CellState::Missing
-            })
-            .map(|(k, e)| (rank(e), if e.priority { k.depth } else { 0 }, *k))
+            .filter(|(_, e)| (e.selected || e.pinned) && e.state == CellState::Missing)
+            .map(|(k, e)| (e.projected_px, *k))
             .collect();
-        due.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        due.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         due.truncate(room);
         due.into_iter()
-            .map(|(_, _, k)| {
+            .map(|(_, k)| {
                 let e = self.entries.get_mut(&k).expect("listed above");
                 e.state = CellState::Requested;
                 e.requested_at = now;
@@ -632,13 +589,11 @@ impl CellCache {
 
     /// Evicts cells not used for [`EVICT_AFTER_SECONDS`], then, while more
     /// than [`MAX_CACHED_CELLS`] remain, the least recently used (ties in key
-    /// order). Selected, pinned, and priority cells, and requests in flight,
-    /// are never evicted.
+    /// order). Selected and pinned cells, and requests in flight, are never
+    /// evicted.
     /// Returns the evicted keys in key order.
     pub fn evict(&mut self, now: f64) -> Vec<CellKey> {
-        let droppable = |e: &CellEntry| {
-            !e.selected && !e.pinned && !e.priority && e.state != CellState::Requested
-        };
+        let droppable = |e: &CellEntry| !e.selected && !e.pinned && e.state != CellState::Requested;
         let mut gone: BTreeSet<CellKey> = self
             .entries
             .iter()
@@ -1424,26 +1379,6 @@ mod tests {
         c.complete(first[0], FetchOutcome::Decoded(None), 0.1);
         assert_eq!(c.take_requests(0.1).len(), 1);
         assert_eq!(c.counts().in_flight, MAX_IN_FLIGHT);
-    }
-
-    #[test]
-    fn priority_cells_go_first_coarsest_first_and_are_kept() {
-        let mut c = CellCache::new();
-        let n = MAX_IN_FLIGHT as u32 + 8;
-        let keys: Vec<CellKey> = (0..n).map(|i| key(10, i, 0, 0)).collect();
-        c.set_selection(sel(&keys), 0.0);
-        let (fine, coarse) = (key(12, 0, 0, 0), key(2, 0, 0, 0));
-        c.set_priority(&[fine, coarse], 0.0);
-        let first = c.take_requests(0.0);
-        assert_eq!(first.len(), MAX_IN_FLIGHT);
-        assert_eq!(&first[..2], &[coarse, fine]);
-        c.complete(coarse, ready(), 0.0);
-        c.set_selection(Vec::new(), 0.0);
-        assert!(c.evict(1000.0).iter().all(|k| *k != coarse));
-        assert!(c.entry(&coarse).is_some_and(|e| e.priority));
-        // No longer a priority: an unused cell like any other.
-        c.set_priority(&[], 1000.0);
-        assert!(c.evict(2000.0).contains(&coarse));
     }
 
     #[test]

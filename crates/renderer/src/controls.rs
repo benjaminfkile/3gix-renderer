@@ -1,10 +1,9 @@
 //! Keyboard and mouse controls, shared by the desktop window and the
 //! browser canvas.
 //!
-//! Turns `winit` window events into flight or walking input for the
-//! [`Camera`] and the [`Observer`] (fly and walk, `Tab`), the spawn chooser
-//! (`G`), actions on the simulation clock ([`crate::sim::ClockAction`]),
-//! view jumps, and the
+//! Turns `winit` window events into flight input for the free [`Camera`],
+//! actions on the simulation clock ([`crate::sim::ClockAction`]), view
+//! jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
 //! matched by physical position, so they sit in the same place on every
@@ -14,7 +13,6 @@ use crate::camera::{Camera, FlightInput, SPEED_LIMITS};
 use crate::render::gpu::{Exposure, EXPOSURE_STEP_STOPS};
 use crate::render::scene::MeshMode;
 use crate::sim::{ClockAction, Simulation};
-use crate::walk::Observer;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -42,13 +40,6 @@ pub struct Controls {
     /// `true` while frame markers and frame-to-parent lines are hidden
     /// (`M`): they are drawing aids, not matter.
     pub hide_guides: bool,
-    /// `true` while the spawn chooser is open (`G`): the number keys pick a
-    /// frame to spawn onto ([`crate::walk::spawn_frames`]).
-    pub spawning: bool,
-    /// The spawn chooser index picked since the last frame.
-    spawn: Option<usize>,
-    /// Space pressed in walk mode since the last frame.
-    jump: bool,
     /// The speed being typed after `V`, meters per second, as typed; `None`
     /// when no speed is being typed.
     pub speed_entry: Option<String>,
@@ -88,19 +79,6 @@ impl Controls {
         out
     }
 
-    /// Whether Space was pressed in walk mode since the last frame; clears
-    /// it.
-    pub fn take_jump(&mut self) -> bool {
-        std::mem::take(&mut self.jump)
-    }
-
-    /// The spawn chooser index (`0` for key `1`, up to `9` for key `0`)
-    /// picked since the last frame; clears it. The frame loop resolves it
-    /// against [`crate::walk::spawn_frames`].
-    pub fn take_spawn(&mut self) -> Option<usize> {
-        self.spawn.take()
-    }
-
     /// Applies one window event. Returns `true` when the user asked to
     /// quit (`Escape`). Events that are not input are ignored.
     pub fn handle(
@@ -108,13 +86,12 @@ impl Controls {
         event: &WindowEvent,
         sim: &mut Simulation,
         camera: &mut Camera,
-        observer: &mut Observer,
     ) -> bool {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
-                    return self.key(code, pressed, event.repeat, sim, camera, observer);
+                    return self.key(code, pressed, event.repeat, sim, camera);
                 }
             }
             WindowEvent::MouseInput {
@@ -151,16 +128,14 @@ impl Controls {
         repeat: bool,
         sim: &mut Simulation,
         camera: &mut Camera,
-        observer: &mut Observer,
     ) -> bool {
         if self.speed_entry.is_some() && pressed {
-            self.type_speed(code, camera, observer);
+            self.type_speed(code, camera);
             return false;
         }
-        if code == KeyCode::Space && pressed && !repeat && observer.walking() {
-            self.jump = true;
-            return false;
-        }
+        let clock = |sim: &mut Simulation, camera: &mut Camera, a: ClockAction| {
+            crate::camera::apply_clock(sim, camera, a)
+        };
         let f = &mut self.flight;
         match code {
             KeyCode::KeyW => f.forward = pressed,
@@ -171,22 +146,14 @@ impl Controls {
             KeyCode::KeyQ => f.down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => f.boost = pressed,
             _ if !pressed || repeat => {}
-            KeyCode::Space => observer.apply_clock(sim, camera, ClockAction::TogglePause),
-            KeyCode::BracketLeft => observer.apply_clock(sim, camera, ClockAction::HalveRate),
-            KeyCode::BracketRight => observer.apply_clock(sim, camera, ClockAction::DoubleRate),
-            KeyCode::Comma => observer.apply_clock(sim, camera, ClockAction::StepBack),
-            KeyCode::Period => observer.apply_clock(sim, camera, ClockAction::StepForward),
-            KeyCode::Backspace => observer.apply_clock(sim, camera, ClockAction::ToggleRewind),
-            KeyCode::KeyN => observer.apply_clock(sim, camera, ClockAction::JumpToNow),
-            KeyCode::Tab => {
-                let v = camera.flight_velocity(sim.system(), &self.flight);
-                observer.toggle(sim.system(), camera, v);
-            }
-            KeyCode::KeyG => self.spawning = !self.spawning,
-            KeyCode::Home => {
-                observer.stop();
-                *camera = Camera::home(sim.system());
-            }
+            KeyCode::Space => clock(sim, camera, ClockAction::TogglePause),
+            KeyCode::BracketLeft => clock(sim, camera, ClockAction::HalveRate),
+            KeyCode::BracketRight => clock(sim, camera, ClockAction::DoubleRate),
+            KeyCode::Comma => clock(sim, camera, ClockAction::StepBack),
+            KeyCode::Period => clock(sim, camera, ClockAction::StepForward),
+            KeyCode::Backspace => clock(sim, camera, ClockAction::ToggleRewind),
+            KeyCode::KeyN => clock(sim, camera, ClockAction::JumpToNow),
+            KeyCode::Home => *camera = Camera::home(sim.system()),
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::KeyV => self.speed_entry = Some(String::new()),
             KeyCode::KeyX => self.mesh_mode = self.mesh_mode.next(),
@@ -194,18 +161,14 @@ impl Controls {
             KeyCode::Minus | KeyCode::NumpadSubtract => self.bias_exposure(-EXPOSURE_STEP_STOPS),
             KeyCode::Escape => return true,
             other => {
-                if let Some(index) = digit_index(other) {
-                    if self.spawning {
-                        self.spawning = false;
-                        self.spawn = Some(index);
-                    } else if let Some(cam) = Camera::view_of_index(sim.system(), index) {
-                        observer.stop();
-                        *camera = Camera {
-                            speed: camera.speed,
-                            cruise: camera.cruise,
-                            ..cam
-                        };
-                    }
+                if let Some(cam) =
+                    digit_index(other).and_then(|i| Camera::view_of_index(sim.system(), i))
+                {
+                    *camera = Camera {
+                        speed: camera.speed,
+                        cruise: camera.cruise,
+                        ..cam
+                    };
                 }
             }
         }
@@ -213,11 +176,10 @@ impl Controls {
     }
 
     /// One key while a speed is being typed: digits and one decimal point
-    /// add to it, `Backspace` removes the last character, `Enter` sets it
-    /// (the walking speed in walk mode, the flight speed in fly mode, each
-    /// clamped to its limits) and `Escape` drops it. Other keys do nothing
-    /// until the entry is closed.
-    fn type_speed(&mut self, code: KeyCode, camera: &mut Camera, observer: &mut Observer) {
+    /// add to it, `Backspace` removes the last character, `Enter` sets it as
+    /// the flight speed (clamped to [`SPEED_LIMITS`]) and `Escape` drops it.
+    /// Other keys do nothing until the entry is closed.
+    fn type_speed(&mut self, code: KeyCode, camera: &mut Camera) {
         let Some(text) = self.speed_entry.as_mut() else {
             return;
         };
@@ -227,9 +189,7 @@ impl Controls {
         match code {
             KeyCode::Enter | KeyCode::NumpadEnter => {
                 if let Ok(v) = text.parse::<f64>() {
-                    if observer.walking() {
-                        observer.set_walk_speed(v);
-                    } else if !v.is_nan() {
+                    if !v.is_nan() {
                         let (lo, hi) = SPEED_LIMITS;
                         camera.speed = v.clamp(lo, hi);
                     }
@@ -257,7 +217,7 @@ impl Controls {
 
     /// The controls' own overlay lines: the mesh debug mode, and the speed
     /// entry while a speed is being typed.
-    pub fn status_lines(&self, observer: &Observer) -> Vec<String> {
+    pub fn status_lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self
             .mesh_mode
             .label()
@@ -265,9 +225,8 @@ impl Controls {
             .into_iter()
             .collect();
         if let Some(t) = &self.speed_entry {
-            let what = if observer.walking() { "walk" } else { "flight" };
             lines.push(format!(
-                "type a {what} speed: {t}_ m/s  (Enter sets, Esc cancels)"
+                "type a flight speed: {t}_ m/s  (Enter sets, Esc cancels)"
             ));
         }
         lines
@@ -330,7 +289,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_typed_speed_sets_the_walk_or_flight_speed() {
+    fn a_typed_speed_sets_the_flight_speed() {
         let mut c = Controls::new(None);
         let mut camera = Camera {
             frame_id: 0,
@@ -339,14 +298,12 @@ mod tests {
             speed: 1.0,
             cruise: 1.0,
         };
-        let mut observer = Observer::new();
-        let typing = |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera, o: &mut Observer| {
+        let typing = |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera| {
             c.speed_entry = Some(String::new());
             for &k in keys {
-                c.type_speed(k, cam, o);
+                c.type_speed(k, cam);
             }
         };
-        // Fly mode: the flight speed.
         typing(
             &mut c,
             &[
@@ -357,7 +314,6 @@ mod tests {
                 KeyCode::Enter,
             ],
             &mut camera,
-            &mut observer,
         );
         assert_eq!(camera.speed, 25.5);
         assert_eq!(c.speed_entry, None);
@@ -372,17 +328,11 @@ mod tests {
                 KeyCode::Period,
             ],
             &mut camera,
-            &mut observer,
         );
         assert_eq!(c.speed_entry.as_deref(), Some("7."));
-        c.type_speed(KeyCode::Escape, &mut camera, &mut observer);
+        c.type_speed(KeyCode::Escape, &mut camera);
         assert_eq!(c.speed_entry, None);
         assert_eq!(camera.speed, 25.5);
-        // The walking speed clamps to Mach 4.
-        observer.set_walk_speed(1.0e6);
-        assert_eq!(observer.walk_speed, crate::walk::WALK_SPEED_LIMITS.1);
-        observer.set_walk_speed(0.0);
-        assert_eq!(observer.walk_speed, crate::walk::WALK_SPEED_LIMITS.0);
     }
 
     #[test]

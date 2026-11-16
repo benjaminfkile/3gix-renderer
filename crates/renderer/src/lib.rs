@@ -24,10 +24,6 @@
 //!   6.4).
 //! - [`camera`]: the free camera parented to its nearest frame, the floating
 //!   origin of `space-model.md` section 5.
-//! - [`walk`]: fly and walk modes, the observer body stepped by the core
-//!   laws, and spawning onto any frame with matter (`space-model.md`
-//!   sections 3 and 6.3).
-//! - [`probe`]: the walking observer's matter probe over the loaded cells.
 //! - [`controls`]: keyboard and mouse bindings, shared by the window and the
 //!   browser canvas (native, or with the `web` feature).
 //! - [`stream`]: cell selection, the cell cache, decoding and compositing,
@@ -60,14 +56,12 @@ pub mod directions;
 pub mod extract;
 pub mod farfield;
 pub mod light;
-pub mod probe;
 pub mod protocol;
 pub mod render;
 pub mod seen;
 pub mod sim;
 pub mod stream;
 pub mod volume;
-pub mod walk;
 pub mod world;
 
 #[cfg(not(target_arch = "wasm32"))]
