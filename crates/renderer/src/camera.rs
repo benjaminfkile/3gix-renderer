@@ -342,9 +342,32 @@ impl Camera {
         direction: Vec3,
         distance: Option<f64>,
     ) -> Option<Camera> {
+        Camera::over_pitched(system, frame_id, direction, distance, None)
+    }
+
+    /// [`Camera::over`], looking `pitch_deg` degrees below level (level:
+    /// toward the frame's `+z` heading, or `+x` at a pole) when given.
+    pub fn over_pitched(
+        system: &FrameSystem,
+        frame_id: u64,
+        direction: Vec3,
+        distance: Option<f64>,
+        pitch_deg: Option<f64>,
+    ) -> Option<Camera> {
         let frame = system.tree().get(frame_id)?;
         let distance = distance.unwrap_or(3.0 * frame.root_extent.value() / 8.0);
-        let look = look_rotation(direction.scale(-1.0), Vec3::new(0.0, 0.0, 1.0));
+        let look = match pitch_deg {
+            None => look_rotation(direction.scale(-1.0), Vec3::new(0.0, 0.0, 1.0)),
+            Some(p) => {
+                let z = Vec3::new(0.0, 0.0, 1.0);
+                let level = (z - direction.scale(z.dot(direction)))
+                    .normalized()
+                    .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+                let a = (-p).to_radians();
+                let forward = level.scale(a.cos()) - direction.scale(a.sin());
+                look_rotation(forward, direction)
+            }
+        };
         Some(Camera {
             frame_id,
             position: direction.scale(distance),

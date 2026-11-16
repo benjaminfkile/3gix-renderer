@@ -370,8 +370,10 @@ pub struct HeadlessFrame {
 pub fn view_camera(system: &FrameSystem, view: View, distance_scale: f64) -> Result<Camera> {
     let camera = match view {
         View::Home => Camera::home(system),
-        View::Over(s) => Camera::over(system, s.frame_id, s.direction, s.distance)
-            .ok_or_else(|| anyhow!("frame {} is not in the registry", s.frame_id))?,
+        View::Over(s) => {
+            Camera::over_pitched(system, s.frame_id, s.direction, s.distance, s.pitch_deg)
+                .ok_or_else(|| anyhow!("frame {} is not in the registry", s.frame_id))?
+        }
         View::Key(index) => Camera::view_of_index(system, index)
             .ok_or_else(|| anyhow!("no frame is bound to the number key of view {view}"))?,
     };
@@ -560,7 +562,15 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     let sim = launch_simulation(system, config, now);
     let camera = config
         .start_on
-        .and_then(|s| Camera::over(sim.system(), s.frame_id, s.direction, s.distance))
+        .and_then(|s| {
+            Camera::over_pitched(
+                sim.system(),
+                s.frame_id,
+                s.direction,
+                s.distance,
+                s.pitch_deg,
+            )
+        })
         .unwrap_or_else(|| Camera::home(sim.system()));
     let mut app = App {
         sim,

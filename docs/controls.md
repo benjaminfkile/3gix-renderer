@@ -87,7 +87,8 @@ matter like the free camera. The overlay says `camera on frame <id>`.
 the direction `x, y, z` of its axes as soon as the frame is listed. With
 a distance, `--start-on <frame>:<x>,<y>,<z>@<m>`, it only places the free
 camera `<m>` meters from the frame origin on that line, looking back at the
-origin. A headless run does the same (`--view-distance-scale` moves a
+origin; `@<m>^<deg>` looks `<deg>` degrees below level instead (level is
+toward the frame's `+z`). A headless run does the same (`--view-distance-scale` moves a
 placed camera along the line).
 
 ## Simulation time

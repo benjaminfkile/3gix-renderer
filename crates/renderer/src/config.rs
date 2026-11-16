@@ -97,10 +97,11 @@ FLAGS:
     --height <u32>                 render height in pixels (default 720)
     --view <home|0-9>              headless view: home (default) or the number key's view
     --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
-    --start-on <frame>:<x>,<y>,<z>[@<m>]
+    --start-on <frame>:<x>,<y>,<z>[@<m>[^<deg>]]
                                    spawn the camera onto frame <frame> along the direction
                                    x, y, z of its axes (as G does); with @<m>, only place it
                                    <m> meters from the frame origin, looking at the origin
+                                   (with ^<deg>: <deg> degrees below level instead)
     --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
                                    with a non-zero status after this many seconds
     --stats-json <path.json>       headless: write the overlay statistics as JSON
@@ -306,21 +307,35 @@ pub struct StartOn {
     pub direction: gx_core::units::Vec3,
     /// Distance from the frame origin, meters; `None` for the default.
     pub distance: Option<f64>,
+    /// With a distance: look this many degrees below level (toward the
+    /// frame's `+z` heading) instead of at the frame origin.
+    pub pitch_deg: Option<f64>,
 }
 
 impl StartOn {
-    /// Parses `<frame>:<x>,<y>,<z>[@<meters>]`; the direction must not be
-    /// zero and the distance must be above zero.
+    /// Parses `<frame>:<x>,<y>,<z>[@<meters>[^<pitch degrees>]]`; the
+    /// direction must not be zero, the distance must be above zero, and the
+    /// pitch between -90 and 90.
     pub fn parse(s: &str) -> Option<StartOn> {
-        let (place, distance) = match s.split_once('@') {
-            Some((p, d)) => {
+        let (place, distance, pitch_deg) = match s.split_once('@') {
+            Some((p, rest)) => {
+                let (d, pitch) = match rest.split_once('^') {
+                    Some((d, a)) => {
+                        let a: f64 = a.trim().parse().ok()?;
+                        if !(-90.0..=90.0).contains(&a) {
+                            return None;
+                        }
+                        (d, Some(a))
+                    }
+                    None => (rest, None),
+                };
                 let d: f64 = d.trim().parse().ok()?;
                 if !(d.is_finite() && d > 0.0) {
                     return None;
                 }
-                (p, Some(d))
+                (p, Some(d), pitch)
             }
-            None => (s, None),
+            None => (s, None, None),
         };
         let (frame, dir) = place.split_once(':')?;
         let frame_id = frame.trim().parse().ok()?;
@@ -340,6 +355,7 @@ impl StartOn {
             frame_id,
             direction,
             distance,
+            pitch_deg,
         })
     }
 }
@@ -853,6 +869,12 @@ mod tests {
             .start_on
             .unwrap();
         assert_eq!(s.distance, Some(6.37e6));
+        let s = parse_flags(["--start-on", "4:1,0,0@6.37e6^-20"])
+            .unwrap()
+            .start_on
+            .unwrap();
+        assert_eq!(s.pitch_deg, Some(-20.0));
+        assert!(parse_flags(["--start-on", "4:1,0,0@6.37e6^-100"]).is_err());
     }
 
     #[test]

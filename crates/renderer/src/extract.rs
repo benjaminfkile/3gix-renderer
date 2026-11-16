@@ -55,10 +55,9 @@
 //! from one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
-//! A cube straddling a face is drawn once: by the cell on the face's low
-//! side when the cells are at the same depth (two copies from two mesh
-//! origins would fight in the depth buffer), and by the finer cell at a
-//! depth transition: a cell with finer cells selected across a face cuts
+//! Same-depth neighbors both draw the cubes straddling their shared face,
+//! from the same samples, so their meshes overlap there and never part. At
+//! a depth transition a cell with finer cells selected across a face cuts
 //! its mesh at that face ([`FaceNeighbors::clip`]), and the finer side,
 //! padded from it, reaches half a sample past the face to meet it. Where
 //! two meshes still meet at slightly different heights (across a depth
@@ -1031,24 +1030,10 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
     let mut indices: Vec<u32> = Vec::new();
 
     // Cubes between grid points PAD - 1 and n + PAD: the cell's own cubes
-    // and those straddling its faces, half a sample beyond them. A cube
-    // straddling a low face whose same-depth neighbor is loaded is that
-    // neighbor's to draw (it straddles the neighbor's high face, from the
-    // same samples): drawing it twice, from two mesh origins, would make
-    // two copies of one surface fight in the depth buffer.
-    let shared_low: [bool; 3] = core::array::from_fn(|a| {
-        matches!(grid.neighbors[face_index(a, false)], Some(Pad::Samples(..)))
-    });
+    // and those straddling its faces, half a sample beyond them.
     for z in PAD - 1..n + PAD {
         for y in PAD - 1..n + PAD {
             for x in PAD - 1..n + PAD {
-                if [x, y, z]
-                    .iter()
-                    .zip(shared_low)
-                    .any(|(&c, shared)| shared && c == PAD - 1)
-                {
-                    continue;
-                }
                 let base = [x, y, z];
                 let at = |c: usize| {
                     let o = corner_offset(c);
