@@ -636,15 +636,31 @@ impl CellCache {
 
     /// Evicts cells not used for [`EVICT_AFTER_SECONDS`], then, while more
     /// than [`MAX_CACHED_CELLS`] remain, the least recently used (ties in key
-    /// order). Selected and pinned cells, and requests in flight, are never
-    /// evicted.
+    /// order). Selected and pinned cells, the ancestors of selected cells,
+    /// and requests in flight are never evicted.
     /// Returns the evicted keys in key order.
     pub fn evict(&mut self, now: f64) -> Vec<CellKey> {
-        let droppable = |e: &CellEntry| !e.selected && !e.pinned && e.state != CellState::Requested;
+        // The selection refines only loaded cells, so the ancestors of the
+        // selected cells are what it stands on: dropping one collapses the
+        // selection below it to that depth, which asks for it again, which
+        // refines again, over and over.
+        let mut chain: BTreeSet<CellKey> = BTreeSet::new();
+        for s in &self.selection {
+            let mut up = s.key.parent();
+            while let Some(p) = up {
+                if !chain.insert(p) {
+                    break;
+                }
+                up = p.parent();
+            }
+        }
+        let droppable = |k: &CellKey, e: &CellEntry| {
+            !e.selected && !e.pinned && e.state != CellState::Requested && !chain.contains(k)
+        };
         let mut gone: BTreeSet<CellKey> = self
             .entries
             .iter()
-            .filter(|(_, e)| droppable(e) && now - e.last_used >= EVICT_AFTER_SECONDS)
+            .filter(|(k, e)| droppable(k, e) && now - e.last_used >= EVICT_AFTER_SECONDS)
             .map(|(k, _)| *k)
             .collect();
         let remaining = self.entries.len() - gone.len();
@@ -652,7 +668,7 @@ impl CellCache {
             let mut lru: Vec<(f64, CellKey)> = self
                 .entries
                 .iter()
-                .filter(|(k, e)| droppable(e) && !gone.contains(k))
+                .filter(|(k, e)| droppable(k, e) && !gone.contains(k))
                 .map(|(k, e)| (e.last_used, *k))
                 .collect();
             lru.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1458,6 +1474,23 @@ mod tests {
         c.complete(first[0], FetchOutcome::Decoded(None), 0.1);
         assert_eq!(c.take_requests(0.1).len(), 1);
         assert_eq!(c.counts().in_flight, MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn ancestors_of_selected_cells_are_kept() {
+        let mut c = CellCache::new();
+        let parent = key(3, 1, 1, 1);
+        let child = key(4, 2, 2, 2);
+        let other = key(3, 5, 5, 5);
+        c.set_selection(sel(&[parent, other]), 0.0);
+        c.complete(parent, ready(), 0.0);
+        c.complete(other, ready(), 0.0);
+        // The parent is refined: its child is selected instead.
+        c.set_selection(sel(&[child]), 1.0);
+        let gone = c.evict(1000.0);
+        assert!(!gone.contains(&parent), "the parent was evicted");
+        assert!(gone.contains(&other));
+        assert!(c.entry(&parent).is_some());
     }
 
     #[test]
