@@ -375,6 +375,8 @@ pub struct HeadlessFrame {
 pub fn view_camera(system: &FrameSystem, view: View, distance_scale: f64) -> Result<Camera> {
     let camera = match view {
         View::Home => Camera::home(system),
+        View::Over(s) => Camera::over(system, s.frame_id, s.direction)
+            .ok_or_else(|| anyhow!("frame {} is not in the registry", s.frame_id))?,
         View::Key(index) => Camera::view_of_index(system, index)
             .ok_or_else(|| anyhow!("no frame is bound to the number key of view {view}"))?,
     };
@@ -516,10 +518,14 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     check_origin(&system, fetcher.origin_utc_ms());
     let now = tdb_of_utc_ms(fetcher.now_utc_ms());
     let sim = launch_simulation(system, config, now);
-    let camera = Camera::home(sim.system());
+    let camera = config
+        .start_on
+        .and_then(|s| Camera::over(sim.system(), s.frame_id, s.direction))
+        .unwrap_or_else(|| Camera::home(sim.system()));
     let mut app = App {
         sim,
         camera,
+        start_on: config.start_on,
         observer: Observer::new(),
         world: World::new(default_threads()),
         fetcher,
@@ -643,6 +649,8 @@ impl Gfx {
 struct App {
     sim: Simulation,
     camera: Camera,
+    /// `--start-on` until the observer has spawned there.
+    start_on: Option<crate::config::StartOn>,
     observer: Observer,
     world: World,
     fetcher: Fetcher,
@@ -673,8 +681,21 @@ impl App {
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
         if let Some(index) = self.controls.take_spawn() {
+            self.start_on = None;
             let (system, cache) = (self.sim.system(), self.world.cache());
             spawn_by_index(&mut self.observer, system, cache, index, &mut self.camera);
+        }
+        if let Some(s) = self.start_on {
+            // Spawn as soon as the frame's coarse matter is loaded; the
+            // camera is on the line from its origin along the direction.
+            let (system, cache) = (self.sim.system(), self.world.cache());
+            if crate::walk::spawn_frames(cache, system.tree()).contains(&s.frame_id)
+                && self
+                    .observer
+                    .spawn(system, cache, s.frame_id, &mut self.camera)
+            {
+                self.start_on = None;
+            }
         }
         let input = self.controls.take_flight();
         let jump = self.controls.take_jump();
@@ -699,7 +720,7 @@ impl App {
             .select(seen.system(), seen.camera(), size, t, false);
         self.world
             .set_priority(&self.observer.priority_cells(self.sim.system()), t);
-        if self.controls.spawning {
+        if self.controls.spawning || self.start_on.is_some() {
             self.world.survey(self.sim.system(), t);
         }
         set_fetch_time(&mut self.fetcher, &self.sim);

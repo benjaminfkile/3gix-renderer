@@ -146,6 +146,14 @@ until buoyancy holds it, where the surrounding density is its own.
 
 With the chooser closed the number keys are the fly views described above.
 
+`--start-on <frame>:<x>,<y>,<z>` starts the window over that frame instead
+of at `Home`: the camera is placed `3 * root_extent / 8` from the frame
+origin along the direction `x, y, z` of the frame's axes, looking back at
+the origin, and as soon as the frame is listed the observer spawns on that
+line exactly as the chooser would. Choosing a frame with `G` first cancels
+it. A headless run with `--start-on` renders the view from that camera
+(`--view-distance-scale` moves it along the line).
+
 ## Simulation time
 
 | Input | Action |

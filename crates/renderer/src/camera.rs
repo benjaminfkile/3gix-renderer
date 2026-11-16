@@ -353,6 +353,23 @@ impl Camera {
         ))
     }
 
+    /// A view of `frame_id` from along `direction` (unit, frame axes):
+    /// parented to the frame, `3 * root_extent / 8` from its origin along
+    /// `direction`, looking back at the origin with the frame's `+z` as the
+    /// up hint. `None` if the id is not in the tree.
+    pub fn over(system: &FrameSystem, frame_id: u64, direction: Vec3) -> Option<Camera> {
+        let frame = system.tree().get(frame_id)?;
+        let distance = 3.0 * frame.root_extent.value() / 8.0;
+        let look = look_rotation(direction.scale(-1.0), Vec3::new(0.0, 0.0, 1.0));
+        Some(Camera {
+            frame_id,
+            position: direction.scale(distance),
+            orientation: look,
+            speed: DEFAULT_SPEED_MPS,
+            cruise: DEFAULT_SPEED_MPS,
+        })
+    }
+
     /// The same camera at `factor` times its distance from its frame
     /// origin, along the same line, with the same view direction.
     pub fn with_distance_scale(self, factor: f64) -> Camera {

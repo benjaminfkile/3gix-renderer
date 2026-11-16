@@ -97,6 +97,9 @@ FLAGS:
     --height <u32>                 render height in pixels (default 720)
     --view <home|0-9>              headless view: home (default) or the number key's view
     --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
+    --start-on <frame>:<x>,<y>,<z> start over frame <frame> along the direction x, y, z of its
+                                   axes; the window spawns walking there once the frame's
+                                   matter is loaded, a headless run renders the view from there
     --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
                                    with a non-zero status after this many seconds
     --stats-json <path.json>       headless: write the overlay statistics as JSON
@@ -183,7 +186,7 @@ impl fmt::Display for Start {
 }
 
 /// The camera view a headless run renders.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum View {
     /// The `Home` view of the whole system.
     #[default]
@@ -191,6 +194,9 @@ pub enum View {
     /// The view a number key selects, by its index: key `1` is index 0,
     /// key `0` is index 9 (see [`crate::camera::selectable_frames`]).
     Key(usize),
+    /// The view from along a direction of a frame (`--start-on`,
+    /// [`crate::camera::Camera::over`]).
+    Over(StartOn),
 }
 
 impl View {
@@ -214,6 +220,11 @@ impl fmt::Display for View {
         match self {
             View::Home => f.write_str("home"),
             View::Key(i) => write!(f, "key {}", (i + 1) % 10),
+            View::Over(s) => write!(
+                f,
+                "over frame {} along {}, {}, {}",
+                s.frame_id, s.direction.x, s.direction.y, s.direction.z
+            ),
         }
     }
 }
@@ -279,6 +290,43 @@ pub struct Config {
     /// How surface meshes are drawn at start (`--mesh-mode`, `X` in the
     /// window).
     pub mesh_mode: crate::render::scene::MeshMode,
+    /// `--start-on`: a place to start over (and, in the window, to spawn
+    /// walking on) instead of the `Home` view.
+    pub start_on: Option<StartOn>,
+}
+
+/// A frame and a direction from its origin, in its axes (`--start-on`).
+/// The direction is a unit vector.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct StartOn {
+    /// The frame.
+    pub frame_id: u64,
+    /// Unit direction from the frame origin, frame axes.
+    pub direction: gx_core::units::Vec3,
+}
+
+impl StartOn {
+    /// Parses `<frame>:<x>,<y>,<z>`; the direction must not be zero.
+    pub fn parse(s: &str) -> Option<StartOn> {
+        let (frame, dir) = s.split_once(':')?;
+        let frame_id = frame.trim().parse().ok()?;
+        let v: Vec<f64> = dir
+            .split(',')
+            .map(|x| x.trim().parse::<f64>())
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let [x, y, z] = v[..] else {
+            return None;
+        };
+        if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+            return None;
+        }
+        let direction = gx_core::units::Vec3::new(x, y, z).normalized()?;
+        Some(StartOn {
+            frame_id,
+            direction,
+        })
+    }
 }
 
 /// The command line flags, each `None` when not given.
@@ -312,6 +360,8 @@ pub struct Flags {
     pub exposure_stops: Option<f64>,
     /// `--mesh-mode`.
     pub mesh_mode: Option<crate::render::scene::MeshMode>,
+    /// `--start-on`.
+    pub start_on: Option<StartOn>,
     /// `--hub-url`.
     pub hub_url: Option<String>,
     /// `--space-id`.
@@ -426,6 +476,14 @@ where
                         )))
                     }
                 })
+            }
+            "--start-on" => {
+                let v = value(&name)?;
+                flags.start_on = Some(StartOn::parse(&v).ok_or_else(|| {
+                    err(format!(
+                        "{name}: {v:?} is not <frame>:<x>,<y>,<z> with a direction other than zero"
+                    ))
+                })?)
             }
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
@@ -560,13 +618,17 @@ impl Config {
             screenshot: flags.screenshot.clone(),
             width: flags.width.unwrap_or(DEFAULT_WIDTH),
             height: flags.height.unwrap_or(DEFAULT_HEIGHT),
-            view: flags.view.unwrap_or_default(),
+            view: flags
+                .start_on
+                .map(View::Over)
+                .unwrap_or(flags.view.unwrap_or_default()),
             view_distance_scale: flags.view_distance_scale.unwrap_or(1.0),
             wait_ready_seconds: flags.wait_ready_seconds,
             stats_json: flags.stats_json.clone(),
             overlay: !flags.no_overlay,
             exposure_stops: flags.exposure_stops,
             mesh_mode: flags.mesh_mode.unwrap_or_default(),
+            start_on: flags.start_on,
             adapter: pick(&flags.adapter, ENV_ADAPTER).filter(|a| !a.trim().is_empty()),
             max_fps: flags.max_fps.unwrap_or(0),
             edge_url,
@@ -758,6 +820,17 @@ mod tests {
         assert!(parse_flags(["--view", "x"]).is_err());
         assert!(parse_flags(["--view-distance-scale", "0"]).is_err());
         assert!(parse_flags(["--wait-ready-seconds", "-1"]).is_err());
+        assert!(parse_flags(["--start-on", "4:0,0,0"]).is_err());
+        assert!(parse_flags(["--start-on", "4:1,2"]).is_err());
+        assert!(parse_flags(["--start-on", "x:1,0,0"]).is_err());
+    }
+
+    #[test]
+    fn start_on_is_a_frame_and_a_unit_direction() {
+        let flags = parse_flags(["--start-on", "4:0,3,4"]).unwrap();
+        let s = flags.start_on.unwrap();
+        assert_eq!(s.frame_id, 4);
+        assert!((s.direction.y - 0.6).abs() < 1e-12 && (s.direction.z - 0.8).abs() < 1e-12);
     }
 
     #[test]
