@@ -209,6 +209,45 @@ struct Field<'a> {
     root_origin: [f64; 3],
     root_edge: f64,
     missing: Cell<bool>,
+    /// The region's cells at depths `depth - 1 ..= depth + 1` as flat
+    /// tables ([`Level`]), so a lookup is an index, not a key built and
+    /// searched in the ordered maps for every sample.
+    levels: Vec<Level<'a>>,
+}
+
+/// What the snapshot holds for one cell of the region.
+#[derive(Copy, Clone)]
+enum Slot<'a> {
+    /// The cell's section.
+    Present(&'a Section),
+    /// Known empty.
+    Empty,
+    /// Neither present nor known empty.
+    Missing,
+}
+
+/// The region's cells at one depth, as a dense box of cell indices.
+struct Level<'a> {
+    depth: u8,
+    /// Index of the box's minimum cell (may lie outside the root cell).
+    base: [i64; 3],
+    /// Cells per axis.
+    dims: [i64; 3],
+    /// Drawn, per cell of the box.
+    drawn: Vec<bool>,
+    /// The snapshot's slot, per cell of the box.
+    slots: Vec<Slot<'a>>,
+}
+
+impl Level<'_> {
+    /// The flat index of cell `idx`, if it lies in the box.
+    fn index(&self, idx: [i64; 3]) -> Option<usize> {
+        let l = [0, 1, 2].map(|a| idx[a] - self.base[a]);
+        if (0..3).any(|a| !(0..self.dims[a]).contains(&l[a])) {
+            return None;
+        }
+        Some((l[0] + self.dims[0] * (l[1] + self.dims[1] * l[2])) as usize)
+    }
 }
 
 impl Field<'_> {
@@ -224,7 +263,94 @@ impl Field<'_> {
             root_origin: [o.x - idx[0] * e, o.y - idx[1] * e, o.z - idx[2] * e],
             root_edge: e * (1u64 << k.depth) as f64,
             missing: Cell::new(false),
+            levels: Self::levels(inputs),
         }
+    }
+
+    /// The flat tables of [`Level`]: the same cell ranges as
+    /// [`CellInputs::region`], filled from the snapshot.
+    fn levels(inputs: &CellInputs) -> Vec<Level<'_>> {
+        let key = inputs.key;
+        let d = key.depth;
+        let mut out = Vec::new();
+        for dd in d.saturating_sub(1)..=d.saturating_add(1) {
+            let range = |v: u32| -> (i64, i64) {
+                let (lo, hi) = (i64::from(v) - 1, i64::from(v) + 1);
+                if dd >= d {
+                    let f = 1i64 << (dd - d);
+                    (lo * f, (hi + 1) * f - 1)
+                } else {
+                    let f = 1i64 << (d - dd);
+                    (lo.div_euclid(f), hi.div_euclid(f))
+                }
+            };
+            let r = [range(key.x), range(key.y), range(key.z)];
+            let base = r.map(|(lo, _)| lo);
+            let dims = r.map(|(lo, hi)| hi - lo + 1);
+            let count = (dims[0] * dims[1] * dims[2]) as usize;
+            let mut level = Level {
+                depth: dd,
+                base,
+                dims,
+                drawn: vec![false; count],
+                slots: vec![Slot::Missing; count],
+            };
+            let side = 1i64 << dd;
+            for z in 0..dims[2] {
+                for y in 0..dims[1] {
+                    for x in 0..dims[0] {
+                        let idx = [base[0] + x, base[1] + y, base[2] + z];
+                        if idx.iter().any(|&v| !(0..side).contains(&v)) {
+                            continue;
+                        }
+                        let Ok(k) = CellKey::new(
+                            key.frame_id,
+                            dd,
+                            idx[0] as u32,
+                            idx[1] as u32,
+                            idx[2] as u32,
+                        ) else {
+                            continue;
+                        };
+                        let i = level.index(idx).expect("inside the box");
+                        level.drawn[i] = inputs.drawn.contains(&k);
+                        level.slots[i] = if k == key {
+                            Slot::Present(&inputs.section)
+                        } else {
+                            match inputs.sections.get(&k) {
+                                Some(Some(sec)) => Slot::Present(sec),
+                                Some(None) => Slot::Empty,
+                                None => Slot::Missing,
+                            }
+                        };
+                    }
+                }
+            }
+            out.push(level);
+        }
+        out
+    }
+
+    /// The cell index at depth `dd` holding the center of sample `c` of
+    /// depth `d`, or `None` outside the root cell (the arithmetic of
+    /// [`Field::holder`]).
+    fn holder_index(&self, d: u8, c: [i64; 3], dd: u8) -> Option<[i64; 3]> {
+        let n = self.n as i64;
+        let idx = if dd <= d {
+            c.map(|v| v.div_euclid(n << (d - dd)))
+        } else {
+            c.map(|v| ((2 * v + 1) << (dd - d)).div_euclid(2 * n))
+        };
+        let side = 1i64 << dd;
+        if idx.iter().any(|&v| !(0..side).contains(&v)) {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// The table of depth `dd`, if the region has one.
+    fn level(&self, dd: u8) -> Option<&Level<'_>> {
+        self.levels.iter().find(|l| l.depth == dd)
     }
 
     /// The cell of depth `dd` holding the center of sample `c` of depth `d`.
@@ -252,6 +378,23 @@ impl Field<'_> {
     /// Sample `c` of depth `d`, or `None` for vacuum; records a missing
     /// input when `strict`.
     fn sample(&self, d: u8, c: [i64; 3], strict: bool) -> Option<gx_core::matter::Sample> {
+        // Fast path: the region's tables.
+        if let Some(level) = self.level(d) {
+            let idx = self.holder_index(d, c, d)?;
+            if let Some(i) = level.index(idx) {
+                let section = match level.slots[i] {
+                    Slot::Present(s) => s,
+                    Slot::Empty => return None,
+                    Slot::Missing => {
+                        if strict {
+                            self.missing.set(true);
+                        }
+                        return None;
+                    }
+                };
+                return self.read(section, c, strict);
+            }
+        }
         let k = self.holder(d, c, d)?;
         let section = if k == self.inputs.key {
             Some(&self.inputs.section)
@@ -267,6 +410,17 @@ impl Field<'_> {
                 }
             }
         }?;
+        self.read(section, c, strict)
+    }
+
+    /// Sample `c` (in its depth's sample grid) of `section`, the cell
+    /// holding it, or `None` for vacuum.
+    fn read(
+        &self,
+        section: &Section,
+        c: [i64; 3],
+        strict: bool,
+    ) -> Option<gx_core::matter::Sample> {
         let n = self.n as i64;
         if i64::from(section.resolution()) != n {
             if strict {
@@ -298,13 +452,89 @@ impl MixedField for Field<'_> {
     fn drawn_depth(&self, d: u8, c: [i64; 3]) -> Option<u8> {
         let home = self.inputs.key.depth;
         (home.saturating_sub(1)..=home.saturating_add(1)).find(|&dd| {
-            self.holder(d, c, dd)
-                .is_some_and(|k| self.inputs.drawn.contains(&k))
+            let Some(idx) = self.holder_index(d, c, dd) else {
+                return false;
+            };
+            match self.level(dd).and_then(|l| Some((l, l.index(idx)?))) {
+                Some((l, i)) => l.drawn[i],
+                // Outside the region's tables: the ordered set.
+                None => self
+                    .holder(d, c, dd)
+                    .is_some_and(|k| self.inputs.drawn.contains(&k)),
+            }
         })
     }
 
+    fn interior_value(&self, d: u8, q: [i64; 3]) -> Option<f64> {
+        // A point strictly inside this cell: its eight samples are the
+        // cell's own, no finer cell touches it (the cell is drawn, so
+        // nothing below it is), and the sum runs in lattice_value's order.
+        let key = self.inputs.key;
+        if d != key.depth {
+            return None;
+        }
+        let n = self.n as i64;
+        let base = [key.x, key.y, key.z].map(|v| i64::from(v) * n);
+        let l = [0, 1, 2].map(|a| q[a] - base[a]);
+        if l.iter().any(|&v| !(1..n).contains(&v)) {
+            return None;
+        }
+        let section = &self.inputs.section;
+        if i64::from(section.resolution()) != n {
+            return None;
+        }
+        let samples = section.samples()?;
+        let mut sum = 0.0;
+        for o in 0..8usize {
+            let c = [
+                (l[0] - 1 + (o & 1) as i64) as usize,
+                (l[1] - 1 + ((o >> 1) & 1) as i64) as usize,
+                (l[2] - 1 + ((o >> 2) & 1) as i64) as usize,
+            ];
+            let j = c[0] + self.n * (c[1] + self.n * c[2]);
+            sum += if forms_surface(samples.state(j)) {
+                samples.occupancy(j).value()
+            } else {
+                0.0
+            };
+        }
+        Some(sum / 8.0)
+    }
+
     fn occupancy(&self, d: u8, c: [i64; 3]) -> f64 {
-        self.sample(d, c, true).map_or(0.0, |s| s.occupancy.value())
+        // Only the occupancy and the state are read, straight from their
+        // channels, not the whole sample.
+        let Some(level) = self.level(d) else {
+            return self.sample(d, c, true).map_or(0.0, |s| s.occupancy.value());
+        };
+        let Some(idx) = self.holder_index(d, c, d) else {
+            return 0.0;
+        };
+        let Some(i) = level.index(idx) else {
+            return self.sample(d, c, true).map_or(0.0, |s| s.occupancy.value());
+        };
+        let section = match level.slots[i] {
+            Slot::Present(s) => s,
+            Slot::Empty => return 0.0,
+            Slot::Missing => {
+                self.missing.set(true);
+                return 0.0;
+            }
+        };
+        let n = self.n as i64;
+        if i64::from(section.resolution()) != n {
+            self.missing.set(true);
+            return 0.0;
+        }
+        let Some(samples) = section.samples() else {
+            return 0.0;
+        };
+        let l = c.map(|v| v.rem_euclid(n) as usize);
+        let j = l[0] + self.n * (l[1] + self.n * l[2]);
+        if j >= samples.len() || !forms_surface(samples.state(j)) {
+            return 0.0;
+        }
+        samples.occupancy(j).value()
     }
 }
 
@@ -416,15 +646,19 @@ pub struct ExtractPool {
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
-/// The default worker count: the available parallelism, at most four, and
-/// zero on the web where there are no threads.
+/// The default worker count: every core but two (the frame thread's, and
+/// one for the selection thread, decoding, and the system), and zero on
+/// the web where there are no threads. Extraction is most of the work while
+/// a view settles (`rendering.md` 5.2), so it gets the rest of the cores;
+/// with one more, the frame thread's worst step went past 16 ms.
 pub fn default_threads() -> usize {
     if cfg!(target_arch = "wasm32") {
         0
     } else {
         std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .clamp(1, 4)
+            .saturating_sub(2)
+            .max(1)
     }
 }
 
@@ -504,5 +738,96 @@ impl Drop for ExtractPool {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transvoxel::MixedField;
+    use gx_core::matter::{Sample, Samples};
+    use gx_core::units::{Attenuation, Density, Kelvin, Meters, Ratio, Vec3};
+
+    /// The snapshot's field with the interior shortcut turned off: the
+    /// general search of `lattice_value` for every point.
+    struct NoShortcut<'a>(Field<'a>);
+
+    impl MixedField for NoShortcut<'_> {
+        fn resolution(&self) -> usize {
+            self.0.resolution()
+        }
+        fn root_origin(&self) -> [f64; 3] {
+            self.0.root_origin()
+        }
+        fn root_edge(&self) -> f64 {
+            self.0.root_edge()
+        }
+        fn drawn_depth(&self, d: u8, c: [i64; 3]) -> Option<u8> {
+            self.0.drawn_depth(d, c)
+        }
+        fn occupancy(&self, d: u8, c: [i64; 3]) -> f64 {
+            self.0.occupancy(d, c)
+        }
+    }
+
+    /// A cell of resolution 16 cut by a tilted plane and holding a ball,
+    /// occupancy ramping linearly over one sample, so the surface crosses
+    /// interior and boundary points alike.
+    fn section() -> Section {
+        let key = CellKey::new(1, 2, 1, 2, 1).unwrap();
+        let g = key.geometry(Meters::new(64.0));
+        let res = 16u8;
+        let h = g.edge.value() / f64::from(res);
+        let center = g.origin + Vec3::new(8.0, 8.0, 8.0);
+        let samples = Samples::from_fn(res, |x, y, z| {
+            let p = g.origin
+                + Vec3::new(
+                    (f64::from(x) + 0.5) * h,
+                    (f64::from(y) + 0.5) * h,
+                    (f64::from(z) + 0.5) * h,
+                );
+            let plane =
+                (p.z - g.origin.z - 5.0) + 0.3 * (p.x - g.origin.x) - 0.2 * (p.y - g.origin.y);
+            let ball = (p - center).length() - 4.0;
+            let dist = plane.min(ball);
+            let occ = (0.5 - dist / h).clamp(0.0, 1.0);
+            if occ <= 0.0 {
+                return Sample::VACUUM;
+            }
+            Sample {
+                density: Density::new(2700.0 * occ),
+                state: State::Solid,
+                temperature: Kelvin::new(288.0),
+                albedo: [Ratio::new(0.3); 3],
+                roughness: Ratio::new(0.9),
+                attenuation: Attenuation::new(0.0),
+                radiating_temperature: Kelvin::new(288.0),
+                occupancy: Ratio::new(occ),
+            }
+        });
+        Section::new(key, g.origin, g.edge, res, samples).expect("a valid section")
+    }
+
+    #[test]
+    fn interior_shortcut_gives_identical_meshes() {
+        let inputs = CellInputs::alone(Arc::new(section()));
+        let key = inputs.key;
+        let cell = CellAt {
+            depth: key.depth,
+            index: [key.x, key.y, key.z].map(i64::from),
+        };
+        let fast = extract_mixed(&Field::new(&inputs), cell);
+        let slow = extract_mixed(&NoShortcut(Field::new(&inputs)), cell);
+        assert!(!fast.indices.is_empty(), "the surface crosses the cell");
+        assert_eq!(fast.indices, slow.indices);
+        let bits = |m: &crate::transvoxel::MixedMesh| -> Vec<u64> {
+            m.positions
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .chain(m.normals.iter().flatten().map(|v| u64::from(v.to_bits())))
+                .collect()
+        };
+        assert_eq!(bits(&fast), bits(&slow));
     }
 }

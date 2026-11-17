@@ -95,6 +95,14 @@ pub trait MixedField {
     /// Occupancy of sample `c` at depth `d`: its occupancy if solid or
     /// fluid, 0 otherwise or outside the root cell.
     fn occupancy(&self, d: u8, c: [i64; 3]) -> f64;
+    /// [`lattice_value`] at point `q` of depth `d` when the field can give
+    /// it without the general search, or `None`. An implementation returns
+    /// `Some` only where the result is the same bits: a point strictly
+    /// inside a drawn cell of depth `d`, whose eight samples are that
+    /// cell's own, summed in the order of [`lattice_value`].
+    fn interior_value(&self, _d: u8, _q: [i64; 3]) -> Option<f64> {
+        None
+    }
 }
 
 /// A drawn cell: its depth and index at that depth.
@@ -133,6 +141,9 @@ fn around(q: [i64; 3], o: usize) -> [i64; 3] {
 /// The value at lattice point `q` of depth `d` (module docs). Every cell
 /// calls this for every point it reads.
 pub fn lattice_value(field: &dyn MixedField, d: u8, q: [i64; 3]) -> f64 {
+    if let Some(v) = field.interior_value(d, q) {
+        return v;
+    }
     // The finest drawn depth touching the point; 2:1 balance keeps it at
     // most one deeper than any touching cell.
     let (mut d, mut q) = (d, q);
