@@ -500,6 +500,13 @@ fn frame_step_at_4096_cells() {
         least >= MAX_CELLS_PER_FRAME * 9 / 10 && most <= MAX_CELLS_PER_FRAME,
         "the view selects about 4096 cells ({least} to {most})"
     );
+    world.finish_extraction();
+    println!(
+        "budget: extraction per cell over {} cells: p50 {:.3} ms, p95 {:.3} ms",
+        world.extraction_times().count(),
+        world.extraction_times().percentile(50.0).unwrap_or(0.0),
+        world.extraction_times().percentile(95.0).unwrap_or(0.0)
+    );
     if cfg!(debug_assertions) {
         println!("budget: debug build, the frame step is not timed");
     } else {

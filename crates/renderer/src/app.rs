@@ -284,6 +284,11 @@ pub struct HeadlessStats {
     pub frame_step_ms: (Option<f64>, Option<f64>, Option<f64>),
     /// Steps measured.
     pub frame_steps: u64,
+    /// Extraction time per cell over the run, milliseconds: the 50th and
+    /// 95th percentiles ([`World::extraction_times`]).
+    pub extraction_ms: (Option<f64>, Option<f64>),
+    /// Extractions measured.
+    pub extractions: u64,
     /// Selections made during the run ([`World::selection_rounds`]).
     pub selection_rounds: u64,
     /// Cells requested before their parent had arrived
@@ -388,6 +393,9 @@ impl HeadlessStats {
             "frame_step_ms_p95": self.frame_step_ms.1,
             "frame_step_ms_max": self.frame_step_ms.2,
             "frame_steps": self.frame_steps,
+            "extraction_ms_p50": self.extraction_ms.0,
+            "extraction_ms_p95": self.extraction_ms.1,
+            "extractions": self.extractions,
             "selection_rounds": self.selection_rounds,
             "cells_requested_ahead": self.cells_requested_ahead,
         });
@@ -554,6 +562,11 @@ pub fn render_headless_view(
                 world.step_times().max(),
             ),
             frame_steps: world.step_times().count(),
+            extraction_ms: (
+                world.extraction_times().percentile(50.0),
+                world.extraction_times().percentile(95.0),
+            ),
+            extractions: world.extraction_times().count(),
             selection_rounds: world.selection_rounds(),
             cells_requested_ahead: world.cache().requested_ahead(),
             sprites: sprite_stats(&scene, width, height),

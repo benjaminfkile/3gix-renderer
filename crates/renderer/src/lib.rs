@@ -35,7 +35,7 @@
 //!   section 3).
 //! - [`selector`]: the selection on its own thread natively, inline in the
 //!   browser (`rendering.md` sections 3.4 and 4).
-//! - [`extract`]: surface extraction by marching cubes on a worker pool.
+//! - [`extract`]: Transvoxel extraction of drawn cells on a worker pool.
 //! - [`volume`]: gas and plasma drawn by ray marching.
 //! - [`farfield`]: far frames drawn as point sprites.
 //! - [`light`]: lights and emission from hot matter (`matter-format.md`

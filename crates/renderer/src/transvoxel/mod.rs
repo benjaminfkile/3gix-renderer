@@ -4,7 +4,7 @@
 //! sections 2.2 and 2.4), and cells between depths with transition cells
 //! ([`mixed`], sections 2.2, 2.3, and 2.5).
 //!
-//! This module stands alone: nothing in the world draws with it yet.
+//! The world draws every cell with it through [`crate::extract`].
 
 pub mod lattice;
 pub mod mixed;

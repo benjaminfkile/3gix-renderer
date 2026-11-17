@@ -23,9 +23,9 @@
 //!
 //! Extraction inputs are gathered incrementally. An arrival marks the cells
 //! whose inputs can read the arrived cell (itself, the cells around it at
-//! its depth, and the children of those); a change of the selection marks
-//! the cells near each cell whose selected status changed; a change of a
-//! frame's isovalue marks the frame's cells. Only marked cells are looked
+//! its depth, the children of those, and its parent and the cells around
+//! the parent); a change of the selection marks the cells near each cell
+//! whose selected status changed. Only marked cells are looked
 //! at, and only for what is left of the step's time slice once the draw
 //! list is built ([`STEP_SLICE_SECONDS`]): what does not fit waits for the
 //! next frame. A
@@ -34,14 +34,14 @@
 
 use crate::camera::Camera;
 use crate::clock::{now_seconds, StepTimes};
-use crate::extract::{ExtractPool, FaceNeighbor, FaceNeighbors, SurfaceMesh};
+use crate::extract::{CellInputs, ExtractPool, Extraction, SurfaceMesh};
 use crate::farfield::{depth_zero_key, far_frames, frame_sprite, Sprite};
 use crate::light::{lights_for, merge_frame_emitters, strongest_lights, PointLight};
 use crate::seen::Seen;
 use crate::selector::{SelectJob, Selected, SelectionLayout, Selector};
 use crate::stream::{
-    face_neighbor_keys, offset_key, CacheCounts, CellCache, CellMap, CellSet, CellState,
-    FetchOutcome, NeighborMatter, AROUND, SELECT_INTERVAL_SECONDS,
+    offset_key, CacheCounts, CellCache, CellMap, CellSet, CellState, FetchOutcome, AROUND,
+    SELECT_INTERVAL_SECONDS,
 };
 use crate::volume::VolumeGrid;
 use gx_core::frames::FrameSystem;
@@ -121,10 +121,10 @@ pub struct WorldCounts {
     pub extracting: usize,
 }
 
-/// A held mesh and the face neighbors it was extracted with.
+/// A held mesh and the inputs it was extracted with.
 struct Extracted {
     mesh: Arc<SurfaceMesh>,
-    neighbors: FaceNeighbors,
+    inputs: CellInputs,
 }
 
 /// Where the inputs of extraction may have changed, to be turned into
@@ -135,8 +135,6 @@ enum Mark {
     Arrival(CellKey),
     /// A cell's selected or above-selected status changed.
     Layout(CellKey),
-    /// A frame's isovalue changed.
-    Frame(u64),
 }
 
 /// The camera and view a selection was made for.
@@ -160,16 +158,18 @@ impl Pose {
 
 /// The cell cache, the extraction pool, and the extracted meshes.
 ///
-/// A cell's mesh depends on its `Ready` and known empty neighbors, on the
-/// selection around it, and on its frame's isovalue (the padding and
-/// transition rules of [`crate::extract`]). Whenever those change the cell
-/// is extracted again, and its previous mesh is drawn until the new one is
+/// A drawn cell's mesh depends on the sections and the drawn selection in
+/// its region ([`CellInputs`]). Whenever those change the cell is
+/// extracted again, and its previous mesh is drawn until the new one is
 /// done.
 pub struct World {
     cache: CellCache,
     pool: ExtractPool,
     meshes: CellMap<Extracted>,
-    extracting: CellMap<FaceNeighbors>,
+    extracting: CellMap<CellInputs>,
+    /// Inputs whose extraction read an input neither present nor known
+    /// empty: not extracted again until they change.
+    waiting: CellMap<CellInputs>,
     layout: SelectionLayout,
     marks: VecDeque<Mark>,
     dirty: CellSet,
@@ -185,6 +185,7 @@ pub struct World {
     arrived_since_selection: bool,
     rounds: u64,
     steps: StepTimes,
+    extraction_times: StepTimes,
     last_evict: f64,
 }
 
@@ -198,6 +199,7 @@ impl World {
             pool: ExtractPool::new(threads),
             meshes: CellMap::default(),
             extracting: CellMap::default(),
+            waiting: CellMap::default(),
             layout: SelectionLayout::default(),
             marks: VecDeque::new(),
             dirty: CellSet::default(),
@@ -211,6 +213,7 @@ impl World {
             arrived_since_selection: false,
             rounds: 0,
             steps: StepTimes::new(),
+            extraction_times: StepTimes::new(),
             last_evict: f64::NEG_INFINITY,
         }
     }
@@ -225,9 +228,15 @@ impl World {
         self.meshes.get(key).map(|e| &e.mesh)
     }
 
-    /// The neighbors the mesh of a cell was extracted with, if it has one.
-    pub fn mesh_neighbors(&self, key: &CellKey) -> Option<&FaceNeighbors> {
-        self.meshes.get(key).map(|e| &e.neighbors)
+    /// The inputs the mesh of a cell was extracted with, if it has one.
+    pub fn mesh_inputs(&self, key: &CellKey) -> Option<&CellInputs> {
+        self.meshes.get(key).map(|e| &e.inputs)
+    }
+
+    /// Extraction time per cell so far, milliseconds, one entry per
+    /// finished extraction.
+    pub fn extraction_times(&self) -> &StepTimes {
+        &self.extraction_times
     }
 
     /// Selections made this session ([`World::select`]).
@@ -251,128 +260,41 @@ impl World {
         self.cache.selection().iter().map(|c| c.key.depth).max()
     }
 
-    /// The `Ready` and known empty face neighbors of a cell now, as
-    /// extraction takes them.
-    fn neighbors_of(&self, key: &CellKey, isovalue: Option<f64>) -> FaceNeighbors {
-        let layout = &self.layout;
-        let across = face_neighbor_keys(key);
-        let mut faces: [Option<FaceNeighbor>; 6] =
-            self.cache.face_neighbors(key).map(|n| match n? {
-                (_, NeighborMatter::Ready(cell)) => Some(FaceNeighbor::Ready(cell.section.clone())),
-                (k, NeighborMatter::Empty) => Some(FaceNeighbor::Empty(k)),
-            });
-        for f in 0..6 {
-            let Some(k) = across[f] else {
-                continue;
-            };
-            if layout.selected.contains(&k) {
-                continue;
+    /// The extraction inputs of a drawn `Ready` cell now
+    /// ([`CellInputs`]), or `None` for a cell that is not drawn or not
+    /// `Ready`.
+    fn inputs_of(&self, key: &CellKey) -> Option<CellInputs> {
+        if !self.layout.selected.contains(key) {
+            return None;
+        }
+        let Some(CellState::Ready(cell)) = self.cache.state(key) else {
+            return None;
+        };
+        let mut drawn = std::collections::BTreeSet::new();
+        let mut sections = BTreeMap::new();
+        for k in CellInputs::region(key) {
+            if self.layout.selected.contains(&k) {
+                drawn.insert(k);
             }
-            // Finer cells are selected across this face: pad from what
-            // is loaded there.
-            if layout.above_selected.contains(&k) {
+            if k == *key {
                 continue;
             }
-            // A coarser cell is selected across this face: pad from it,
-            // so the surface meets what is drawn there.
-            let mut up = k.parent();
-            while let Some(a) = up {
-                if layout.selected.contains(&a) {
-                    if let Some(CellState::Ready(cell)) = self.cache.state(&a) {
-                        faces[f] = Some(FaceNeighbor::Ready(cell.section.clone()));
-                    }
-                    break;
+            match self.cache.state(&k) {
+                Some(CellState::Ready(c)) => {
+                    sections.insert(k, Some(c.section.clone()));
                 }
-                up = a.parent();
+                _ if self.cache.known_empty(&k) => {
+                    sections.insert(k, None);
+                }
+                _ => {}
             }
         }
-        let parent = key.parent().and_then(|p| match self.cache.state(&p) {
-            Some(CellState::Ready(cell)) => Some(cell.section.clone()),
-            _ => None,
-        });
-        // The loaded cells at the parent's depth around it, and which of
-        // them hold no matter.
-        let mut parent_neighbors = Vec::new();
-        let mut parent_empty = Vec::new();
-        if let (Some(p), Some(_)) = (key.parent(), &parent) {
-            let order = crate::stream::diagonal_offsets().into_iter().chain([
-                [-1, 0, 0],
-                [1, 0, 0],
-                [0, -1, 0],
-                [0, 1, 0],
-                [0, 0, -1],
-                [0, 0, 1],
-            ]);
-            for o in order {
-                let Some(k) = offset_key(&p, o) else {
-                    continue;
-                };
-                match self.cache.state(&k) {
-                    Some(CellState::Ready(cell)) => {
-                        parent_neighbors.push(cell.section.clone());
-                        if !cell.has_matter && self.cache.known_empty(&k) {
-                            parent_empty.push(o);
-                        }
-                    }
-                    _ => {
-                        if self.cache.known_empty(&k) {
-                            parent_empty.push(o);
-                        }
-                    }
-                }
-            }
-        }
-        // The cells at this depth up to two over in every direction whose
-        // region a coarser cell one depth up draws: the transition toward
-        // them (extract) reaches a cell's padding, which lies in the cells
-        // next to it, so it must know theirs too.
-        let mut coarser: Vec<[i8; 3]> = Vec::new();
-        for dz in -2i8..=2 {
-            for dy in -2i8..=2 {
-                for dx in -2i8..=2 {
-                    if dx == 0 && dy == 0 && dz == 0 {
-                        continue;
-                    }
-                    let k = (|| {
-                        CellKey::new(
-                            key.frame_id,
-                            key.depth,
-                            key.x.checked_add_signed(i32::from(dx))?,
-                            key.y.checked_add_signed(i32::from(dy))?,
-                            key.z.checked_add_signed(i32::from(dz))?,
-                        )
-                        .ok()
-                    })();
-                    let drawn_coarser = k.is_some_and(|k| {
-                        !layout.selected.contains(&k)
-                            && !layout.above_selected.contains(&k)
-                            && k.parent().is_some_and(|p| layout.selected.contains(&p))
-                    });
-                    if drawn_coarser {
-                        coarser.push([dx, dy, dz]);
-                    }
-                }
-            }
-        }
-        FaceNeighbors {
-            faces,
-            parent,
-            parent_neighbors,
-            parent_empty,
-            coarser,
-            isovalue,
-            diagonal: self
-                .cache
-                .diagonal_neighbors(key)
-                .into_iter()
-                .map(|n| match n? {
-                    (_, NeighborMatter::Ready(cell)) => {
-                        Some(FaceNeighbor::Ready(cell.section.clone()))
-                    }
-                    (k, NeighborMatter::Empty) => Some(FaceNeighbor::Empty(k)),
-                })
-                .collect(),
-        }
+        Some(CellInputs {
+            key: *key,
+            section: cell.section.clone(),
+            drawn,
+            sections,
+        })
     }
 
     /// Selects cells for the camera ([`crate::stream::select_all`],
@@ -478,14 +400,10 @@ impl World {
     /// Applies a fetch result: the cell's state, and marks for the cells
     /// whose extraction inputs it can change.
     pub fn complete(&mut self, key: CellKey, outcome: FetchOutcome, now: f64) {
-        let before = self.cache.frame_isovalue(key.frame_id);
         self.cache.complete(key, outcome, now);
         self.changes.push((key, self.cache.state(&key).cloned()));
         self.arrived_since_selection = true;
         self.marks.push_back(Mark::Arrival(key));
-        if self.cache.frame_isovalue(key.frame_id).map(f64::to_bits) != before.map(f64::to_bits) {
-            self.marks.push_back(Mark::Frame(key.frame_id));
-        }
     }
 
     /// One step of the frame thread's matter work (module docs): applies
@@ -512,8 +430,8 @@ impl World {
             self.last_evict = now;
             self.evict(now);
         }
-        for (key, mesh) in self.pool.try_results() {
-            self.accept(key, mesh);
+        for (key, done, seconds) in self.pool.try_results() {
+            self.accept(key, done, seconds);
         }
         let draw = self.draw_list(seen, view_px, now);
         self.pump_until(Some(started + STEP_SLICE_SECONDS));
@@ -533,8 +451,8 @@ impl World {
     /// from those its mesh was extracted with is queued for extraction; one
     /// already being extracted is looked at again once that is done.
     pub fn pump_until(&mut self, deadline: Option<f64>) {
-        for (key, mesh) in self.pool.try_results() {
-            self.accept(key, mesh);
+        for (key, done, seconds) in self.pool.try_results() {
+            self.accept(key, done, seconds);
         }
         let over = || deadline.is_some_and(|d| now_seconds() > d);
         while let Some(m) = self.marks.pop_front() {
@@ -579,10 +497,18 @@ impl World {
     fn apply_mark(&mut self, m: Mark) {
         match m {
             Mark::Arrival(a) => {
-                // Faces, edges, and corners read the cells around at the
-                // same depth; a cell's parent level reads its parent and
-                // the cells around the parent.
+                // A cell's region holds the cells around it at its depth,
+                // one depth coarser, and one depth finer
+                // ([`CellInputs::region`]).
                 self.mark(a);
+                if let Some(p) = a.parent() {
+                    self.mark(p);
+                    for o in AROUND {
+                        if let Some(c) = offset_key(&p, o) {
+                            self.mark(c);
+                        }
+                    }
+                }
                 for c in std::iter::once(Some(a)).chain(AROUND.iter().map(|&o| offset_key(&a, o))) {
                     let Some(c) = c else {
                         continue;
@@ -596,8 +522,9 @@ impl World {
                 }
             }
             Mark::Layout(c) => {
-                // Cells up to two over at its depth, and at the depth below
-                // up to two over from its children.
+                // Cells up to two over at its depth, at the depth below up
+                // to two over from its children, and at the depth above
+                // around its parent.
                 let block = |k: CellKey, lo: i64, hi: i64| -> Vec<CellKey> {
                     let mut out = Vec::new();
                     for dz in lo..=hi {
@@ -624,48 +551,55 @@ impl World {
                         self.mark(k);
                     }
                 }
-            }
-            Mark::Frame(f) => {
-                let keys: Vec<CellKey> = self
-                    .cache
-                    .entries()
-                    .filter(|(k, e)| k.frame_id == f && matches!(e.state, CellState::Ready(_)))
-                    .map(|(k, _)| *k)
-                    .collect();
-                for k in keys {
-                    self.mark(k);
+                if let Some(p) = c.parent() {
+                    for k in block(p, -1, 1) {
+                        self.mark(k);
+                    }
                 }
             }
         }
     }
 
-    /// Queues `k` for extraction if it is `Ready` and its inputs differ
-    /// from those of its mesh.
+    /// Queues `k` for extraction if it is drawn and `Ready` and its
+    /// inputs differ from those of its mesh.
     fn look_at(&mut self, k: CellKey) {
-        let Some(CellState::Ready(cell)) = self.cache.state(&k) else {
-            return;
-        };
         if self.extracting.contains_key(&k) {
             self.deferred.insert(k);
             return;
         }
-        let section = cell.section.clone();
-        let neighbors = self.neighbors_of(&k, self.cache.frame_isovalue(k.frame_id));
-        if let Some(held) = self.meshes.get(&k) {
-            if held.neighbors.same_as(&neighbors) {
-                return;
-            }
-        }
-        self.extracting.insert(k, neighbors.clone());
-        self.pool.submit(k, section, neighbors);
-    }
-
-    fn accept(&mut self, key: CellKey, mesh: Arc<SurfaceMesh>) {
-        let Some(neighbors) = self.extracting.remove(&key) else {
+        let Some(inputs) = self.inputs_of(&k) else {
             return;
         };
-        if matches!(self.cache.state(&key), Some(CellState::Ready(_))) {
-            self.meshes.insert(key, Extracted { mesh, neighbors });
+        let held = self.meshes.get(&k).map(|e| &e.inputs);
+        if held
+            .into_iter()
+            .chain(self.waiting.get(&k))
+            .any(|h| h.same_as(&inputs))
+        {
+            return;
+        }
+        self.extracting.insert(k, inputs.clone());
+        self.pool.submit(inputs);
+    }
+
+    fn accept(&mut self, key: CellKey, done: Extraction, seconds: f64) {
+        let Some(inputs) = self.extracting.remove(&key) else {
+            return;
+        };
+        self.extraction_times.record(seconds * 1e3);
+        let ready = matches!(self.cache.state(&key), Some(CellState::Ready(_)));
+        match done {
+            Extraction::Done(mesh) => {
+                self.waiting.remove(&key);
+                if ready {
+                    self.meshes.insert(key, Extracted { mesh, inputs });
+                }
+            }
+            Extraction::Waiting => {
+                if ready {
+                    self.waiting.insert(key, inputs);
+                }
+            }
         }
         if self.deferred.remove(&key) {
             self.mark(key);
@@ -678,7 +612,7 @@ impl World {
         while !self.extracting.is_empty() || !self.dirty_queue.is_empty() {
             if !self.extracting.is_empty() {
                 match self.pool.wait_result() {
-                    Some((key, mesh)) => self.accept(key, mesh),
+                    Some((key, done, seconds)) => self.accept(key, done, seconds),
                     None => break,
                 }
             }
@@ -691,6 +625,7 @@ impl World {
         for k in self.cache.evict(now) {
             self.changes.push((k, None));
             self.meshes.remove(&k);
+            self.waiting.remove(&k);
             self.marks.push_back(Mark::Arrival(k));
         }
     }
@@ -775,27 +710,40 @@ impl World {
 
     /// Returns `true` when nothing the selection needs is still on its way:
     /// every cell of the target has arrived or is `Gone`, every selected
-    /// and pinned cell is drawable or `Gone`, and nothing is being
-    /// extracted.
+    /// cell is drawable or `Gone`, every pinned cell has arrived or is
+    /// `Gone`, and nothing is being extracted. A pinned cell is read for
+    /// the far field and lights; it gets a mesh only when it is drawn.
     pub fn settled(&self) -> bool {
         let resolved =
             |k: &CellKey| self.drawable(k) || self.cache.state(k) == Some(&CellState::Gone);
         self.extraction_idle()
             && self.cache.outstanding() == 0
             && self.cache.selection().iter().all(|s| resolved(&s.key))
-            && self.cache.pinned().all(resolved)
+            && self
+                .cache
+                .pinned()
+                .all(|k| self.arrived(k) || self.cache.state(k) == Some(&CellState::Gone))
     }
 
     /// Returns `true` when every selected cell is drawn at its selected
-    /// depth: the drawn selection is the target, every selected and every
-    /// pinned cell can be drawn, and nothing is being extracted. Stricter
-    /// than [`World::settled`]: a `Gone` cell is not ready.
+    /// depth: the drawn selection is the target, every selected cell can
+    /// be drawn, every pinned cell has arrived, and nothing is being
+    /// extracted. Stricter than [`World::settled`]: a `Gone` cell is not
+    /// ready.
     pub fn ready(&self) -> bool {
         self.extraction_idle()
             && self.cache.outstanding() == 0
             && self.cache.at_target()
             && self.cache.selection().iter().all(|s| self.drawable(&s.key))
-            && self.cache.pinned().all(|k| self.drawable(k))
+            && self.cache.pinned().all(|k| self.arrived(k))
+    }
+
+    /// Whether a cell is `Ready` or `Empty`.
+    fn arrived(&self, key: &CellKey) -> bool {
+        matches!(
+            self.cache.state(key),
+            Some(CellState::Ready(_) | CellState::Empty)
+        )
     }
 
     /// The draw set (see [`CellCache::draw_set`]), its meshes and volumes,
@@ -930,11 +878,10 @@ mod tests {
     use gx_core::matter::{Sample, Samples, Section, State};
     use gx_core::units::{Attenuation, Density, Kelvin, Meters, Ratio, Vec3};
 
-    /// Cell `(x, 0, 0)` at depth 2 of a frame with a 16 m root, at
-    /// resolution 4, solid where `fill(k)` holds for the sample layer `k`
-    /// along z.
-    fn cell(x: u32, fill: impl Fn(u32) -> bool) -> (CellKey, FetchOutcome) {
-        let key = CellKey::new(3, 2, x, 0, 0).unwrap();
+    /// Cell `(x, y, z)` at depth 1 of a frame with a 16 m root, at
+    /// resolution 4, solid where `fill` holds for the sample center.
+    fn cell(x: u32, y: u32, z: u32, fill: impl Fn([f64; 3]) -> bool) -> (CellKey, FetchOutcome) {
+        let key = CellKey::new(3, 1, x, y, z).unwrap();
         let solid = Sample {
             density: Density::new(1000.0),
             state: State::Solid,
@@ -945,12 +892,21 @@ mod tests {
             radiating_temperature: Kelvin::new(300.0),
             occupancy: Ratio::new(1.0),
         };
+        let o = [x, y, z].map(|v| -8.0 + 8.0 * f64::from(v));
         let section = Section::new(
             key,
-            Vec3::new(-8.0 + 4.0 * f64::from(x), -8.0, -8.0),
-            Meters::new(4.0),
+            Vec3::new(o[0], o[1], o[2]),
+            Meters::new(8.0),
             4,
-            Samples::from_fn(4, |_, _, k| if fill(k) { solid } else { Sample::VACUUM }),
+            Samples::from_fn(4, |i, j, k| {
+                let c = [i, j, k];
+                let p: [f64; 3] = std::array::from_fn(|a| o[a] + 2.0 * f64::from(c[a]) + 1.0);
+                if fill(p) {
+                    solid
+                } else {
+                    Sample::VACUUM
+                }
+            }),
         )
         .unwrap();
         let ready = ReadyCell::new(section);
@@ -958,52 +914,40 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_is_extracted_again_when_a_neighbor_arrives() {
+    fn a_drawn_cell_waits_for_its_inputs_and_is_extracted_once() {
         let mut world = World::new(0);
-        let (a, fetched) = cell(1, |_| true);
+        // A solid ball of radius 5 m around the root's center, drawn as
+        // the eight cells of depth 1, of which only one has arrived.
+        let ball = |p: [f64; 3]| p.iter().map(|v| v * v).sum::<f64>() < 25.0;
+        let all: Vec<[u32; 3]> = (0..8).map(|i| [i & 1, (i >> 1) & 1, i >> 2]).collect();
+        for c in &all {
+            let k = CellKey::new(3, 1, c[0], c[1], c[2]).unwrap();
+            world.layout.selected.insert(k);
+        }
+        let (a, fetched) = cell(0, 0, 0, ball);
         world.complete(a, fetched, 0.0);
         world.finish_extraction();
-        // Filled and clamped on every face: nothing to draw.
-        assert!(world.mesh(&a).unwrap().is_empty());
-        assert_eq!(world.mesh_neighbors(&a).unwrap().count(), 0);
+        // Its neighbors are neither present nor known empty: no mesh.
+        assert!(world.mesh(&a).is_none());
 
-        // The +x neighbor holds matter in its lower half only, so the upper
-        // half of the shared face is now a real surface of `a`.
-        let (b, fetched) = cell(2, |k| k < 2);
-        world.complete(b, fetched, 0.0);
+        for c in &all[1..] {
+            let (k, fetched) = cell(c[0], c[1], c[2], ball);
+            world.complete(k, fetched, 0.0);
+        }
         world.finish_extraction();
-        let neighbors = world.mesh_neighbors(&a).unwrap();
-        assert_eq!(neighbors.count(), 1);
-        assert!(neighbors.faces[1].is_some());
         let mesh = world.mesh(&a).unwrap().clone();
         assert!(!mesh.is_empty());
-        // The wall lies on the face, x = 0, and the top of the neighbor's
-        // matter reaches half a sample (0.5 m) into the straddling cubes.
-        let surface = &mesh.positions[..mesh.skirt_from];
-        assert!(surface
+        // The surface lies inside its own cell.
+        assert!(mesh
+            .positions
             .iter()
-            .all(|p| (0.0..=0.5).contains(&p[0]) && p[2] >= -6.0));
-        assert!(surface.iter().any(|p| p[0] == 0.0 && p[2] > -6.0));
-        assert_eq!(world.mesh_neighbors(&b).unwrap().count(), 1);
+            .all(|p| p.iter().all(|v| (-8.0..=0.0).contains(v))));
+        assert_eq!(world.mesh_inputs(&a).unwrap().drawn.len(), 8);
+        assert!(world.extraction_times().count() >= 8);
 
         // Nothing changed: nothing is extracted again.
         world.pump();
         assert_eq!(world.counts().extracting, 0);
         assert!(Arc::ptr_eq(world.mesh(&a).unwrap(), &mesh));
-
-        // The -x neighbor turns out to hold no matter: its vacuum is data,
-        // so `a` is extracted again with a wall on that face, x = -4.
-        let c = CellKey::new(3, 2, 0, 0, 0).unwrap();
-        world.complete(c, FetchOutcome::Decoded(None), 0.0);
-        world.finish_extraction();
-        assert_eq!(world.mesh_neighbors(&a).unwrap().count(), 2);
-        let walled = world.mesh(&a).unwrap();
-        assert!(walled.positions.iter().any(|p| p[0] == -4.0));
-        assert!(walled
-            .vertices
-            .iter()
-            .zip(&walled.positions)
-            .filter(|(_, p)| p[0] == -4.0 && p[2] > -6.0)
-            .all(|(v, _)| v.normal[0] < -0.999));
     }
 }

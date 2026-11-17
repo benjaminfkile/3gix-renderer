@@ -420,15 +420,6 @@ pub struct ReadyCell {
     /// still no matter; such a cell counts as empty for
     /// [`CellCache::known_empty`].
     pub has_matter: bool,
-    /// The density of the drawn surface, kilograms per cubic meter, the
-    /// isovalue of [`crate::extract`] ([`crate::extract::surface_isovalue`]);
-    /// `None` without solid or fluid samples. Extraction keeps this rule
-    /// until it moves to occupancy 0.5 (`rendering.md` 2).
-    pub surface_isovalue: Option<f64>,
-    /// [`crate::extract::inner_isovalue`]: the isovalue from matter well
-    /// inside the cell, `None` for a thin shell. The frame's shared
-    /// isovalue is the smallest of these ([`CellCache::frame_isovalue`]).
-    pub inner_isovalue: Option<f64>,
     /// The cell's children can show more than it does (`rendering.md`
     /// 3.1): it is a solid or fluid cell whose occupancy crosses 0.5 (some
     /// solid or fluid sample at or above 0.5 and some sample below it, or a
@@ -445,7 +436,6 @@ impl ReadyCell {
     /// its emitter, its volume, its mean albedo, whether it and its
     /// descendants are refinable. Runs off the frame thread.
     pub fn new(section: Section) -> ReadyCell {
-        let surface_isovalue = crate::extract::surface_isovalue(&section);
         let volume = VolumeGrid::from_section(&section).map(Arc::new);
         let n = usize::from(section.resolution());
         let refinable = section.samples().is_some_and(|s| {
@@ -469,8 +459,6 @@ impl ReadyCell {
             has_matter: section
                 .samples()
                 .is_some_and(|s| (0..s.len()).any(|i| s.density(i).value() > 0.0)),
-            surface_isovalue,
-            inner_isovalue: crate::extract::inner_isovalue(&section),
             refinable,
             ahead: AheadBits::of(&section),
             section: Arc::new(section),
@@ -1228,7 +1216,6 @@ pub struct CellCache {
     needed: Vec<SelectedCell>,
     in_flight: usize,
     pinned: BTreeSet<CellKey>,
-    isovalues: BTreeMap<u64, f64>,
     requested_ahead: u64,
 }
 
@@ -1293,31 +1280,6 @@ impl CellCache {
                 None
             }
         }
-    }
-
-    /// The isovalue every surface of `frame_id` is drawn at until
-    /// extraction moves to occupancy 0.5: the smallest of its loaded
-    /// cells' inner ones ([`ReadyCell::inner_isovalue`]), kept up to date
-    /// as cells arrive and leave. `None` before any cell of the frame with
-    /// a surface has arrived.
-    pub fn frame_isovalue(&self, frame_id: u64) -> Option<f64> {
-        self.isovalues.get(&frame_id).copied()
-    }
-
-    fn recompute_isovalue(&mut self, frame_id: u64) {
-        let v = self
-            .entries
-            .iter()
-            .filter(|(k, _)| k.frame_id == frame_id)
-            .filter_map(|(_, e)| match &e.state {
-                CellState::Ready(c) => c.inner_isovalue,
-                _ => None,
-            })
-            .reduce(f64::min);
-        match v {
-            Some(v) => self.isovalues.insert(frame_id, v),
-            None => self.isovalues.remove(&frame_id),
-        };
     }
 
     /// Returns `true` when `key` is `Ready` and its children can show more
@@ -1507,10 +1469,6 @@ impl CellCache {
         if e.state == CellState::Requested {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
-        let was_iso = match &e.state {
-            CellState::Ready(c) => c.inner_isovalue,
-            _ => None,
-        };
         e.state = match outcome {
             FetchOutcome::Decoded(Some(cell)) => CellState::Ready(cell),
             FetchOutcome::Decoded(None) => CellState::Empty,
@@ -1520,19 +1478,6 @@ impl CellCache {
             }
         };
         e.last_used = now;
-        let iso = match &e.state {
-            CellState::Ready(c) => c.inner_isovalue,
-            _ => None,
-        };
-        let frame = key.frame_id;
-        match (was_iso, iso) {
-            (Some(_), _) => self.recompute_isovalue(frame),
-            (None, Some(v)) => {
-                let m = self.isovalues.entry(frame).or_insert(v);
-                *m = m.min(v);
-            }
-            (None, None) => {}
-        }
     }
 
     /// Marks cells as used now (drawn as stand-ins), so eviction keeps them.
@@ -1588,18 +1533,8 @@ impl CellCache {
             );
         }
         gone.sort();
-        let mut frames: BTreeSet<u64> = BTreeSet::new();
         for k in &gone {
-            if let Some(e) = self.entries.remove(k) {
-                if let CellState::Ready(c) = &e.state {
-                    if c.inner_isovalue.is_some() {
-                        frames.insert(k.frame_id);
-                    }
-                }
-            }
-        }
-        for f in frames {
-            self.recompute_isovalue(f);
+            self.entries.remove(k);
         }
         gone
     }

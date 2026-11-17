@@ -34,16 +34,13 @@ pub fn extract_regular(hood: &Neighborhood) -> Result<SurfaceMesh, LatticeError>
     let mut mesh = SurfaceMesh {
         key: hood.center.key(),
         origin: hood.center.origin(),
-        isovalue: SURFACE_OCCUPANCY,
         positions: Vec::new(),
         vertices: Vec::new(),
         indices: Vec::new(),
         bounds_min: [f64::INFINITY; 3],
         bounds_max: [f64::NEG_INFINITY; 3],
-        skirt_from: 0,
     };
     march(&lattice, &mut mesh);
-    mesh.skirt_from = mesh.positions.len();
     if mesh.positions.is_empty() {
         let o = lattice.origin;
         mesh.bounds_min = o;

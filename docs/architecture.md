@@ -44,7 +44,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
 | `stream` | Cell selection (a target that asks up to three depths ahead from arrived occupancy, and the drawn selection pruned from it, `rendering.md` 3), the cell cache keyed by hash map, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
-| `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
+| `extract` | The inputs of one drawn cell's Transvoxel extraction, the surface mesh, the extraction worker pool | `rendering.md` 2, 3.3 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
 | `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
 | `light` | Emitters from the light escaping each frame's depth-0 cell, point lights, the emission lookup table | `matter-format.md` 3.3 |
@@ -262,19 +262,23 @@ a light, a dense sample is a surface.
    `Section` is kept together with its emitter if it is a depth-0 cell
    (step 5).
 4. **Extraction** (`extract`) runs on a pool of `std::thread` workers fed by
-   a channel: marching cubes over the composited density of the solid and
-   fluid samples at the sample centers, at half the density of the matter
-   just inside the boundary with vacuum: the smallest density of the solid
-   and fluid samples at least two samples in from any boundary, halved (half
-   the largest when no sample is that deep). A body denser toward its
-   center draws only its outer surface. Gas and plasma samples count as vacuum here. The grid is
-   padded on each face with the first layer of the face neighbor when that
-   cell is `Ready` at the same depth (`CellCache::face_neighbors`), with
-   vacuum when it is `Empty` at the same depth, and by clamping otherwise
-   (see the padding rule below). `World` extracts a cell again whenever its
-   set of `Ready` and `Empty` face neighbors changes, so
-   seams close as neighbors arrive; the previous mesh is drawn until the
-   new one is done. The browser build, with no threads, extracts inline.
+   a channel: every drawn cell is extracted with the Transvoxel algorithm
+   (`transvoxel`, `rendering.md` section 2) at the level set
+   `occupancy = 0.5` of its solid and fluid samples. Gas and plasma samples
+   count as occupancy 0 here. Its inputs (`extract::CellInputs`) are the
+   drawn selection and the sections, one depth coarser, at its depth, and
+   one depth finer, in the region of the cell grown by one cell of its
+   depth on every side: same-depth neighbors give the values on shared
+   faces, a face with a neighbor drawn one depth finer gets transition
+   cells, and a face with a neighbor drawn one depth coarser is owned by
+   this, the finer, side. A cell is extracted only from inputs that are
+   present or known empty; an extraction that reads anything else gives no
+   mesh and waits. `World` extracts a cell again only when its inputs
+   change, found from arrivals and selection changes; the previous mesh is
+   drawn until the new one is done. The browser build, with no threads,
+   extracts inline. Extraction time per cell (median and 95th percentile)
+   is reported in `--stats-json` (`extraction_ms_p50`,
+   `extraction_ms_p95`) and by the budget test.
    **Volumes** (`volume`): the gas and plasma samples of the same section
    become a `VolumeGrid` at decode time, drawn by ray marching
    (`docs/shading.md`). A cell whose densest sample is gas or plasma is
@@ -326,65 +330,14 @@ cell never counts as ready, so its parent stays rather than leaving a hole.
 
 ## The extraction determinism contract
 
-The same composited section with the same face neighbors always gives
-bit-identical vertex and index buffers, whatever thread extracts it and
-however many times:
+The same inputs always give bit-identical vertex and index buffers, whatever
+thread extracts them and however many times:
 
-- The grid is walked in index order, x fastest, then y, then z. Vertices are
-  created in that walk and shared through a table addressed by grid edge;
-  nothing is sorted, hashed, or ordered by pointer.
-- The triangle table is derived once, by a fixed procedure, from the cube
-  faces (`extract::case_table`).
+- The inputs are held in ordered maps; the lattice is walked in index order
+  and vertices are shared through an ordered table keyed by position.
+- Every lattice point gets one value from one rule (`rendering.md` section
+  2.3), so two cells that share a point compute the same bits.
 - Every value is plain `f64` arithmetic with `sqrt`, both correctly rounded
   in IEEE 754; attributes are narrowed to `f32` last.
-- The isovalue (`extract::surface_isovalue`) comes from two fixed erosion
-  passes over the section's solid and fluid samples, in index order.
-- A mesh depends only on its own section and the sections of its `Ready`
-  face neighbors at the same depth, so the order the pool finishes jobs in
-  changes only which frame a mesh first appears in. Once every cell has
-  arrived, every mesh has been extracted with its final neighbors.
-
-## The padding rule
-
-The section grid is padded with one layer on every face, so the cubes of
-the outer layer straddle the cell faces. The padding is never a vacuum
-default; it always comes from the hub's data:
-
-- **Neighbor.** When the cell across the face is `Ready` at the same depth,
-  the padding is that cell's first layer of samples on that side (resampled
-  to the nearest sample center if its resolution differs). When it is
-  `Empty` at the same depth (fetched, and the hub holds no matter for it),
-  the padding is its samples, which are vacuum.
-- **Clamp.** Otherwise (not fetched yet, `Gone`, or only at another depth)
-  the cell's own boundary samples repeat outward.
-
-A padding point beyond two or three faces at once is vacuum if any of those
-faces has an `Empty` neighbor, else takes the first of those faces, in the
-order x, y, z, with a `Ready` neighbor (its other coordinates clamped), else
-clamps. Preferring the known vacuum makes two cells sharing one face agree
-on the points that are also beyond a second, empty face.
-
-Either way, a density that continues across a face has no crossing at the
-face, so no wall is emitted there: two filled neighbors join without a seam
-and a filled cell with no neighbor is simply open at its faces (its
-neighbors, when they arrive, draw their side). A surface that crosses a
-face continues half a sample into the straddling cubes; both cells draw
-that half sample from the same samples, so the meshes overlap slightly
-rather than leave a gap. Real surfaces at a face, matter in one cell
-meeting a neighbor that holds vacuum (`Ready` with vacuum samples there,
-or `Empty`), are drawn exactly at the face, because the neighbor's vacuum is
-data. Clamping such a face instead would extrude the surface outward as
-short walls lit edge-on: the first e2e run with this rule showed exactly
-that as a dark notch where a body's poles cross into empty cells, which is
-why `Empty` neighbors count.
-
-Accepted limits: neighbors at another depth are not used (the face clamps),
-so a depth transition shows a step of up to half a coarse sample; and the
-isovalue is per section, so where two neighbors' isovalues differ the
-surfaces meet with a small offset. Coarse cells give coarse meshes; the
-renderer does not smooth beyond the gradient normals.
-
-Before this rule the padding was vacuum, so matter filling a cell ended in
-a wall at each face, and two filled neighbors met wall to wall. Those walls
-were lit edge-on and showed as dark creases along every cell boundary
-(`docs/e2e/README.md`).
+- A mesh depends only on its inputs, so the order the pool finishes jobs in
+  changes only which frame a mesh first appears in.

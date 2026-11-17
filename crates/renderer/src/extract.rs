@@ -1,140 +1,51 @@
-//! Surface extraction: marching cubes over a composited density grid.
+//! Surface extraction of drawn cells with Transvoxel (`rendering.md`
+//! sections 2 and 3.3): what one cell's extraction reads, the mesh it
+//! gives, and the worker pool that runs it.
 //!
-//! Implements the renderer's step "extracts surfaces" of `space-model.md`
-//! section 2 over one composited section (`matter-format.md` sections 3.3
-//! and 3.5). The renderer knows nothing about what the matter is: a dense
-//! sample is inside a surface, and the surface is where the density falls
-//! to half that of the matter just inside the boundary with vacuum ("The
-//! isovalue" below).
+//! A drawn cell is extracted with [`crate::transvoxel::extract_mixed`] over
+//! a snapshot of what it reads ([`CellInputs`]): the drawn selection around
+//! it (which cells are drawn, and at which depth) and the sections of the
+//! cells one depth coarser, at its depth, and one depth finer in the region
+//! of the cell grown by one cell of its depth on every side. Same-depth
+//! neighbors give the corners on shared faces; a face whose neighbor is
+//! drawn one depth finer gets transition cells; a face whose neighbor is
+//! drawn one depth coarser is owned by this (finer) side, which reads the
+//! coarser field resampled (`rendering.md` section 2.3). The surface is the
+//! level set `occupancy = 0.5`; nothing else is assumed about the matter.
 //!
 //! Only solid and fluid samples form surfaces ([`forms_surface`]). Gas and
-//! plasma have no hard surface; they count as vacuum here and are drawn as a
-//! volume instead ([`crate::volume`]). A cell that holds both gives a mesh
-//! from its solid and fluid samples and a volume from the rest.
+//! plasma count as occupancy 0 here and are drawn as a volume instead
+//! ([`crate::volume`]).
 //!
-//! # The grid
+//! # Inputs present or known empty
 //!
-//! The samples of a section of resolution `n` are values at the sample
-//! centers, `origin + (i + 1/2) * e / n` per axis. Extraction runs over those
-//! points padded with two layers on every side, so the grid has `n + 4`
-//! points per axis; the cubes between the inner padding layer and the
-//! cell's own samples straddle the cell faces, and the outer layer only
-//! feeds the gradient there. The padding is never a vacuum default; it
-//! always comes from the hub's data. Per face:
-//!
-//! - **Neighbor.** When the cell across the face is `Ready` at the same
-//!   depth ([`FaceNeighbors`], gathered from
-//!   [`crate::stream::CellCache::face_neighbors`]), the padding is that
-//!   neighbor's first layer of samples on that side. A neighbor of a
-//!   different resolution is sampled at the nearest sample center. When the
-//!   cell across the face was fetched and holds no matter (`Empty`), its
-//!   samples are vacuum, and that is what the padding holds: this is the
-//!   hub's data for that cell, not a default.
-//! - **Coarser cell.** When the cell across the face at the same depth is
-//!   not loaded but a coarser cell holding that region is
-//!   ([`crate::stream::CellCache::face_neighbors`]), the padding is that
-//!   cell read at the padding points' positions: the density trilinear over
-//!   its solid and fluid sample centers, the other values from the nearest
-//!   sample. A depth transition then joins the coarser surface instead of
-//!   ending at the face.
-//! - **Clamp.** Otherwise (nothing across the face is loaded, or it is
-//!   `Gone`) the cell's own boundary samples are repeated outward.
-//!
-//! Points beyond two or three faces at once (the padding's edges and
-//! corners) are vacuum if any of those faces has an `Empty` neighbor;
-//! otherwise they take the first of those faces, in the order x, y, z, that
-//! has a `Ready` neighbor, with the other coordinates clamped into range;
-//! otherwise they clamp. Preferring the known vacuum makes two cells that
-//! share one face agree on the points that are also beyond a second,
-//! empty face.
-//!
-//! With either rule a density that continues across a face has no
-//! isovalue crossing there, so no wall is emitted at the face: two filled
-//! neighbors join without a seam, and a filled cell with no neighbor is
-//! open at its faces. A surface that crosses a face (a plane running from
-//! one cell into the next) continues into the straddling cubes, half
-//! a sample beyond the face; both cells draw that half sample, from the
-//! same samples, so the two meshes overlap there instead of leaving a gap.
-//! Where a coarser cell one depth up lies across a face, edge, or corner,
-//! a cell's density fades into the parent level's field (its parent's
-//! samples and those of the loaded cells around the parent, as one lattice,
-//! [`ParentLevel`]): fully at that side, not at all at the far side of the
-//! cell. The coarser cell draws that same field, so the two meet with no
-//! step and no change of shading, and the finer detail fades in across a
-//! whole cell instead of stopping at a line.
-//!
-//! Every mesh is cut at its cell's six faces: the cubes straddling a face
-//! are drawn by both neighbors from the same samples, and each keeps the
-//! half on its own side, so same-depth neighbors meet edge to edge at the
-//! face with no overlap (two copies would fight in the depth buffer) and
-//! no gap. Where
-//! two meshes still meet at slightly different heights (across a depth
-//! transition), a skirt hung from every open edge of a mesh, one sample
-//! down into the matter and drawn from both sides, fills the crack
-//! ([`add_skirts`]). Every cell of a frame is drawn at one
-//! isovalue (below), so neighbors put the surface at the same density.
-//!
-//! # The isovalue
-//!
-//! The drawn surface is the boundary between matter and vacuum, so the
-//! isovalue is half the density of the matter just inside it: half the
-//! smallest density of the section's solid and fluid samples that lie at
-//! least four samples in from any boundary of that matter or of the
-//! section ([`surface_isovalue`]). A section with no such sample (a thin
-//! shell) uses half its largest solid or fluid density. Gas and plasma
-//! samples take no part. That is each section's own isovalue; the world
-//! draws every cell of a frame at the smallest of its loaded cells'
-//! ([`FaceNeighbors::isovalue`],
-//! [`crate::stream::CellCache::frame_isovalue`]). A cell at a coarse depth
-//! gives a coarse mesh, and nothing here smooths it.
-//!
-//! This density rule predates the occupancy channel. The surface the
-//! format defines is the level set `occupancy = 0.5` (`matter-format.md`
-//! section 3.3, `rendering.md` section 2); extraction moves to it, with
-//! Transvoxel transitions in place of the skirts and fades above, when it
-//! is rewritten. Until then selection and asking ahead already follow
-//! occupancy ([`crate::stream`]).
-
-//! # Cubes and triangles
-//!
-//! A corner is inside when its density is strictly above the isovalue. The
-//! triangle table is not typed in: [`case_table`] derives it once from the
-//! cube faces. On every face the inside corners are kept apart (an inside
-//! run of corners gets its own segment), a rule that depends only on the
-//! four corners of the face, so the two cubes sharing a face always cut it
-//! the same way and the mesh is watertight. Segments are linked into loops
-//! and each loop is fanned into triangles, wound counterclockwise as seen
-//! from the outside (from lower density).
+//! A cell is extracted only from inputs that are present or known empty.
+//! Every read of a section the snapshot does not hold is recorded; an
+//! extraction that made one gives no mesh ([`Extraction::Waiting`]) and the
+//! cell is looked at again when something in its region arrives.
 //!
 //! # Attributes
 //!
-//! Positions are linear interpolations along cube edges, in `f64`, in the
-//! frame's coordinates. Normals are the negated density gradient (central
-//! differences averaged over the 3 x 3 points across each axis with
-//! weights 1, 2, 1, the Sobel kernel, so a surface oblique to the grid does
-//! not shade in bands at every sample layer), interpolated along the edge
-//! and normalized, so they point from dense to thin. Albedo, roughness, and
-//! temperature are density-weighted along the edge, the same rule the
-//! compositing uses, so vacuum on one side never dims or cools the surface;
-//! the state is that of the corner inside the surface, and the density is
-//! the linear interpolation.
+//! Positions and normals come from the Transvoxel module. Albedo,
+//! roughness, temperature, density, and state are those of the eight
+//! samples of the cell's depth around the lattice point nearest the
+//! vertex, density-weighted over solid and fluid samples, with the state
+//! of the densest one (`matter-format.md` section 3.5).
 //!
 //! # Determinism
 //!
-//! The grid is walked in index order (x fastest, then y, then z), vertices
-//! are created in that walk and shared through an index table addressed by
-//! grid edge, and every value is plain `f64` arithmetic with `sqrt`. The same
-//! section with the same neighbors always gives bit-identical vertex and
-//! index buffers. Extraction may run on a worker pool ([`ExtractPool`]);
-//! each mesh depends only on its own section and its neighbors, so which
-//! thread ran it never shows in the output.
+//! The snapshot is held in ordered maps, extraction is plain `f64`
+//! arithmetic in a fixed order, and each mesh depends only on its inputs,
+//! so which worker thread ran it never shows in the output.
 
+use crate::transvoxel::{extract_mixed, CellAt, MixedField};
 use gx_core::key::CellKey;
-use gx_core::matter::{Sample, Samples, Section, State};
+use gx_core::matter::{Section, State};
 use gx_core::units::Vec3;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// Returns `true` for the states that form surfaces: solid and fluid.
 /// Everything else (vacuum, gas, plasma) counts as vacuum for extraction.
@@ -167,9 +78,6 @@ pub struct SurfaceMesh {
     pub key: CellKey,
     /// Minimum corner of the cell, meters, frame coordinates.
     pub origin: Vec3,
-    /// The density the surface follows, kilograms per cubic meter
-    /// ([`surface_isovalue`]).
-    pub isovalue: f64,
     /// Vertex positions, meters, frame coordinates.
     pub positions: Vec<[f64; 3]>,
     /// Vertex attributes, one per position.
@@ -180,9 +88,6 @@ pub struct SurfaceMesh {
     pub bounds_min: [f64; 3],
     /// Largest corner of the box around every position, frame coordinates.
     pub bounds_max: [f64; 3],
-    /// The first position (and vertex) of the skirts ([`add_skirts`]):
-    /// the ones before it lie on the surface.
-    pub skirt_from: usize,
 }
 
 impl SurfaceMesh {
@@ -197,1222 +102,317 @@ impl SurfaceMesh {
     }
 }
 
-/// The index of a face in [`FaceNeighbors::faces`]: `2 * axis` for the low
-/// side (toward smaller coordinates) and `2 * axis + 1` for the high side,
-/// so the order is `-x, +x, -y, +y, -z, +z`.
-pub fn face_index(axis: usize, high: bool) -> usize {
-    2 * axis + usize::from(high)
-}
-
-/// What is known of the cell across one face, at the same depth.
+/// Everything the extraction of one drawn cell reads (module docs).
 #[derive(Clone, Debug)]
-pub enum FaceNeighbor {
-    /// The cell is `Ready`: its composited section.
-    Ready(Arc<Section>),
-    /// The cell was fetched and holds no matter (`Empty`: an empty
-    /// composite, or no layer has the key). Its samples are all vacuum.
-    Empty(CellKey),
+pub struct CellInputs {
+    /// The cell, with the section it holds.
+    pub key: CellKey,
+    /// The cell's own section.
+    pub section: Arc<Section>,
+    /// Drawn cells of the region, at any depth.
+    pub drawn: BTreeSet<CellKey>,
+    /// Sections of the region one depth coarser, at the cell's depth, and
+    /// one depth finer: `Some` when present, `None` when known empty.
+    pub sections: BTreeMap<CellKey, Option<Arc<Section>>>,
 }
 
-impl FaceNeighbor {
-    /// The neighbor's key.
-    pub fn key(&self) -> CellKey {
-        match self {
-            FaceNeighbor::Ready(s) => s.key(),
-            FaceNeighbor::Empty(k) => *k,
-        }
-    }
-
-    /// Same section object (pointer identity), or the same empty key.
-    fn same_as(&self, other: &FaceNeighbor) -> bool {
-        match (self, other) {
-            (FaceNeighbor::Ready(a), FaceNeighbor::Ready(b)) => Arc::ptr_eq(a, b),
-            (FaceNeighbor::Empty(a), FaceNeighbor::Empty(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-/// The cells across the six faces of a cell, at the same depth, that
-/// extraction pads with (see the module docs). A face without one is padded
-/// by clamping.
-#[derive(Clone, Debug, Default)]
-pub struct FaceNeighbors {
-    /// One entry per face, in the order of [`face_index`].
-    pub faces: [Option<FaceNeighbor>; 6],
-    /// The isovalue to draw at, shared by every cell of the frame so
-    /// neighbors put the surface at the same density; `None` uses the
-    /// section's own ([`surface_isovalue`]).
-    pub isovalue: Option<f64>,
-    /// The cell's parent when loaded: with its neighbors at the same depth
-    /// it is the field a coarser neighbor draws ([`ParentLevel`]).
-    pub parent: Option<Arc<Section>>,
-    /// The loaded cells at the parent's depth around it (its face, edge,
-    /// and corner neighbors): with the parent they form the parent level's
-    /// field across its faces ([`ParentLevel`]).
-    pub parent_neighbors: Vec<Arc<Section>>,
-    /// Offsets from the parent (-1, 0, or 1 per axis) of the cells at its
-    /// depth around it known to hold no matter: the parent level's field
-    /// is 0 there, not the parent's nearest sample.
-    pub parent_empty: Vec<[i8; 3]>,
-    /// Offsets (-2 to 2 per axis) of the cells at this depth around it
-    /// whose region a coarser cell one depth up draws, from the selection:
-    /// the cell fades into its parent level toward them ([`fade_weight`]).
-    /// Taken from what is drawn, not from what is cached there, so two
-    /// cells sharing a face agree on it.
-    pub coarser: Vec<[i8; 3]>,
-    /// The cells across the 12 edges and 8 corners, in the order of
-    /// [`crate::stream::diagonal_offsets`] (empty when not gathered):
-    /// padding points beyond two or three faces read them.
-    pub diagonal: Vec<Option<FaceNeighbor>>,
-}
-
-impl FaceNeighbors {
-    /// No neighbors: every face clamps.
-    pub fn none() -> FaceNeighbors {
-        FaceNeighbors::default()
-    }
-
-    /// Returns `true` when both hold the same neighbors on every face:
-    /// the same section objects (pointer identity, not a comparison of
-    /// samples) or the same empty cells.
-    pub fn same_as(&self, other: &FaceNeighbors) -> bool {
-        let same = |a: &Option<FaceNeighbor>, b: &Option<FaceNeighbor>| match (a, b) {
-            (Some(a), Some(b)) => a.same_as(b),
-            (None, None) => true,
-            _ => false,
-        };
-        let same_parent = match (&self.parent, &other.parent) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        let same_around = self.parent_neighbors.len() == other.parent_neighbors.len()
+impl CellInputs {
+    /// Returns `true` when `other` holds the same drawn cells and the same
+    /// sections (the same shared section, not merely equal bytes).
+    pub fn same_as(&self, other: &CellInputs) -> bool {
+        self.key == other.key
+            && Arc::ptr_eq(&self.section, &other.section)
+            && self.drawn == other.drawn
+            && self.sections.len() == other.sections.len()
             && self
-                .parent_neighbors
+                .sections
                 .iter()
-                .zip(&other.parent_neighbors)
-                .all(|(a, b)| Arc::ptr_eq(a, b));
-        same_parent
-            && same_around
-            && self.parent_empty == other.parent_empty
-            && self.coarser == other.coarser
-            && self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
-            && self.diagonal.len() == other.diagonal.len()
-            && self
-                .diagonal
-                .iter()
-                .zip(&other.diagonal)
-                .all(|(a, b)| same(a, b))
-            && self
-                .faces
-                .iter()
-                .zip(&other.faces)
-                .all(|(a, b)| match (a, b) {
-                    (Some(a), Some(b)) => a.same_as(b),
-                    (None, None) => true,
-                    _ => false,
+                .zip(&other.sections)
+                .all(|((ka, a), (kb, b))| {
+                    ka == kb
+                        && match (a, b) {
+                            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
                 })
     }
 
-    /// Number of faces with a neighbor.
-    pub fn count(&self) -> usize {
-        self.faces.iter().filter(|f| f.is_some()).count()
-    }
-}
-
-/// Returns `true` when `neighbor` is the cell across face `face` of `key`
-/// at the same depth, or a coarser cell holding it.
-fn covers_face(key: &CellKey, neighbor: &CellKey, face: usize) -> bool {
-    if neighbor.depth > key.depth || neighbor.frame_id != key.frame_id {
-        return false;
-    }
-    let Some(mut c) = crate::stream::face_neighbor_keys(key)[face] else {
-        return false;
-    };
-    while c.depth > neighbor.depth {
-        match c.parent() {
-            Some(p) => c = p,
-            None => return false,
-        }
-    }
-    c == *neighbor
-}
-
-/// Returns `true` when `neighbor` is the cell across face `face` of `key`:
-/// same frame, same depth, one step along the face's axis.
-fn is_face_neighbor(key: &CellKey, neighbor: &CellKey, face: usize) -> bool {
-    let (axis, high) = (face / 2, face % 2 == 1);
-    let a = [key.x, key.y, key.z];
-    let b = [neighbor.x, neighbor.y, neighbor.z];
-    key.frame_id == neighbor.frame_id
-        && key.depth == neighbor.depth
-        && (0..3).all(|k| {
-            if k != axis {
-                a[k] == b[k]
-            } else if high {
-                a[k].checked_add(1) == Some(b[k])
-            } else {
-                a[k].checked_sub(1) == Some(b[k])
-            }
-        })
-}
-
-/// Layers of padding on every side of the extraction grid: the outer one
-/// only feeds the gradient of the vertices in the cubes straddling the
-/// faces.
-const PAD: usize = 2;
-
-/// The density of `section`'s solid and fluid samples at frame coordinates
-/// `p`, trilinear over its sample centers, clamped into them.
-fn trilinear(p: [f64; 3], section: &Section, samples: &Samples) -> f64 {
-    let r = usize::from(section.resolution());
-    let u = coarse_coords(p, section);
-    let mut i0 = [0usize; 3];
-    let mut f = [0.0f64; 3];
-    for b in 0..3 {
-        let c = u[b].clamp(0.0, (r - 1) as f64);
-        let lo = (c.floor() as usize).min(r.saturating_sub(2));
-        i0[b] = lo;
-        f[b] = if r > 1 { c - lo as f64 } else { 0.0 };
-    }
-    let d = |x: usize, y: usize, z: usize| -> f64 {
-        let (x, y, z) = (x.min(r - 1), y.min(r - 1), z.min(r - 1));
-        let i = x + r * (y + r * z);
-        if forms_surface(samples.state(i)) {
-            samples.density(i).value()
-        } else {
-            0.0
-        }
-    };
-    let mut acc = 0.0;
-    for c in 0..8 {
-        let o = corner_offset(c);
-        let w: f64 = (0..3)
-            .map(|b| if o[b] == 1 { f[b] } else { 1.0 - f[b] })
-            .product();
-        if w > 0.0 {
-            acc += w * d(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
-        }
-    }
-    acc
-}
-
-/// Hangs a skirt from every open edge of the mesh (an edge of one
-/// triangle only: where the mesh ends at its cell's faces): a strip down
-/// into the matter, `depth` meters along the inward normal (one sample),
-/// drawn from both sides. Where a neighbor's surface meets this one a
-/// little higher or lower (a depth transition, two isovalue crossings a
-/// sample apart) the strip fills the crack; where they meet exactly it lies
-/// inside the matter and never shows. The strip takes the edge's vertex
-/// attributes, so it shades like the surface above it.
-fn add_skirts(
-    positions: &mut Vec<[f64; 3]>,
-    vertices: &mut Vec<SurfaceVertex>,
-    indices: &mut Vec<u32>,
-    depth: f64,
-) {
-    let mut uses: BTreeMap<(u32, u32), (u32, u32, u32)> = BTreeMap::new();
-    for tri in indices.as_chunks::<3>().0 {
-        for e in 0..3 {
-            let (a, b) = (tri[e], tri[(e + 1) % 3]);
-            let k = (a.min(b), a.max(b));
-            uses.entry(k).and_modify(|u| u.2 += 1).or_insert((a, b, 1));
-        }
-    }
-    let mut lowered: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut lower =
-        |v: u32, positions: &mut Vec<[f64; 3]>, vertices: &mut Vec<SurfaceVertex>| -> u32 {
-            if let Some(&i) = lowered.get(&v) {
-                return i;
-            }
-            let p = positions[v as usize];
-            let attr = vertices[v as usize];
-            let n = attr.normal;
-            let q = core::array::from_fn(|c| p[c] - f64::from(n[c]) * depth);
-            let i = positions.len() as u32;
-            positions.push(q);
-            vertices.push(attr);
-            lowered.insert(v, i);
-            i
-        };
-    let open: Vec<(u32, u32)> = uses
-        .values()
-        .filter(|u| u.2 == 1)
-        .map(|u| (u.0, u.1))
-        .collect();
-    for (a, b) in open {
-        let (la, lb) = (lower(a, positions, vertices), lower(b, positions, vertices));
-        // Both windings: the strip is seen from either side of the crack.
-        indices.extend_from_slice(&[a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
-    }
-}
-
-/// Cuts the mesh at the plane where coordinate `axis` equals `plane`,
-/// keeping the side below it (`keep_below`) or above it. Triangles across
-/// the plane are cut along it, with new vertices interpolated linearly
-/// (normals renormalized; state and density from the kept end).
-fn clip_mesh(
-    positions: &mut Vec<[f64; 3]>,
-    vertices: &mut Vec<SurfaceVertex>,
-    indices: &mut Vec<u32>,
-    axis: usize,
-    plane: f64,
-    keep_below: bool,
-) {
-    let inside = |p: &[f64; 3]| {
-        if keep_below {
-            p[axis] <= plane
-        } else {
-            p[axis] >= plane
-        }
-    };
-    let mut cut: BTreeMap<(u32, u32), u32> = BTreeMap::new();
-    let mut split =
-        |a: u32, b: u32, positions: &mut Vec<[f64; 3]>, vertices: &mut Vec<SurfaceVertex>| -> u32 {
-            let k = (a.min(b), a.max(b));
-            if let Some(&i) = cut.get(&k) {
-                return i;
-            }
-            let (pa, pb) = (positions[a as usize], positions[b as usize]);
-            let t = (plane - pa[axis]) / (pb[axis] - pa[axis]);
-            let p: [f64; 3] = core::array::from_fn(|c| pa[c] + t * (pb[c] - pa[c]));
-            let (va, vb) = (vertices[a as usize], vertices[b as usize]);
-            let tf = t as f32;
-            let lerp3 = |x: [f32; 3], y: [f32; 3]| -> [f32; 3] {
-                core::array::from_fn(|c| x[c] + tf * (y[c] - x[c]))
-            };
-            let n = lerp3(va.normal, vb.normal);
-            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            let kept = if inside(&pa) { va } else { vb };
-            let v = SurfaceVertex {
-                normal: if len > 0.0 {
-                    n.map(|x| x / len)
+    /// The cells whose sections or drawn status a cell's extraction may
+    /// read: at depths `depth - 1 ..= depth + 1`, those overlapping the cell
+    /// grown by one cell of its depth on every side. Ascending order.
+    pub fn region(key: &CellKey) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        let d = key.depth;
+        let lo = |v: u32| i64::from(v) - 1;
+        let hi = |v: u32| i64::from(v) + 1;
+        for dd in d.saturating_sub(1)..=d.saturating_add(1) {
+            let side = 1i64 << dd;
+            // Cell range at depth dd covering [lo, hi + 1) at depth d.
+            let range = |v: u32| -> (i64, i64) {
+                if dd >= d {
+                    let s = 1i64 << (dd - d);
+                    (lo(v) * s, (hi(v) + 1) * s - 1)
                 } else {
-                    va.normal
-                },
-                albedo: lerp3(va.albedo, vb.albedo),
-                roughness: va.roughness + tf * (vb.roughness - va.roughness),
-                temperature: va.temperature + tf * (vb.temperature - va.temperature),
-                ..kept
+                    let s = 1i64 << (d - dd);
+                    (lo(v).div_euclid(s), hi(v).div_euclid(s))
+                }
             };
-            let i = positions.len() as u32;
-            positions.push(p);
-            vertices.push(v);
-            cut.insert(k, i);
-            i
-        };
-    let mut out = Vec::with_capacity(indices.len());
-    for tri in indices.as_chunks::<3>().0 {
-        let ins: Vec<bool> = tri
-            .iter()
-            .map(|&i| inside(&positions[i as usize]))
-            .collect();
-        let count = ins.iter().filter(|&&b| b).count();
-        if count == 0 {
-            continue;
-        }
-        if count == 3 {
-            out.extend_from_slice(tri);
-            continue;
-        }
-        // Sutherland-Hodgman over the triangle's three edges.
-        let mut poly: Vec<u32> = Vec::with_capacity(4);
-        for e in 0..3 {
-            let (a, b) = (tri[e], tri[(e + 1) % 3]);
-            let (ia, ib) = (ins[e], ins[(e + 1) % 3]);
-            if ia {
-                poly.push(a);
-            }
-            if ia != ib {
-                poly.push(split(a, b, positions, vertices));
+            let (x, y, z) = (range(key.x), range(key.y), range(key.z));
+            for cz in z.0.max(0)..=z.1.min(side - 1) {
+                for cy in y.0.max(0)..=y.1.min(side - 1) {
+                    for cx in x.0.max(0)..=x.1.min(side - 1) {
+                        if let Ok(k) =
+                            CellKey::new(key.frame_id, dd, cx as u32, cy as u32, cz as u32)
+                        {
+                            out.push(k);
+                        }
+                    }
+                }
             }
         }
-        for k in 1..poly.len().saturating_sub(1) {
-            let t = [poly[0], poly[k], poly[k + 1]];
-            // A cut can leave a sliver of no area along the plane (a
-            // corner exactly on it): no surface, so not drawn.
-            let [p0, p1, p2] = t.map(|i| positions[i as usize]);
-            let (u, w) = (
-                [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
-                [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]],
-            );
-            let c = [
-                u[1] * w[2] - u[2] * w[1],
-                u[2] * w[0] - u[0] * w[2],
-                u[0] * w[1] - u[1] * w[0],
-            ];
-            let area2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
-            let scale = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2])
-                * (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-            if area2 > 1e-18 * scale && area2 > 0.0 {
-                out.extend_from_slice(&t);
-            }
-        }
+        out.sort_unstable();
+        out
     }
-    *indices = out;
-}
 
-/// The field of the parent level: the parent cell's samples and those of the
-/// loaded cells at its depth around it, as one lattice, so the field runs
-/// on across the parent's faces. Next to a coarser cell, a cell fades into
-/// this field (module docs): it is the field the coarser cell draws.
-pub struct ParentLevel<'a> {
-    /// Sample spacing of the level, meters.
-    step: f64,
-    /// Resolution of every section of the level.
-    res: i64,
-    /// The parent's origin, frame coordinates: lattice index 0 sits half a
-    /// step in from it.
-    origin: [f64; 3],
-    /// Sections of the level with their first lattice index relative to the
-    /// parent's.
-    sections: Vec<([i64; 3], &'a Samples)>,
-    /// First lattice indices of the cells around the parent known to hold
-    /// no matter.
-    empty: Vec<[i64; 3]>,
-}
-
-impl<'a> ParentLevel<'a> {
-    /// The level around `parent` from it, `around` (cells at its depth;
-    /// others are ignored), and `empty` (offsets from the parent, -1, 0, or 1
-    /// per axis, of cells at its depth known to hold no matter). `None` when
-    /// the parent has no samples.
-    pub fn new(
-        parent: &'a Section,
-        around: impl Iterator<Item = &'a Section>,
-        empty: &[[i8; 3]],
-    ) -> Option<ParentLevel<'a>> {
-        let res = i64::from(parent.resolution());
-        let step = parent.edge().value() / res as f64;
-        let o = parent.origin();
-        let origin = [o.x, o.y, o.z];
-        let mut sections = vec![([0i64; 3], parent.samples()?)];
-        for s in around {
-            if s.key().depth != parent.key().depth || i64::from(s.resolution()) != res {
-                continue;
-            }
-            let Some(samples) = s.samples() else {
-                continue;
-            };
-            let so = s.origin();
-            let base = [so.x, so.y, so.z];
-            let index: [i64; 3] =
-                core::array::from_fn(|k| ((base[k] - origin[k]) / step).round() as i64);
-            sections.push((index, samples));
-        }
-        let empty = empty
-            .iter()
-            .map(|o| core::array::from_fn(|k| i64::from(o[k]) * res))
+    /// Inputs for a section drawn alone: every other cell of the region
+    /// known empty and not drawn.
+    pub fn alone(section: Arc<Section>) -> CellInputs {
+        let key = section.key();
+        let sections = CellInputs::region(&key)
+            .into_iter()
+            .filter(|k| *k != key)
+            .map(|k| (k, None))
             .collect();
-        Some(ParentLevel {
-            step,
-            res,
-            origin,
+        CellInputs {
+            key,
+            section,
+            drawn: BTreeSet::from([key]),
             sections,
-            empty,
-        })
-    }
-
-    /// Solid and fluid density at lattice index `q`, from the section that
-    /// holds it, 0 in a cell known to hold no matter, or the nearest sample
-    /// of the parent when nothing is known there.
-    fn at(&self, q: [i64; 3]) -> f64 {
-        let r = self.res;
-        let within = |b: &[i64; 3]| (0..3).all(|k| (b[k]..b[k] + r).contains(&q[k]));
-        if self.empty.iter().any(within) {
-            return 0.0;
-        }
-        let pick = self
-            .sections
-            .iter()
-            .find(|(b, _)| (0..3).all(|k| (b[k]..b[k] + r).contains(&q[k])))
-            .copied()
-            .unwrap_or(self.sections[0]);
-        let c: [usize; 3] = core::array::from_fn(|k| (q[k] - pick.0[k]).clamp(0, r - 1) as usize);
-        let i = c[0] + r as usize * (c[1] + r as usize * c[2]);
-        if forms_surface(pick.1.state(i)) {
-            pick.1.density(i).value()
-        } else {
-            0.0
         }
     }
-
-    /// Lattice coordinates of frame coordinates `p`.
-    fn coords(&self, p: [f64; 3]) -> [f64; 3] {
-        core::array::from_fn(|k| (p[k] - self.origin[k]) / self.step - 0.5)
-    }
-
-    /// Trilinear density at frame coordinates `p`.
-    pub fn density(&self, p: [f64; 3]) -> f64 {
-        let u = self.coords(p);
-        let i0: [i64; 3] = core::array::from_fn(|k| u[k].floor() as i64);
-        let f: [f64; 3] = core::array::from_fn(|k| u[k] - i0[k] as f64);
-        let mut acc = 0.0;
-        for c in 0..8 {
-            let o = corner_offset(c);
-            let w: f64 = (0..3)
-                .map(|k| if o[k] == 1 { f[k] } else { 1.0 - f[k] })
-                .product();
-            if w > 0.0 {
-                acc += w * self.at(core::array::from_fn(|k| i0[k] + o[k] as i64));
-            }
-        }
-        acc
-    }
 }
 
-/// How far a cell fades into its parent level at grid point `p` (grid
-/// indices, padding included): 1 within or at the region of a coarser cell,
-/// falling to 0 one cell (`n` samples) from it, the largest over `coarser`
-/// (offsets of cells at this depth, [`FaceNeighbors::coarser`]). Distance
-/// is the largest over the axes of how far the sample center lies outside
-/// the region, so the weight is one function of position: a cell and its
-/// neighbors compute the same value at any point, padding included.
-fn fade_weight(p: [usize; 3], coarser: &[[i8; 3]], n: usize) -> f64 {
-    let nf = n as f64;
-    let c: [f64; 3] = core::array::from_fn(|k| p[k] as f64 - PAD as f64 + 0.5);
-    let mut w = 0.0f64;
-    for o in coarser {
-        let d = (0..3)
-            .map(|k| {
-                let lo = f64::from(o[k]) * nf;
-                (lo - c[k]).max(c[k] - (lo + nf)).max(0.0)
-            })
-            .fold(0.0f64, f64::max);
-        w = w.max(1.0 - d / nf);
-    }
-    w.clamp(0.0, 1.0)
+/// The result of one extraction.
+#[derive(Clone, Debug)]
+pub enum Extraction {
+    /// The mesh, from inputs that were all present or known empty.
+    Done(Arc<SurfaceMesh>),
+    /// A read found an input that is neither present nor known empty.
+    Waiting,
 }
 
-/// Frame coordinates `p` in `section`'s sample units: 0 at the first
-/// sample center, 1 at the next.
-fn coarse_coords(p: [f64; 3], section: &Section) -> [f64; 3] {
-    let o = section.origin();
-    let step = section.edge().value() / f64::from(section.resolution());
-    let o = [o.x, o.y, o.z];
-    core::array::from_fn(|b| (p[b] - o[b]) / step - 0.5)
-}
-
-/// Corner `c` of a cube is offset `(c & 1, (c >> 1) & 1, (c >> 2) & 1)`.
-fn corner_offset(c: usize) -> [usize; 3] {
-    [c & 1, (c >> 1) & 1, (c >> 2) & 1]
-}
-
-/// The twelve cube edges as `(low corner, axis)`: the edge runs from the
-/// low corner to the corner with the `axis` bit set.
-fn cube_edges() -> [(usize, usize); 12] {
-    let mut out = [(0, 0); 12];
-    let mut i = 0;
-    for axis in 0..3 {
-        for c in 0..8 {
-            if c & (1 << axis) == 0 {
-                out[i] = (c, axis);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Index of the cube edge between corners `a` and `b` (adjacent).
-fn edge_between(edges: &[(usize, usize); 12], a: usize, b: usize) -> usize {
-    let low = a.min(b);
-    let axis = (a ^ b).trailing_zeros() as usize;
-    edges
-        .iter()
-        .position(|&e| e == (low, axis))
-        .expect("adjacent corners share an edge")
-}
-
-/// Triangles for every corner configuration: entry `config` lists triangles
-/// as triples of cube edge indices. Bit `c` of `config` is set when corner
-/// `c`, at offset `(c & 1, (c >> 1) & 1, (c >> 2) & 1)`, is inside. Edges
-/// are numbered by axis (x, then y, then z) and, within an axis, by the
-/// index of their lower corner.
-pub fn case_table() -> &'static [Vec<[u8; 3]>] {
-    static TABLE: OnceLock<Vec<Vec<[u8; 3]>>> = OnceLock::new();
-    TABLE.get_or_init(build_case_table)
-}
-
-fn build_case_table() -> Vec<Vec<[u8; 3]>> {
-    let edges = cube_edges();
-    (0..256usize)
-        .map(|config| {
-            let inside = |c: usize| config & (1 << c) != 0;
-            // next[edge] = the edge the surface loop continues to.
-            let mut next = [usize::MAX; 12];
-            for axis in 0..3 {
-                let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-                for side in 0..2 {
-                    // Corners counterclockwise seen from outside the face.
-                    let mut ring: Vec<usize> = [(0, 0), (1, 0), (1, 1), (0, 1)]
-                        .iter()
-                        .map(|&(a, b)| (side << axis) | (a << u) | (b << v))
-                        .collect();
-                    if side == 0 {
-                        ring.reverse();
-                    }
-                    // Crossings in ring order: (edge, entering).
-                    let mut crossings = Vec::new();
-                    for k in 0..4 {
-                        let (a, b) = (ring[k], ring[(k + 1) % 4]);
-                        if inside(a) != inside(b) {
-                            crossings.push((edge_between(&edges, a, b), inside(b)));
-                        }
-                    }
-                    // Each inside run is one segment: from the crossing that
-                    // enters it to the next one, which leaves it.
-                    for i in 0..crossings.len() {
-                        let (from, entering) = crossings[i];
-                        if entering {
-                            let (to, _) = crossings[(i + 1) % crossings.len()];
-                            next[from] = to;
-                        }
-                    }
-                }
-            }
-            let mut seen = [false; 12];
-            let mut triangles = Vec::new();
-            for start in 0..12 {
-                if next[start] == usize::MAX || seen[start] {
-                    continue;
-                }
-                let mut ring = Vec::new();
-                let mut e = start;
-                while !seen[e] {
-                    seen[e] = true;
-                    ring.push(e as u8);
-                    e = next[e];
-                }
-                for i in 1..ring.len() - 1 {
-                    triangles.push([ring[0], ring[i], ring[i + 1]]);
-                }
-            }
-            triangles
-        })
-        .collect()
-}
-
-/// The section's samples on the padded grid.
-struct Grid<'a> {
-    /// The section's own samples and resolution.
-    own: &'a Samples,
-    /// Resolution of the section.
+/// The [`MixedField`] over a snapshot.
+struct Field<'a> {
+    inputs: &'a CellInputs,
     n: usize,
-    /// Usable neighbors, per face.
-    neighbors: [Option<Pad<'a>>; 6],
-    /// Usable edge and corner neighbors, by offset.
-    diagonal: Vec<([i8; 3], Pad<'a>)>,
-    /// Points per axis: resolution plus two.
-    m: usize,
-    /// Density at every grid point, solid and fluid only.
-    density: Vec<f64>,
-    /// Sample spacing, meters.
-    step: f64,
-    origin: Vec3,
+    root_origin: [f64; 3],
+    root_edge: f64,
+    missing: Cell<bool>,
 }
 
-/// A usable face neighbor on the grid.
-#[derive(Copy, Clone)]
-enum Pad<'a> {
-    /// A neighbor's samples and resolution.
-    Samples(&'a Samples, usize),
-    /// A coarser cell holding the region across the face: read at the
-    /// grid point's position, the density trilinear.
-    Coarse(&'a Section, &'a Samples),
-    /// A neighbor known to hold no matter.
-    Empty,
-}
-
-/// Sample index `c` of a resolution `from` mapped to the sample of
-/// resolution `to` whose center is nearest, ties to the higher index:
-/// `floor((c + 1/2) to / from)`, in integers.
-fn remap(c: usize, from: usize, to: usize) -> usize {
-    if from == to {
-        c
-    } else {
-        ((2 * c + 1) * to / (2 * from)).min(to - 1)
-    }
-}
-
-impl<'a> Grid<'a> {
-    /// The samples and sample index that grid point `p` takes its values
-    /// from: the section's own sample inside, a neighbor's first layer or
-    /// the clamped own sample in the padding (see the module docs). `None`
-    /// for a neighbor known to hold no matter.
-    /// The edge or corner neighbor grid point `p` lies in, when it lies
-    /// beyond two or three faces and that neighbor was gathered.
-    fn diagonal_pad(&self, p: [usize; 3]) -> Option<Pad<'a>> {
-        let n = self.n;
-        let o: [i8; 3] = core::array::from_fn(|a| {
-            if p[a] < PAD {
-                -1
-            } else if p[a] >= n + PAD {
-                1
-            } else {
-                0
-            }
-        });
-        if o.iter().filter(|&&d| d != 0).count() < 2 {
-            return None;
+impl Field<'_> {
+    fn new(inputs: &CellInputs) -> Field<'_> {
+        let s = &inputs.section;
+        let k = s.key();
+        let e = s.edge().value();
+        let o = s.origin();
+        let idx = [k.x, k.y, k.z].map(f64::from);
+        Field {
+            inputs,
+            n: usize::from(s.resolution()),
+            root_origin: [o.x - idx[0] * e, o.y - idx[1] * e, o.z - idx[2] * e],
+            root_edge: e * (1u64 << k.depth) as f64,
+            missing: Cell::new(false),
         }
-        self.diagonal
-            .iter()
-            .find(|(d, _)| *d == o)
-            .map(|(_, pad)| *pad)
     }
 
-    fn source(&self, p: [usize; 3]) -> Option<(&'a Samples, usize)> {
-        let n = self.n;
-        match self.diagonal_pad(p) {
-            Some(Pad::Empty) => return None,
-            Some(Pad::Coarse(section, samples)) => {
-                let r = usize::from(section.resolution());
-                let u = coarse_coords(self.position(p), section);
-                let q: [usize; 3] = core::array::from_fn(|b| {
-                    (u[b] + 0.5).floor().clamp(0.0, (r - 1) as f64) as usize
-                });
-                return Some((samples, q[0] + r * (q[1] + r * q[2])));
-            }
-            Some(Pad::Samples(samples, r)) => {
-                let q: [usize; 3] = core::array::from_fn(|b| {
-                    if p[b] < PAD {
-                        (r + p[b]).saturating_sub(PAD)
-                    } else if p[b] >= n + PAD {
-                        (p[b] - (n + PAD)).min(r - 1)
-                    } else {
-                        remap(p[b] - PAD, n, r)
-                    }
-                });
-                return Some((samples, q[0] + r * (q[1] + r * q[2])));
-            }
-            None => {}
-        }
-        let beyond = |axis: usize| -> Option<Pad<'a>> {
-            let (low, high) = (p[axis] < PAD, p[axis] >= n + PAD);
-            if low || high {
-                self.neighbors[face_index(axis, high)]
-            } else {
-                None
-            }
+    /// The cell of depth `dd` holding the center of sample `c` of depth `d`.
+    fn holder(&self, d: u8, c: [i64; 3], dd: u8) -> Option<CellKey> {
+        let n = self.n as i64;
+        let idx = if dd <= d {
+            c.map(|v| v.div_euclid(n << (d - dd)))
+        } else {
+            c.map(|v| ((2 * v + 1) << (dd - d)).div_euclid(2 * n))
         };
-        // Beyond a face known to hold no matter is vacuum, even where the
-        // point is also beyond another face: both cells sharing that other
-        // face then see the same values there.
-        if (0..3).any(|axis| matches!(beyond(axis), Some(Pad::Empty))) {
+        let side = 1i64 << dd;
+        if idx.iter().any(|&v| !(0..side).contains(&v)) {
             return None;
         }
-        for axis in 0..3 {
-            if let Some(Pad::Coarse(section, samples)) = beyond(axis) {
-                let r = usize::from(section.resolution());
-                let u = coarse_coords(self.position(p), section);
-                let q: [usize; 3] = core::array::from_fn(|b| {
-                    (u[b] + 0.5).floor().clamp(0.0, (r - 1) as f64) as usize
-                });
-                return Some((samples, q[0] + r * (q[1] + r * q[2])));
-            }
-            if let Some(Pad::Samples(samples, r)) = beyond(axis) {
-                let high = p[axis] >= n + PAD;
-                let q: [usize; 3] = core::array::from_fn(|b| {
-                    if b == axis {
-                        if high {
-                            (p[axis] - (n + PAD)).min(r - 1)
-                        } else {
-                            (r + p[axis]).saturating_sub(PAD)
-                        }
-                    } else {
-                        remap(p[b].clamp(PAD, n + PAD - 1) - PAD, n, r)
-                    }
-                });
-                return Some((samples, q[0] + r * (q[1] + r * q[2])));
-            }
-        }
-        let q: [usize; 3] = core::array::from_fn(|b| p[b].clamp(PAD, n + PAD - 1) - PAD);
-        Some((self.own, q[0] + n * (q[1] + n * q[2])))
-    }
-
-    fn index(&self, p: [usize; 3]) -> usize {
-        p[0] + self.m * (p[1] + self.m * p[2])
-    }
-
-    /// The density at grid point `p` when the first face it lies beyond
-    /// with a `Ready` neighbor has a coarser one there (the same rule as
-    /// [`Grid::source`]): trilinear over that cell's solid and fluid sample
-    /// centers, clamped into them. `None` otherwise.
-    fn coarse_density(&self, p: [usize; 3]) -> Option<f64> {
-        let n = self.n;
-        if let Some(pad) = self.diagonal_pad(p) {
-            return match pad {
-                Pad::Coarse(section, samples) => {
-                    Some(trilinear(self.position(p), section, samples))
-                }
-                _ => None,
-            };
-        }
-        let beyond = |axis: usize| -> Option<Pad<'a>> {
-            if p[axis] < PAD || p[axis] >= n + PAD {
-                self.neighbors[face_index(axis, p[axis] >= n + PAD)]
-            } else {
-                None
-            }
-        };
-        if (0..3).any(|axis| matches!(beyond(axis), Some(Pad::Empty))) {
-            return None;
-        }
-        let (section, samples) = (0..3).find_map(|axis| match beyond(axis) {
-            Some(Pad::Coarse(s, x)) => Some(Some((s, x))),
-            Some(Pad::Samples(..)) => Some(None),
-            _ => None,
-        })??;
-        Some(trilinear(self.position(p), section, samples))
-    }
-
-    fn d(&self, p: [usize; 3]) -> f64 {
-        self.density[self.index(p)]
-    }
-
-    /// Frame coordinates of grid point `p`: sample `p - 1`'s center.
-    fn position(&self, p: [usize; 3]) -> [f64; 3] {
-        let o = [self.origin.x, self.origin.y, self.origin.z];
-        core::array::from_fn(|a| o[a] + (p[a] as f64 - PAD as f64 + 0.5) * self.step)
-    }
-
-    /// Density gradient at grid point `p`, kilograms per cubic meter per
-    /// meter: along each axis the central difference, averaged over the
-    /// 3 x 3 points around `p` across that axis with weights 1, 2, 1 per
-    /// direction (the Sobel kernel). The average keeps the normal from
-    /// swinging from one sample layer to the next where a surface runs
-    /// oblique to the grid. Points at the grid's border take one-sided
-    /// differences; vertices never sit there (the padding is two deep).
-    fn gradient(&self, p: [usize; 3]) -> [f64; 3] {
-        let m = self.m;
-        core::array::from_fn(|a| {
-            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
-            let mut acc = 0.0;
-            let mut weight = 0.0;
-            for ob in [-1i64, 0, 1] {
-                for oc in [-1i64, 0, 1] {
-                    let mut q = p;
-                    let (qb, qc) = (p[b] as i64 + ob, p[c] as i64 + oc);
-                    if qb < 0 || qc < 0 || qb >= m as i64 || qc >= m as i64 {
-                        continue;
-                    }
-                    q[b] = qb as usize;
-                    q[c] = qc as usize;
-                    let w = (2 - ob.abs()) as f64 * (2 - oc.abs()) as f64;
-                    let mut lo = q;
-                    let mut hi = q;
-                    if q[a] > 0 {
-                        lo[a] -= 1;
-                    }
-                    if q[a] + 1 < m {
-                        hi[a] += 1;
-                    }
-                    let span = (hi[a] - lo[a]) as f64 * self.step;
-                    acc += w * (self.d(hi) - self.d(lo)) / span;
-                    weight += w;
-                }
-            }
-            acc / weight
-        })
-    }
-
-    /// The sample at grid point `p` (see [`Grid::source`]), `None` in an
-    /// empty neighbor. Its weight in the attributes is the grid density,
-    /// which is 0 for samples that do not form surfaces.
-    fn sample(&self, p: [usize; 3]) -> Option<Sample> {
-        let (samples, i) = self.source(p)?;
-        samples.get(i)
-    }
-}
-
-/// Extracts the surface of the solid and fluid samples of a composited
-/// section, every face padded by clamping (see the module docs and
-/// [`extract_with`]). An empty section, or one with no solid or fluid
-/// sample, gives an empty mesh.
-pub fn extract(section: &Section) -> SurfaceMesh {
-    extract_with(section, &FaceNeighbors::none())
-}
-
-/// The isovalue of a section's surface (module docs, "The isovalue"), or
-/// `None` without solid or fluid matter.
-pub fn surface_isovalue(section: &Section) -> Option<f64> {
-    isovalues(section).map(|(own, _)| own)
-}
-
-/// Half the smallest density of the section's matter at least four samples
-/// in from every boundary, or `None` when it has none (a thin shell, whose
-/// own isovalue falls back to half its largest density). Only these set
-/// the isovalue shared by a frame
-/// ([`crate::stream::CellCache::frame_isovalue`]): a sliver of matter in a
-/// cell says nothing about how dense the matter under the surface is.
-pub fn inner_isovalue(section: &Section) -> Option<f64> {
-    isovalues(section).and_then(|(_, inner)| inner)
-}
-
-/// The section's own isovalue, and the inner one when it has inner matter.
-fn isovalues(section: &Section) -> Option<(f64, Option<f64>)> {
-    let samples = section.samples()?;
-    let n = usize::from(section.resolution());
-    let count = n * n * n;
-    let mut inside: Vec<bool> = (0..count)
-        .map(|i| forms_surface(samples.state(i)) && samples.density(i).value() > 0.0)
-        .collect();
-    let max = (0..count)
-        .filter(|&i| inside[i])
-        .map(|i| samples.density(i).value())
-        .fold(0.0f64, f64::max);
-    if max <= 0.0 {
-        return None;
-    }
-    // Erode INNER_DEPTH times: a sample survives a pass when it and all 26
-    // samples around it in the section were inside. What survives is
-    // matter at least that many samples in from any boundary in every
-    // direction, past the partly filled ones.
-    for _ in 0..INNER_DEPTH {
-        let prev = inside.clone();
-        for z in 0..n {
-            for y in 0..n {
-                for x in 0..n {
-                    let i = x + n * (y + n * z);
-                    if !prev[i] {
-                        continue;
-                    }
-                    let edge = x == 0 || y == 0 || z == 0 || x + 1 == n || y + 1 == n || z + 1 == n;
-                    inside[i] = !edge
-                        && (0..27).all(|k| {
-                            let (dx, dy, dz) = (k % 3, (k / 3) % 3, k / 9);
-                            prev[(x + dx - 1) + n * ((y + dy - 1) + n * (z + dz - 1))]
-                        });
-                }
-            }
-        }
-    }
-    let inner = (0..count)
-        .filter(|&i| inside[i])
-        .map(|i| samples.density(i).value())
-        .fold(f64::INFINITY, f64::min);
-    Some(if inner.is_finite() {
-        (inner / 2.0, Some(inner / 2.0))
-    } else {
-        (max / 2.0, None)
-    })
-}
-
-/// How many samples in from every boundary the matter that sets the
-/// isovalue lies ([`surface_isovalue`]).
-const INNER_DEPTH: usize = 4;
-
-/// Extracts the surface of the solid and fluid samples of a composited
-/// section, padding each face with the neighbor's samples where `neighbors`
-/// holds one (vacuum for an empty one) and by clamping elsewhere. A
-/// neighbor that is not the cell across its face at the same depth is
-/// ignored; a `Ready` section without samples counts as empty.
-/// An empty section, or one with no solid or fluid sample, gives an empty
-/// mesh: the neighbors draw their own side of the faces.
-pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh {
-    let key = section.key();
-    let origin = section.origin();
-    let empty = |isovalue| SurfaceMesh {
-        key,
-        origin,
-        isovalue,
-        positions: Vec::new(),
-        vertices: Vec::new(),
-        indices: Vec::new(),
-        bounds_min: [origin.x, origin.y, origin.z],
-        bounds_max: [origin.x, origin.y, origin.z],
-        skirt_from: 0,
-    };
-    let Some(samples) = section.samples() else {
-        return empty(0.0);
-    };
-    let n = usize::from(section.resolution());
-    let Some(own_isovalue) = surface_isovalue(section) else {
-        return empty(0.0);
-    };
-    let isovalue = neighbors.isovalue.unwrap_or(own_isovalue);
-    let diagonal: Vec<([i8; 3], Pad<'_>)> = crate::stream::diagonal_offsets()
-        .into_iter()
-        .zip(&neighbors.diagonal)
-        .filter_map(|(o, n)| {
-            let n = n.as_ref()?;
-            let at = crate::stream::offset_key(&key, o)?;
-            let k = n.key();
-            let same = k == at;
-            let mut up = at;
-            while up.depth > k.depth {
-                up = up.parent()?;
-            }
-            if up != k || k.frame_id != key.frame_id {
-                return None;
-            }
-            Some((
-                o,
-                match n {
-                    FaceNeighbor::Ready(s) => match s.samples() {
-                        Some(samples) if same => Pad::Samples(samples, usize::from(s.resolution())),
-                        Some(samples) => Pad::Coarse(s, samples),
-                        None => Pad::Empty,
-                    },
-                    FaceNeighbor::Empty(_) => Pad::Empty,
-                },
-            ))
-        })
-        .collect();
-    let usable: [Option<Pad<'_>>; 6] = core::array::from_fn(|f| {
-        let neighbor = neighbors.faces[f].as_ref()?;
-        let same = is_face_neighbor(&key, &neighbor.key(), f);
-        if !same && !covers_face(&key, &neighbor.key(), f) {
-            return None;
-        }
-        Some(match neighbor {
-            FaceNeighbor::Ready(s) => match s.samples() {
-                Some(samples) if same => Pad::Samples(samples, usize::from(s.resolution())),
-                Some(samples) => Pad::Coarse(s, samples),
-                None => Pad::Empty,
-            },
-            FaceNeighbor::Empty(_) => Pad::Empty,
-        })
-    });
-    let m = n + 2 * PAD;
-    let mut grid = Grid {
-        own: samples,
-        n,
-        neighbors: usable,
-        diagonal,
-        m,
-        density: Vec::new(),
-        step: section.edge().value() / n as f64,
-        origin,
-    };
-    let mut density = vec![0.0f64; m * m * m];
-    for z in 0..m {
-        for y in 0..m {
-            for x in 0..m {
-                if let Some(d) = grid.coarse_density([x, y, z]) {
-                    density[x + m * (y + m * z)] = d;
-                    continue;
-                }
-                let Some((s, i)) = grid.source([x, y, z]) else {
-                    continue;
-                };
-                if forms_surface(s.state(i)) {
-                    density[x + m * (y + m * z)] = s.density(i).value();
-                }
-            }
-        }
-    }
-    // Where a coarser cell one depth up lies across a face, edge, or
-    // corner, fade this cell's density into the parent level's field (its
-    // parent and the loaded cells around it, [`ParentLevel`]): fully at that
-    // face, edge, or corner, none at the far side of the cell. The coarser
-    // cell draws the same field there, so the two meet with nothing to see,
-    // and the finer detail fades in across a whole cell instead of a line.
-    // The padding beyond such a side takes the field outright, so the
-    // density runs on across it and the normals have no kink.
-    let level = neighbors.parent.as_deref().and_then(|parent| {
-        ParentLevel::new(
-            parent,
-            neighbors.parent_neighbors.iter().map(|s| s.as_ref()),
-            &neighbors.parent_empty,
+        CellKey::new(
+            self.inputs.key.frame_id,
+            dd,
+            idx[0] as u32,
+            idx[1] as u32,
+            idx[2] as u32,
         )
-    });
-    if let Some(level) = &level {
-        let sides = &neighbors.coarser;
-        if !sides.is_empty() {
-            for z in 0..m {
-                for y in 0..m {
-                    for x in 0..m {
-                        let p = [x, y, z];
-                        let w = fade_weight(p, sides, n);
-                        if w > 0.0 {
-                            let i = x + m * (y + m * z);
-                            let target = level.density(grid.position(p));
-                            density[i] = density[i] * (1.0 - w) + target * w;
-                        }
+        .ok()
+    }
+
+    /// Sample `c` of depth `d`, or `None` for vacuum; records a missing
+    /// input when `strict`.
+    fn sample(&self, d: u8, c: [i64; 3], strict: bool) -> Option<gx_core::matter::Sample> {
+        let k = self.holder(d, c, d)?;
+        let section = if k == self.inputs.key {
+            Some(&self.inputs.section)
+        } else {
+            match self.inputs.sections.get(&k) {
+                Some(Some(s)) => Some(s),
+                Some(None) => None,
+                None => {
+                    if strict {
+                        self.missing.set(true);
                     }
+                    None
                 }
             }
+        }?;
+        let n = self.n as i64;
+        if i64::from(section.resolution()) != n {
+            if strict {
+                self.missing.set(true);
+            }
+            return None;
         }
+        let l = c.map(|v| v.rem_euclid(n) as usize);
+        let s = section
+            .samples()?
+            .get(l[0] + self.n * (l[1] + self.n * l[2]))?;
+        forms_surface(s.state).then_some(s)
     }
-    grid.density = density;
+}
 
-    let table = case_table();
-    let edges = cube_edges();
-    // Vertex index by grid edge: point index * 3 + axis.
-    let mut by_edge = vec![u32::MAX; m * m * m * 3];
-    let mut positions: Vec<[f64; 3]> = Vec::new();
-    let mut vertices: Vec<SurfaceVertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
+impl MixedField for Field<'_> {
+    fn resolution(&self) -> usize {
+        self.n
+    }
 
-    // Cubes between grid points PAD - 1 and n + PAD: the cell's own cubes
-    // and those straddling its faces, half a sample beyond them.
-    for z in PAD - 1..n + PAD {
-        for y in PAD - 1..n + PAD {
-            for x in PAD - 1..n + PAD {
-                let base = [x, y, z];
-                let at = |c: usize| {
-                    let o = corner_offset(c);
-                    [base[0] + o[0], base[1] + o[1], base[2] + o[2]]
+    fn root_origin(&self) -> [f64; 3] {
+        self.root_origin
+    }
+
+    fn root_edge(&self) -> f64 {
+        self.root_edge
+    }
+
+    fn drawn_depth(&self, d: u8, c: [i64; 3]) -> Option<u8> {
+        let home = self.inputs.key.depth;
+        (home.saturating_sub(1)..=home.saturating_add(1)).find(|&dd| {
+            self.holder(d, c, dd)
+                .is_some_and(|k| self.inputs.drawn.contains(&k))
+        })
+    }
+
+    fn occupancy(&self, d: u8, c: [i64; 3]) -> f64 {
+        self.sample(d, c, true).map_or(0.0, |s| s.occupancy.value())
+    }
+}
+
+/// Extracts one drawn cell from its inputs (module docs).
+pub fn extract(inputs: &CellInputs) -> Extraction {
+    let field = Field::new(inputs);
+    let key = inputs.key;
+    let mixed = extract_mixed(
+        &field,
+        CellAt {
+            depth: key.depth,
+            index: [key.x, key.y, key.z].map(i64::from),
+        },
+    );
+    if field.missing.get() {
+        return Extraction::Waiting;
+    }
+    let h = field.root_edge / (field.n as f64 * (1u64 << key.depth) as f64);
+    let vertices = mixed
+        .positions
+        .iter()
+        .zip(&mixed.normals)
+        .map(|(p, &normal)| {
+            let q: [i64; 3] =
+                std::array::from_fn(|a| ((p[a] - field.root_origin[a]) / h).round() as i64);
+            let (mut mass, mut albedo, mut rough, mut temp) = (0.0, [0.0; 3], 0.0, 0.0);
+            let (mut densest, mut state) = (0.0, 0u8);
+            for o in 0..8 {
+                let c = [
+                    q[0] - 1 + (o & 1),
+                    q[1] - 1 + ((o >> 1) & 1),
+                    q[2] - 1 + ((o >> 2) & 1),
+                ];
+                let Some(s) = field.sample(key.depth, c, false) else {
+                    continue;
                 };
-                let mut config = 0usize;
-                for c in 0..8 {
-                    if grid.d(at(c)) > isovalue {
-                        config |= 1 << c;
-                    }
-                }
-                let tris = &table[config];
-                if tris.is_empty() {
+                let w = s.density.value();
+                if w <= 0.0 {
                     continue;
                 }
-                for tri in tris {
-                    for &e in tri {
-                        let (c, axis) = edges[usize::from(e)];
-                        let a = at(c);
-                        let slot = grid.index(a) * 3 + axis;
-                        if by_edge[slot] == u32::MAX {
-                            let mut b = a;
-                            b[axis] += 1;
-                            by_edge[slot] = positions.len() as u32;
-                            let (p, v) = edge_vertex(&grid, a, b, isovalue);
-                            positions.push(p);
-                            vertices.push(v);
-                        }
-                        indices.push(by_edge[slot]);
-                    }
+                mass += w;
+                for (b, a) in albedo.iter_mut().enumerate() {
+                    *a += w * s.albedo[b].value();
+                }
+                rough += w * s.roughness.value();
+                temp += w * s.radiating_temperature.value();
+                if w > densest {
+                    densest = w;
+                    state = s.state.as_u8();
                 }
             }
-        }
-    }
-
-    let edge = section.edge().value();
-    for f in 0..6 {
-        {
-            let (axis, high) = (f / 2, f % 2 == 1);
-            let o = [origin.x, origin.y, origin.z][axis];
-            let plane = if high { o + edge } else { o };
-            clip_mesh(
-                &mut positions,
-                &mut vertices,
-                &mut indices,
-                axis,
-                plane,
-                high,
-            );
-        }
-    }
-
-    let skirt_from = positions.len();
-    add_skirts(&mut positions, &mut vertices, &mut indices, edge / n as f64);
-
+            let m = if mass > 0.0 { mass } else { 1.0 };
+            SurfaceVertex {
+                normal,
+                albedo: albedo.map(|a| (a / m) as f32),
+                roughness: (rough / m) as f32,
+                temperature: (temp / m) as f32,
+                state: u32::from(state),
+                density: (mass / 8.0) as f32,
+            }
+        })
+        .collect();
     let mut bounds_min = [f64::INFINITY; 3];
     let mut bounds_max = [f64::NEG_INFINITY; 3];
-    for p in &positions {
+    for p in &mixed.positions {
         for a in 0..3 {
             bounds_min[a] = bounds_min[a].min(p[a]);
             bounds_max[a] = bounds_max[a].max(p[a]);
         }
     }
-    if positions.is_empty() {
-        return empty(isovalue);
+    if mixed.positions.is_empty() {
+        let o = inputs.section.origin();
+        bounds_min = [o.x, o.y, o.z];
+        bounds_max = bounds_min;
     }
-    SurfaceMesh {
+    Extraction::Done(Arc::new(SurfaceMesh {
         key,
-        origin,
-        isovalue,
-        positions,
+        origin: inputs.section.origin(),
+        positions: mixed.positions,
         vertices,
-        indices,
+        indices: mixed.indices,
         bounds_min,
         bounds_max,
-        skirt_from,
-    }
+    }))
 }
 
-/// The vertex where the surface crosses the grid edge from `a` to `b`.
-fn edge_vertex(
-    grid: &Grid<'_>,
-    a: [usize; 3],
-    b: [usize; 3],
-    iso: f64,
-) -> ([f64; 3], SurfaceVertex) {
-    let (da, db) = (grid.d(a), grid.d(b));
-    // Exactly one end is above the isovalue, so `da != db`.
-    let t = (iso - da) / (db - da);
-    let (pa, pb) = (grid.position(a), grid.position(b));
-    let position = core::array::from_fn(|k| pa[k] + t * (pb[k] - pa[k]));
+/// A finished job: the cell, its result, and the extraction time,
+/// seconds.
+pub type Finished = (CellKey, Extraction, f64);
 
-    let (ga, gb) = (grid.gradient(a), grid.gradient(b));
-    let g: [f64; 3] = core::array::from_fn(|k| ga[k] + t * (gb[k] - ga[k]));
-    let len = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
-    let normal = if len > 0.0 {
-        [
-            (-g[0] / len) as f32,
-            (-g[1] / len) as f32,
-            (-g[2] / len) as f32,
-        ]
-    } else {
-        // A flat gradient: point from the inside end to the outside end.
-        let axis = (0..3).find(|&k| a[k] != b[k]).unwrap_or(0);
-        let mut n = [0.0f32; 3];
-        n[axis] = if da > db { 1.0 } else { -1.0 };
-        n
-    };
-
-    // Density-weighted attributes; vacuum, gas, and plasma weigh nothing.
-    let (sa, sb) = (grid.sample(a), grid.sample(b));
-    let wa = (1.0 - t) * da;
-    let wb = t * db;
-    let total = wa + wb;
-    let mut albedo = [0.0f64; 3];
-    let mut roughness = 0.0;
-    for (s, w) in [(sa, wa), (sb, wb)] {
-        if let (Some(s), true) = (s, w > 0.0) {
-            for (acc, al) in albedo.iter_mut().zip(s.albedo) {
-                *acc += w * al.value();
-            }
-            roughness += w * s.roughness.value();
-        }
-    }
-    let (inside, outside) = if da > db { (sa, sb) } else { (sb, sa) };
-    // A surface radiates from its outermost matter: the outer sample's
-    // radiating temperature when it holds solid or fluid matter, else the
-    // inner one's. The inner sample's own outer side faces the outer
-    // sample's matter, so its light does not leave there.
-    let temperature = match (outside, inside) {
-        (Some(o), _) if o.density.value() > 0.0 && forms_surface(o.state) => {
-            o.radiating_temperature.value()
-        }
-        (_, Some(i)) => i.radiating_temperature.value(),
-        _ => 0.0,
-    };
-    let vertex = SurfaceVertex {
-        normal,
-        albedo: albedo.map(|v| (v / total) as f32),
-        roughness: (roughness / total) as f32,
-        temperature: temperature as f32,
-        state: u32::from(inside.map_or(State::Vacuum, |s| s.state).as_u8()),
-        density: (da + t * (db - da)) as f32,
-    };
-    (position, vertex)
+/// Extracts and times one job.
+fn run(inputs: &CellInputs) -> Finished {
+    let t0 = crate::clock::now_seconds();
+    let out = extract(inputs);
+    (inputs.key, out, crate::clock::now_seconds() - t0)
 }
 
-/// A job for the pool: one cell's composited section and its neighbors.
-type Job = (CellKey, Arc<Section>, FaceNeighbors);
-
-/// Runs [`extract_with`] on worker threads.
+/// A pool of extraction workers.
 ///
-/// Jobs go in over a channel and finished meshes come back over another, in
-/// whatever order the workers finish; each mesh carries its key, and its
-/// contents depend only on its section. With zero threads (the browser
+/// Jobs go in over a channel and finished results come back over another,
+/// in whatever order the workers finish; each carries its key, and its
+/// contents depend only on its inputs. With zero threads (the browser
 /// build, where `std::thread` is unavailable) extraction runs inline on
 /// [`ExtractPool::submit`].
 pub struct ExtractPool {
-    jobs: Option<mpsc::Sender<Job>>,
-    results: mpsc::Receiver<(CellKey, Arc<SurfaceMesh>)>,
-    inline: VecDeque<(CellKey, Arc<SurfaceMesh>)>,
+    jobs: Option<mpsc::Sender<CellInputs>>,
+    results: mpsc::Receiver<Finished>,
+    inline: VecDeque<Finished>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -1440,7 +440,7 @@ impl ExtractPool {
                 workers: Vec::new(),
             };
         }
-        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let (jobs, job_rx) = mpsc::channel::<CellInputs>();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let workers = (0..threads)
             .map(|i| {
@@ -1450,11 +450,10 @@ impl ExtractPool {
                     .name(format!("gx-extract-{i}"))
                     .spawn(move || loop {
                         let job = rx.lock().expect("job queue lock").recv();
-                        let Ok((key, section, neighbors)) = job else {
+                        let Ok(inputs) = job else {
                             break;
                         };
-                        let mesh = Arc::new(extract_with(&section, &neighbors));
-                        if tx.send((key, mesh)).is_err() {
+                        if tx.send(run(&inputs)).is_err() {
                             break;
                         }
                     })
@@ -1469,29 +468,28 @@ impl ExtractPool {
         }
     }
 
-    /// Queues one section for extraction with its face neighbors.
-    pub fn submit(&mut self, key: CellKey, section: Arc<Section>, neighbors: FaceNeighbors) {
+    /// Queues one cell for extraction.
+    pub fn submit(&mut self, inputs: CellInputs) {
         match &self.jobs {
             Some(tx) => {
-                tx.send((key, section, neighbors))
-                    .expect("extraction workers are running");
+                tx.send(inputs).expect("extraction workers are running");
             }
             None => {
-                let mesh = Arc::new(extract_with(&section, &neighbors));
-                self.inline.push_back((key, mesh));
+                let done = run(&inputs);
+                self.inline.push_back(done);
             }
         }
     }
 
-    /// The meshes finished so far, without waiting.
-    pub fn try_results(&mut self) -> Vec<(CellKey, Arc<SurfaceMesh>)> {
+    /// The results finished so far, without waiting.
+    pub fn try_results(&mut self) -> Vec<Finished> {
         let mut out: Vec<_> = self.inline.drain(..).collect();
         out.extend(self.results.try_iter());
         out
     }
 
-    /// Waits for the next finished mesh. `None` if nothing can arrive.
-    pub fn wait_result(&mut self) -> Option<(CellKey, Arc<SurfaceMesh>)> {
+    /// Waits for the next finished result. `None` if nothing can arrive.
+    pub fn wait_result(&mut self) -> Option<Finished> {
         if let Some(r) = self.inline.pop_front() {
             return Some(r);
         }
@@ -1506,457 +504,5 @@ impl Drop for ExtractPool {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gx_core::matter::{Sample, Samples};
-    use gx_core::units::{Attenuation, Density, Kelvin, Meters, Ratio};
-    use std::collections::BTreeMap;
-
-    const EDGE: f64 = 8.0;
-
-    fn solid(density: f64) -> Sample {
-        Sample {
-            density: Density::new(density),
-            state: State::Solid,
-            temperature: Kelvin::new(300.0),
-            albedo: [Ratio::new(0.6), Ratio::new(0.5), Ratio::new(0.4)],
-            roughness: Ratio::new(0.7),
-            attenuation: Attenuation::new(0.0),
-            radiating_temperature: Kelvin::new(300.0),
-            occupancy: Ratio::new(1.0),
-        }
-    }
-
-    /// A radially symmetric blob of radius `radius` meters centered in a
-    /// cell of edge [`EDGE`] at resolution `res`: a sample is matter when
-    /// its center lies within the radius, with a density ramp so the
-    /// gradient is well defined.
-    fn blob(res: u8, radius: f64) -> Section {
-        let step = EDGE / f64::from(res);
-        let samples = Samples::from_fn(res, |x, y, z| {
-            let c = |i: u32| (f64::from(i) + 0.5) * step - EDGE / 2.0;
-            let r = (c(x) * c(x) + c(y) * c(y) + c(z) * c(z)).sqrt();
-            if r < radius {
-                solid(5000.0 * (1.0 + (radius - r) / radius))
-            } else {
-                Sample::VACUUM
-            }
-        });
-        Section::new(
-            CellKey::new(2, 0, 0, 0, 0).unwrap(),
-            Vec3::new(-EDGE / 2.0, -EDGE / 2.0, -EDGE / 2.0),
-            Meters::new(EDGE),
-            res,
-            samples,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn matter_denser_inside_draws_only_its_outer_surface() {
-        // A dense inner ball inside a lighter outer layer: the surface is
-        // the boundary with vacuum, not where the density falls to half
-        // the inner ball's.
-        let res = 32u8;
-        let step = EDGE / f64::from(res);
-        let radius = 3.5;
-        let samples = Samples::from_fn(res, |x, y, z| {
-            let c = |i: u32| (f64::from(i) + 0.5) * step - EDGE / 2.0;
-            let r = (c(x) * c(x) + c(y) * c(y) + c(z) * c(z)).sqrt();
-            if r < 0.5 * radius {
-                solid(13000.0)
-            } else if r < radius {
-                solid(3000.0)
-            } else {
-                Sample::VACUUM
-            }
-        });
-        let section = Section::new(
-            CellKey::new(2, 0, 0, 0, 0).unwrap(),
-            Vec3::new(-EDGE / 2.0, -EDGE / 2.0, -EDGE / 2.0),
-            Meters::new(EDGE),
-            res,
-            samples,
-        )
-        .unwrap();
-        assert_eq!(surface_isovalue(&section), Some(1500.0));
-        let mesh = extract(&section);
-        assert!(!mesh.positions.is_empty());
-        for p in &mesh.positions {
-            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-            assert!(r > radius - step, "a vertex at radius {r}");
-        }
-        assert_closed(&mesh);
-    }
-
-    /// Every undirected edge is shared by exactly two triangles, and they
-    /// traverse it in opposite directions.
-    fn assert_closed(mesh: &SurfaceMesh) {
-        let mut uses: BTreeMap<(u32, u32), i32> = BTreeMap::new();
-        for t in mesh.indices.chunks(3) {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                *uses.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
-            }
-        }
-        let mut count: BTreeMap<(u32, u32), i32> = BTreeMap::new();
-        for t in mesh.indices.chunks(3) {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                *count.entry((a.min(b), a.max(b))).or_default() += 1;
-            }
-        }
-        for (e, n) in &count {
-            assert_eq!(*n, 2, "edge {e:?} used {n} times");
-            assert_eq!(uses[e], 0, "edge {e:?} traversed one way twice");
-        }
-    }
-
-    #[test]
-    fn table_cases() {
-        let t = case_table();
-        assert_eq!(t.len(), 256);
-        assert!(t[0].is_empty() && t[255].is_empty());
-        assert_eq!(t[1].len(), 1);
-        // Complementary single corner: still one triangle.
-        assert_eq!(t[254].len(), 1);
-        // Two adjacent corners: a quad.
-        assert_eq!(t[3].len(), 2);
-        // Every triangle uses three distinct edges.
-        assert!(t
-            .iter()
-            .flatten()
-            .all(|tri| tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2]));
-    }
-
-    #[test]
-    fn blob_is_closed_and_normals_point_outward() {
-        let section = blob(24, 2.5);
-        let mesh = extract(&section);
-        assert!(mesh.triangle_count() > 500, "{}", mesh.triangle_count());
-        assert_eq!(mesh.positions.len(), mesh.vertices.len());
-        assert_closed(&mesh);
-
-        let mut dot_sum = 0.0;
-        let mut wind_sum = 0.0;
-        for (p, v) in mesh.positions.iter().zip(&mesh.vertices) {
-            let r = Vec3::new(p[0], p[1], p[2]).normalized().unwrap();
-            let n = Vec3::new(
-                f64::from(v.normal[0]),
-                f64::from(v.normal[1]),
-                f64::from(v.normal[2]),
-            );
-            dot_sum += n.dot(r);
-            assert_eq!(v.state, 1);
-            assert!((v.temperature - 300.0).abs() < 1e-3);
-            assert!((v.albedo[0] - 0.6).abs() < 1e-6);
-            assert!((v.roughness - 0.7).abs() < 1e-6);
-        }
-        let mean = dot_sum / mesh.positions.len() as f64;
-        assert!(mean > 0.8, "mean normal dot radial {mean}");
-
-        // The winding agrees with the normals: counterclockwise from outside.
-        for t in mesh.indices.chunks(3) {
-            let p = |i: u32| {
-                let q = mesh.positions[i as usize];
-                Vec3::new(q[0], q[1], q[2])
-            };
-            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
-            let face = (b - a).cross(c - a);
-            let centroid = (a + b + c).scale(1.0 / 3.0);
-            wind_sum += face.dot(centroid).signum();
-        }
-        assert!(
-            wind_sum > 0.95 * mesh.triangle_count() as f64,
-            "winding agrees on {wind_sum} of {}",
-            mesh.triangle_count()
-        );
-
-        // Every vertex lies near the radius (within a sample).
-        let step = EDGE / 24.0;
-        for p in &mesh.positions {
-            let r = Vec3::new(p[0], p[1], p[2]).length();
-            assert!((r - 2.5).abs() < step * 1.5, "vertex at radius {r}");
-        }
-    }
-
-    #[test]
-    fn vertex_count_is_stable_and_buffers_identical() {
-        let section = blob(20, 3.0);
-        let a = extract(&section);
-        let b = extract(&section);
-        assert_eq!(a.positions.len(), b.positions.len());
-        assert_eq!(a.indices, b.indices);
-        let bits = |m: &SurfaceMesh| -> Vec<u64> {
-            m.positions
-                .iter()
-                .flat_map(|p| p.map(f64::to_bits))
-                .chain(m.vertices.iter().flat_map(|v| {
-                    v.normal
-                        .iter()
-                        .chain(&v.albedo)
-                        .chain([&v.roughness, &v.temperature, &v.density])
-                        .map(|f| u64::from(f.to_bits()))
-                        .chain([u64::from(v.state)])
-                        .collect::<Vec<_>>()
-                }))
-                .collect()
-        };
-        assert_eq!(bits(&a), bits(&b));
-
-        // The pool gives the same mesh as a direct call.
-        let mut pool = ExtractPool::new(3);
-        let key = section.key();
-        let shared = Arc::new(section);
-        for _ in 0..4 {
-            pool.submit(key, shared.clone(), FaceNeighbors::none());
-        }
-        for _ in 0..4 {
-            let (k, mesh) = pool.wait_result().unwrap();
-            assert_eq!(k, key);
-            assert_eq!(*mesh, a);
-        }
-    }
-
-    /// Cell `x` of a row along x at depth 2 of a frame with a 16 m root
-    /// (edge 4 m, origin `-8 + 4 x` m on x and -8 m on y and z), at
-    /// resolution `res`, with sample `(i, j, k)` from `fill`.
-    fn row_cell(x: u32, res: u8, fill: impl Fn(u32, u32, u32) -> Sample) -> Arc<Section> {
-        Arc::new(
-            Section::new(
-                CellKey::new(2, 2, x, 0, 0).unwrap(),
-                Vec3::new(-8.0 + 4.0 * f64::from(x), -8.0, -8.0),
-                Meters::new(4.0),
-                res,
-                Samples::from_fn(res, fill),
-            )
-            .unwrap(),
-        )
-    }
-
-    /// Solid in the lower half of the cell along z: a horizontal surface
-    /// that runs through the x and y faces.
-    fn lower_half(res: u8) -> impl Fn(u32, u32, u32) -> Sample {
-        move |_, _, k| {
-            if 2 * k < u32::from(res) {
-                solid(1000.0)
-            } else {
-                Sample::VACUUM
-            }
-        }
-    }
-
-    /// Triangles whose three vertices all lie on the plane `axis = at`.
-    /// Surface triangles (not skirts) lying in the plane `axis = at`.
-    fn triangles_on_plane(mesh: &SurfaceMesh, axis: usize, at: f64) -> usize {
-        mesh.indices
-            .chunks(3)
-            .filter(|t| t.iter().all(|&i| (i as usize) < mesh.skirt_from))
-            .filter(|t| {
-                t.iter()
-                    .all(|&i| (mesh.positions[i as usize][axis] - at).abs() < 1e-9)
-            })
-            .count()
-    }
-
-    /// Every vertex normal points straight up: the mesh has no walls.
-    fn assert_flat_up(mesh: &SurfaceMesh) {
-        assert!(!mesh.is_empty());
-        for v in &mesh.vertices {
-            assert!(v.normal[2] > 0.999, "normal {:?}", v.normal);
-        }
-    }
-
-    /// The pair of neighbors across the face between row cells 1 and 2.
-    fn pair(a: &Arc<Section>, b: &Arc<Section>) -> (FaceNeighbors, FaceNeighbors) {
-        let mut na = FaceNeighbors::none();
-        na.faces[face_index(0, true)] = Some(FaceNeighbor::Ready(b.clone()));
-        let mut nb = FaceNeighbors::none();
-        nb.faces[face_index(0, false)] = Some(FaceNeighbor::Ready(a.clone()));
-        (na, nb)
-    }
-
-    #[test]
-    fn filled_cell_with_clamped_padding_has_no_faces() {
-        let filled = row_cell(1, 4, |_, _, _| solid(1000.0));
-        let mesh = extract(&filled);
-        assert_eq!(mesh.triangle_count(), 0);
-
-        // A surface through the faces ends there without turning into a
-        // wall: no triangle lies on any face.
-        let half = row_cell(1, 4, lower_half(4));
-        let mesh = extract(&half);
-        assert_flat_up(&mesh);
-        for (axis, lo) in [(0, -4.0), (1, -8.0), (2, -8.0)] {
-            assert_eq!(triangles_on_plane(&mesh, axis, lo), 0);
-            assert_eq!(triangles_on_plane(&mesh, axis, lo + 4.0), 0);
-        }
-        // The surface is the plane between the second and third layers.
-        for p in &mesh.positions[..mesh.skirt_from] {
-            assert_eq!(p[2], -6.0);
-        }
-    }
-
-    #[test]
-    fn filled_neighbors_share_no_wall() {
-        // Cells 1 and 2 share the plane x = 0.
-        let a = row_cell(1, 4, |_, _, _| solid(1000.0));
-        let b = row_cell(2, 4, |_, _, _| solid(1000.0));
-        let (na, nb) = pair(&a, &b);
-        for mesh in [extract_with(&a, &na), extract_with(&b, &nb)] {
-            assert_eq!(triangles_on_plane(&mesh, 0, 0.0), 0);
-            assert_eq!(mesh.triangle_count(), 0);
-        }
-
-        let a = row_cell(1, 4, lower_half(4));
-        let b = row_cell(2, 4, lower_half(4));
-        let (na, nb) = pair(&a, &b);
-        for mesh in [extract_with(&a, &na), extract_with(&b, &nb)] {
-            assert_eq!(triangles_on_plane(&mesh, 0, 0.0), 0);
-            assert_flat_up(&mesh);
-        }
-    }
-
-    #[test]
-    fn neighbor_samples_are_used() {
-        // A neighbor that holds vacuum where the cell is filled: the face is
-        // a real surface, and it sits exactly on the shared plane.
-        let a = row_cell(1, 4, |_, _, _| solid(1000.0));
-        let b = row_cell(2, 4, |_, _, _| Sample::VACUUM);
-        let (na, _) = pair(&a, &b);
-        let mesh = extract_with(&a, &na);
-        assert!(!mesh.is_empty());
-        assert!(triangles_on_plane(&mesh, 0, 0.0) > 0);
-        for (p, v) in mesh.positions[..mesh.skirt_from].iter().zip(&mesh.vertices) {
-            assert_eq!(p[0], 0.0);
-            assert!(v.normal[0] > 0.999, "normal {:?}", v.normal);
-        }
-
-        // A section that is not the cell across the face is ignored.
-        let mut wrong = FaceNeighbors::none();
-        wrong.faces[face_index(0, false)] = Some(FaceNeighbor::Ready(b.clone()));
-        wrong.faces[face_index(1, true)] = Some(FaceNeighbor::Ready(b.clone()));
-        wrong.faces[face_index(2, true)] = Some(FaceNeighbor::Empty(b.key()));
-        assert_eq!(extract_with(&a, &wrong), extract(&a));
-
-        // A neighbor known to be empty is vacuum too: the same wall.
-        let mut empty = FaceNeighbors::none();
-        empty.faces[face_index(0, true)] = Some(FaceNeighbor::Empty(b.key()));
-        assert_eq!(extract_with(&a, &empty), mesh);
-        assert!(!empty.same_as(&na));
-        assert!(empty.same_as(&empty.clone()));
-    }
-
-    #[test]
-    fn neighbor_of_another_resolution() {
-        let a = row_cell(1, 4, lower_half(4));
-        let b = row_cell(2, 8, lower_half(8));
-        let (na, nb) = pair(&a, &b);
-        for mesh in [extract_with(&a, &na), extract_with(&b, &nb)] {
-            assert_eq!(triangles_on_plane(&mesh, 0, 0.0), 0);
-            assert_flat_up(&mesh);
-        }
-        assert_eq!(remap(0, 4, 8), 1);
-        assert_eq!(remap(3, 4, 8), 7);
-        assert_eq!(remap(2, 4, 8), 5);
-        assert_eq!(remap(7, 8, 4), 3);
-        assert_eq!(remap(5, 8, 1), 0);
-    }
-
-    #[test]
-    fn neighbors_compare_by_identity() {
-        let a = row_cell(1, 4, lower_half(4));
-        let b = row_cell(2, 4, lower_half(4));
-        let (na, _) = pair(&a, &b);
-        assert!(na.same_as(&na.clone()));
-        assert_eq!(na.count(), 1);
-        let (other, _) = pair(&a, &row_cell(2, 4, lower_half(4)));
-        assert!(!na.same_as(&other));
-        assert!(!na.same_as(&FaceNeighbors::none()));
-    }
-
-    #[test]
-    fn gas_and_plasma_take_no_part() {
-        // A solid ball inside a much denser hot gas shell: the surface
-        // follows the solid alone, at half the solid density.
-        let res = 16;
-        let step = EDGE / f64::from(res);
-        let samples = Samples::from_fn(res, |x, y, z| {
-            let c = |i: u32| (f64::from(i) + 0.5) * step - EDGE / 2.0;
-            let r = (c(x) * c(x) + c(y) * c(y) + c(z) * c(z)).sqrt();
-            if r < 2.0 {
-                solid(1000.0)
-            } else if r < 3.5 {
-                Sample {
-                    density: Density::new(5000.0),
-                    state: State::Gas,
-                    temperature: Kelvin::new(4000.0),
-                    albedo: [Ratio::new(0.1); 3],
-                    roughness: Ratio::new(0.0),
-                    attenuation: Attenuation::new(1.0),
-                    radiating_temperature: Kelvin::new(4000.0),
-                    occupancy: Ratio::new(1.0),
-                }
-            } else {
-                Sample::VACUUM
-            }
-        });
-        let section = Section::new(
-            CellKey::new(2, 0, 0, 0, 0).unwrap(),
-            Vec3::new(-EDGE / 2.0, -EDGE / 2.0, -EDGE / 2.0),
-            Meters::new(EDGE),
-            res,
-            samples,
-        )
-        .unwrap();
-        let mesh = extract(&section);
-        assert_eq!(mesh.isovalue, 500.0);
-        assert!(!mesh.is_empty());
-        assert_closed(&mesh);
-        for (p, v) in mesh.positions.iter().zip(&mesh.vertices) {
-            let r = Vec3::new(p[0], p[1], p[2]).length();
-            assert!(r < 2.0 + step, "vertex at radius {r}");
-            assert_eq!(v.state, 1);
-            assert!((v.temperature - 300.0).abs() < 1e-3);
-        }
-
-        // Gas alone gives no surface.
-        let gas_only = Section::new(
-            CellKey::new(2, 0, 0, 0, 0).unwrap(),
-            Vec3::zero(),
-            Meters::new(EDGE),
-            2,
-            Samples::filled(
-                2,
-                Sample {
-                    density: Density::new(1.0),
-                    state: State::Plasma,
-                    temperature: Kelvin::new(6000.0),
-                    albedo: [Ratio::new(0.0); 3],
-                    roughness: Ratio::new(0.0),
-                    attenuation: Attenuation::new(1.0),
-                    radiating_temperature: Kelvin::new(6000.0),
-                    occupancy: Ratio::new(1.0),
-                },
-            ),
-        )
-        .unwrap();
-        assert!(extract(&gas_only).is_empty());
-    }
-
-    #[test]
-    fn empty_and_inline() {
-        let key = CellKey::new(2, 0, 0, 0, 0).unwrap();
-        let s = Section::empty(key, Vec3::zero(), Meters::new(1.0)).unwrap();
-        assert!(extract(&s).is_empty());
-        let mut pool = ExtractPool::new(0);
-        pool.submit(key, Arc::new(blob(8, 2.0)), FaceNeighbors::none());
-        let r = pool.try_results();
-        assert_eq!(r.len(), 1);
-        assert!(!r[0].1.is_empty());
     }
 }

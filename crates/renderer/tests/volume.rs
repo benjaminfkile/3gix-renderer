@@ -183,7 +183,12 @@ fn rays_stop_at_a_surface_inside_the_volume() {
         }
     }
     let mixed = Section::new(plasma.key(), plasma.origin(), plasma.edge(), 8, samples).unwrap();
-    let mesh = Arc::new(renderer::extract::extract(&mixed));
+    let mesh = match renderer::extract::extract(&renderer::extract::CellInputs::alone(Arc::new(
+        mixed.clone(),
+    ))) {
+        renderer::extract::Extraction::Done(m) => m,
+        renderer::extract::Extraction::Waiting => panic!("a lone cell reads nothing else"),
+    };
     assert!(!mesh.is_empty());
     assert_eq!(mesh.bounds_max[2], 2.0);
     let grid = Arc::new(VolumeGrid::from_section(&mixed).unwrap());
