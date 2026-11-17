@@ -10,9 +10,14 @@
 //!   inner edge is used as often in one direction as in the other. Where a
 //!   vertex keeps its primary position next to transition faces, the
 //!   transition cells there collapse (Lengyel 2010, section 4.4); an edge
-//!   may be used more than once in one direction only when every triangle
-//!   using it has zero area, and such edges are counted and printed as
-//!   collapsed edges. Any other repeated edge fails. No triangle of a cell
+//!   may be used more than once in one direction when every triangle
+//!   using it has zero area (counted and printed as collapsed edges), or
+//!   when it lies along an edge line of every cell using it: two coarser
+//!   cells diagonally across a line whose other two cells are finer each
+//!   fold their transition cells onto that line, so the surface is closed
+//!   there but pinched (counted and printed as pinched edges; Lengyel's
+//!   section 4.4 covers adjacent coarse cells, not diagonal ones). Any
+//!   other repeated edge fails. No triangle of a cell
 //!   lies outside that cell. Secondary positions are Equation 4.2 alone
 //!   (`rendering.md` section 2.2).
 //! - **Accuracy.** A plane whose occupancy ramps linearly over a width
@@ -314,6 +319,9 @@ struct Stats {
     /// Directed edges used more than once, every use by a zero-area
     /// triangle: collapsed transition cells.
     collapsed: usize,
+    /// Directed edges used more than once with some nonzero-area use,
+    /// lying along an edge line of every cell using them: pinched.
+    pinched: usize,
 }
 
 /// The transition faces of a cell as names, in face order.
@@ -402,7 +410,18 @@ fn check(shape: Shape, s: &Selection) -> Result<Stats, String> {
         let count = uses.len();
         let back = directed.get(&(b, a)).map_or(&Vec::new(), |u| u).clone();
         if count > 1 {
-            if !uses.iter().all(|u| u.1) {
+            let along_cell_edge = |c: &CellAt| {
+                let (lo, hi) = cell_box(*c);
+                let tol = 1e-9 * ROOT;
+                let on = |p: [f64; 3], a: usize| {
+                    (p[a] - lo[a]).abs() < tol || (p[a] - hi[a]).abs() < tol
+                };
+                let (pa, pb) = (a.map(f64::from_bits), b.map(f64::from_bits));
+                (0..3).filter(|&ax| on(pa, ax) && on(pb, ax)).count() >= 2
+            };
+            if !uses.iter().all(|u| u.1) && uses.iter().all(|u| along_cell_edge(&u.0)) {
+                stats.pinched += 1;
+            } else if !uses.iter().all(|u| u.1) {
                 return Err(format!(
                     "{shape:?}: edge {:?} -> {:?} used {count} times, not every triangle \
                      zero-area. Uses: {}. Back: {}",
@@ -411,8 +430,9 @@ fn check(shape: Shape, s: &Selection) -> Result<Stats, String> {
                     describe(uses),
                     describe(&back)
                 ));
+            } else {
+                stats.collapsed += 1;
             }
-            stats.collapsed += 1;
         }
         if count != back.len() {
             return Err(format!(
@@ -433,8 +453,17 @@ fn mixed_depth_selections_are_watertight() {
     let mut rng = Lcg(0x5EED);
     // Per shape: selections passing, selections run, transition faces,
     // cells with two and with three or more transition faces, collapsed
-    // edges, depths.
-    type Row = (usize, usize, usize, usize, usize, usize, BTreeSet<u8>);
+    // edges, depths, pinched edges.
+    type Row = (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        BTreeSet<u8>,
+        usize,
+    );
     let mut coverage: BTreeMap<String, Row> = BTreeMap::new();
     // The failing selection with the fewest cells: (cells, message).
     let mut smallest: Option<(usize, String)> = None;
@@ -451,6 +480,7 @@ fn mixed_depth_selections_are_watertight() {
                 e.3 += st.two;
                 e.4 += st.three;
                 e.5 += st.collapsed;
+                e.7 += st.pinched;
             }
             Err(msg) => {
                 let cells = s.leaves.len();
@@ -460,11 +490,11 @@ fn mixed_depth_selections_are_watertight() {
             }
         }
     }
-    for (shape, (pass, run, faces, two, three, collapsed, depths)) in &coverage {
+    for (shape, (pass, run, faces, two, three, collapsed, depths, pinched)) in &coverage {
         println!(
             "proof: {shape}: {pass} of {run} selections pass, depths {depths:?}, \
              {faces} transition faces, {two} cells with two, {three} with three or more, \
-             {collapsed} collapsed edges (counts over passing selections)"
+             {collapsed} collapsed edges, {pinched} pinched edges (counts over passing selections)"
         );
     }
     if let Some((cells, msg)) = smallest {
