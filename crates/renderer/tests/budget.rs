@@ -24,6 +24,10 @@
 //!   crossed by a plane, with its 26 same-depth neighbors, timed over 50
 //!   runs; the median and 95th percentile are printed, no limit is
 //!   asserted yet.
+//! - **Transvoxel transition cells.** Extraction of one resolution 32 cell
+//!   crossed by a plane, with neighbors one depth finer across one face
+//!   and across three faces, timed over 50 runs each; the median and 95th
+//!   percentile are printed, no limit is asserted yet.
 //!
 //! The watertightness proof of section 2.5 belongs to surface extraction
 //! and comes with it.
@@ -580,4 +584,82 @@ fn transvoxel_regular_cell_timing() {
         ms(times[(times.len() * 95).div_ceil(100) - 1]),
         times.len()
     );
+}
+
+/// Times [`renderer::transvoxel::extract_mixed`] on one resolution 32
+/// cell crossed by a tilted plane, with its neighbors drawn one depth finer
+/// across one face (+x) and across three faces (+x, +y, +z). Prints the
+/// median and 95th percentile, asserts no limit.
+#[test]
+fn transvoxel_transition_cell_timing() {
+    use renderer::transvoxel::{extract_mixed, CellAt, MixedField};
+    const N: usize = 32;
+    /// A tilted plane through the timed cell, the root cell split once,
+    /// and the depth 1 cells in `finer` split once more.
+    struct Plane {
+        finer: Vec<[i64; 3]>,
+    }
+    const EDGE: f64 = 64.0;
+    impl MixedField for Plane {
+        fn resolution(&self) -> usize {
+            N
+        }
+        fn root_origin(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+        fn root_edge(&self) -> f64 {
+            EDGE
+        }
+        fn drawn_depth(&self, d: u8, c: [i64; 3]) -> Option<u8> {
+            let per = (N as i64) << d;
+            if c.iter().any(|&v| !(0..per).contains(&v)) {
+                return None;
+            }
+            // The depth 1 cell holding the sample center.
+            let one = c.map(|v| (2 * v + 1) * 2 / (2 * per));
+            Some(if self.finer.contains(&one) { 2 } else { 1 })
+        }
+        fn occupancy(&self, d: u8, c: [i64; 3]) -> f64 {
+            let per = (N as i64) << d;
+            if c.iter().any(|&v| !(0..per).contains(&v)) {
+                return 0.0;
+            }
+            let s = EDGE / per as f64;
+            let p = c.map(|v| (v as f64 + 0.5) * s);
+            let n: [f64; 3] = [0.21, -0.34, 1.0];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            let distance =
+                (n[0] * (p[0] - 16.0) + n[1] * (p[1] - 16.0) + n[2] * (p[2] - 16.0)) / len;
+            (0.5 - distance / s).clamp(0.0, 1.0)
+        }
+    }
+    let cell = CellAt {
+        depth: 1,
+        index: [0, 0, 0],
+    };
+    for (label, finer) in [
+        ("one face", vec![[1, 0, 0]]),
+        ("three faces", vec![[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
+    ] {
+        let field = Plane { finer };
+        let mut times = Vec::new();
+        let mut triangles = 0;
+        let mut faces = 0;
+        for _ in 0..50 {
+            let start = Instant::now();
+            let mesh = extract_mixed(&field, cell);
+            times.push(start.elapsed());
+            triangles = mesh.indices.len() / 3;
+            faces = mesh.transition_faces.iter().filter(|&&f| f).count();
+        }
+        assert!(triangles > 0);
+        times.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        println!(
+            "transvoxel cell with transitions on {label} ({faces}), resolution {N}, {triangles} triangles: median {:.3} ms, p95 {:.3} ms over {} runs",
+            ms(times[times.len() / 2]),
+            ms(times[(times.len() * 95).div_ceil(100) - 1]),
+            times.len()
+        );
+    }
 }
