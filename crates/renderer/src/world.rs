@@ -189,8 +189,13 @@ impl World {
                 up = a.parent();
             }
         }
+        let parent = key.parent().and_then(|p| match self.cache.state(&p) {
+            Some(CellState::Ready(cell)) => Some(cell.section.clone()),
+            _ => None,
+        });
         FaceNeighbors {
             faces,
+            parent,
             isovalue,
             diagonal: self
                 .cache

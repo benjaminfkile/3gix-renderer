@@ -55,6 +55,12 @@
 //! from one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
+//! Within [`BLEND_SAMPLES`] samples of a face with a coarser cell one depth
+//! up across it, a cell's density fades into the field the coarser cell
+//! draws at that face: the cell's parent's samples joined there to the
+//! neighbor's ([`FaceNeighbors::parent`]). A depth transition then has no
+//! step, and the finer detail tapers off instead of stopping at a line.
+//!
 //! Every mesh is cut at its cell's six faces: the cubes straddling a face
 //! are drawn by both neighbors from the same samples, and each keeps the
 //! half on its own side, so same-depth neighbors meet edge to edge at the
@@ -236,6 +242,10 @@ pub struct FaceNeighbors {
     /// neighbors put the surface at the same density; `None` uses the
     /// section's own ([`surface_isovalue`]).
     pub isovalue: Option<f64>,
+    /// The cell's parent when loaded: with a coarser face neighbor one
+    /// depth up, the field the coarser side draws at their shared face is
+    /// the parent's samples joined to the neighbor's ([`BLEND_SAMPLES`]).
+    pub parent: Option<Arc<Section>>,
     /// The cells across the 12 edges and 8 corners, in the order of
     /// [`crate::stream::diagonal_offsets`] (empty when not gathered):
     /// padding points beyond two or three faces read them.
@@ -257,7 +267,13 @@ impl FaceNeighbors {
             (None, None) => true,
             _ => false,
         };
-        self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
+        let same_parent = match (&self.parent, &other.parent) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_parent
+            && self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
             && self.diagonal.len() == other.diagonal.len()
             && self
                 .diagonal
@@ -511,6 +527,71 @@ fn clip_mesh(
         }
     }
     *indices = out;
+}
+
+/// Samples over which a cell's density fades into the field drawn across a
+/// face with a coarser neighbor ([`FaceNeighbors::parent`]).
+const BLEND_SAMPLES: f64 = 8.0;
+
+/// The density at frame coordinates `p` of the field formed by `parent`'s
+/// samples and, one layer beyond its face on `axis` (`high` side), the
+/// samples of `across`, the same-depth cell there: trilinear over their
+/// sample centers, clamped into them. This is the field the coarser cell
+/// across draws at that face (it pads from `parent`).
+fn joined_density(p: [f64; 3], parent: &Section, across: &Section, axis: usize, high: bool) -> f64 {
+    let r = usize::from(parent.resolution());
+    let (Some(ps), Some(cs)) = (parent.samples(), across.samples()) else {
+        return 0.0;
+    };
+    let u = coarse_coords(p, parent);
+    // Index range along `axis`: one layer past the parent on the joined
+    // side, as -1 (low) or r (high).
+    let (lo, hi) = if high {
+        (0i64, r as i64)
+    } else {
+        (-1i64, r as i64 - 1)
+    };
+    let mut i0 = [0i64; 3];
+    let mut f = [0.0f64; 3];
+    for b in 0..3 {
+        let (l, h) = if b == axis {
+            (lo, hi)
+        } else {
+            (0, r as i64 - 1)
+        };
+        let c = u[b].clamp(l as f64, h as f64);
+        let base = (c.floor() as i64).clamp(l, (h - 1).max(l));
+        i0[b] = base;
+        f[b] = if h > l { c - base as f64 } else { 0.0 };
+    }
+    let d = |q: [i64; 3]| -> f64 {
+        let mut q = q;
+        let from_across = q[axis] < 0 || q[axis] >= r as i64;
+        let samples = if from_across {
+            q[axis] = if q[axis] < 0 { r as i64 - 1 } else { 0 };
+            cs
+        } else {
+            ps
+        };
+        let c: [usize; 3] = core::array::from_fn(|b| q[b].clamp(0, r as i64 - 1) as usize);
+        let i = c[0] + r * (c[1] + r * c[2]);
+        if forms_surface(samples.state(i)) {
+            samples.density(i).value()
+        } else {
+            0.0
+        }
+    };
+    let mut acc = 0.0;
+    for k in 0..8 {
+        let o = corner_offset(k);
+        let w: f64 = (0..3)
+            .map(|b| if o[b] == 1 { f[b] } else { 1.0 - f[b] })
+            .product();
+        if w > 0.0 {
+            acc += w * d(core::array::from_fn(|b| i0[b] + o[b] as i64));
+        }
+    }
+    acc
 }
 
 /// Frame coordinates `p` in `section`'s sample units: 0 at the first
@@ -1028,6 +1109,68 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
                 };
                 if forms_surface(s.state(i)) {
                     density[x + m * (y + m * z)] = s.density(i).value();
+                }
+            }
+        }
+    }
+    // Near a face with a coarser cell one depth up across it, fade this
+    // cell's density into the field the coarser side draws there: the
+    // parent's samples joined at the face to the neighbor's. The two
+    // surfaces then meet at the face with no step, and the finer detail
+    // tapers off over BLEND_SAMPLES samples instead of stopping at a line.
+    if let Some(parent) = neighbors.parent.as_deref() {
+        let joins: Vec<(usize, bool, &Section)> = (0..6)
+            .filter_map(|f| {
+                let across = neighbors.faces[f].as_ref()?;
+                let FaceNeighbor::Ready(c) = across else {
+                    return None;
+                };
+                let usable = matches!(grid.neighbors[f], Some(Pad::Coarse(..)))
+                    && c.key().depth + 1 == key.depth
+                    && parent.key().depth == c.key().depth
+                    && c.resolution() == parent.resolution()
+                    && c.samples().is_some()
+                    && parent.samples().is_some();
+                usable.then_some((f / 2, f % 2 == 1, c.as_ref()))
+            })
+            .collect();
+        // Own points within the blend, and the padding beyond a joined face,
+        // which takes the joined field outright (w = 1): the density then
+        // runs on smoothly across the face and the gradient there has no
+        // spike to tilt the normals.
+        let own = |c: usize| (PAD..n + PAD).contains(&c);
+        for z in 0..m {
+            for y in 0..m {
+                for x in 0..m {
+                    let p = [x, y, z];
+                    let mut best: Option<(f64, usize, bool, &Section)> = None;
+                    for &(axis, high, c) in &joins {
+                        let beyond = if high {
+                            p[axis] >= n + PAD
+                        } else {
+                            p[axis] < PAD
+                        };
+                        let others_own = (0..3).filter(|&b| b != axis).all(|b| own(p[b]));
+                        if !others_own || (!own(p[axis]) && !beyond) {
+                            continue;
+                        }
+                        let t = if beyond {
+                            -1.0
+                        } else if high {
+                            (n + PAD - 1 - p[axis]) as f64 + 0.5
+                        } else {
+                            (p[axis] - PAD) as f64 + 0.5
+                        };
+                        let w = (1.0 - t / BLEND_SAMPLES).clamp(0.0, 1.0);
+                        if w > 0.0 && best.is_none_or(|b| w > b.0) {
+                            best = Some((w, axis, high, c));
+                        }
+                    }
+                    if let Some((w, axis, high, c)) = best {
+                        let i = x + m * (y + m * z);
+                        let target = joined_density(grid.position(p), parent, c, axis, high);
+                        density[i] = density[i] * (1.0 - w) + target * w;
+                    }
                 }
             }
         }
