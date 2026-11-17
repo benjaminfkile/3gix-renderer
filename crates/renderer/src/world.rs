@@ -121,6 +121,14 @@ pub struct WorldCounts {
     pub extracting: usize,
 }
 
+/// One consistent set of drawn cells and their meshes (see [`World`]).
+struct Shown {
+    /// The drawn selection.
+    keys: Vec<CellKey>,
+    /// Each selected cell's mesh, extracted for exactly this selection.
+    meshes: Vec<Arc<SurfaceMesh>>,
+}
+
 /// A held mesh and the inputs it was extracted with.
 struct Extracted {
     mesh: Arc<SurfaceMesh>,
@@ -156,13 +164,32 @@ impl Pose {
     }
 }
 
+/// Longest a selection waits for the one before it to be shown
+/// ([`World::select`]), seconds.
+pub const PACE_LIMIT_SECONDS: f64 = 1.0;
+
 /// The cell cache, the extraction pool, and the extracted meshes.
 ///
 /// A drawn cell's mesh depends on the sections and the drawn selection in
 /// its region ([`CellInputs`]). Whenever those change the cell is
-/// extracted again, and its previous mesh is drawn until the new one is
-/// done.
+/// extracted again.
+///
+/// What is drawn is always one consistent set ([`Shown`]): the drawn
+/// selection at a moment when every selected cell's mesh was extracted for
+/// exactly that selection. Transvoxel joins depths only between meshes
+/// made for the same selection (`rendering.md` 2.3 and 3.3), so a mesh
+/// made for an older selection next to one made for a newer one leaves a
+/// crack. While the selection changes faster than its cells are
+/// extracted, the last consistent set keeps drawing.
 pub struct World {
+    /// The set drawn now ([`Shown`]); `None` until the first selection
+    /// whose cells are all extracted.
+    shown: Option<Shown>,
+    /// Times the shown set was replaced by a different selection.
+    shown_switches: u64,
+    /// When the current selection was applied, while its cells are not
+    /// all extracted for it yet; `None` once it is shown.
+    building_since: Option<f64>,
     cache: CellCache,
     pool: ExtractPool,
     meshes: CellMap<Extracted>,
@@ -195,6 +222,9 @@ impl World {
     /// inline.
     pub fn new(threads: usize) -> World {
         World {
+            shown: None,
+            shown_switches: 0,
+            building_since: None,
             cache: CellCache::new(),
             pool: ExtractPool::new(threads),
             meshes: CellMap::default(),
@@ -335,7 +365,18 @@ impl World {
             || self
                 .last_selection
                 .is_none_or(|t| now - t >= SELECT_INTERVAL_SECONDS);
-        if !due || self.selector.busy() {
+        if applied {
+            self.building_since = Some(now);
+        }
+        // Paced by extraction: a new selection starts only once the current
+        // one is shown (every cell extracted for it), or after
+        // PACE_LIMIT_SECONDS, so a camera that keeps moving still sees each
+        // finished selection drawn instead of none.
+        let building = !force
+            && self
+                .building_since
+                .is_some_and(|t| now - t < PACE_LIMIT_SECONDS && !self.consistent());
+        if !due || self.selector.busy() || building {
             return applied;
         }
         self.last_selection = Some(now);
@@ -362,6 +403,7 @@ impl World {
         };
         if let Some(done) = done {
             self.apply_selection(done);
+            self.building_since = Some(now);
             applied = true;
         }
         applied
@@ -728,10 +770,13 @@ impl World {
     /// Returns `true` when every selected cell is drawn at its selected
     /// depth: the drawn selection is the target, every selected cell can
     /// be drawn, every pinned cell has arrived, and nothing is being
-    /// extracted. Stricter than [`World::settled`]: a `Gone` cell is not
+    /// extracted, and no selection is due for cells that arrived since the
+    /// last one (a paced selection, [`World::select`], may still be
+    /// waiting). Stricter than [`World::settled`]: a `Gone` cell is not
     /// ready.
     pub fn ready(&self) -> bool {
         self.extraction_idle()
+            && !self.arrived_since_selection
             && self.cache.outstanding() == 0
             && self.cache.at_target()
             && self.cache.selection().iter().all(|s| self.drawable(&s.key))
@@ -768,9 +813,12 @@ impl World {
             .map(|f| (f.frame_id, f.cell_weight() as f32))
             .collect();
         let weight = |frame: u64| cell_weights.get(&frame).copied().unwrap_or(1.0);
-        let keys = self.cache.draw_set(|k| self.drawable(k));
+        self.update_shown();
+        let (keys, shown_meshes) = match &self.shown {
+            Some(s) => (s.keys.clone(), s.meshes.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
         self.cache.touch(&keys, now);
-        let mut meshes = Vec::new();
         let mut volumes = Vec::new();
         for k in keys.iter().filter(|k| weight(k.frame_id) > 0.0) {
             if let Some(CellState::Ready(cell)) = self.cache.state(k) {
@@ -778,12 +826,11 @@ impl World {
                     volumes.push(v.clone());
                 }
             }
-            if let Some(e) = self.meshes.get(k) {
-                if !e.mesh.is_empty() {
-                    meshes.push(e.mesh.clone());
-                }
-            }
         }
+        let meshes: Vec<Arc<SurfaceMesh>> = shown_meshes
+            .into_iter()
+            .filter(|m| weight(m.key.frame_id) > 0.0 && !m.is_empty())
+            .collect();
         let mut emitters = Vec::new();
         for f in system.tree().frames() {
             if let Some(CellState::Ready(cell)) = self.cache.state(&depth_zero_key(f.frame_id)) {
@@ -826,6 +873,86 @@ impl World {
             sprites,
             cell_weights,
         }
+    }
+
+    /// Whether the drawn selection's cells are all extracted for exactly
+    /// that selection: nothing marked, queued, or being extracted (so every
+    /// `Ready` cell's held mesh was looked at against its current inputs),
+    /// and every selected cell is drawable without a stand-in and not
+    /// waiting for an input.
+    fn consistent(&self) -> bool {
+        self.marks.is_empty()
+            && self.dirty_queue.is_empty()
+            && self.extracting.is_empty()
+            && self
+                .cache
+                .selection()
+                .iter()
+                .all(|s| !self.waiting.contains_key(&s.key) && self.drawable(&s.key))
+    }
+
+    /// Takes the drawn selection as the shown set when it is consistent
+    /// ([`World::consistent`]); otherwise the shown set stays.
+    fn update_shown(&mut self) {
+        if !self.consistent() {
+            return;
+        }
+        let keys: Vec<CellKey> = self.cache.selection().iter().map(|s| s.key).collect();
+        self.building_since = None;
+        if self.shown.as_ref().is_none_or(|s| s.keys != keys) {
+            self.shown_switches += 1;
+        }
+        let meshes = keys
+            .iter()
+            .filter_map(|k| self.meshes.get(k).map(|e| e.mesh.clone()))
+            .collect();
+        self.shown = Some(Shown { keys, meshes });
+    }
+
+    /// Open edges of the shown meshes of `frame_id`: directed edges whose
+    /// reverse no shown mesh uses, with positions compared on a grid of
+    /// `tolerance` meters (shared vertices of two cells agree only to
+    /// rounding). Edges on the frame's root cube boundary are not counted.
+    /// A watertight shown set has none (`rendering.md` 2.5); this is the
+    /// check on real data, while the camera moves.
+    pub fn open_edges(&self, frame_id: u64, root_extent: f64, tolerance: f64) -> usize {
+        let Some(shown) = &self.shown else {
+            return 0;
+        };
+        let q = |p: [f64; 3]| p.map(|v| (v / tolerance).round() as i64);
+        let half = (0.5 * root_extent / tolerance).round() as i64;
+        let on_root = |a: [i64; 3], b: [i64; 3]| {
+            (0..3).any(|i| (a[i].abs() - half).abs() <= 1 && (b[i].abs() - half).abs() <= 1)
+        };
+        let mut edges: std::collections::HashMap<([i64; 3], [i64; 3]), i64> =
+            std::collections::HashMap::new();
+        for m in shown.meshes.iter().filter(|m| m.key.frame_id == frame_id) {
+            for t in m.indices.as_chunks::<3>().0 {
+                let p = t.map(|i| q(m.positions[i as usize]));
+                if p[0] == p[1] || p[1] == p[2] || p[0] == p[2] {
+                    continue;
+                }
+                for k in 0..3 {
+                    let (a, b) = (p[k], p[(k + 1) % 3]);
+                    *edges.entry((a, b)).or_default() += 1;
+                    *edges.entry((b, a)).or_default() -= 1;
+                }
+            }
+        }
+        edges
+            .iter()
+            .filter(|((a, b), &n)| n > 0 && !on_root(*a, *b))
+            .count()
+    }
+
+    /// The shown cells, empty before anything is shown.
+    pub fn shown_keys(&self) -> &[CellKey] {
+        self.shown.as_ref().map_or(&[], |s| &s.keys)
+    }
+
+    /// Times the shown set was replaced by a different selection.
+    pub fn shown_switches(&self) -> u64 {
+        self.shown_switches
     }
 
     /// Counts for the overlay.

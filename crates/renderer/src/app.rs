@@ -279,6 +279,10 @@ pub struct HeadlessStats {
     /// selected depth ([`World::ready`]), or `None` if that never happened
     /// within the wait.
     pub settle_seconds: Option<f64>,
+    /// Open edges of the drawn meshes of the camera's frame
+    /// ([`World::open_edges`]): 0 when what is drawn is watertight
+    /// (`rendering.md` 2.5).
+    pub open_edges: usize,
     /// Frame-thread matter work per step over the run, milliseconds: the
     /// 50th and 95th percentiles and the maximum ([`matter_step`]).
     pub frame_step_ms: (Option<f64>, Option<f64>, Option<f64>),
@@ -389,6 +393,7 @@ impl HeadlessStats {
         });
         let budget = serde_json::json!({
             "settle_seconds": self.settle_seconds,
+            "open_edges": self.open_edges,
             "frame_step_ms_p50": self.frame_step_ms.0,
             "frame_step_ms_p95": self.frame_step_ms.1,
             "frame_step_ms_max": self.frame_step_ms.2,
@@ -556,6 +561,10 @@ pub fn render_headless_view(
             ready: world.ready(),
             stream_seconds,
             settle_seconds,
+            open_edges: sim.system().tree().get(camera.frame_id).map_or(0, |f| {
+                let extent = f.root_extent.value();
+                world.open_edges(f.frame_id, extent, extent * 1e-12)
+            }),
             frame_step_ms: (
                 world.step_times().percentile(50.0),
                 world.step_times().percentile(95.0),

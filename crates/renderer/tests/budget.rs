@@ -670,3 +670,91 @@ fn transvoxel_transition_cell_timing() {
         );
     }
 }
+
+/// What is drawn stays watertight while the camera moves (`rendering.md`
+/// 2.5 and 3.3): over a plane and a ball, a camera flying
+/// fast enough that the selection would change every step; at every step
+/// the shown meshes have no open edge off the root cube's boundary, and the
+/// shown set switches along the way (selection is paced by extraction,
+/// [`renderer::world::PACE_LIMIT_SECONDS`], so it is not simply frozen).
+#[test]
+fn shown_set_is_watertight_while_moving() {
+    for shape in [Shape::Plane, Shape::Ball] {
+        watertight_while_moving(shape);
+    }
+}
+
+/// The overhang's flight crosses a cell face that its slab's end face lies
+/// almost on (x = 62,500 m), and the shown meshes there have open edges:
+/// every mesh is extracted for the shown selection and the selection is
+/// balanced, so the crack is in the transition cells for a surface nearly
+/// parallel to a transition face. Tracked in 3GIXHub
+/// docs/implementation/known-issues.md ("Surfaces"); run it with
+/// `--ignored` when working on that.
+#[test]
+#[ignore = "known crack: a surface nearly parallel to a transition face (known-issues.md, Surfaces)"]
+fn shown_set_is_watertight_while_moving_overhang() {
+    watertight_while_moving(Shape::Overhang);
+}
+
+fn watertight_while_moving(shape: Shape) {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let depth = 10u8;
+        let mut rig = rig(shape, depth);
+        let c = Vec3::new(CENTER[0], CENTER[1], CENTER[2]);
+        let start = view_of(shape, depth);
+        let place = |t: f64| {
+            let along = Vec3::new(1.0, 0.3, 0.0).scale(t);
+            let p = start.position + along;
+            camera(p, c + along.scale(0.5))
+        };
+        let mut world = World::new(default_threads());
+        settle_in_rounds(&mut rig, &mut world, &place(0.0), VIEW);
+        let tolerance = EXTENT * 1e-9;
+        let mut now = 10.0;
+        let mut worst = 0usize;
+        let before = world.shown_switches();
+        let mut selected_changes = 0usize;
+        let mut last: Option<Vec<renderer::stream::SelectedCell>> = None;
+        for i in 0..240 {
+            now += 1.0 / 60.0;
+            let cam = place(0.002 * EXTENT * i as f64);
+            let seen = Seen::instant(&rig.system, &cam);
+            matter_step(&mut world, &mut rig.fetcher, &seen, VIEW, now);
+            let open = world.open_edges(FRAME, EXTENT, tolerance);
+            worst = worst.max(open);
+            let sel = world.cache().selection().to_vec();
+            if last
+                .as_ref()
+                .is_some_and(|l| l.iter().map(|c| c.key).ne(sel.iter().map(|c| c.key)))
+            {
+                selected_changes += 1;
+            }
+            last = Some(sel);
+            // Real time between steps, as in the window at 60 frames per
+            // second: pacing and extraction run on the wall clock.
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let changes = world.shown_switches() - before;
+        println!(
+            "budget: {}: moving, worst open edges {worst}, selection changed {selected_changes} times, shown set switched {changes} times",
+            shape.name()
+        );
+        assert_eq!(worst, 0, "{}: open edges in the shown meshes", shape.name());
+        assert!(
+            selected_changes > 0,
+            "{}: the selection never changed",
+            shape.name()
+        );
+        // Switching depends on extraction keeping up with the flight: timed
+        // in a release build only, like the frame step.
+        if !cfg!(debug_assertions) {
+            assert!(
+                changes >= 3,
+                "{}: the shown set switched only {changes} times",
+                shape.name()
+            );
+        }
+    }
+}
