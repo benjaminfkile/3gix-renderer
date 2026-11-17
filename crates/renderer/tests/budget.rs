@@ -20,6 +20,11 @@
 //!   near side, and the ring's far rim, seen through its hole, are refined
 //!   like any other surface.
 //!
+//! - **Transvoxel regular cells.** Extraction of one resolution 32 cell
+//!   crossed by a plane, with its 26 same-depth neighbors, timed over 50
+//!   runs; the median and 95th percentile are printed, no limit is
+//!   asserted yet.
+//!
 //! The watertightness proof of section 2.5 belongs to surface extraction
 //! and comes with it.
 //!
@@ -496,4 +501,83 @@ fn frame_step_at_4096_cells() {
     } else {
         assert!(p95 <= 4.0, "frame step p95 {p95:.3} ms, at most 4 ms");
     }
+}
+
+/// Times [`renderer::transvoxel::extract_regular`] on one resolution 32
+/// cell crossed by a tilted plane (module docs). Prints, asserts no limit.
+#[test]
+fn transvoxel_regular_cell_timing() {
+    use renderer::transvoxel::{extract_regular, Neighborhood, Slot};
+    const N: u8 = 32;
+    let edge = 32.0;
+    let h = edge / f64::from(N);
+    let normal: [f64; 3] = [0.21, -0.34, 1.0];
+    let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    let distance =
+        |p: [f64; 3]| (normal[0] * p[0] + normal[1] * p[1] + normal[2] * p[2] - 0.37) / len;
+    let section = |c: [i32; 3]| {
+        let key = CellKey::new(
+            FRAME,
+            5,
+            (8 + c[0]) as u32,
+            (8 + c[1]) as u32,
+            (8 + c[2]) as u32,
+        )
+        .expect("a valid key");
+        let o = c.map(|v| f64::from(v) * edge - 0.5 * edge);
+        let samples = Samples::from_fn(N, |x, y, z| {
+            let i = [x, y, z];
+            let at: [f64; 3] = std::array::from_fn(|a| o[a] + (f64::from(i[a]) + 0.5) * h);
+            let occupancy = (0.5 - distance(at) / h).clamp(0.0, 1.0);
+            if occupancy <= 0.0 {
+                return Sample::VACUUM;
+            }
+            Sample {
+                density: Density::new(2500.0 * occupancy),
+                state: State::Solid,
+                temperature: Kelvin::new(290.0),
+                albedo: [Ratio::new(0.4); 3],
+                roughness: Ratio::new(0.8),
+                attenuation: Attenuation::new(0.0),
+                radiating_temperature: Kelvin::new(290.0),
+                occupancy: Ratio::new(occupancy),
+            }
+        });
+        Arc::new(
+            Section::new(
+                key,
+                Vec3::new(o[0], o[1], o[2]),
+                Meters::new(edge),
+                N,
+                samples,
+            )
+            .expect("valid"),
+        )
+    };
+    let mut hood = Neighborhood::new(section([0, 0, 0]));
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                hood.slots[Neighborhood::slot_index(dx, dy, dz)] =
+                    Slot::Present(section([dx, dy, dz]));
+            }
+        }
+    }
+    let mut times = Vec::new();
+    let mut triangles = 0;
+    for _ in 0..50 {
+        let start = Instant::now();
+        let mesh = extract_regular(&hood).expect("every neighbor present");
+        times.push(start.elapsed());
+        triangles = mesh.triangle_count();
+    }
+    assert!(triangles > 0);
+    times.sort();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    println!(
+        "transvoxel regular cell, resolution {N}, {triangles} triangles: median {:.3} ms, p95 {:.3} ms over {} runs",
+        ms(times[times.len() / 2]),
+        ms(times[(times.len() * 95).div_ceil(100) - 1]),
+        times.len()
+    );
 }
