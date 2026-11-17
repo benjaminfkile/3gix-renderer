@@ -193,9 +193,30 @@ impl World {
             Some(CellState::Ready(cell)) => Some(cell.section.clone()),
             _ => None,
         });
+        // The loaded cells at the parent's depth around it.
+        let parent_neighbors: Vec<Arc<gx_core::matter::Section>> = match key.parent() {
+            Some(p) if parent.is_some() => crate::stream::diagonal_offsets()
+                .into_iter()
+                .chain([
+                    [-1, 0, 0],
+                    [1, 0, 0],
+                    [0, -1, 0],
+                    [0, 1, 0],
+                    [0, 0, -1],
+                    [0, 0, 1],
+                ])
+                .filter_map(|o| crate::stream::offset_key(&p, o))
+                .filter_map(|k| match self.cache.state(&k) {
+                    Some(CellState::Ready(cell)) => Some(cell.section.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         FaceNeighbors {
             faces,
             parent,
+            parent_neighbors,
             isovalue,
             diagonal: self
                 .cache
