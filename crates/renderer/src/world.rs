@@ -213,10 +213,64 @@ impl World {
                 .collect(),
             _ => Vec::new(),
         };
+        let parent_empty: Vec<[i8; 3]> = match key.parent() {
+            Some(p) if parent.is_some() => crate::stream::diagonal_offsets()
+                .into_iter()
+                .chain([
+                    [-1, 0, 0],
+                    [1, 0, 0],
+                    [0, -1, 0],
+                    [0, 1, 0],
+                    [0, 0, -1],
+                    [0, 0, 1],
+                ])
+                .filter(|&o| {
+                    crate::stream::offset_key(&p, o).is_some_and(|k| {
+                        !matches!(self.cache.state(&k), Some(CellState::Ready(c)) if c.has_matter)
+                            && self.cache.known_empty(&k)
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // The cells at this depth up to two over in every direction whose
+        // region a coarser cell one depth up draws: the fade toward them
+        // (extract) reaches a cell's padding, which lies in the cells next
+        // to it, so it must know theirs too.
+        let mut coarser: Vec<[i8; 3]> = Vec::new();
+        for dz in -2i8..=2 {
+            for dy in -2i8..=2 {
+                for dx in -2i8..=2 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let k = (|| {
+                        CellKey::new(
+                            key.frame_id,
+                            key.depth,
+                            key.x.checked_add_signed(i32::from(dx))?,
+                            key.y.checked_add_signed(i32::from(dy))?,
+                            key.z.checked_add_signed(i32::from(dz))?,
+                        )
+                        .ok()
+                    })();
+                    let drawn_coarser = k.is_some_and(|k| {
+                        !layout.selected.contains(&k)
+                            && !layout.above_selected.contains(&k)
+                            && k.parent().is_some_and(|p| layout.selected.contains(&p))
+                    });
+                    if drawn_coarser {
+                        coarser.push([dx, dy, dz]);
+                    }
+                }
+            }
+        }
         FaceNeighbors {
             faces,
             parent,
             parent_neighbors,
+            parent_empty,
+            coarser,
             isovalue,
             diagonal: self
                 .cache
@@ -441,16 +495,18 @@ impl World {
         let resolved =
             |k: &CellKey| self.drawable(k) || self.cache.state(k) == Some(&CellState::Gone);
         self.extracting.is_empty()
+            && self.cache.support_loaded()
             && self.cache.selection().iter().all(|s| resolved(&s.key))
             && self.cache.pinned().all(resolved)
     }
 
     /// Returns `true` when every selected and every pinned cell can be
-    /// drawn (`Ready` with its mesh, or `Empty`) and nothing is being
+    /// drawn, every support cell has arrived, (`Ready` with its mesh, or `Empty`) and nothing is being
     /// extracted. Stricter than [`World::settled`]: a `Gone` cell is not
     /// ready.
     pub fn ready(&self) -> bool {
         self.extracting.is_empty()
+            && self.cache.support_loaded()
             && self.cache.selection().iter().all(|s| self.drawable(&s.key))
             && self.cache.pinned().all(|k| self.drawable(k))
     }

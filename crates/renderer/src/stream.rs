@@ -475,6 +475,11 @@ pub struct CellEntry {
     /// Kept for the far field: requested like a selected cell, never
     /// evicted.
     pub pinned: bool,
+    /// Needed by the latest selection without being drawn: a cell at the
+    /// depth of a coarser cell's neighbor, whose samples the field a cell
+    /// fades into next to it is made of ([`support_cells`]). Requested like
+    /// a selected cell and not evicted while needed.
+    pub support: bool,
     /// Session time the cell was last selected or drawn, seconds.
     pub last_used: f64,
     /// Projected size at the latest selection, pixels.
@@ -489,6 +494,7 @@ impl CellEntry {
             state: CellState::Missing,
             selected: false,
             pinned: false,
+            support: false,
             last_used: now,
             projected_px: 0.0,
             requested_at: f64::NEG_INFINITY,
@@ -503,7 +509,8 @@ pub struct CacheCounts {
     pub selected: usize,
     /// Selected cells that are `Ready` or `Empty`.
     pub ready: usize,
-    /// Selected cells that are `Requested`.
+    /// Selected cells that are `Requested`, and support cells not loaded
+    /// yet ([`CellEntry::support`]).
     pub pending: usize,
     /// Requests in flight.
     pub in_flight: usize,
@@ -650,6 +657,14 @@ impl CellCache {
         }
     }
 
+    /// Returns `true` when no support cell ([`CellEntry::support`]) is
+    /// still missing or in flight.
+    pub fn support_loaded(&self) -> bool {
+        self.entries
+            .values()
+            .all(|e| !e.support || !matches!(e.state, CellState::Missing | CellState::Requested))
+    }
+
     /// The latest selection.
     pub fn selection(&self) -> &[SelectedCell] {
         &self.selection
@@ -661,6 +676,19 @@ impl CellCache {
     pub fn set_selection(&mut self, cells: Vec<SelectedCell>, now: f64) {
         for e in self.entries.values_mut() {
             e.selected = false;
+            e.support = false;
+        }
+        for (k, px) in support_cells(&cells) {
+            // Not asked for where nothing is known to be there; kept when it
+            // has arrived (empty or not), or it would be dropped and asked
+            // for again.
+            if self.state(&k).is_none() && self.known_empty(&k) {
+                continue;
+            }
+            let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
+            e.support = true;
+            e.last_used = now;
+            e.projected_px = e.projected_px.max(px);
         }
         for c in &cells {
             let e = self
@@ -672,7 +700,7 @@ impl CellCache {
             e.projected_px = c.projected_px;
         }
         self.entries
-            .retain(|_, e| e.selected || e.pinned || e.state != CellState::Missing);
+            .retain(|_, e| e.selected || e.pinned || e.support || e.state != CellState::Missing);
         self.selection = cells;
     }
 
@@ -711,7 +739,7 @@ impl CellCache {
         let mut due: Vec<(f64, CellKey)> = self
             .entries
             .iter()
-            .filter(|(_, e)| (e.selected || e.pinned) && e.state == CellState::Missing)
+            .filter(|(_, e)| (e.selected || e.pinned || e.support) && e.state == CellState::Missing)
             .map(|(k, e)| (e.projected_px, *k))
             .collect();
         due.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -772,7 +800,11 @@ impl CellCache {
             }
         }
         let droppable = |k: &CellKey, e: &CellEntry| {
-            !e.selected && !e.pinned && e.state != CellState::Requested && !chain.contains(k)
+            !e.selected
+                && !e.pinned
+                && !e.support
+                && e.state != CellState::Requested
+                && !chain.contains(k)
         };
         let mut gone: BTreeSet<CellKey> = self
             .entries
@@ -814,6 +846,13 @@ impl CellCache {
             }
             if e.pinned {
                 c.pinned += 1;
+            }
+            if e.support && !e.selected {
+                // Support cells hold up the drawing as selected ones do.
+                if matches!(e.state, CellState::Requested | CellState::Missing) {
+                    c.pending += 1;
+                }
+                continue;
             }
             if !e.selected {
                 continue;
@@ -1009,6 +1048,62 @@ pub struct FetcherStats {
     pub directions: crate::directions::DirectionStats,
     /// The worker ([`gx_worker::WorkerSnapshot`]).
     pub worker: gx_worker::WorkerSnapshot,
+}
+
+/// The cells a selection needs without drawing them, with the projected
+/// size to request them at: for every selected cell with a coarser selected
+/// cell across a face, edge, or corner, its parent's 26 neighbors at the
+/// parent's depth that are not selected or ancestors of selected cells
+/// (those are loaded anyway). Next to a coarser cell a cell fades into the
+/// field of its parent and these neighbors ([`crate::extract::ParentLevel`]);
+/// two cells sharing a face reach it through different parents, so both
+/// need the whole neighborhood to fade into the same field there.
+pub fn support_cells(selection: &[SelectedCell]) -> BTreeMap<CellKey, f64> {
+    let selected: BTreeSet<CellKey> = selection.iter().map(|c| c.key).collect();
+    let mut above: BTreeSet<CellKey> = BTreeSet::new();
+    for k in &selected {
+        let mut up = k.parent();
+        while let Some(p) = up {
+            if !above.insert(p) {
+                break;
+            }
+            up = p.parent();
+        }
+    }
+    let around: Vec<[i8; 3]> = diagonal_offsets()
+        .into_iter()
+        .chain([
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+        ])
+        .collect();
+    let mut out: BTreeMap<CellKey, f64> = BTreeMap::new();
+    for c in selection {
+        let Some(parent) = c.key.parent() else {
+            continue;
+        };
+        let next_to_coarser = around.iter().any(|&o| {
+            offset_key(&c.key, o)
+                .and_then(|k| k.parent())
+                .is_some_and(|p| selected.contains(&p))
+        });
+        if !next_to_coarser {
+            continue;
+        }
+        for &o in &around {
+            if let Some(k) = offset_key(&parent, o) {
+                if !selected.contains(&k) && !above.contains(&k) {
+                    let px = out.entry(k).or_insert(0.0);
+                    *px = px.max(c.projected_px * 2.0);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The moment to ask for directions at, UTC milliseconds: `wanted` (the

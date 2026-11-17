@@ -254,6 +254,16 @@ pub struct FaceNeighbors {
     /// and corner neighbors): with the parent they form the parent level's
     /// field across its faces ([`ParentLevel`]).
     pub parent_neighbors: Vec<Arc<Section>>,
+    /// Offsets from the parent (-1, 0, or 1 per axis) of the cells at its
+    /// depth around it known to hold no matter: the parent level's field
+    /// is 0 there, not the parent's nearest sample.
+    pub parent_empty: Vec<[i8; 3]>,
+    /// Offsets (-2 to 2 per axis) of the cells at this depth around it
+    /// whose region a coarser cell one depth up draws, from the selection:
+    /// the cell fades into its parent level toward them ([`fade_weight`]).
+    /// Taken from what is drawn, not from what is cached there, so two
+    /// cells sharing a face agree on it.
+    pub coarser: Vec<[i8; 3]>,
     /// The cells across the 12 edges and 8 corners, in the order of
     /// [`crate::stream::diagonal_offsets`] (empty when not gathered):
     /// padding points beyond two or three faces read them.
@@ -288,6 +298,8 @@ impl FaceNeighbors {
                 .all(|(a, b)| Arc::ptr_eq(a, b));
         same_parent
             && same_around
+            && self.parent_empty == other.parent_empty
+            && self.coarser == other.coarser
             && self.isovalue.map(f64::to_bits) == other.isovalue.map(f64::to_bits)
             && self.diagonal.len() == other.diagonal.len()
             && self
@@ -559,14 +571,20 @@ pub struct ParentLevel<'a> {
     /// Sections of the level with their first lattice index relative to the
     /// parent's.
     sections: Vec<([i64; 3], &'a Samples)>,
+    /// First lattice indices of the cells around the parent known to hold
+    /// no matter.
+    empty: Vec<[i64; 3]>,
 }
 
 impl<'a> ParentLevel<'a> {
-    /// The level around `parent` from it and `around` (cells at its depth;
-    /// others are ignored). `None` when the parent has no samples.
+    /// The level around `parent` from it, `around` (cells at its depth;
+    /// others are ignored), and `empty` (offsets from the parent, -1, 0, or 1
+    /// per axis, of cells at its depth known to hold no matter). `None` when
+    /// the parent has no samples.
     pub fn new(
         parent: &'a Section,
         around: impl Iterator<Item = &'a Section>,
+        empty: &[[i8; 3]],
     ) -> Option<ParentLevel<'a>> {
         let res = i64::from(parent.resolution());
         let step = parent.edge().value() / res as f64;
@@ -586,18 +604,28 @@ impl<'a> ParentLevel<'a> {
                 core::array::from_fn(|k| ((base[k] - origin[k]) / step).round() as i64);
             sections.push((index, samples));
         }
+        let empty = empty
+            .iter()
+            .map(|o| core::array::from_fn(|k| i64::from(o[k]) * res))
+            .collect();
         Some(ParentLevel {
             step,
             res,
             origin,
             sections,
+            empty,
         })
     }
 
     /// Solid and fluid density at lattice index `q`, from the section that
-    /// holds it, or the nearest sample of the parent when none does.
+    /// holds it, 0 in a cell known to hold no matter, or the nearest sample
+    /// of the parent when nothing is known there.
     fn at(&self, q: [i64; 3]) -> f64 {
         let r = self.res;
+        let within = |b: &[i64; 3]| (0..3).all(|k| (b[k]..b[k] + r).contains(&q[k]));
+        if self.empty.iter().any(within) {
+            return 0.0;
+        }
         let pick = self
             .sections
             .iter()
@@ -635,6 +663,29 @@ impl<'a> ParentLevel<'a> {
         }
         acc
     }
+}
+
+/// How far a cell fades into its parent level at grid point `p` (grid
+/// indices, padding included): 1 within or at the region of a coarser cell,
+/// falling to 0 one cell (`n` samples) from it, the largest over `coarser`
+/// (offsets of cells at this depth, [`FaceNeighbors::coarser`]). Distance
+/// is the largest over the axes of how far the sample center lies outside
+/// the region, so the weight is one function of position: a cell and its
+/// neighbors compute the same value at any point, padding included.
+fn fade_weight(p: [usize; 3], coarser: &[[i8; 3]], n: usize) -> f64 {
+    let nf = n as f64;
+    let c: [f64; 3] = core::array::from_fn(|k| p[k] as f64 - PAD as f64 + 0.5);
+    let mut w = 0.0f64;
+    for o in coarser {
+        let d = (0..3)
+            .map(|k| {
+                let lo = f64::from(o[k]) * nf;
+                (lo - c[k]).max(c[k] - (lo + nf)).max(0.0)
+            })
+            .fold(0.0f64, f64::max);
+        w = w.max(1.0 - d / nf);
+    }
+    w.clamp(0.0, 1.0)
 }
 
 /// Frame coordinates `p` in `section`'s sample units: 0 at the first
@@ -1168,58 +1219,17 @@ pub fn extract_with(section: &Section, neighbors: &FaceNeighbors) -> SurfaceMesh
         ParentLevel::new(
             parent,
             neighbors.parent_neighbors.iter().map(|s| s.as_ref()),
+            &neighbors.parent_empty,
         )
     });
     if let Some(level) = &level {
-        let coarser = |pad: &Option<Pad<'_>>| -> bool {
-            matches!(pad, Some(Pad::Coarse(s, _)) if s.key().depth + 1 == key.depth)
-        };
-        // Offsets (-1, 0, 1 per axis) of the sides with a coarser cell
-        // across: faces, then edges and corners.
-        let mut sides: Vec<[i8; 3]> = (0..6)
-            .filter(|&f| coarser(&grid.neighbors[f]))
-            .map(|f| {
-                let mut o = [0i8; 3];
-                o[f / 2] = if f % 2 == 1 { 1 } else { -1 };
-                o
-            })
-            .collect();
-        sides.extend(
-            grid.diagonal
-                .iter()
-                .filter(|(_, pad)| coarser(&Some(*pad)))
-                .map(|(o, _)| *o),
-        );
+        let sides = &neighbors.coarser;
         if !sides.is_empty() {
             for z in 0..m {
                 for y in 0..m {
                     for x in 0..m {
                         let p = [x, y, z];
-                        let mut w = 0.0f64;
-                        for o in &sides {
-                            // Samples from this side along each of its axes
-                            // (negative beyond it); the side is reached when
-                            // every one of them is.
-                            let mut t = f64::NEG_INFINITY;
-                            let mut on_side = true;
-                            for a in 0..3 {
-                                let d = match o[a] {
-                                    1 => (n + PAD - 1) as f64 - p[a] as f64 + 0.5,
-                                    -1 => p[a] as f64 - PAD as f64 + 0.5,
-                                    _ => {
-                                        if !(PAD..n + PAD).contains(&p[a]) {
-                                            on_side = false;
-                                        }
-                                        continue;
-                                    }
-                                };
-                                t = t.max(d);
-                            }
-                            if !on_side {
-                                continue;
-                            }
-                            w = w.max((1.0 - t / n as f64).clamp(0.0, 1.0));
-                        }
+                        let w = fade_weight(p, sides, n);
                         if w > 0.0 {
                             let i = x + m * (y + m * z);
                             let target = level.density(grid.position(p));
