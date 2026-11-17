@@ -5,68 +5,96 @@
 //! camera, streams finished sections from the CDN, receives freshly
 //! computed ones from the worker, composites layers" of `space-model.md`
 //! section 2, over the octree cells of section 5, with the compositing rule
-//! of section 8 and `matter-format.md` section 3.5. The hub side is the
-//! loop of `client-compute.md` section 1, run by [`crate::directions`].
+//! of section 8 and `matter-format.md` section 3.5, and the selection and
+//! streaming rules of `rendering.md` section 3. The hub side is the loop of
+//! `client-compute.md` section 1, run by [`crate::directions`].
 //!
-//! # Selection
+//! # Selection (`rendering.md` 3.1)
 //!
-//! Every 100 ms ([`SELECT_INTERVAL_SECONDS`]), every frame whose
-//! `root_extent / 8` region is in the view or within `4 * root_extent` of
-//! the camera is passed to [`gx_core::lod::select_cells`] with a pixel error
-//! of 512 ([`PIXEL_ERROR`]), the viewport height, the vertical field of view, and at most 4096
-//! cells ([`select_all`]), except frames drawn as a sprite only. Only cells
-//! loaded and [`ReadyCell::refinable`] are refined
-//! ([`gx_core::lod::select_cells_with`]): ones the drawn surface crosses,
-//! or that hold a volume. Empty space and solid interiors stay coarse, so
-//! the budget goes to the surfaces, and the selection deepens toward them
-//! one level per arrival. Only cells inside the view (a cone around the
-//! view's diagonal, [`VIEW_CONE_MARGIN`] wider) or holding the camera are
-//! refined: what is behind or beside the camera stays coarse until it
-//! turns. Nor are cells hidden behind the body itself, beyond the horizon
-//! of a sphere just under the drawn surface below the camera
-//! ([`OCCLUDER_FRACTION`]). The selection is then balanced ([`balance`]):
-//! cells sharing a face differ by at most one depth. A frame's
-//! depth limit is the deepest of its registry `max_depth` and its layers'
-//! configs ([`crate::protocol::frame_system_from_registries`]).
+//! Every frame whose `root_extent / 8` region is in the view or within
+//! `4 * root_extent` of the camera, except frames drawn as a sprite only,
+//! is passed to [`gx_core::lod::select_cells_with`] with a pixel error of
+//! [`PIXEL_ERROR`], the viewport height, the vertical field of view, and at
+//! most [`MAX_CELLS_PER_FRAME`] cells ([`select_all`]). A cell is refined
+//! only inside the view cone ([`VIEW_CONE_MARGIN`] wider than the view's
+//! diagonal) and only where it is refinable: a solid or fluid cell whose
+//! occupancy crosses 0.5, or a cell holding gas or plasma
+//! ([`ReadyCell::refinable`]). Nothing else limits it: there is no
+//! occlusion culling and no assumption about the shape of a frame's matter
+//! (`rendering.md` 1.1). A frame's depth limit is the deepest of its
+//! registry `max_depth` and its layers' configs
+//! ([`crate::protocol::frame_system_from_registries`]).
+//!
+//! Each selection makes two trees of cells per frame:
+//!
+//! - **The target**: what the frame would be drawn with if every cell had
+//!   arrived. A cell that has not arrived counts as refinable when the
+//!   occupancy of its nearest arrived ancestor, at most
+//!   [`AHEAD_DEPTHS`]` - 1` depths up, says the 0.5 level crosses its region
+//!   with one sample of margin ([`ReadyCell::ahead`]). The target is then
+//!   balanced 2:1 ([`balance_target`]): it is split until no two cells that
+//!   touch across a face, an edge, or a corner differ by more than one
+//!   depth.
+//! - **The drawn selection**: the target, pruned from the root down, so that
+//!   a cell is split only when every child has arrived and every cell
+//!   around it at its own depth is split or outside the target
+//!   ([`drawn_from_target`]). It is balanced by construction and holds only
+//!   arrived cells, and it is the target once everything has arrived.
+//!
+//! # Asking ahead (`rendering.md` 3.2) and switching depth (3.3)
+//!
+//! Every cell of the target, leaves and the cells above them, that has not
+//! arrived is requested, largest projected size first, at most
+//! [`MAX_IN_FLIGHT`] at a time. Because the target reaches up to
+//! [`AHEAD_DEPTHS`] depths below the arrived cells, refinement takes about
+//! one round trip per three depths. The drawn selection switches a region to
+//! finer cells only when everything it needs there has arrived; the coarser
+//! cells draw until then.
+//!
+//! # When the selection runs (`rendering.md` 3.4)
+//!
+//! [`crate::world::World`] selects when results arrive, when a first mesh is
+//! extracted, when the camera or the view changes, and otherwise every
+//! [`SELECT_INTERVAL_SECONDS`] as the frames move.
 //!
 //! # The cache
 //!
-//! [`CellCache`] holds one [`CellState`] per cell key. Selected cells start
-//! `Missing`; at most [`MAX_IN_FLIGHT`] (one directions batch) are
-//! `Requested` at a time, largest projected size first. A request stays
-//! `Requested` until the fetcher has every layer's section, however long the
-//! hub keeps it `pending`; the fetcher retries on its own. The sections are
-//! decoded and validated per layer and composited with
-//! [`gx_core::matter::composite`] into `Ready` or, when the composite holds
-//! no matter, `Empty`. Sections that fail validation, or a module that
-//! fails, make a cell `Gone`. Cells not selected for 60 s are evicted, and
-//! the cache never holds more than 4096 cells it could drop.
+//! [`CellCache`] holds one [`CellEntry`] per cell key, in a hash map keyed
+//! by cell ([`CellMap`]): every lookup the selection and the extraction
+//! inputs make is constant time. A request stays `Requested` until the
+//! fetcher has every layer's section, however long the hub keeps it
+//! `pending`; the fetcher retries on its own. Sections are decoded once on
+//! their way in, off the frame thread (`rendering.md` 3.5), and composited
+//! with [`gx_core::matter::composite`] into `Ready` or, when the composite
+//! holds no matter, `Empty`. Sections that fail validation, or a module
+//! that fails, make a cell `Gone`. Cells of no target for 60 s are evicted,
+//! and the cache never holds more than 4096 cells it could drop.
 //!
 //! A frame that is a sprite only in the far field ([`crate::farfield`]) has
 //! no cells selected. The depth-0 cell of every frame that may need a sprite
 //! is pinned ([`CellCache::pin`]): fetched once like a selected cell and
 //! never evicted, so the sprite's brightness is always at hand.
 //!
-//! # Depth transitions
+//! # Drawing
 //!
-//! [`CellCache::draw_set`] never leaves a hole. A selected cell that cannot
-//! be drawn yet is covered by its loaded children if all of them can be
-//! drawn, or else by its nearest drawable ancestor. A drawn ancestor hides
-//! every drawn cell below it, so a parent keeps drawing while any of its
-//! children is not ready, and stops once all of them are.
+//! [`CellCache::draw_set`] draws the drawn selection. A selected cell whose
+//! mesh is not extracted yet is covered by its drawable children if all of
+//! them are, or else by its nearest drawable ancestor; a drawn ancestor
+//! hides every drawn cell below it, so nothing is drawn twice.
 //!
 //! # The fetcher
 //!
 //! [`Fetcher`] (native) runs [`crate::directions::Coordinator`] on the
 //! frame loop's thread and carries out its actions on a tokio runtime:
 //! directions through [`crate::hub::HubClient`], sections from the local
-//! cache ([`gx_worker::DiskCache`]) or the edge, `compute` jobs on the
-//! worker pool ([`gx_worker::WorkerPool`]), which hands each section over
-//! at once and uploads it with its claim in the background, and readiness
-//! notices from the socket. The browser has its own fetcher with the same
-//! coordinator (`crate::web`).
+//! cache ([`gx_worker::DiskCache`]) or the edge, decoded on a blocking task,
+//! `compute` jobs on the worker pool ([`gx_worker::WorkerPool`]), which
+//! hands each section over decoded at once and uploads it with its claim in
+//! the background, and readiness notices from the socket. The browser has
+//! its own fetcher with the same coordinator (`crate::web`).
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::directions::Arrived;
 use crate::farfield::focal_px;
 use crate::farfield::{far_frames, mean_albedo, FarFieldCell};
 use crate::light::cell_emitter;
@@ -75,50 +103,121 @@ use gx_core::emission::Emitter;
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::lod::{select_cells_with, SelectionParams};
-use gx_core::matter::{self, composite, Section};
+use gx_core::matter::{self, composite, Section, State};
+use gx_core::registry::Frame;
 use gx_core::units::{Meters, Vec3};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
-/// Seconds between two selections.
+/// Seconds between two selections when nothing else asks for one: the
+/// frames move and turn, and the camera with its frame.
 pub const SELECT_INTERVAL_SECONDS: f64 = 0.1;
 
-/// Largest projected cell edge, pixels, that is not refined further: 512,
-/// so a cell of 32 samples per axis (the modules' resolution) draws its
-/// samples at most about 16 pixels apart, and the ones near the camera
-/// finer. Every refinement selects all eight children of a cell, about
-/// half of them air or rock on flat ground, and [`balance`] adds more, so
-/// the selection grows by a few hundred cells per depth: refining until a
-/// whole cell was a few pixels put the selection at its limit with
-/// millions of triangles smaller than a pixel.
+/// Largest projected cell edge, pixels, that is not refined further.
+/// Justified by the screen and the budget (`rendering.md` 1.2 and 5.2):
+/// at 512 a cell of 32 samples per axis draws its samples at most about 16
+/// pixels apart, and a 1280 x 720 view stays within [`MAX_CELLS_PER_FRAME`]
+/// cells and 2,000,000 triangles.
 pub const PIXEL_ERROR: f64 = 512.0;
 
 /// Factor on the half angle of the view cone inside which cells are
-/// refined ([`select_all`]): cells outside the view stay coarse until the
-/// camera turns toward them.
+/// refined ([`select_all`]): a little wider than the view
+/// (`rendering.md` 3.1), so turning slightly does not show coarse cells.
 pub const VIEW_CONE_MARGIN: f64 = 1.15;
 
-/// The occluding sphere for horizon culling ([`select_all`]), as a fraction
-/// of the radius of the drawn surface under the camera: a little lower, so
-/// relief rising over the horizon still counts as visible.
-pub const OCCLUDER_FRACTION: f64 = 0.995;
-
-/// Most cells selected per frame.
+/// Most cells selected per frame: the budget's limit (`rendering.md` 5.2).
 pub const MAX_CELLS_PER_FRAME: usize = 4096;
 
-/// Most cells requested at once: one directions batch
-/// ([`crate::protocol::MAX_DIRECTION_KEYS`]).
-pub const MAX_IN_FLIGHT: usize = crate::protocol::MAX_DIRECTION_KEYS;
+/// Percent of [`MAX_CELLS_PER_FRAME`] the balanced target of a frame aims
+/// at when [`select_all`] adjusts a frame's cell budget: close to the
+/// limit, with room for the target to grow a little between selections
+/// without passing it.
+pub const BUDGET_AIM: usize = 97;
 
-/// Seconds a cell may go unselected before it is evicted.
+/// Most cells requested at once: as many as the directions loop asks the
+/// hub about at once, [`crate::directions::MAX_DIRECTIONS_IN_FLIGHT`]
+/// batches of [`crate::protocol::MAX_DIRECTION_KEYS`] keys. Asking ahead
+/// three depths at a time can need more than one batch in one round trip
+/// (`rendering.md` 3.2); more than this would only wait in the directions
+/// queue, where a moving camera can no longer reorder it.
+pub const MAX_IN_FLIGHT: usize =
+    crate::directions::MAX_DIRECTIONS_IN_FLIGHT * crate::protocol::MAX_DIRECTION_KEYS;
+
+/// Seconds a cell may be outside every target before it is evicted.
 pub const EVICT_AFTER_SECONDS: f64 = 60.0;
 
 /// Most cells the cache keeps once eviction has dropped what it can.
 pub const MAX_CACHED_CELLS: usize = 4096;
 
-/// How far below a selected cell [`CellCache::draw_set`] looks for loaded
-/// descendants to cover it.
+/// How far below a cell [`CellCache::known_empty`] and
+/// [`CellCache::draw_set`] look for arrived descendants that cover it.
 pub const COVER_LEVELS: u8 = 2;
+
+/// How many depths below an arrived cell the selection predicts and asks
+/// for (`rendering.md` 3.2).
+pub const AHEAD_DEPTHS: u8 = 3;
+
+/// Samples of margin around a descendant's region when predicting whether
+/// the 0.5 level crosses it (`rendering.md` 3.2).
+pub const AHEAD_MARGIN_SAMPLES: usize = 1;
+
+/// The level of occupancy that is a solid or fluid surface
+/// (`matter-format.md` section 3.3).
+pub const SURFACE_OCCUPANCY: f64 = 0.5;
+
+/// A fast, deterministic hasher for cell keys: the same keys hash the same
+/// on every run and every machine (FxHash's multiply and rotate).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CellHasher(u64);
+
+impl CellHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for CellHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(u64::from(b));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+/// A hash map keyed by cell with [`CellHasher`]. Iteration order is never
+/// used for anything that is drawn or sent.
+pub type CellMap<V> = HashMap<CellKey, V, BuildHasherDefault<CellHasher>>;
+
+/// A hash set of cells with [`CellHasher`].
+pub type CellSet = HashSet<CellKey, BuildHasherDefault<CellHasher>>;
 
 /// One selected cell and its projected size.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -127,6 +226,177 @@ pub struct SelectedCell {
     pub key: CellKey,
     /// Projected edge in pixels, the request priority (largest first).
     pub projected_px: f64,
+}
+
+/// Which descendants of a cell, one to [`AHEAD_DEPTHS`] depths down, the
+/// cell's occupancy says are refinable: the 0.5 level of its solid and
+/// fluid samples crosses the descendant's region of the samples, with
+/// [`AHEAD_MARGIN_SAMPLES`] of margin, or gas or plasma is there
+/// (`rendering.md` 3.2). One bit per descendant: 8 at one depth down, 64 at
+/// two, 512 at three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AheadBits([u64; 10]);
+
+impl AheadBits {
+    /// Bit offset of the descendants `levels` depths down.
+    fn base(levels: u8) -> usize {
+        match levels {
+            1 => 0,
+            2 => 8,
+            _ => 72,
+        }
+    }
+
+    /// The bit index of descendant `(x, y, z)` (relative to the cell, each
+    /// `0..2^levels`) `levels` depths down.
+    fn index(levels: u8, x: u32, y: u32, z: u32) -> usize {
+        let side = 1usize << levels;
+        Self::base(levels) + x as usize + side * (y as usize + side * z as usize)
+    }
+
+    fn set(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+
+    fn get(&self, i: usize) -> bool {
+        self.0[i / 64] & (1 << (i % 64)) != 0
+    }
+
+    /// No descendant is refinable.
+    pub fn none() -> AheadBits {
+        AheadBits([0; 10])
+    }
+
+    /// Computes the bits from a section's samples.
+    pub fn of(section: &Section) -> AheadBits {
+        let mut bits = AheadBits::none();
+        let Some(s) = section.samples() else {
+            return bits;
+        };
+        let n = usize::from(section.resolution());
+        let flags: Vec<u8> = (0..s.len()).map(|i| sample_flags(s, n, i)).collect();
+        let deepest = AHEAD_DEPTHS;
+        let side = 1u32 << deepest;
+        // The deepest level box by box; the coarser levels are the union of
+        // their children, whose boxes with margin cover the parent's box
+        // with margin.
+        let mut masks = vec![0u8; (side * side * side) as usize];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let range = |c: u32| {
+                        let lo = (n * c as usize) / side as usize;
+                        let hi = (n * (c as usize + 1)).div_ceil(side as usize);
+                        (
+                            lo.saturating_sub(AHEAD_MARGIN_SAMPLES),
+                            (hi + AHEAD_MARGIN_SAMPLES).min(n),
+                        )
+                    };
+                    let (x0, x1) = range(x);
+                    let (y0, y1) = range(y);
+                    let (z0, z1) = range(z);
+                    let mut m = 0u8;
+                    'scan: for k in z0..z1 {
+                        for j in y0..y1 {
+                            let row = n * (j + n * k);
+                            for i in x0..x1 {
+                                m |= flags[row + i];
+                                if crossing(m) {
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                    masks[(x + side * (y + side * z)) as usize] = m;
+                }
+            }
+        }
+        for levels in (1..=deepest).rev() {
+            let side = 1u32 << levels;
+            for z in 0..side {
+                for y in 0..side {
+                    for x in 0..side {
+                        let m = masks[(x + side * (y + side * z)) as usize];
+                        if crossing(m) {
+                            bits.set(Self::index(levels, x, y, z));
+                        }
+                    }
+                }
+            }
+            if levels > 1 {
+                let half = side / 2;
+                let mut up = vec![0u8; (half * half * half) as usize];
+                for z in 0..side {
+                    for y in 0..side {
+                        for x in 0..side {
+                            up[(x / 2 + half * (y / 2 + half * (z / 2))) as usize] |=
+                                masks[(x + side * (y + side * z)) as usize];
+                        }
+                    }
+                }
+                masks = up;
+            }
+        }
+        bits
+    }
+
+    /// Whether `descendant`, 1 to [`AHEAD_DEPTHS`] depths below `cell`, is
+    /// predicted refinable. `false` for any other key.
+    pub fn predicts(&self, cell: &CellKey, descendant: &CellKey) -> bool {
+        let Some(levels) = descendant.depth.checked_sub(cell.depth) else {
+            return false;
+        };
+        if !(1..=AHEAD_DEPTHS).contains(&levels) || descendant.frame_id != cell.frame_id {
+            return false;
+        }
+        let local = |d: u32, c: u32| d.checked_sub(c << levels).filter(|&l| l < (1 << levels));
+        match (
+            local(descendant.x, cell.x),
+            local(descendant.y, cell.y),
+            local(descendant.z, cell.z),
+        ) {
+            (Some(x), Some(y), Some(z)) => self.get(Self::index(levels, x, y, z)),
+            _ => false,
+        }
+    }
+}
+
+/// Flag bits of sample `i` of a section of resolution `n` for
+/// [`crossing`]: 1 when its surface occupancy is below 0.5, 2 when at or
+/// above, 4 for gas or plasma. The surface occupancy of a solid or fluid
+/// sample is its occupancy; every other sample has none.
+///
+/// A partly filled solid or fluid sample on a face of the section counts as
+/// both sides of 0.5. Its sub-cube is cut by the boundary of its matter
+/// (occupancy is the filled share of the sub-cube, `matter-format.md`
+/// section 3.3), and the part of that sub-cube between the sample's center
+/// and the face lies past the last sample center: the 0.5 level may cross
+/// there, and the sample on the other side of the face that would show it
+/// belongs to the neighbor. A fully filled or empty face sample holds no
+/// boundary in its sub-cube, so nothing crosses there.
+fn sample_flags(s: &gx_core::matter::Samples, n: usize, i: usize) -> u8 {
+    match s.state(i) {
+        State::Solid | State::Fluid => {
+            let occupancy = s.occupancy(i).value();
+            let (x, y, z) = (i % n, (i / n) % n, i / (n * n));
+            let on_face = [x, y, z].iter().any(|&c| c == 0 || c + 1 == n);
+            if on_face && occupancy < 1.0 {
+                3
+            } else if occupancy >= SURFACE_OCCUPANCY {
+                2
+            } else {
+                1
+            }
+        }
+        State::Gas | State::Plasma => 4 | 1,
+        State::Vacuum => 1,
+    }
+}
+
+/// A region with these [`sample_flags`] is refinable: it holds gas or
+/// plasma, or surface occupancy on both sides of 0.5.
+fn crossing(m: u8) -> bool {
+    m & 4 != 0 || m & 3 == 3
 }
 
 /// A fetched and composited cell.
@@ -152,43 +422,42 @@ pub struct ReadyCell {
     pub has_matter: bool,
     /// The density of the drawn surface, kilograms per cubic meter, the
     /// isovalue of [`crate::extract`] ([`crate::extract::surface_isovalue`]);
-    /// `None` without solid or fluid samples.
+    /// `None` without solid or fluid samples. Extraction keeps this rule
+    /// until it moves to occupancy 0.5 (`rendering.md` 2).
     pub surface_isovalue: Option<f64>,
     /// [`crate::extract::inner_isovalue`]: the isovalue from matter well
     /// inside the cell, `None` for a thin shell. The frame's shared
     /// isovalue is the smallest of these ([`CellCache::frame_isovalue`]).
     pub inner_isovalue: Option<f64>,
-    /// The cell's children can show more than it does: its drawn surface
-    /// crosses it (some sample below [`ReadyCell::surface_isovalue`] and
-    /// some at or above it), or it holds gas or plasma drawn as a volume.
-    /// Only such cells are refined ([`select_all`]).
+    /// The cell's children can show more than it does (`rendering.md`
+    /// 3.1): it is a solid or fluid cell whose occupancy crosses 0.5 (some
+    /// solid or fluid sample at or above 0.5 and some sample below it, or a
+    /// partly filled one on a face of the cell, see [`sample_flags`]), or
+    /// it holds gas or plasma. Only such cells are refined ([`select_all`]).
     pub refinable: bool,
+    /// Which descendants up to [`AHEAD_DEPTHS`] down are predicted
+    /// refinable, for asking ahead.
+    pub ahead: AheadBits,
 }
 
 impl ReadyCell {
     /// Derives everything the renderer keeps about a composited section:
-    /// its emitter, its volume, and its mean albedo.
+    /// its emitter, its volume, its mean albedo, whether it and its
+    /// descendants are refinable. Runs off the frame thread.
     pub fn new(section: Section) -> ReadyCell {
         let surface_isovalue = crate::extract::surface_isovalue(&section);
         let volume = VolumeGrid::from_section(&section).map(Arc::new);
-        let refinable = volume.is_some()
-            || surface_isovalue.is_some_and(|iso| {
-                section.samples().is_some_and(|s| {
-                    let (mut below, mut above) = (false, false);
-                    for i in 0..s.len() {
-                        let d = s.get(i).map_or(0.0, |x| x.density.value());
-                        if d < iso {
-                            below = true;
-                        } else {
-                            above = true;
-                        }
-                        if below && above {
-                            return true;
-                        }
-                    }
-                    false
-                })
-            });
+        let n = usize::from(section.resolution());
+        let refinable = section.samples().is_some_and(|s| {
+            let mut m = 0u8;
+            for i in 0..s.len() {
+                m |= sample_flags(s, n, i);
+                if crossing(m) {
+                    return true;
+                }
+            }
+            false
+        });
         ReadyCell {
             emitter: if section.key().depth == 0 {
                 cell_emitter(&section)
@@ -197,12 +466,13 @@ impl ReadyCell {
             },
             volume,
             mean_albedo: mean_albedo(&section),
-            has_matter: section.samples().is_some_and(|s| {
-                (0..s.len()).any(|i| s.get(i).is_some_and(|x| x.density.value() > 0.0))
-            }),
+            has_matter: section
+                .samples()
+                .is_some_and(|s| (0..s.len()).any(|i| s.density(i).value() > 0.0)),
             surface_isovalue,
             inner_isovalue: crate::extract::inner_isovalue(&section),
             refinable,
+            ahead: AheadBits::of(&section),
             section: Arc::new(section),
         }
     }
@@ -219,7 +489,7 @@ impl ReadyCell {
 /// Where a cell is in its fetch.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellState {
-    /// Selected, not yet requested.
+    /// Known, not yet requested.
     Missing,
     /// The fetcher is resolving it: directions, streams, or a module run.
     Requested,
@@ -230,6 +500,13 @@ pub enum CellState {
     Empty,
     /// Sections that fail validation, or a module that failed. Never drawn.
     Gone,
+}
+
+impl CellState {
+    /// The cell has arrived: `Ready` or `Empty`.
+    pub fn arrived(&self) -> bool {
+        matches!(self, CellState::Ready(_) | CellState::Empty)
+    }
 }
 
 /// What the cache knows of the matter in a face neighbor
@@ -254,10 +531,9 @@ pub enum FetchOutcome {
 }
 
 /// Decodes and validates each layer's section for `key` (`matter-format.md`
-/// section 4), checks each section's geometry against the registry's
-/// `root_extent` (section 3.1), and composites them (section 3.5). The
-/// sections are the non-empty layers' in the build's layer order; none at
-/// all is a cell without matter.
+/// section 4), then composites them ([`cell_from_sections`]). For bytes
+/// nobody has decoded yet; sections that arrive through a fetcher come
+/// decoded ([`cell_from_arrived`]).
 pub fn decode_cell<S: AsRef<[u8]>>(
     key: &CellKey,
     sections: &[S],
@@ -266,12 +542,49 @@ pub fn decode_cell<S: AsRef<[u8]>>(
     let mut decoded = Vec::with_capacity(sections.len());
     for (i, bytes) in sections.iter().enumerate() {
         match matter::decode(key, bytes.as_ref()) {
-            Ok(s) => decoded.push(s),
+            Ok(s) => decoded.push(Arc::new(s)),
             Err(e) => {
                 return FetchOutcome::Invalid(format!("section {i}: code {}: {}", e.code, e.reason))
             }
         }
     }
+    cell_from_sections(key, &decoded, root_extent)
+}
+
+/// The cell from every layer's arrived section: the decoded section where
+/// the stream or the worker decoded it on the way in, else decoded here.
+/// Each section is validated once (`rendering.md` 3.5).
+pub fn cell_from_arrived(key: &CellKey, sections: &[Arrived], root_extent: Meters) -> FetchOutcome {
+    let mut decoded = Vec::with_capacity(sections.len());
+    for (i, a) in sections.iter().enumerate() {
+        match &a.decoded {
+            Some(s) if s.key() == *key => decoded.push(s.clone()),
+            Some(_) => {
+                return FetchOutcome::Invalid(format!("section {i}: decoded for another key"))
+            }
+            None => match matter::decode(key, &a.bytes) {
+                Ok(s) => decoded.push(Arc::new(s)),
+                Err(e) => {
+                    return FetchOutcome::Invalid(format!(
+                        "section {i}: code {}: {}",
+                        e.code, e.reason
+                    ))
+                }
+            },
+        }
+    }
+    cell_from_sections(key, &decoded, root_extent)
+}
+
+/// Checks each decoded section's geometry against the registry's
+/// `root_extent` (`matter-format.md` section 3.1) and composites them
+/// (section 3.5). The sections are the non-empty layers' in the build's
+/// layer order; none at all is a cell without matter.
+pub fn cell_from_sections(
+    key: &CellKey,
+    decoded: &[Arc<Section>],
+    root_extent: Meters,
+) -> FetchOutcome {
     let g = key.geometry(root_extent);
     if let Some(i) = decoded
         .iter()
@@ -284,7 +597,7 @@ pub fn decode_cell<S: AsRef<[u8]>>(
     if decoded.is_empty() {
         return FetchOutcome::Decoded(None);
     }
-    let refs: Vec<&Section> = decoded.iter().collect();
+    let refs: Vec<&Section> = decoded.iter().map(|s| s.as_ref()).collect();
     match composite(&refs) {
         Ok(c) if c.is_empty() => FetchOutcome::Decoded(None),
         Ok(c) => FetchOutcome::Decoded(Some(Arc::new(ReadyCell::new(c)))),
@@ -321,32 +634,47 @@ pub fn frame_in_range(system: &FrameSystem, camera: &Camera, frame_id: u64, aspe
     off_axis <= half_diag + (region / d).min(1.0).asin()
 }
 
+/// What one selection decided ([`select_all`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Selection {
+    /// The drawn selection: arrived cells, balanced, in `(frame, depth, x,
+    /// y, z)` order, with their projected sizes.
+    pub drawn: Vec<SelectedCell>,
+    /// The cells of [`Selection::drawn`], for lookups.
+    pub drawn_cells: CellSet,
+    /// The target's leaves, in the same order.
+    pub target: Vec<SelectedCell>,
+    /// Every cell of the target, leaves and the cells above them.
+    pub target_cells: CellSet,
+    /// The cells of the target that have not arrived and are not known to
+    /// hold no matter, largest projected size first (ties in key order):
+    /// what to request.
+    pub needed: Vec<SelectedCell>,
+}
+
 /// Selects the cells of every frame in range ([`frame_in_range`]) that is
-/// not a sprite only in the far field ([`crate::farfield::FarFrame::sprite_only`]),
-/// in ascending key order, with their projected sizes.
+/// not a sprite only in the far field ([`crate::farfield::FarFrame::sprite_only`]):
+/// the target and the drawn selection of the module docs. `budgets` is the
+/// cell budget per frame for [`gx_core::lod::select_cells_with`]
+/// (default [`MAX_CELLS_PER_FRAME`]); when balancing makes a frame's target
+/// larger than [`MAX_CELLS_PER_FRAME`] it is scaled toward [`BUDGET_AIM`]
+/// and the frame selected again, and while the target stays below the aim
+/// it is scaled up for the next selection.
 pub fn select_all(
     system: &FrameSystem,
     camera: &Camera,
     (view_width_px, view_height_px): (f64, f64),
-    may_refine: impl Fn(CellKey) -> bool,
-    loaded: impl Fn(&CellKey) -> bool,
-    occluders: &BTreeMap<u64, f64>,
-    wanted: &mut BTreeSet<CellKey>,
-) -> Vec<SelectedCell> {
+    cache: &impl CellStates,
+    budgets: &mut BTreeMap<u64, usize>,
+) -> Selection {
     let aspect = view_width_px / view_height_px.max(1.0);
-    let params = SelectionParams {
-        pixel_error: PIXEL_ERROR,
-        view_height_px,
-        vertical_fov_rad: FIELD_OF_VIEW_Y,
-        max_cells: MAX_CELLS_PER_FRAME,
-    };
     let focal = focal_px(view_height_px);
     let sprites: BTreeSet<u64> = far_frames(system, camera, view_height_px)
         .iter()
         .filter(|f| f.sprite_only())
         .map(|f| f.frame_id)
         .collect();
-    let mut out = Vec::new();
+    let mut out = Selection::default();
     for frame in system.tree().frames() {
         if sprites.contains(&frame.frame_id)
             || !frame_in_range(system, camera, frame.frame_id, aspect)
@@ -364,225 +692,497 @@ pub fn select_all(
         let half_y = 0.5 * FIELD_OF_VIEW_Y;
         let half_x = (half_y.tan() * aspect).atan();
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * VIEW_CONE_MARGIN;
-        let extent = frame.root_extent;
-        let in_view = |key: CellKey| -> bool {
-            let g = key.geometry(extent);
-            let half = 0.5 * g.edge.value();
-            let center = g.origin + Vec3::new(half, half, half);
-            let to = center - cam;
-            let d = to.length();
-            let radius = half * 3.0f64.sqrt();
-            if d <= radius {
-                return true;
-            }
-            let angle = (to.dot(forward) / d).clamp(-1.0, 1.0).acos();
-            angle <= cone + (radius / d).asin()
+        let view = FrameView {
+            frame,
+            cam,
+            forward,
+            cone,
+            focal,
         };
-        // Beyond the horizon of the frame's body (a sphere of radius
-        // `occluders[frame]` about its origin): a cell whose nearest point
-        // is farther than the camera's horizon plus that of the cell's
-        // highest point is hidden behind the body.
-        let occluder = occluders.get(&frame.frame_id).copied();
-        let r_cam = cam.length();
-        let visible = |key: CellKey| -> bool {
-            let Some(r) = occluder.filter(|&r| r < r_cam) else {
-                return true;
-            };
-            let g = key.geometry(extent);
-            let half = 0.5 * g.edge.value();
-            let center = g.origin + Vec3::new(half, half, half);
-            let radius = half * 3.0f64.sqrt();
-            let top = center.length() + radius;
-            if top <= r {
-                return false;
-            }
-            let near = ((center - cam).length() - radius).max(0.0);
-            let horizon = (r_cam * r_cam - r * r).sqrt() + (top * top - r * r).sqrt();
-            near <= horizon
-        };
-        // A cell is split only once all its children have arrived, so
-        // everything selected is loaded and drawn as selected, and the
-        // fade between depths (crate::extract) matches what is on screen.
-        // Its children are asked for and kept (`wanted`) and replace their
-        // parent together when the last arrives.
-        let wanted_here = std::cell::RefCell::new(BTreeSet::new());
-        let refine = |key: CellKey| {
-            if !(may_refine(key) && in_view(key) && visible(key)) {
-                return false;
-            }
-            let Some(children) = key.children() else {
-                return false;
-            };
-            if children.iter().all(&loaded) {
-                return true;
-            }
-            // All of them: those that have arrived must stay until the
-            // last one does.
-            wanted_here.borrow_mut().extend(children);
-            false
-        };
-        let first = select_cells_with(frame, cam, &params, refine).cells;
-        let mut wanted_here = wanted_here.into_inner();
-        let selected = balance(first, &loaded, &mut wanted_here);
-        wanted.extend(wanted_here);
-        for key in selected {
-            let g = key.geometry(frame.root_extent);
-            let e = g.edge.value();
-            let gap = |c: f64, o: f64| (o - c).max(c - (o + e)).max(0.0);
-            let d = Vec3::new(
-                gap(cam.x, g.origin.x),
-                gap(cam.y, g.origin.y),
-                gap(cam.z, g.origin.z),
-            )
-            .length();
-            out.push(SelectedCell {
-                key,
-                projected_px: e / d.max(e) * focal,
-            });
-        }
-    }
-    out
-}
-
-/// Evens out the selection until no two cells that touch (across a face,
-/// an edge, or a corner) differ by more than one depth, so detail steps by
-/// one level at a time and a cell only ever meets cells one depth coarser
-/// (the fade between depths, [`crate::extract`], assumes that). Where a
-/// cell touches one two or more depths coarser, the coarser one is split
-/// into its eight children when all of them are `loaded`; otherwise all
-/// eight go to `wanted` (fetched, and kept until the last arrives) and the finer side is merged into its parent instead (always
-/// loaded: the selection only refines loaded cells). Repeats until nothing
-/// changes (at most [`BALANCE_PASSES`] passes). Returns the cells in
-/// `(depth, x, y, z)` order.
-pub fn balance(
-    cells: Vec<CellKey>,
-    loaded: impl Fn(&CellKey) -> bool,
-    wanted: &mut BTreeSet<CellKey>,
-) -> Vec<CellKey> {
-    let mut set: BTreeSet<CellKey> = cells.into_iter().collect();
-    let around: Vec<[i8; 3]> = diagonal_offsets()
-        .into_iter()
-        .chain([
-            [-1, 0, 0],
-            [1, 0, 0],
-            [0, -1, 0],
-            [0, 1, 0],
-            [0, 0, -1],
-            [0, 0, 1],
-        ])
-        .collect();
-    for _ in 0..BALANCE_PASSES {
-        let mut split: BTreeSet<CellKey> = BTreeSet::new();
-        let mut merge: BTreeSet<CellKey> = BTreeSet::new();
-        for k in &set {
-            for &o in &around {
-                let Some(across) = offset_key(k, o) else {
-                    continue;
-                };
-                // The selected cell holding the region across, if coarser.
-                let mut up = across.parent();
-                while let Some(c) = up {
-                    if set.contains(&c) {
-                        if k.depth > c.depth + 1 {
-                            match c.children() {
-                                Some(children) if children.iter().all(&loaded) => {
-                                    split.insert(c);
-                                }
-                                Some(children) => {
-                                    wanted.extend(children);
-                                    if let Some(p) = k.parent() {
-                                        merge.insert(p);
-                                    }
-                                }
-                                None => {}
-                            }
-                        }
-                        break;
-                    }
-                    up = c.parent();
-                }
-            }
-        }
-        if split.is_empty() && merge.is_empty() {
-            break;
-        }
-        // Merges first: a merged parent drops everything below it.
-        let merge: Vec<CellKey> = merge
-            .iter()
-            .filter(|m| {
-                let mut up = m.parent();
-                while let Some(a) = up {
-                    if merge.contains(&a) {
-                        return false;
-                    }
-                    up = a.parent();
-                }
-                true
-            })
+        let budget = budgets
+            .get(&frame.frame_id)
             .copied()
-            .collect();
-        for m in &merge {
-            // What the merge drops stays cached (`wanted`): it comes back
-            // as soon as the coarser side has loaded.
-            let dropped: Vec<CellKey> = set.iter().filter(|k| is_below(k, m)).copied().collect();
-            for k in dropped {
-                set.remove(&k);
-                wanted.insert(k);
-            }
-            set.insert(*m);
+            .unwrap_or(MAX_CELLS_PER_FRAME);
+        let params = SelectionParams {
+            pixel_error: PIXEL_ERROR,
+            view_height_px,
+            vertical_fov_rad: FIELD_OF_VIEW_Y,
+            max_cells: budget,
+        };
+        let mut tree = target_tree(&view, &params, cache);
+        let leaves = tree.leaves.len();
+        // Balancing adds cells in about a fixed proportion: scale the
+        // budget by how far the balanced target is from the limit, aiming
+        // a little below it.
+        let scaled =
+            |n: usize| (budget * MAX_CELLS_PER_FRAME * BUDGET_AIM / (100 * n.max(1))).max(1);
+        if leaves > MAX_CELLS_PER_FRAME && budget > 1 {
+            // Over the limit: select again with the smaller budget.
+            let lower = scaled(leaves).min(budget - 1);
+            let params = SelectionParams {
+                max_cells: lower,
+                ..params
+            };
+            tree = target_tree(&view, &params, cache);
+            budgets.insert(frame.frame_id, lower);
+        } else if budget < MAX_CELLS_PER_FRAME
+            && leaves * 100 < MAX_CELLS_PER_FRAME * BUDGET_AIM - MAX_CELLS_PER_FRAME
+        {
+            // More than a point below the aim: raise the budget for next
+            // time.
+            budgets.insert(
+                frame.frame_id,
+                scaled(leaves).clamp(budget + 1, MAX_CELLS_PER_FRAME),
+            );
         }
-        for c in split {
-            if !set.contains(&c) {
-                continue;
-            }
-            if let Some(children) = c.children() {
-                set.remove(&c);
-                set.extend(children);
-            }
+        let drawn = drawn_from_target(&tree, cache);
+        out.drawn_cells.extend(drawn.iter().copied());
+        for key in drawn {
+            out.drawn.push(view.selected(key));
         }
+        let mut leaves: Vec<CellKey> = tree.leaves.iter().copied().collect();
+        leaves.sort_unstable_by_key(|k| (k.depth, k.x, k.y, k.z));
+        out.target
+            .extend(leaves.into_iter().map(|k| view.selected(k)));
+        out.needed.extend(
+            needed_cells(&tree, cache)
+                .into_iter()
+                .map(|k| view.selected(k)),
+        );
+        out.target_cells.extend(tree.leaves);
+        out.target_cells.extend(tree.internal);
     }
-    let mut out: Vec<CellKey> = set.into_iter().collect();
-    out.sort_by_key(|k| (k.depth, k.x, k.y, k.z));
+    out.needed.sort_by(|a, b| {
+        b.projected_px
+            .total_cmp(&a.projected_px)
+            .then(a.key.cmp(&b.key))
+    });
     out
 }
 
-/// `k` lies strictly below `a`.
-fn is_below(k: &CellKey, a: &CellKey) -> bool {
-    let mut up = k.parent();
-    while let Some(p) = up {
-        if p == *a {
+/// Whether the selection's geometry asks to refine `key` for this camera
+/// and view: its frame is in range and not a sprite only, the cell is
+/// inside the view cone, larger on screen than [`PIXEL_ERROR`], and above
+/// its frame's depth limit. Together with [`ReadyCell::refinable`] this is
+/// the whole of the selection rule (`rendering.md` 3.1); tests use it to
+/// show that nothing else holds a cell back.
+pub fn wants_refinement(
+    system: &FrameSystem,
+    camera: &Camera,
+    (view_width_px, view_height_px): (f64, f64),
+    key: &CellKey,
+) -> bool {
+    let aspect = view_width_px / view_height_px.max(1.0);
+    let Some(frame) = system.tree().get(key.frame_id) else {
+        return false;
+    };
+    let sprite = far_frames(system, camera, view_height_px)
+        .iter()
+        .any(|f| f.frame_id == key.frame_id && f.sprite_only());
+    if sprite || !frame_in_range(system, camera, key.frame_id, aspect) {
+        return false;
+    }
+    let forward = system.root_orientation(frame.frame_id).conjugate().rotate(
+        camera
+            .root_orientation(system)
+            .rotate(Vec3::new(0.0, 0.0, -1.0)),
+    );
+    let half_y = 0.5 * FIELD_OF_VIEW_Y;
+    let half_x = (half_y.tan() * aspect).atan();
+    let view = FrameView {
+        frame,
+        cam: camera_in_frame(system, camera, frame.frame_id),
+        forward,
+        cone: (half_x.tan().hypot(half_y.tan())).atan() * VIEW_CONE_MARGIN,
+        focal: focal_px(view_height_px),
+    };
+    key.depth < frame.max_depth
+        && view.in_view(*key)
+        && view.selected(*key).projected_px > PIXEL_ERROR
+}
+
+/// One frame as the selection sees it.
+struct FrameView<'a> {
+    frame: &'a Frame,
+    /// The camera in the frame's coordinates.
+    cam: Vec3,
+    /// The view direction in the frame's axes.
+    forward: Vec3,
+    /// Half angle of the view cone, radians.
+    cone: f64,
+    /// Focal length, pixels.
+    focal: f64,
+}
+
+impl FrameView<'_> {
+    /// Inside the view cone, or holding the camera.
+    fn in_view(&self, key: CellKey) -> bool {
+        let g = key.geometry(self.frame.root_extent);
+        let half = 0.5 * g.edge.value();
+        let center = g.origin + Vec3::new(half, half, half);
+        let to = center - self.cam;
+        let d = to.length();
+        let radius = half * 3.0f64.sqrt();
+        if d <= radius {
             return true;
         }
-        if p.depth < a.depth {
-            return false;
-        }
-        up = p.parent();
+        let angle = (to.dot(self.forward) / d).clamp(-1.0, 1.0).acos();
+        angle <= self.cone + (radius / d).asin()
     }
-    false
+
+    /// The cell with its projected edge, pixels.
+    fn selected(&self, key: CellKey) -> SelectedCell {
+        let g = key.geometry(self.frame.root_extent);
+        let e = g.edge.value();
+        let gap = |c: f64, o: f64| (o - c).max(c - (o + e)).max(0.0);
+        let d = Vec3::new(
+            gap(self.cam.x, g.origin.x),
+            gap(self.cam.y, g.origin.y),
+            gap(self.cam.z, g.origin.z),
+        )
+        .length();
+        SelectedCell {
+            key,
+            projected_px: e / d.max(e) * self.focal,
+        }
+    }
 }
 
-/// Most passes of [`balance`].
-pub const BALANCE_PASSES: usize = 24;
+/// A tree of cells: its leaves and the cells above them (split).
+#[derive(Clone, Debug, Default)]
+pub struct CellTree {
+    /// The leaves.
+    pub leaves: CellSet,
+    /// Every strict ancestor of a leaf.
+    pub internal: CellSet,
+}
+
+impl CellTree {
+    /// The tree whose leaves are `leaves`.
+    pub fn from_leaves(leaves: impl IntoIterator<Item = CellKey>) -> CellTree {
+        let leaves: CellSet = leaves.into_iter().collect();
+        let mut internal = CellSet::default();
+        for k in &leaves {
+            let mut up = k.parent();
+            while let Some(p) = up {
+                if !internal.insert(p) {
+                    break;
+                }
+                up = p.parent();
+            }
+        }
+        CellTree { leaves, internal }
+    }
+
+    /// `key` is a leaf or above one.
+    pub fn contains(&self, key: &CellKey) -> bool {
+        self.leaves.contains(key) || self.internal.contains(key)
+    }
+}
+
+/// The balanced target of one frame (module docs).
+fn target_tree(
+    view: &FrameView<'_>,
+    params: &SelectionParams,
+    cache: &impl CellStates,
+) -> CellTree {
+    let refine = |key: CellKey| view.in_view(key) && cache.refinable_or_predicted(&key);
+    let cells = select_cells_with(view.frame, view.cam, params, refine).cells;
+    let mut tree = CellTree::from_leaves(cells);
+    balance_target(&mut tree);
+    tree
+}
+
+/// The offsets of the 26 cells around a cell: every `(dx, dy, dz)` in
+/// `{-1, 0, 1}^3` but zero, in ascending order of `dz`, then `dy`, then
+/// `dx`.
+pub const AROUND: [[i8; 3]; 26] = {
+    let mut out = [[0i8; 3]; 26];
+    let mut i = 0;
+    let mut dz = -1i8;
+    while dz <= 1 {
+        let mut dy = -1i8;
+        while dy <= 1 {
+            let mut dx = -1i8;
+            while dx <= 1 {
+                if !(dx == 0 && dy == 0 && dz == 0) {
+                    out[i] = [dx, dy, dz];
+                    i += 1;
+                }
+                dx += 1;
+            }
+            dy += 1;
+        }
+        dz += 1;
+    }
+    out
+};
+
+/// The parents of the 26 cells around `key` at its depth, other than its
+/// own parent: at most 7 distinct cells, the corner of the 27 cells around
+/// the parent that `key` sits in. A cell around `key` across the low side
+/// of an axis has the parent's low neighbor as its parent when `key` is the
+/// low child along that axis, and the parent itself otherwise; the high
+/// side the same way. `None` past the root cube, and for a depth-0 key.
+pub fn around_parents(key: &CellKey) -> [Option<CellKey>; 7] {
+    let Some(parent) = key.parent() else {
+        return [None; 7];
+    };
+    let step = |c: u32| if c & 1 == 1 { 1i8 } else { -1i8 };
+    let s = [step(key.x), step(key.y), step(key.z)];
+    core::array::from_fn(|i| {
+        let bits = i + 1;
+        let o = core::array::from_fn(|a| if bits >> a & 1 == 1 { s[a] } else { 0 });
+        offset_key(&parent, o)
+    })
+}
+
+/// Splits `tree` until it is balanced 2:1: no two leaves that touch across
+/// a face, an edge, or a corner differ by more than one depth. A tree is
+/// balanced exactly when, for every split cell, the 26 cells around it at
+/// its own depth are cells of the tree (their parents are split), or lie
+/// where the tree has no cell (outside the root cube, or a child the
+/// selection culled by distance).
+///
+/// One pass over the split cells, deepest first: where a cell around a
+/// split cell lies inside a coarser leaf, that leaf is split down to it.
+/// What a split adds is shallower than the cell being checked, so it is
+/// checked later in the same pass; nothing is checked twice. Splitting
+/// never needs anything loaded: the target is what would be drawn if every
+/// cell had arrived. The result is the smallest balanced tree holding
+/// `tree`, whatever the order of the cells within one depth.
+pub fn balance_target(tree: &mut CellTree) {
+    let mut buckets: Vec<Vec<CellKey>> = vec![Vec::new(); 32];
+    for k in &tree.internal {
+        buckets[usize::from(k.depth)].push(*k);
+    }
+    for depth in (1..32usize).rev() {
+        let mut i = 0;
+        while i < buckets[depth].len() {
+            let n = buckets[depth][i];
+            i += 1;
+            for p in around_parents(&n).into_iter().flatten() {
+                if tree.internal.contains(&p) {
+                    continue;
+                }
+                // The leaf holding `p`, at or above it; none means the
+                // region is not in the tree.
+                let mut leaf = Some(p);
+                while let Some(a) = leaf {
+                    if tree.leaves.contains(&a) {
+                        break;
+                    }
+                    if tree.internal.contains(&a) {
+                        leaf = None;
+                        break;
+                    }
+                    leaf = a.parent();
+                }
+                let Some(mut a) = leaf else {
+                    continue;
+                };
+                // Split from that leaf down to `p`.
+                loop {
+                    tree.leaves.remove(&a);
+                    tree.internal.insert(a);
+                    buckets[usize::from(a.depth)].push(a);
+                    let Some(children) = a.children() else {
+                        break;
+                    };
+                    tree.leaves.extend(children);
+                    if a == p {
+                        break;
+                    }
+                    let shift = p.depth - a.depth - 1;
+                    match children
+                        .into_iter()
+                        .find(|c| (p.x >> shift, p.y >> shift, p.z >> shift) == (c.x, c.y, c.z))
+                    {
+                        Some(c) => a = c,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The drawn selection from a balanced target (module docs): from the root
+/// down, a split cell of the target stays split when every child has
+/// arrived (or is known to hold no matter) and every cell around it at its
+/// depth is split here too, or lies where the target has no cell. Returns
+/// the leaves in `(depth, x, y, z)` order.
+pub fn drawn_from_target(tree: &CellTree, cache: &impl CellStates) -> Vec<CellKey> {
+    // Shallowest first: a cell is decided after its parent and after the
+    // parents of the cells around it.
+    let internal: Vec<CellKey> = by_depth(tree.internal.iter()).concat();
+    // Split cells, with whether they or an ancestor hold no matter.
+    let mut split: CellMap<bool> = CellMap::default();
+    for n in &internal {
+        let parent_empty = match n.parent() {
+            Some(p) => match split.get(&p) {
+                Some(&e) => e,
+                None => continue,
+            },
+            None => false,
+        };
+        let empty = parent_empty || cache.holds_no_matter(n);
+        let Some(children) = n.children() else {
+            continue;
+        };
+        let arrived = empty
+            || children
+                .iter()
+                .all(|c| !tree.contains(c) || cache.arrived_or_empty(c));
+        if !arrived {
+            continue;
+        }
+        let balanced = around_parents(n)
+            .into_iter()
+            .flatten()
+            .all(|p| split.contains_key(&p) || !tree.internal.contains(&p));
+        if balanced {
+            split.insert(*n, empty);
+        }
+    }
+    let mut out: Vec<CellKey> = Vec::new();
+    match internal.first() {
+        Some(root) if root.depth == 0 && split.contains_key(root) => {}
+        _ => {
+            // Nothing split: the root alone, if the target has one.
+            out.extend(
+                tree.leaves
+                    .iter()
+                    .chain(tree.internal.iter())
+                    .filter(|k| k.depth == 0),
+            );
+            return out;
+        }
+    }
+    for n in &internal {
+        if !split.contains_key(n) {
+            continue;
+        }
+        for c in n.children().into_iter().flatten() {
+            if tree.contains(&c) && !split.contains_key(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out.sort_unstable_by_key(|k| (k.depth, k.x, k.y, k.z));
+    out
+}
+
+/// The cells of `tree` that have not arrived and are not known to hold no
+/// matter, shallowest first. A cell under one that holds no matter is known
+/// to hold none. Every cell's parent is in the tree, so one pass from the
+/// root down, depth by depth, knows each parent's answer before its
+/// children's.
+fn needed_cells(tree: &CellTree, cache: &impl CellStates) -> Vec<CellKey> {
+    let mut empty: CellSet = CellSet::default();
+    let mut out = Vec::new();
+    for bucket in by_depth(tree.internal.iter().chain(tree.leaves.iter())) {
+        for k in bucket {
+            let under_empty = k.parent().is_some_and(|p| empty.contains(&p));
+            if under_empty || cache.holds_no_matter(&k) {
+                empty.insert(k);
+                continue;
+            }
+            if !matches!(
+                cache.cell_state(&k),
+                Some(CellState::Ready(_) | CellState::Empty | CellState::Gone)
+            ) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// `keys` grouped by depth, shallowest first, each group in no particular
+/// order.
+fn by_depth<'a>(keys: impl Iterator<Item = &'a CellKey>) -> Vec<Vec<CellKey>> {
+    let mut buckets: Vec<Vec<CellKey>> = Vec::new();
+    for k in keys {
+        let d = usize::from(k.depth);
+        if buckets.len() <= d {
+            buckets.resize_with(d + 1, Vec::new);
+        }
+        buckets[d].push(*k);
+    }
+    buckets
+}
+
+/// What the selection reads of the cells: their fetch states. The cache
+/// ([`CellCache`]) provides it on the frame thread, and the selection's own
+/// copy of the states ([`CellMap`] of [`CellState`]) where the selection
+/// runs on its own thread ([`crate::world`]).
+pub trait CellStates {
+    /// The state of `key`, `None` if it is not known.
+    fn cell_state(&self, key: &CellKey) -> Option<&CellState>;
+
+    /// Returns `true` when `key` may be refined in the target: it is
+    /// `Ready` and refinable ([`ReadyCell::refinable`]), or it has not
+    /// arrived and its nearest arrived ancestor, at most
+    /// [`AHEAD_DEPTHS`]` - 1` depths up, predicts it refinable
+    /// ([`ReadyCell::ahead`]).
+    fn refinable_or_predicted(&self, key: &CellKey) -> bool {
+        match self.cell_state(key) {
+            Some(CellState::Ready(c)) => return c.refinable,
+            Some(CellState::Empty | CellState::Gone) => return false,
+            _ => {}
+        }
+        let mut up = *key;
+        for _ in 1..AHEAD_DEPTHS {
+            let Some(a) = up.parent() else {
+                return false;
+            };
+            match self.cell_state(&a) {
+                Some(CellState::Ready(c)) => return c.ahead.predicts(&a, key),
+                Some(CellState::Empty | CellState::Gone) => return false,
+                _ => up = a,
+            }
+        }
+        false
+    }
+
+    /// Returns `true` when `key` has arrived (`Ready` or `Empty`).
+    fn arrived_or_empty(&self, key: &CellKey) -> bool {
+        self.cell_state(key).is_some_and(CellState::arrived)
+    }
+
+    /// `key` itself is fetched and holds no matter.
+    fn holds_no_matter(&self, key: &CellKey) -> bool {
+        match self.cell_state(key) {
+            Some(CellState::Empty) => true,
+            Some(CellState::Ready(cell)) => !cell.has_matter,
+            _ => false,
+        }
+    }
+}
+
+impl CellStates for CellCache {
+    fn cell_state(&self, key: &CellKey) -> Option<&CellState> {
+        self.state(key)
+    }
+}
+
+impl CellStates for CellMap<CellState> {
+    fn cell_state(&self, key: &CellKey) -> Option<&CellState> {
+        self.get(key)
+    }
+}
 
 /// One cache entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellEntry {
     /// Fetch state.
     pub state: CellState,
-    /// In the latest selection.
-    pub selected: bool,
     /// Kept for the far field: requested like a selected cell, never
     /// evicted.
     pub pinned: bool,
-    /// Needed by the latest selection without being drawn: a cell at the
-    /// depth of a coarser cell's neighbor, whose samples the field a cell
-    /// fades into next to it is made of ([`support_cells`]). Requested like
-    /// a selected cell and not evicted while needed.
-    pub support: bool,
-    /// Session time the cell was last selected or drawn, seconds.
+    /// Session time the cell was last in a target or drawn, seconds.
     pub last_used: f64,
-    /// Projected size at the latest selection, pixels.
-    pub projected_px: f64,
     /// Session time of the latest request, seconds.
     pub requested_at: f64,
 }
@@ -591,11 +1191,8 @@ impl CellEntry {
     fn new(now: f64) -> CellEntry {
         CellEntry {
             state: CellState::Missing,
-            selected: false,
             pinned: false,
-            support: false,
             last_used: now,
-            projected_px: 0.0,
             requested_at: f64::NEG_INFINITY,
         }
     }
@@ -604,12 +1201,12 @@ impl CellEntry {
 /// Counts for the overlay.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheCounts {
-    /// Cells in the latest selection.
+    /// Cells in the latest drawn selection.
     pub selected: usize,
     /// Selected cells that are `Ready` or `Empty`.
     pub ready: usize,
-    /// Selected cells that are `Requested`, and support cells not loaded
-    /// yet ([`CellEntry::support`]).
+    /// Cells of the target not arrived yet: requested, or waiting for room
+    /// to be requested.
     pub pending: usize,
     /// Requests in flight.
     pub in_flight: usize,
@@ -619,11 +1216,20 @@ pub struct CacheCounts {
     pub cached: usize,
 }
 
-/// The cell cache: one entry per key, in key order.
+/// The cell cache: one entry per key, the latest selection, and what it
+/// needs.
 #[derive(Clone, Debug, Default)]
 pub struct CellCache {
-    entries: BTreeMap<CellKey, CellEntry>,
+    entries: CellMap<CellEntry>,
     selection: Vec<SelectedCell>,
+    selection_cells: CellSet,
+    target: Vec<SelectedCell>,
+    target_cells: CellSet,
+    needed: Vec<SelectedCell>,
+    in_flight: usize,
+    pinned: BTreeSet<CellKey>,
+    isovalues: BTreeMap<u64, f64>,
+    requested_ahead: u64,
 }
 
 impl CellCache {
@@ -642,7 +1248,7 @@ impl CellCache {
         self.entries.get(key).map(|e| &e.state)
     }
 
-    /// Every entry, in key order.
+    /// Every entry, in no particular order.
     pub fn entries(&self) -> impl Iterator<Item = (&CellKey, &CellEntry)> {
         self.entries.iter()
     }
@@ -670,46 +1276,52 @@ impl CellCache {
     /// What is known of cell `k` for padding: `Ready`, known empty, or the
     /// nearest `Ready` coarser cell holding it.
     fn neighbor_at(&self, k: CellKey) -> Option<(CellKey, NeighborMatter<'_>)> {
-        {
-            match self.state(&k) {
-                Some(CellState::Ready(cell)) => Some((k, NeighborMatter::Ready(cell))),
-                _ if self.known_empty(&k) => Some((k, NeighborMatter::Empty)),
-                _ => {
-                    // The nearest loaded coarser cell holding the region
-                    // across the face: extraction reads it at the grid
-                    // points' positions, so a depth transition joins.
-                    let mut up = k.parent();
-                    while let Some(a) = up {
-                        if let Some(CellState::Ready(cell)) = self.state(&a) {
-                            return Some((a, NeighborMatter::Ready(cell)));
-                        }
-                        up = a.parent();
+        match self.state(&k) {
+            Some(CellState::Ready(cell)) => Some((k, NeighborMatter::Ready(cell))),
+            _ if self.known_empty(&k) => Some((k, NeighborMatter::Empty)),
+            _ => {
+                // The nearest loaded coarser cell holding the region across
+                // the face: extraction reads it at the grid points'
+                // positions, so a depth transition joins.
+                let mut up = k.parent();
+                while let Some(a) = up {
+                    if let Some(CellState::Ready(cell)) = self.state(&a) {
+                        return Some((a, NeighborMatter::Ready(cell)));
                     }
-                    None
+                    up = a.parent();
                 }
+                None
             }
         }
     }
 
-    /// The isovalue every surface of `frame_id` is drawn at: the smallest
-    /// of its loaded cells' inner ones ([`ReadyCell::inner_isovalue`]), so
-    /// neighboring cells put the surface at the same density. `None`
-    /// before any cell of the frame with a surface has arrived.
+    /// The isovalue every surface of `frame_id` is drawn at until
+    /// extraction moves to occupancy 0.5: the smallest of its loaded
+    /// cells' inner ones ([`ReadyCell::inner_isovalue`]), kept up to date
+    /// as cells arrive and leave. `None` before any cell of the frame with
+    /// a surface has arrived.
     pub fn frame_isovalue(&self, frame_id: u64) -> Option<f64> {
-        self.entries
+        self.isovalues.get(&frame_id).copied()
+    }
+
+    fn recompute_isovalue(&mut self, frame_id: u64) {
+        let v = self
+            .entries
             .iter()
             .filter(|(k, _)| k.frame_id == frame_id)
             .filter_map(|(_, e)| match &e.state {
                 CellState::Ready(c) => c.inner_isovalue,
                 _ => None,
             })
-            .reduce(f64::min)
+            .reduce(f64::min);
+        match v {
+            Some(v) => self.isovalues.insert(frame_id, v),
+            None => self.isovalues.remove(&frame_id),
+        };
     }
 
     /// Returns `true` when `key` is `Ready` and its children can show more
-    /// than it does ([`ReadyCell::refinable`]). A cell not loaded yet is not
-    /// refined: the selection refines toward surfaces one level per
-    /// arrival.
+    /// than it does ([`ReadyCell::refinable`]).
     pub fn refinable(&self, key: &CellKey) -> bool {
         matches!(self.state(key), Some(CellState::Ready(c)) if c.refinable)
     }
@@ -717,10 +1329,7 @@ impl CellCache {
     /// Returns `true` when `key` has arrived (`Ready` or `Empty`) or is
     /// known to hold no matter: the selection can stand on it.
     pub fn loaded(&self, key: &CellKey) -> bool {
-        matches!(
-            self.state(key),
-            Some(CellState::Ready(_) | CellState::Empty)
-        ) || self.known_empty(key)
+        self.arrived_or_empty(key) || self.empty_above(key)
     }
 
     /// Returns `true` when the cache knows that `key` holds no matter: it
@@ -730,24 +1339,19 @@ impl CellCache {
     /// need not be cached: the selection may hold its region at another
     /// depth.
     pub fn known_empty(&self, key: &CellKey) -> bool {
-        let empty = |k: &CellKey| self.holds_no_matter(k);
+        self.empty_above(key) || self.empty_below(key, COVER_LEVELS)
+    }
+
+    /// `key` or one of its ancestors is fetched and holds no matter.
+    pub fn empty_above(&self, key: &CellKey) -> bool {
         let mut up = Some(*key);
         while let Some(k) = up {
-            if empty(&k) {
+            if self.holds_no_matter(&k) {
                 return true;
             }
             up = k.parent();
         }
-        self.empty_below(key, COVER_LEVELS)
-    }
-
-    /// `key` itself is fetched and holds no matter.
-    fn holds_no_matter(&self, key: &CellKey) -> bool {
-        match self.state(key) {
-            Some(CellState::Empty) => true,
-            Some(CellState::Ready(cell)) => !cell.has_matter,
-            _ => false,
-        }
+        false
     }
 
     /// `key` holds no matter, or every child holds none, recursively within
@@ -765,75 +1369,76 @@ impl CellCache {
         }
     }
 
-    /// Returns `true` when no support cell ([`CellEntry::support`]) is
-    /// still missing or in flight.
-    pub fn support_loaded(&self) -> bool {
-        self.entries
-            .values()
-            .all(|e| !e.support || !matches!(e.state, CellState::Missing | CellState::Requested))
-    }
-
-    /// The latest selection.
+    /// The latest drawn selection.
     pub fn selection(&self) -> &[SelectedCell] {
         &self.selection
     }
 
-    /// Replaces the selection. New keys start `Missing`; `Missing` keys no
-    /// longer selected or pinned are dropped, since there is nothing to
-    /// keep.
-    pub fn set_selection(&mut self, cells: Vec<SelectedCell>, now: f64) {
-        self.set_selection_wanting(cells, &BTreeSet::new(), now);
+    /// The latest target's leaves.
+    pub fn target(&self) -> &[SelectedCell] {
+        &self.target
     }
 
-    /// [`CellCache::set_selection`], also asking for `wanted`: children of
-    /// selected cells that the selection waits for before splitting them
-    /// (see [`select_all`]). They are fetched and kept like support cells.
-    pub fn set_selection_wanting(
-        &mut self,
-        cells: Vec<SelectedCell>,
-        wanted: &BTreeSet<CellKey>,
-        now: f64,
-    ) {
-        for e in self.entries.values_mut() {
-            e.selected = false;
-            e.support = false;
-        }
-        let sel_px: BTreeMap<CellKey, f64> =
-            cells.iter().map(|c| (c.key, c.projected_px)).collect();
-        let mut needed = support_cells(&cells);
-        for w in wanted {
-            let px = w
-                .parent()
-                .and_then(|p| sel_px.get(&p).copied())
-                .unwrap_or(0.0)
-                * 0.5;
-            let e = needed.entry(*w).or_insert(0.0);
-            *e = e.max(px);
-        }
-        for (k, px) in needed {
-            // Not asked for where nothing is known to be there; kept when it
-            // has arrived (empty or not), or it would be dropped and asked
-            // for again.
-            if self.state(&k).is_none() && self.known_empty(&k) {
-                continue;
-            }
-            let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
-            e.support = true;
-            e.last_used = now;
-            e.projected_px = e.projected_px.max(px);
-        }
-        for c in &cells {
-            let e = self
-                .entries
-                .entry(c.key)
-                .or_insert_with(|| CellEntry::new(now));
-            e.selected = true;
-            e.last_used = now;
-            e.projected_px = c.projected_px;
-        }
-        self.entries
-            .retain(|_, e| e.selected || e.pinned || e.support || e.state != CellState::Missing);
-        self.selection = cells;
+    /// Every cell of the latest target, leaves and the cells above them.
+    pub fn target_cells(&self) -> &CellSet {
+        &self.target_cells
+    }
+
+    /// The latest drawn selection is the target: every cell the target
+    /// needs has arrived and the drawn selection has switched to it.
+    pub fn at_target(&self) -> bool {
+        self.selection.len() == self.target.len()
+            && self
+                .selection
+                .iter()
+                .zip(&self.target)
+                .all(|(a, b)| a.key == b.key)
+    }
+
+    /// Cells of the target that have not arrived: requested, or waiting
+    /// for room.
+    pub fn outstanding(&self) -> usize {
+        self.needed
+            .iter()
+            .filter(
+                |c| !matches!(self.state(&c.key), Some(s) if s.arrived() || *s == CellState::Gone),
+            )
+            .count()
+    }
+
+    /// Cells requested before their parent had arrived, this session: what
+    /// asking ahead requested (`rendering.md` 3.2).
+    pub fn requested_ahead(&self) -> u64 {
+        self.requested_ahead
+    }
+
+    /// Replaces the selection with `selection` (see [`select_all`]).
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection.drawn;
+        self.selection_cells = selection.drawn_cells;
+        self.target = selection.target;
+        self.target_cells = selection.target_cells;
+        self.needed = selection.needed;
+    }
+
+    /// Replaces the selection with these cells as both the drawn selection
+    /// and the target, all of them needed: for tests and tools that pick
+    /// cells by hand.
+    pub fn set_cells(&mut self, cells: Vec<SelectedCell>) {
+        let mut needed = cells.clone();
+        needed.sort_by(|a, b| {
+            b.projected_px
+                .total_cmp(&a.projected_px)
+                .then(a.key.cmp(&b.key))
+        });
+        let tree = CellTree::from_leaves(cells.iter().map(|c| c.key));
+        self.set_selection(Selection {
+            drawn_cells: cells.iter().map(|c| c.key).collect(),
+            drawn: cells.clone(),
+            target: cells,
+            target_cells: tree.leaves.into_iter().chain(tree.internal).collect(),
+            needed,
+        });
     }
 
     /// Pins a cell: it is requested like a selected cell (if it is not
@@ -844,46 +1449,53 @@ impl CellCache {
             .entries
             .entry(key)
             .or_insert_with(|| CellEntry::new(now));
+        self.pinned.insert(key);
         !std::mem::replace(&mut e.pinned, true)
     }
 
     /// The pinned cells, in key order.
     pub fn pinned(&self) -> impl Iterator<Item = &CellKey> {
-        self.entries
-            .iter()
-            .filter(|(_, e)| e.pinned)
-            .map(|(k, _)| k)
+        self.pinned.iter()
     }
 
-    /// Picks the next requests: selected or pinned `Missing` cells,
-    /// largest projected size first (ties in key order), up to
-    /// [`MAX_IN_FLIGHT`] in flight. Marks them `Requested`.
+    /// Picks the next requests: the target's cells that have not arrived,
+    /// largest projected size first (ties in key order), then pinned cells
+    /// not yet fetched, up to [`MAX_IN_FLIGHT`] in flight. Marks them
+    /// `Requested`.
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
-        let in_flight = self
-            .entries
-            .values()
-            .filter(|e| e.state == CellState::Requested)
-            .count();
-        let room = MAX_IN_FLIGHT.saturating_sub(in_flight);
+        let mut room = MAX_IN_FLIGHT.saturating_sub(self.in_flight);
+        let mut out = Vec::new();
         if room == 0 {
-            return Vec::new();
+            return out;
         }
-        let mut due: Vec<(f64, CellKey)> = self
-            .entries
+        let candidates: Vec<CellKey> = self
+            .needed
             .iter()
-            .filter(|(_, e)| (e.selected || e.pinned || e.support) && e.state == CellState::Missing)
-            .map(|(k, e)| (e.projected_px, *k))
+            .map(|c| c.key)
+            .chain(self.pinned.iter().copied())
             .collect();
-        due.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        due.truncate(room);
-        due.into_iter()
-            .map(|(_, k)| {
-                let e = self.entries.get_mut(&k).expect("listed above");
-                e.state = CellState::Requested;
-                e.requested_at = now;
-                k
-            })
-            .collect()
+        for k in candidates {
+            if room == 0 {
+                break;
+            }
+            let ahead = k
+                .parent()
+                .is_some_and(|p| !self.state(&p).is_some_and(CellState::arrived));
+            let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
+            if e.state != CellState::Missing {
+                continue;
+            }
+            e.state = CellState::Requested;
+            e.requested_at = now;
+            e.last_used = now;
+            self.in_flight += 1;
+            room -= 1;
+            if ahead {
+                self.requested_ahead += 1;
+            }
+            out.push(k);
+        }
+        out
     }
 
     /// Applies the result of a request for `key`.
@@ -892,6 +1504,13 @@ impl CellCache {
             .entries
             .entry(key)
             .or_insert_with(|| CellEntry::new(now));
+        if e.state == CellState::Requested {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        let was_iso = match &e.state {
+            CellState::Ready(c) => c.inner_isovalue,
+            _ => None,
+        };
         e.state = match outcome {
             FetchOutcome::Decoded(Some(cell)) => CellState::Ready(cell),
             FetchOutcome::Decoded(None) => CellState::Empty,
@@ -900,6 +1519,20 @@ impl CellCache {
                 CellState::Gone
             }
         };
+        e.last_used = now;
+        let iso = match &e.state {
+            CellState::Ready(c) => c.inner_isovalue,
+            _ => None,
+        };
+        let frame = key.frame_id;
+        match (was_iso, iso) {
+            (Some(_), _) => self.recompute_isovalue(frame),
+            (None, Some(v)) => {
+                let m = self.isovalues.entry(frame).or_insert(v);
+                *m = m.min(v);
+            }
+            (None, None) => {}
+        }
     }
 
     /// Marks cells as used now (drawn as stand-ins), so eviction keeps them.
@@ -913,43 +1546,38 @@ impl CellCache {
 
     /// Evicts cells not used for [`EVICT_AFTER_SECONDS`], then, while more
     /// than [`MAX_CACHED_CELLS`] remain, the least recently used (ties in key
-    /// order). Selected and pinned cells, the ancestors of selected cells,
-    /// and requests in flight are never evicted.
-    /// Returns the evicted keys in key order.
+    /// order). Cells of the latest target (which holds the drawn selection
+    /// and every ancestor of it), pinned cells, and requests in flight are
+    /// never evicted and count as used now. Returns the evicted keys in key
+    /// order.
     pub fn evict(&mut self, now: f64) -> Vec<CellKey> {
-        // The selection refines only loaded cells, so the ancestors of the
-        // selected cells are what it stands on: dropping one collapses the
-        // selection below it to that depth, which asks for it again, which
-        // refines again, over and over.
-        let mut chain: BTreeSet<CellKey> = BTreeSet::new();
-        for s in &self.selection {
-            let mut up = s.key.parent();
-            while let Some(p) = up {
-                if !chain.insert(p) {
-                    break;
-                }
-                up = p.parent();
+        for k in self
+            .target_cells
+            .iter()
+            .chain(self.selection.iter().map(|s| &s.key))
+        {
+            if let Some(e) = self.entries.get_mut(k) {
+                e.last_used = now;
             }
         }
-        let droppable = |k: &CellKey, e: &CellEntry| {
-            !e.selected
-                && !e.pinned
-                && !e.support
-                && e.state != CellState::Requested
-                && !chain.contains(k)
+        let keep = |k: &CellKey, e: &CellEntry, cells: &CellSet| {
+            e.pinned || e.state == CellState::Requested || cells.contains(k)
         };
-        let mut gone: BTreeSet<CellKey> = self
+        let mut gone: Vec<CellKey> = self
             .entries
             .iter()
-            .filter(|(k, e)| droppable(k, e) && now - e.last_used >= EVICT_AFTER_SECONDS)
+            .filter(|(k, e)| {
+                !keep(k, e, &self.target_cells) && now - e.last_used >= EVICT_AFTER_SECONDS
+            })
             .map(|(k, _)| *k)
             .collect();
         let remaining = self.entries.len() - gone.len();
         if remaining > MAX_CACHED_CELLS {
+            let dropped: CellSet = gone.iter().copied().collect();
             let mut lru: Vec<(f64, CellKey)> = self
                 .entries
                 .iter()
-                .filter(|(k, e)| droppable(k, e) && !gone.contains(k))
+                .filter(|(k, e)| !keep(k, e, &self.target_cells) && !dropped.contains(k))
                 .map(|(k, e)| (e.last_used, *k))
                 .collect();
             lru.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -959,105 +1587,137 @@ impl CellCache {
                     .map(|(_, k)| k),
             );
         }
+        gone.sort();
+        let mut frames: BTreeSet<u64> = BTreeSet::new();
         for k in &gone {
-            self.entries.remove(k);
+            if let Some(e) = self.entries.remove(k) {
+                if let CellState::Ready(c) = &e.state {
+                    if c.inner_isovalue.is_some() {
+                        frames.insert(k.frame_id);
+                    }
+                }
+            }
         }
-        gone.into_iter().collect()
+        for f in frames {
+            self.recompute_isovalue(f);
+        }
+        gone
     }
 
     /// Counts for the overlay.
     pub fn counts(&self) -> CacheCounts {
-        let mut c = CacheCounts {
+        CacheCounts {
             selected: self.selection.len(),
+            ready: self
+                .selection
+                .iter()
+                .filter(|s| self.loaded(&s.key))
+                .count(),
+            pending: self.outstanding(),
+            in_flight: self.in_flight,
+            pinned: self.pinned.len(),
             cached: self.entries.len(),
-            ..CacheCounts::default()
-        };
-        for e in self.entries.values() {
-            if e.state == CellState::Requested {
-                c.in_flight += 1;
-            }
-            if e.pinned {
-                c.pinned += 1;
-            }
-            if e.support && !e.selected {
-                // Support cells hold up the drawing as selected ones do.
-                if matches!(e.state, CellState::Requested | CellState::Missing) {
-                    c.pending += 1;
-                }
-                continue;
-            }
-            if !e.selected {
-                continue;
-            }
-            match e.state {
-                CellState::Ready(_) | CellState::Empty => c.ready += 1,
-                CellState::Requested => c.pending += 1,
-                _ => {}
-            }
         }
-        c
     }
 
     /// The cells to draw for the latest selection, in key order, applying
-    /// the depth transition rule of the module docs. `drawable` says whether
-    /// a cell can be drawn now (its mesh is ready, or it is `Empty`).
+    /// the rule of the module docs. `drawable` says whether a cell can be
+    /// drawn now (its mesh is ready, or it holds no matter).
+    ///
+    /// A selected cell that cannot be drawn is drawn by a stand-in: its
+    /// drawable descendants within [`COVER_LEVELS`] if they cover it, else
+    /// its nearest drawable ancestor. An ancestor drawn as a stand-in hides
+    /// every selected cell below it, with their stand-ins, and every
+    /// ancestor stand-in below it. Selected cells never hold one another,
+    /// so the work beyond one look per selected cell is proportional to
+    /// what the ancestor stand-ins hide: the cells below such an ancestor
+    /// are found by walking down the target from it, which holds every
+    /// cell above a selected one and stops at the selected ones.
     pub fn draw_set(&self, drawable: impl Fn(&CellKey) -> bool) -> Vec<CellKey> {
-        let mut set: BTreeSet<CellKey> = BTreeSet::new();
+        let mut out: Vec<CellKey> = Vec::with_capacity(self.selection.len());
+        let mut covers: Vec<(CellKey, Vec<CellKey>)> = Vec::new();
+        let mut above: CellSet = CellSet::default();
+        let mut walked: CellMap<Option<CellKey>> = CellMap::default();
         for s in &self.selection {
             if drawable(&s.key) {
-                set.insert(s.key);
+                out.push(s.key);
                 continue;
             }
             if let Some(cover) = cover_below(&s.key, COVER_LEVELS, &drawable) {
-                set.extend(cover);
+                covers.push((s.key, cover));
                 continue;
             }
-            let mut up = s.key.parent();
-            while let Some(p) = up {
-                if drawable(&p) {
-                    set.insert(p);
-                    break;
-                }
-                up = p.parent();
-            }
-        }
-        // A drawn ancestor hides everything below it.
-        let hidden: Vec<CellKey> = set
-            .iter()
-            .filter(|k| {
-                let mut up = k.parent();
+            // Siblings share the walk up: remember it per parent.
+            let Some(parent) = s.key.parent() else {
+                continue;
+            };
+            let found = *walked.entry(parent).or_insert_with(|| {
+                let mut up = Some(parent);
                 while let Some(p) = up {
-                    if set.contains(&p) {
-                        return true;
+                    if drawable(&p) {
+                        return Some(p);
                     }
                     up = p.parent();
                 }
-                false
-            })
-            .copied()
-            .collect();
-        for k in hidden {
-            set.remove(&k);
+                None
+            });
+            if let Some(p) = found {
+                above.insert(p);
+            }
         }
-        set.into_iter().collect()
+        if !above.is_empty() {
+            let mut hidden: CellSet = CellSet::default();
+            for a in &above {
+                let mut up = a.parent();
+                while let Some(p) = up {
+                    if above.contains(&p) {
+                        hidden.insert(*a);
+                        break;
+                    }
+                    up = p.parent();
+                }
+                let mut stack: Vec<CellKey> = vec![*a];
+                while let Some(n) = stack.pop() {
+                    for c in n.children().into_iter().flatten() {
+                        if self.selection_cells.contains(&c) {
+                            hidden.insert(c);
+                        } else if self.target_cells.contains(&c) {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+            out.retain(|k| !hidden.contains(k));
+            covers.retain(|(s, _)| !hidden.contains(s));
+            out.extend(above.iter().filter(|k| !hidden.contains(k)));
+        }
+        out.extend(covers.into_iter().flat_map(|(_, cover)| cover));
+        out.sort_unstable();
+        out
     }
+}
+
+/// The ancestor of `key` at `depth` (at most `key.depth`), or `None` deeper.
+pub fn ancestor_at(key: &CellKey, depth: u8) -> Option<CellKey> {
+    let shift = key.depth.checked_sub(depth)?;
+    CellKey::new(
+        key.frame_id,
+        depth,
+        key.x >> shift,
+        key.y >> shift,
+        key.z >> shift,
+    )
+    .ok()
 }
 
 /// The offsets of the 12 edge and 8 corner neighbors of a cell: every
 /// `(dx, dy, dz)` in `{-1, 0, 1}^3` with two or three nonzero, in
 /// ascending order of `dz`, then `dy`, then `dx`.
 pub fn diagonal_offsets() -> Vec<[i8; 3]> {
-    let mut out = Vec::new();
-    for dz in -1i8..=1 {
-        for dy in -1i8..=1 {
-            for dx in -1i8..=1 {
-                if [dx, dy, dz].iter().filter(|&&d| d != 0).count() >= 2 {
-                    out.push([dx, dy, dz]);
-                }
-            }
-        }
-    }
-    out
+    AROUND
+        .into_iter()
+        .filter(|o| o.iter().filter(|&&d| d != 0).count() >= 2)
+        .collect()
 }
 
 /// The cell at offset `o` from `key` at the same depth, or `None` past the
@@ -1182,62 +1842,6 @@ pub struct FetcherStats {
     pub worker: gx_worker::WorkerSnapshot,
 }
 
-/// The cells a selection needs without drawing them, with the projected
-/// size to request them at: for every selected cell with a coarser selected
-/// cell across a face, edge, or corner, its parent's 26 neighbors at the
-/// parent's depth that are not selected or ancestors of selected cells
-/// (those are loaded anyway). Next to a coarser cell a cell fades into the
-/// field of its parent and these neighbors ([`crate::extract::ParentLevel`]);
-/// two cells sharing a face reach it through different parents, so both
-/// need the whole neighborhood to fade into the same field there.
-pub fn support_cells(selection: &[SelectedCell]) -> BTreeMap<CellKey, f64> {
-    let selected: BTreeSet<CellKey> = selection.iter().map(|c| c.key).collect();
-    let mut above: BTreeSet<CellKey> = BTreeSet::new();
-    for k in &selected {
-        let mut up = k.parent();
-        while let Some(p) = up {
-            if !above.insert(p) {
-                break;
-            }
-            up = p.parent();
-        }
-    }
-    let around: Vec<[i8; 3]> = diagonal_offsets()
-        .into_iter()
-        .chain([
-            [-1, 0, 0],
-            [1, 0, 0],
-            [0, -1, 0],
-            [0, 1, 0],
-            [0, 0, -1],
-            [0, 0, 1],
-        ])
-        .collect();
-    let mut out: BTreeMap<CellKey, f64> = BTreeMap::new();
-    for c in selection {
-        let Some(parent) = c.key.parent() else {
-            continue;
-        };
-        let next_to_coarser = around.iter().any(|&o| {
-            offset_key(&c.key, o)
-                .and_then(|k| k.parent())
-                .is_some_and(|p| selected.contains(&p))
-        });
-        if !next_to_coarser {
-            continue;
-        }
-        for &o in &around {
-            if let Some(k) = offset_key(&parent, o) {
-                if !selected.contains(&k) && !above.contains(&k) {
-                    let px = out.entry(k).or_insert(0.0);
-                    *px = px.max(c.projected_px * 2.0);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The moment to ask for directions at, UTC milliseconds: `wanted` (the
 /// drawn moment) clamped to the hub's now and, once known, the origin.
 /// Before anything is drawn, the hub's now.
@@ -1254,8 +1858,10 @@ pub use native::{Fetcher, FetcherOptions};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{decode_cell, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats};
-    use crate::directions::{Action, Coordinator, Origin, StreamResult};
+    use super::{
+        cell_from_arrived, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats,
+    };
+    use crate::directions::{Action, Arrived, Coordinator, Origin, StreamResult};
     use crate::hub::{HubClient, ReadySubscription};
     use crate::protocol::DirectionsResponse;
     use anyhow::{anyhow, Result};
@@ -1265,7 +1871,8 @@ mod native {
     use gx_core::units::Meters;
     use gx_module_host::HostConfig;
     use gx_worker::{
-        BlobKind, Blobs, ComputeJob, DiskCache, UploadTicket, Uploader, WorkerError, WorkerPool,
+        BlobKind, Blobs, ComputeJob, Computed, DiskCache, UploadTicket, Uploader, WorkerError,
+        WorkerPool,
     };
     use std::collections::BTreeMap;
     use std::sync::mpsc;
@@ -1348,7 +1955,7 @@ mod native {
             key: ChunkKey,
             layer: usize,
             address: [u8; 32],
-            result: Result<Arc<[u8]>, WorkerError>,
+            result: Result<Computed, WorkerError>,
         },
         Ready([u8; 32]),
         Event(FetchEvent),
@@ -1570,7 +2177,11 @@ mod native {
                 }
                 Action::Subscribe(address) => self.socket.subscribe(address),
                 Action::Complete(done) => match done.key {
-                    ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done.sections))),
+                    ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
+                        .sections
+                        .into_iter()
+                        .map(|a| a.bytes)
+                        .collect()))),
                     ChunkKey::Cell(key) => {
                         let Some(extent) = self.extents.remove(&key) else {
                             return;
@@ -1581,7 +2192,7 @@ mod native {
                         let tx = self.tx.clone();
                         self.decoding += 1;
                         self.handle.spawn_blocking(move || {
-                            let outcome = decode_cell(&key, &done.sections, extent);
+                            let outcome = cell_from_arrived(&key, &done.sections, extent);
                             let _ = tx.send(Internal::Event(FetchEvent::Completed {
                                 key,
                                 outcome,
@@ -1629,6 +2240,30 @@ mod native {
                 let now = Instant::now();
                 if now >= deadline {
                     return Vec::new();
+                }
+                let mut wait = deadline - now;
+                if let Some(t) = self.coordinator.next_wake() {
+                    let due = Duration::from_secs_f64((t - self.now()).max(0.0));
+                    wait = wait.min(due.max(Duration::from_millis(1)));
+                }
+                if let Ok(msg) = self.rx.recv_timeout(wait) {
+                    let actions = self.apply(msg);
+                    for a in actions {
+                        self.execute(a);
+                    }
+                }
+            }
+        }
+
+        /// Waits up to `timeout` until at least one event can be drained,
+        /// without taking it: the next [`Fetcher::drain`] gets it.
+        pub fn wait_for_events(&mut self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.pump();
+                let now = Instant::now();
+                if !self.out.is_empty() || now >= deadline {
+                    return;
                 }
                 let mut wait = deadline - now;
                 if let Some(t) = self.coordinator.next_wake() {
@@ -1705,8 +2340,31 @@ mod native {
         }
     }
 
+    /// Decodes a cell's section on a blocking task: the one validation it
+    /// gets (`rendering.md` 3.5). The registry key is passed through as
+    /// bytes; [`crate::protocol::frame_system_from_registries`] decodes it.
+    async fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        let ChunkKey::Cell(cell) = key else {
+            return Ok(Arrived::raw(bytes));
+        };
+        let raw = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            gx_core::matter::decode(&cell, &raw)
+                .map(|s| Arrived {
+                    bytes: raw.clone(),
+                    decoded: Some(Arc::new(s)),
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("decoding task: {e}"))?
+    }
+
     /// Gets a stored section: the local cache if it holds a valid copy,
-    /// else the edge, validating and caching what comes back.
+    /// else the edge, caching what comes back once it has decoded. Each
+    /// section is decoded, and so validated, once on its way in, off the
+    /// frame thread.
     async fn stream_section(
         client: &HubClient,
         cache: Option<Arc<DiskCache>>,
@@ -1714,47 +2372,40 @@ mod native {
         address: [u8; 32],
     ) -> StreamResult {
         let name = to_hex(&address);
-        let name_for_cache = name.clone();
-        let cached = match &cache {
-            Some(c) => {
-                let c = c.clone();
-                tokio::task::spawn_blocking(move || {
-                    let bytes = c.get(BlobKind::Section, &name_for_cache)?;
-                    if gx_core::validate(&key.to_string(), &bytes).is_ok() {
-                        Some(bytes)
-                    } else {
-                        c.remove(BlobKind::Section, &name_for_cache);
-                        None
-                    }
-                })
+        if let Some(c) = &cache {
+            let (c2, n2) = (c.clone(), name.clone());
+            let cached = tokio::task::spawn_blocking(move || c2.get(BlobKind::Section, &n2))
                 .await
                 .ok()
-                .flatten()
-            }
-            None => None,
-        };
-        if let Some(bytes) = cached {
-            return StreamResult::Bytes(Arc::from(bytes), Origin::Cache);
-        }
-        match client.get_blob(BlobKind::Section, &name).await {
-            Ok(Some(bytes)) => {
-                let checked = tokio::task::spawn_blocking(move || {
-                    gx_core::validate(&key.to_string(), &bytes)
-                        .map_err(|e| format!("section {name} from the edge is invalid: {e}"))?;
-                    if let Some(c) = &cache {
-                        if let Err(e) = c.put(BlobKind::Section, &name, &bytes) {
-                            tracing::warn!(name, "could not cache the section: {e}");
-                        }
+                .flatten();
+            if let Some(bytes) = cached {
+                match decode_arrived(key, bytes).await {
+                    Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
+                    Err(e) => {
+                        tracing::warn!(name, "dropping a damaged cached section: {e}");
+                        c.remove(BlobKind::Section, &name);
                     }
-                    Ok::<_, String>(bytes)
-                })
-                .await;
-                match checked {
-                    Ok(Ok(bytes)) => StreamResult::Bytes(Arc::from(bytes), Origin::Edge),
-                    Ok(Err(e)) => StreamResult::Failed(e),
-                    Err(e) => StreamResult::Failed(format!("validation task: {e}")),
                 }
             }
+        }
+        match client.get_blob(BlobKind::Section, &name).await {
+            Ok(Some(bytes)) => match decode_arrived(key, bytes).await {
+                Ok(a) => {
+                    if let Some(c) = cache {
+                        let (n2, b2) = (name.clone(), a.bytes.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = c.put(BlobKind::Section, &n2, &b2) {
+                                tracing::warn!(name = n2, "could not cache the section: {e}");
+                            }
+                        })
+                        .await;
+                    }
+                    StreamResult::Bytes(a, Origin::Edge)
+                }
+                Err(e) => {
+                    StreamResult::Failed(format!("section {name} from the edge is invalid: {e}"))
+                }
+            },
             Ok(None) => StreamResult::NotFound,
             Err(e) => StreamResult::Failed(format!("{e:#}")),
         }
@@ -1797,6 +2448,7 @@ mod tests {
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(0.0),
                     radiating_temperature: Kelvin::new(1.0),
+                    occupancy: Ratio::new(1.0),
                 },
             ),
         )
@@ -1808,8 +2460,8 @@ mod tests {
     fn requests_are_capped_and_prioritized() {
         let mut c = CellCache::new();
         let n = MAX_IN_FLIGHT as u32 + 8;
-        let keys: Vec<CellKey> = (0..n).map(|i| key(10, i, 0, 0)).collect();
-        c.set_selection(sel(&keys), 0.0);
+        let keys: Vec<CellKey> = (0..n).map(|i| key(12, i, 0, 0)).collect();
+        c.set_cells(sel(&keys));
         let first = c.take_requests(0.0);
         assert_eq!(first.len(), MAX_IN_FLIGHT);
         // Largest projected size first: the last keys had the largest.
@@ -1826,11 +2478,11 @@ mod tests {
         let parent = key(3, 1, 1, 1);
         let child = key(4, 2, 2, 2);
         let other = key(3, 5, 5, 5);
-        c.set_selection(sel(&[parent, other]), 0.0);
+        c.set_cells(sel(&[parent, other]));
         c.complete(parent, ready(), 0.0);
         c.complete(other, ready(), 0.0);
         // The parent is refined: its child is selected instead.
-        c.set_selection(sel(&[child]), 1.0);
+        c.set_cells(sel(&[child]));
         let gone = c.evict(1000.0);
         assert!(!gone.contains(&parent), "the parent was evicted");
         assert!(gone.contains(&other));
@@ -1841,7 +2493,7 @@ mod tests {
     fn invalid_cells_are_gone_and_not_asked_again() {
         let mut c = CellCache::new();
         let (a, b) = (key(1, 0, 0, 0), key(1, 1, 0, 0));
-        c.set_selection(sel(&[a, b]), 0.0);
+        c.set_cells(sel(&[a, b]));
         assert_eq!(c.take_requests(0.0).len(), 2);
         c.complete(a, FetchOutcome::Invalid("x".into()), 0.0);
         c.complete(b, FetchOutcome::Decoded(None), 0.0);
@@ -1912,10 +2564,10 @@ mod tests {
     fn eviction_by_age_and_cap() {
         let mut c = CellCache::new();
         let a = key(1, 0, 0, 0);
-        c.set_selection(sel(&[a]), 0.0);
+        c.set_cells(sel(&[a]));
         c.take_requests(0.0);
         c.complete(a, ready(), 0.0);
-        c.set_selection(Vec::new(), 1.0);
+        c.set_cells(Vec::new());
         assert!(c.evict(59.0).is_empty());
         assert_eq!(c.evict(60.0), vec![a]);
 
@@ -1938,10 +2590,10 @@ mod tests {
         assert!(c.pin(k, 0.0));
         assert!(!c.pin(k, 0.0));
         // Not selected, still requested.
-        c.set_selection(Vec::new(), 0.0);
+        c.set_cells(Vec::new());
         assert_eq!(c.take_requests(0.0), vec![k]);
         c.complete(k, ready(), 0.1);
-        c.set_selection(Vec::new(), 0.2);
+        c.set_cells(Vec::new());
         assert!(c.evict(1000.0).is_empty());
         assert!(matches!(c.state(&k), Some(CellState::Ready(_))));
         assert_eq!(c.pinned().copied().collect::<Vec<_>>(), vec![k]);
@@ -1953,7 +2605,7 @@ mod tests {
         let parent = key(1, 0, 0, 0);
         let mut kids = parent.children().unwrap();
         kids.sort();
-        c.set_selection(sel(&kids), 0.0);
+        c.set_cells(sel(&kids));
         // Only the parent is drawable: it stands in for all children.
         let mut drawable: BTreeSet<CellKey> = [parent].into();
         let d = |c: &CellCache, s: &BTreeSet<CellKey>| c.draw_set(|k| s.contains(k));
@@ -1967,7 +2619,7 @@ mod tests {
 
         // Moving away: the parent is selected but not ready, its children
         // cover it.
-        c.set_selection(sel(&[parent]), 1.0);
+        c.set_cells(sel(&[parent]));
         drawable.remove(&parent);
         assert_eq!(d(&c, &drawable), kids.to_vec());
         // Nothing drawable anywhere: nothing drawn.
@@ -1991,7 +2643,7 @@ mod tests {
         assert_eq!(face_neighbor_keys(&key(0, 0, 0, 0)), [None; 6]);
 
         let mut c = CellCache::new();
-        c.set_selection(sel(&[k, key(2, 1, 1, 3), key(2, 0, 0, 3)]), 0.0);
+        c.set_cells(sel(&[k, key(2, 1, 1, 3), key(2, 0, 0, 3)]));
         c.complete(key(2, 1, 1, 3), ready(), 0.0);
         c.complete(key(2, 0, 0, 3), FetchOutcome::Decoded(None), 0.0);
         // A Ready cell one depth down touching the +y face is not a neighbor.
@@ -2040,5 +2692,208 @@ mod tests {
         if let FetchOutcome::Decoded(Some(full)) = ready() {
             assert!(full.has_matter);
         }
+    }
+
+    /// A solid cell `key` of a 1 m root at resolution 4 with `occupancy`
+    /// per sample `(x, y, z)`, vacuum where it is 0.
+    fn solid_cell(key: CellKey, occupancy: impl Fn(u32, u32, u32) -> f64) -> ReadyCell {
+        use gx_core::matter::{Sample, Samples};
+        use gx_core::units::{Attenuation, Density, Kelvin, Ratio};
+        let g = key.geometry(Meters::new(1.0));
+        let samples = Samples::from_fn(4, |x, y, z| {
+            let o = occupancy(x, y, z);
+            if o <= 0.0 {
+                Sample::VACUUM
+            } else {
+                Sample {
+                    density: Density::new(1000.0 * o),
+                    state: State::Solid,
+                    temperature: Kelvin::new(300.0),
+                    albedo: [Ratio::new(0.5); 3],
+                    roughness: Ratio::new(0.5),
+                    attenuation: Attenuation::new(0.0),
+                    radiating_temperature: Kelvin::new(300.0),
+                    occupancy: Ratio::new(o),
+                }
+            }
+        });
+        ReadyCell::new(Section::new(key, g.origin, g.edge, 4, samples).unwrap())
+    }
+
+    #[test]
+    fn refinable_and_asking_ahead_follow_occupancy() {
+        let k = key(0, 0, 0, 0);
+        // Full everywhere: no surface, nothing below is refinable.
+        let full = solid_cell(k, |_, _, _| 1.0);
+        assert!(!full.refinable);
+        assert_eq!(full.ahead, AheadBits::none());
+
+        // A boundary at x = 2.5 samples: matter below, vacuum above.
+        let half = solid_cell(k, |x, _, _| match x {
+            0 | 1 => 1.0,
+            2 => 0.5,
+            _ => 0.0,
+        });
+        assert!(half.refinable);
+        let child = |x, y, z| CellKey::new(5, 1, x, y, z).unwrap();
+        // The children on either side of x = 0.5 of the cell hold the
+        // crossing within one sample; the predictions are by region, the
+        // same for every y and z.
+        for (y, z) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert!(half.ahead.predicts(&k, &child(0, y, z)));
+            assert!(half.ahead.predicts(&k, &child(1, y, z)));
+        }
+        // Three depths down: the descendants in the first sample are more
+        // than one sample from the crossing.
+        let deep = |x| CellKey::new(5, 3, x, 0, 0).unwrap();
+        assert!(!half.ahead.predicts(&k, &deep(0)));
+        assert!(half.ahead.predicts(&k, &deep(4)));
+        assert!(!half.ahead.predicts(&k, &key(4, 0, 0, 0)));
+
+        // Full but for a partly filled sample on the +x face: the boundary
+        // lies in that sample's sub-cube, maybe past its center, so the
+        // cell and the descendants at that face count as crossing, and
+        // those away from it do not.
+        let face = solid_cell(k, |x, y, z| if (x, y, z) == (3, 1, 1) { 0.7 } else { 1.0 });
+        assert!(face.refinable);
+        assert!(face.ahead.predicts(&k, &deep(7)));
+        assert!(!face.ahead.predicts(&k, &deep(0)));
+        // The same partly filled sample inside the cell holds no crossing.
+        let inside = solid_cell(k, |x, y, z| if (x, y, z) == (2, 1, 1) { 0.7 } else { 1.0 });
+        assert!(!inside.refinable);
+    }
+
+    #[test]
+    fn around_parents_are_the_parents_of_the_cells_around() {
+        for k in [
+            key(3, 0, 0, 0),
+            key(3, 5, 2, 7),
+            key(3, 4, 3, 3),
+            key(1, 1, 0, 1),
+        ] {
+            let mut brute: Vec<CellKey> = AROUND
+                .iter()
+                .filter_map(|&o| offset_key(&k, o)?.parent())
+                .filter(|p| Some(*p) != k.parent())
+                .collect();
+            brute.sort();
+            brute.dedup();
+            let mut fast: Vec<CellKey> = around_parents(&k).into_iter().flatten().collect();
+            fast.sort();
+            assert_eq!(fast, brute, "{k}");
+        }
+        assert_eq!(around_parents(&key(0, 0, 0, 0)), [None; 7]);
+    }
+
+    /// Every split cell has the 26 cells around it split above too, or
+    /// outside the tree: no two leaves that touch differ by more than one
+    /// depth.
+    fn assert_balanced(tree: &CellTree) {
+        for n in &tree.internal {
+            for o in AROUND {
+                let Some(p) = offset_key(n, o).and_then(|a| a.parent()) else {
+                    continue;
+                };
+                assert!(
+                    tree.internal.contains(&p)
+                        || !tree.contains(&p) && {
+                            // Not in the tree at all: no ancestor is a leaf.
+                            let mut up = p.parent();
+                            let mut leaf = false;
+                            while let Some(a) = up {
+                                leaf |= tree.leaves.contains(&a);
+                                up = a.parent();
+                            }
+                            !leaf
+                        },
+                    "{n} is split next to the leaf holding {p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_splits_only_what_the_rule_needs() {
+        // Two chains of splits toward two points, each to depth 7: as
+        // unbalanced as a tree can be.
+        let mut leaves: CellSet = CellSet::default();
+        let mut cells = vec![key(0, 0, 0, 0)];
+        for target in [[5u32, 100, 77], [126, 3, 64]] {
+            let mut n = key(0, 0, 0, 0);
+            for d in 1..=7u8 {
+                let shift = 7 - d;
+                for c in n.children().unwrap() {
+                    cells.push(c);
+                }
+                n = key(
+                    d,
+                    target[0] >> shift,
+                    target[1] >> shift,
+                    target[2] >> shift,
+                );
+            }
+        }
+        let tree0 = CellTree::from_leaves(cells.iter().copied());
+        for k in &cells {
+            if !tree0.internal.contains(k) {
+                leaves.insert(*k);
+            }
+        }
+        let mut tree = CellTree::from_leaves(leaves.iter().copied());
+        let before = tree.leaves.len();
+        balance_target(&mut tree);
+        assert_balanced(&tree);
+        assert!(tree.leaves.len() > before);
+        // Balancing again changes nothing.
+        let again = tree.clone();
+        balance_target(&mut tree);
+        assert_eq!(tree.leaves, again.leaves);
+        // Every leaf of the balanced tree lies in a leaf of the original or
+        // is one of its leaves: balancing only splits.
+        for l in &tree.leaves {
+            let mut up = Some(*l);
+            let mut found = false;
+            while let Some(a) = up {
+                found |= leaves.contains(&a);
+                up = a.parent();
+            }
+            assert!(found, "{l}");
+        }
+    }
+
+    #[test]
+    fn an_ancestor_stand_in_hides_the_cells_below_it() {
+        let mut c = CellCache::new();
+        let parent = key(1, 0, 0, 0);
+        let mut kids = parent.children().unwrap();
+        kids.sort();
+        // One child is split further: its children are selected too.
+        let mut grand = kids[0].children().unwrap();
+        grand.sort();
+        let lone = grand[0];
+        let mut selected: Vec<CellKey> = kids[1..].to_vec();
+        selected.extend(grand);
+        selected.sort();
+        c.set_cells(sel(&selected));
+        let d = |c: &CellCache, s: &BTreeSet<CellKey>| c.draw_set(|k| s.contains(k));
+        // Everything but one grandchild drawable, and the parent: the
+        // grandchild's nearest drawable ancestor is the parent, which
+        // hides every selected cell.
+        let mut drawable: BTreeSet<CellKey> =
+            selected.iter().copied().filter(|k| *k != lone).collect();
+        drawable.insert(parent);
+        assert_eq!(d(&c, &drawable), vec![parent]);
+        // With the split child drawable too, it stands in for its own
+        // children alone.
+        drawable.insert(kids[0]);
+        assert_eq!(d(&c, &drawable), kids.to_vec());
+        // A grandchild that is not drawable but whose children all are is
+        // covered by them.
+        drawable.remove(&kids[0]);
+        drawable.extend(lone.children().unwrap());
+        let drawn = d(&c, &drawable);
+        assert!(!drawn.contains(&parent));
+        assert!(!drawn.contains(&lone));
+        assert_eq!(drawn.len(), selected.len() - 1 + 8);
     }
 }

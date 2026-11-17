@@ -60,6 +60,7 @@ fn plasma_cell() -> Section {
         roughness: Ratio::new(0.0),
         attenuation: Attenuation::new(ATTENUATION),
         radiating_temperature: Kelvin::new(6000.0),
+        occupancy: Ratio::new(1.0),
     };
     Section::new(key, g.origin, g.edge, 8, Samples::filled(8, sample)).unwrap()
 }
@@ -175,6 +176,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
                         roughness: Ratio::new(1.0),
                         attenuation: Attenuation::new(0.0),
                         radiating_temperature: Kelvin::new(3.0),
+                        occupancy: Ratio::new(1.0),
                     },
                 );
             }

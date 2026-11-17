@@ -20,7 +20,7 @@ use super::hub::WebHub;
 use gx_core::module_io::{self, Tile};
 use gx_core::sha256::to_hex;
 use gx_worker::job::{check_blob, check_section, check_tile, decode_manifest, resolve_tiles};
-use gx_worker::{BlobKind, ComputeJob, WorkerError, WorkerStats};
+use gx_worker::{BlobKind, ComputeJob, Computed, WorkerError, WorkerStats};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
@@ -283,14 +283,15 @@ pub async fn get_blob(
 
 /// Runs one job to a validated section: the address check, the module by
 /// hash, `gx_sources`, the manifest and tiles by hash, `gx_compile`, and
-/// the validator. Does not upload.
+/// the validator, which for a cell decodes the section once and hands it
+/// over decoded. Does not upload.
 pub async fn run_job(
     job: &ComputeJob,
     hub: &WebHub,
     cache: Option<&WebCache>,
     worker: &ModuleWorker,
     stats: &WorkerStats,
-) -> Result<Vec<u8>, WorkerError> {
+) -> Result<Computed, WorkerError> {
     job.check_address()?;
     if !worker.has(&job.module) {
         let wasm = get_blob(hub, cache, BlobKind::Module, &job.module).await?;
@@ -322,7 +323,10 @@ pub async fn run_job(
     let tiles = module_io::encode_tiles(&tile_list)
         .map_err(|e| WorkerError::permanent(format!("encoding the tiles: {e}")))?;
     stats.module_run();
-    let section = worker.compile(&job.module, &request, &tiles).await?;
-    check_section(&job.request.key, &section)?;
-    Ok(section)
+    let bytes = worker.compile(&job.module, &request, &tiles).await?;
+    let section = check_section(&job.request.key, &bytes)?;
+    Ok(Computed {
+        bytes: std::sync::Arc::from(bytes),
+        section: section.map(std::sync::Arc::new),
+    })
 }

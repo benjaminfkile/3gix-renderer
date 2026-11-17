@@ -11,9 +11,11 @@
 use gx_core::address::section_address;
 use gx_core::key::ChunkKey;
 use gx_core::manifest::{self, Manifest};
+use gx_core::matter::Section;
 use gx_core::module_io::ModuleRequest;
 use gx_core::sha256::{sha256, to_hex};
 use std::fmt;
+use std::sync::Arc;
 
 /// The kinds of content-addressed bytes the client reads and caches
 /// (`client-compute.md` sections 2.3 and 6).
@@ -255,11 +257,33 @@ pub fn check_tile(tile: &TileRef, bytes: &[u8]) -> Result<(), WorkerError> {
     check_blob(BlobKind::Source, &tile.sha256, bytes)
 }
 
-/// Validates a section with the library validator under its chunk key
-/// (`space-model.md` section 4 item 2: the worker validates before upload).
-pub fn check_section(key: &ChunkKey, bytes: &[u8]) -> Result<(), WorkerError> {
-    gx_core::validate(&key.to_string(), bytes)
-        .map_err(|e| WorkerError::permanent(format!("section {key} fails validation: {e}")))
+/// A section the worker computed: its bytes, as uploaded, and for a cell
+/// key the section decoded from them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Computed {
+    /// The section bytes the module returned.
+    pub bytes: Arc<[u8]>,
+    /// The decoded section for a cell key, `None` for the registry key.
+    /// Decoding is the validation, so the renderer takes this instead of
+    /// decoding the bytes a second time (`rendering.md` section 3.5).
+    pub section: Option<Arc<Section>>,
+}
+
+/// Validates a section under its chunk key (`space-model.md` section 4
+/// item 2: the worker validates before upload). For a cell key this is the
+/// library decoder, which runs every validation rule and returns the
+/// decoded section, so the bytes are validated once; for the registry key
+/// it is the library validator and the result is `None`.
+pub fn check_section(key: &ChunkKey, bytes: &[u8]) -> Result<Option<Section>, WorkerError> {
+    let fail = |e: gx_core::error::ValidationError| {
+        WorkerError::permanent(format!("section {key} fails validation: {e}"))
+    };
+    match key {
+        ChunkKey::Cell(cell) => gx_core::matter::decode(cell, bytes).map(Some).map_err(fail),
+        ChunkKey::Registry => gx_core::validate(&key.to_string(), bytes)
+            .map(|()| None)
+            .map_err(fail),
+    }
 }
 
 #[cfg(test)]

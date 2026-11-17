@@ -11,16 +11,23 @@
 //! 3. solve the light time of every frame for the camera's position
 //!    ([`Seen`], `space-model.md` section 6.4); everything after this
 //!    reads the retarded states,
-//! 4. stream matter: select cells (every 100 ms), start requests, apply
-//!    what the fetcher brought in (streamed from the edge or the local
-//!    cache, or computed here by the worker), collect extracted meshes, and
-//!    evict ([`crate::world`], [`crate::stream`], [`crate::directions`]),
+//! 4. one step of matter ([`matter_step`], `rendering.md` section 4):
+//!    apply what the fetcher brought in (streamed from the edge or the
+//!    local cache, or computed here by the worker, decoded off the frame
+//!    thread), select cells when something changed, start requests, gather
+//!    extraction inputs within the step's time slice, evict, and build the
+//!    draw list ([`crate::world`], [`crate::stream`], [`crate::directions`]);
+//!    the step's duration is recorded for the statistics and the overlay,
 //! 5. build the camera-relative scene with the drawn cells and their lights
 //!    and draw it with the overlay ([`crate::render`]).
+//!
+//! The window, the headless run, and the budget test run the same
+//! [`matter_step`].
 //!
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
 use crate::camera::Camera;
+use crate::clock::now_seconds;
 use crate::config::{Config, Start, View};
 use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
@@ -32,11 +39,12 @@ use crate::render::gpu::{
 use crate::render::headless::{Headless, Image};
 use crate::render::overlay::{MatterStats, OverlayInfo};
 pub use crate::render::scene::matter_scene;
+use crate::render::scene::scene_with;
 use crate::render::scene::Scene;
 use crate::seen::Seen;
 use crate::sim::{SimClock, Simulation};
 use crate::stream::{FetchEvent, Fetcher};
-use crate::world::World;
+use crate::world::{DrawList, World};
 use anyhow::{anyhow, Context, Result};
 use gx_core::frames::FrameSystem;
 use gx_core::units::Seconds;
@@ -56,29 +64,37 @@ pub const MAX_FRAME_SECONDS: f64 = 0.25;
 /// renders whatever has arrived.
 pub const HEADLESS_STREAM_SECONDS: f64 = 60.0;
 
-/// Starts requests for the cells the world wants and applies every fetch
-/// event that has arrived.
-pub fn stream_step(
+/// Longest a headless run waits for the fetcher between two steps.
+pub const HEADLESS_STEP_WAIT: Duration = Duration::from_millis(4);
+
+/// One step of the frame thread's matter work (`rendering.md` section 4):
+/// takes what the fetcher has brought in, runs [`World::step`] for the view
+/// `seen` of `view_px` pixels at session time `now` (seconds), hands the
+/// requests to the fetcher, and records how long all of it took on this
+/// thread ([`World::record_step`]). Returns the draw list.
+pub fn matter_step(
     world: &mut World,
     fetcher: &mut Fetcher,
-    system: &FrameSystem,
-    events: Vec<FetchEvent>,
+    seen: &Seen,
+    view_px: (u32, u32),
     now: f64,
-) {
-    for event in events {
-        match event {
-            FetchEvent::Completed { key, outcome, .. } => world.complete(key, outcome, now),
-            // Loaded once at startup, before the integrator.
-            FetchEvent::Registry(_) => {}
-        }
-    }
-    for key in world.take_requests(now) {
+) -> DrawList {
+    let started = now_seconds();
+    let results = fetcher.drain().into_iter().filter_map(|e| match e {
+        FetchEvent::Completed { key, outcome, .. } => Some((key, outcome)),
+        // Loaded once at startup, before the integrator.
+        FetchEvent::Registry(_) => None,
+    });
+    let (requests, draw) = world.step(seen, view_px, now, results, started);
+    let system = seen.system();
+    for key in requests {
         if let Some(frame) = system.tree().get(key.frame_id) {
             fetcher.request(key, frame.root_extent);
         }
     }
     fetcher.flush();
-    world.pump();
+    world.record_step((now_seconds() - started) * 1e3);
+    draw
 }
 
 /// The matter values for the overlay.
@@ -93,6 +109,9 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         volumes_drawn: scene.volumes.len(),
         sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),
+        frame_step_p95_ms: world
+            .step_times()
+            .recent_percentile(crate::clock::OVERLAY_STEPS, 95.0),
         ..MatterStats::from_stats(fetcher.map(Fetcher::stats).unwrap_or_default())
     }
 }
@@ -256,6 +275,20 @@ pub struct HeadlessStats {
     pub ready: bool,
     /// Wall-clock seconds spent streaming before drawing.
     pub stream_seconds: f64,
+    /// Wall-clock seconds until every selected cell was drawn at its
+    /// selected depth ([`World::ready`]), or `None` if that never happened
+    /// within the wait.
+    pub settle_seconds: Option<f64>,
+    /// Frame-thread matter work per step over the run, milliseconds: the
+    /// 50th and 95th percentiles and the maximum ([`matter_step`]).
+    pub frame_step_ms: (Option<f64>, Option<f64>, Option<f64>),
+    /// Steps measured.
+    pub frame_steps: u64,
+    /// Selections made during the run ([`World::selection_rounds`]).
+    pub selection_rounds: u64,
+    /// Cells requested before their parent had arrived
+    /// ([`crate::stream::CellCache::requested_ahead`]).
+    pub cells_requested_ahead: u64,
     /// The far field sprites drawn, in ascending frame id order.
     pub sprites: Vec<SpriteStats>,
 }
@@ -349,8 +382,19 @@ impl HeadlessStats {
             "crosshair_frame": o.crosshair.map(|(f, _)| f),
             "crosshair_light_time_seconds": o.crosshair.map(|(_, t)| t),
         });
-        if let (Some(all), serde_json::Value::Object(more)) = (out.as_object_mut(), time) {
-            all.extend(more);
+        let budget = serde_json::json!({
+            "settle_seconds": self.settle_seconds,
+            "frame_step_ms_p50": self.frame_step_ms.0,
+            "frame_step_ms_p95": self.frame_step_ms.1,
+            "frame_step_ms_max": self.frame_step_ms.2,
+            "frame_steps": self.frame_steps,
+            "selection_rounds": self.selection_rounds,
+            "cells_requested_ahead": self.cells_requested_ahead,
+        });
+        for more in [time, budget] {
+            if let (Some(all), serde_json::Value::Object(more)) = (out.as_object_mut(), more) {
+                all.extend(more);
+            }
         }
         out
     }
@@ -416,59 +460,54 @@ pub fn render_headless_view(
     let mut controls = Controls::new(None);
     let mut world = World::new(default_threads());
     let start = Instant::now();
-    {
-        let seen = sim.seen(&camera);
-        world.select(seen.system(), seen.camera(), (width, height), 0.0, true);
-    }
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
     let done = |world: &World| match run.wait_ready_seconds {
         Some(_) => world.ready(),
         None => world.settled(),
     };
-    if let Some(f) = fetcher.as_deref_mut() {
-        set_fetch_time(f, sim);
-        loop {
-            let now = start.elapsed().as_secs_f64();
-            let events = f.wait(Duration::from_millis(50));
-            {
-                let near = world.matter_distances(sim.system(), &camera);
-                let seen = sim.seen_near(&camera, &near);
-                stream_step(&mut world, f, seen.system(), events, now);
+    let mut settle_seconds = None;
+    match fetcher.as_deref_mut() {
+        Some(f) => {
+            set_fetch_time(f, sim);
+            // The same step as the window's, as fast as results come in:
+            // waiting for the fetcher between steps, never longer than
+            // `HEADLESS_STEP_WAIT`, so extraction is picked up as it ends.
+            loop {
+                let now = start.elapsed().as_secs_f64();
+                {
+                    let near = world.matter_distances(sim.system(), &camera);
+                    let seen = sim.seen_near(&camera, &near);
+                    matter_step(&mut world, f, &seen, (width, height), now);
+                }
+                let placed = (camera.frame_id, camera.position);
+                spawner.frame(
+                    sim.system(),
+                    &world,
+                    &mut camera,
+                    &mut controls,
+                    &crate::camera::FlightInput::default(),
+                    now,
+                );
+                let moved = placed != (camera.frame_id, camera.position);
+                if moved {
+                    sim.prepare_light(&camera);
+                }
+                if !moved && spawner.pending.is_none() && done(&world) {
+                    if world.ready() {
+                        settle_seconds = Some(start.elapsed().as_secs_f64());
+                    }
+                    break;
+                }
+                if now > limit {
+                    tracing::warn!(seconds = limit, "not every cell arrived in time");
+                    break;
+                }
+                f.wait_for_events(HEADLESS_STEP_WAIT);
             }
-            let placed = (camera.frame_id, camera.position);
-            spawner.frame(
-                sim.system(),
-                &world,
-                &mut camera,
-                &mut controls,
-                &crate::camera::FlightInput::default(),
-                now,
-            );
-            let moved = placed != (camera.frame_id, camera.position);
-            if moved {
-                sim.prepare_light(&camera);
-            }
-            // The selection deepens toward surfaces as cells arrive
-            // (`stream` module docs): select again, and finish only once
-            // that changes nothing and the camera has stopped moving.
-            let near = world.matter_distances(sim.system(), &camera);
-            let seen = sim.seen_near(&camera, &near);
-            let before: Vec<gx_core::key::CellKey> =
-                world.cache().selection().iter().map(|c| c.key).collect();
-            world.select(seen.system(), seen.camera(), (width, height), now, true);
-            let same = world
-                .cache()
-                .selection()
-                .iter()
-                .map(|c| c.key)
-                .eq(before.iter().copied());
-            if same && !moved && spawner.pending.is_none() && done(&world) {
-                break;
-            }
-            if now > limit {
-                tracing::warn!(seconds = limit, "not every cell arrived in time");
-                break;
-            }
+        }
+        None => {
+            let seen = sim.seen(&camera);
+            world.select(seen.system(), seen.camera(), (width, height), 0.0, true);
         }
     }
     let near = world.matter_distances(sim.system(), &camera);
@@ -508,6 +547,15 @@ pub fn render_headless_view(
             cells_pinned: world.counts().cache.pinned,
             ready: world.ready(),
             stream_seconds,
+            settle_seconds,
+            frame_step_ms: (
+                world.step_times().percentile(50.0),
+                world.step_times().percentile(95.0),
+                world.step_times().max(),
+            ),
+            frame_steps: world.step_times().count(),
+            selection_rounds: world.selection_rounds(),
+            cells_requested_ahead: world.cache().requested_ahead(),
             sprites: sprite_stats(&scene, width, height),
         },
     })
@@ -756,13 +804,9 @@ impl App {
         self.sim.prepare_light(&self.camera);
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
-        self.world
-            .select(seen.system(), seen.camera(), size, t, false);
         set_fetch_time(&mut self.fetcher, &self.sim);
-        let events = self.fetcher.drain();
-        stream_step(&mut self.world, &mut self.fetcher, seen.system(), events, t);
-        self.world.evict(t);
-        let mut scene = matter_scene(&mut self.world, &seen, size, t);
+        let draw = matter_step(&mut self.world, &mut self.fetcher, &seen, size, t);
+        let mut scene = scene_with(&draw, &seen, size);
         scene.mesh_mode = self.controls.mesh_mode;
         if self.controls.hide_guides {
             scene.markers.clear();

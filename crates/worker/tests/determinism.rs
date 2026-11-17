@@ -176,7 +176,7 @@ fn pool_runs_jobs_end_to_end_and_caches_everything() {
         }
         for _ in 0..jobs.len() {
             let (r, sha) = rx.recv_timeout(Duration::from_secs(120)).unwrap();
-            assert_eq!(to_hex(&sha256(&r.unwrap())), sha);
+            assert_eq!(to_hex(&sha256(&r.unwrap().bytes)), sha);
         }
         // Dropping the pool joins its threads, so every upload has started.
         let stats = pool.stats_handle();

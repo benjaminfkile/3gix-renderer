@@ -78,6 +78,7 @@ fn hot() -> Sample {
         roughness: Ratio::new(1.0),
         attenuation: Attenuation::new(1.0),
         radiating_temperature: Kelvin::new(6000.0),
+        occupancy: Ratio::new(1.0),
     }
 }
 
@@ -90,6 +91,7 @@ fn cold() -> Sample {
         roughness: Ratio::new(0.8),
         attenuation: Attenuation::new(0.0),
         radiating_temperature: Kelvin::new(300.0),
+        occupancy: Ratio::new(1.0),
     }
 }
 

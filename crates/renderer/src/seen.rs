@@ -17,9 +17,10 @@
 //! The light of a frame travels from its matter nearest the camera when the
 //! draw loop knows that distance ([`Seen::retarded_near`], from the drawn
 //! meshes' boxes, [`crate::world::World::matter_distances`]), and from its
-//! origin otherwise. From the center of a body the size of Earth the light
-//! takes 0.02 s, in which the body moves hundreds of meters; a camera at
-//! its surface would see the ground drawn that far from where it is.
+//! origin otherwise. From a frame origin 6,400 km away the light takes
+//! 0.02 s, in which a frame moving at tens of kilometers per second moves
+//! hundreds of meters; a camera next to that frame's matter would see the
+//! matter drawn that far from where it is.
 //!
 //! The observer is the camera's position in root coordinates at the
 //! simulation time. Only its position enters, so the solution holds at any
@@ -118,11 +119,11 @@ impl<'a> Seen<'a> {
     /// [`Seen::retarded`], with the light of each frame in `near` measured
     /// over that distance instead of the distance to its origin: `near`
     /// maps a frame id to the distance, meters, from the camera to the
-    /// frame's matter nearest it. A camera close to a
-    /// large body sees its near surface with the light time of that
-    /// surface, not of the body's center (6400 km away on Earth, 0.02 s, in
-    /// which the body moves hundreds of meters). An error `e` in a distance
-    /// moves the drawn body by about `e v / c`.
+    /// frame's matter nearest it. A camera close to a frame's matter sees
+    /// that matter with its own light time, not with the light time of the
+    /// frame's origin (6,400 km away takes 0.02 s, in which a frame at tens
+    /// of kilometers per second moves hundreds of meters). An error `e` in
+    /// a distance moves the drawn frame by about `e v / c`.
     pub fn retarded_near(
         history: &'a History,
         system: &FrameSystem,

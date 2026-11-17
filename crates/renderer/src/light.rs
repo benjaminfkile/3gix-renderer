@@ -288,6 +288,7 @@ mod tests {
             // Optically thick: 2e6 across one sample.
             attenuation: Attenuation::new(1.0e9),
             radiating_temperature: Kelvin::new(t),
+            occupancy: Ratio::new(1.0),
         }
     }
 

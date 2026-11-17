@@ -30,7 +30,8 @@
 
 use crate::protocol::{Direction, DirectionsResponse, MAX_DIRECTION_KEYS};
 use gx_core::key::ChunkKey;
-use gx_worker::{ComputeJob, FailureKind, WorkerError};
+use gx_core::matter::Section;
+use gx_worker::{ComputeJob, Computed, FailureKind, WorkerError};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -60,11 +61,55 @@ pub enum Origin {
     Computed,
 }
 
+/// One layer's section as it arrived: its bytes, and for a cell key the
+/// section decoded from them. Decoding is the validation
+/// (`rendering.md` section 3.5): the stream or the worker that brought the
+/// section in decoded it once, off the frame thread, and compositing takes
+/// the decoded section instead of decoding again. `decoded` is `None` for
+/// the registry key, which [`crate::protocol::frame_system_from_registries`]
+/// decodes, and for bytes nobody has decoded yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arrived {
+    /// The section bytes.
+    pub bytes: Arc<[u8]>,
+    /// The decoded section, if the bytes were decoded on the way in.
+    pub decoded: Option<Arc<Section>>,
+}
+
+impl Arrived {
+    /// Bytes nobody has decoded yet.
+    pub fn raw(bytes: Arc<[u8]>) -> Arrived {
+        Arrived {
+            bytes,
+            decoded: None,
+        }
+    }
+
+    /// Byte length of the section.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns `true` for zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl From<Computed> for Arrived {
+    fn from(c: Computed) -> Arrived {
+        Arrived {
+            bytes: c.bytes,
+            decoded: c.section,
+        }
+    }
+}
+
 /// The outcome of a stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StreamResult {
-    /// The bytes, from the edge or the local cache.
-    Bytes(Arc<[u8]>, Origin),
+    /// The section, from the edge or the local cache.
+    Bytes(Arrived, Origin),
     /// `404`: the address is not stored (any more).
     NotFound,
     /// A network or transport failure.
@@ -77,7 +122,7 @@ pub struct Completion {
     /// The key.
     pub key: ChunkKey,
     /// The non-empty layers' sections, in the build's layer order.
-    pub sections: Vec<Arc<[u8]>>,
+    pub sections: Vec<Arrived>,
     /// Session time, seconds, the key was requested.
     pub requested_at: f64,
 }
@@ -132,7 +177,7 @@ enum Slot {
         address: [u8; 32],
         retry_at: f64,
     },
-    Done(Arc<[u8]>),
+    Done(Arrived),
 }
 
 impl Slot {
@@ -503,7 +548,7 @@ impl Coordinator {
         key: &ChunkKey,
         layer: usize,
         address: [u8; 32],
-        result: Result<Arc<[u8]>, WorkerError>,
+        result: Result<Computed, WorkerError>,
         now: f64,
     ) -> Vec<Action> {
         let mut out = Vec::new();
@@ -517,8 +562,8 @@ impl Coordinator {
             return out;
         }
         match result {
-            Ok(bytes) => {
-                *slot = Slot::Done(bytes);
+            Ok(computed) => {
+                *slot = Slot::Done(computed.into());
                 self.stats.sections_computed += 1;
                 self.finish_if_done(key, &mut out);
             }
@@ -668,8 +713,15 @@ mod tests {
         })
     }
 
-    fn bytes(b: u8) -> Arc<[u8]> {
-        Arc::from(vec![b; 4])
+    fn bytes(b: u8) -> Arrived {
+        Arrived::raw(Arc::from(vec![b; 4]))
+    }
+
+    fn computed(b: u8) -> Computed {
+        Computed {
+            bytes: Arc::from(vec![b; 4]),
+            section: None,
+        }
     }
 
     #[test]
@@ -749,7 +801,7 @@ mod tests {
             0.2,
         );
         assert!(none.is_empty());
-        let done = c.compute_done(&k, 0, [1; 32], Ok(bytes(1)), 0.3);
+        let done = c.compute_done(&k, 0, [1; 32], Ok(computed(1)), 0.3);
         assert_eq!(
             done,
             vec![Action::Complete(Completion {

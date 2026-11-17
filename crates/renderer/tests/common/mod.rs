@@ -129,6 +129,7 @@ fn blob(key: CellKey, extent: f64, res: u8, radius: f64, matter: Sample) -> Sect
         let fraction = f64::from(inside) / f64::from(SUBSAMPLES.pow(3));
         Sample {
             density: Density::new(matter.density.value() * fraction),
+            occupancy: Ratio::new(fraction),
             ..matter
         }
     });
@@ -156,6 +157,7 @@ pub fn hot_section() -> Section {
             roughness: Ratio::new(1.0),
             attenuation: Attenuation::new(HOT_ATTENUATION),
             radiating_temperature: Kelvin::new(HOT_TEMPERATURE),
+            occupancy: Ratio::new(1.0),
         },
     )
 }
@@ -175,6 +177,7 @@ pub fn solid_section() -> Section {
             roughness: Ratio::new(0.8),
             attenuation: Attenuation::new(0.0),
             radiating_temperature: Kelvin::new(SOLID_TEMPERATURE),
+            occupancy: Ratio::new(1.0),
         },
     )
 }
@@ -266,6 +269,7 @@ pub fn gas_section() -> Section {
             roughness: Ratio::new(0.0),
             attenuation: Attenuation::new(10.0),
             radiating_temperature: Kelvin::new(GAS_TEMPERATURE),
+            occupancy: Ratio::new(1.0),
         },
     )
 }

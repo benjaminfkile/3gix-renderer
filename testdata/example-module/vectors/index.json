@@ -7,63 +7,63 @@
     },
     "02-root-cell": {
       "key": "0-0-0-0-0",
-      "sha256": "803985aa36d433a5f8391fcfc5aabe91b573b89531f844f1a7b5d633a656a9a1",
+      "sha256": "f5d6585619999cd5eb393a53472bfb209ad12ab4e6305dfaa8834faad1a51f0d",
       "sources": [
         "0"
       ]
     },
     "03-depth-one": {
       "key": "1-1-1-0-1",
-      "sha256": "64d34796b575ddd755c298fc83d3454d57370f9bb5c954e3acdb42b25a230849",
+      "sha256": "e80a88435ec8675bb26391e3738406ff3cd44f5578d6b69b091478537b0f3827",
       "sources": [
         "33"
       ]
     },
     "04-depth-two": {
       "key": "7-2-3-1-2",
-      "sha256": "b1b104f682d4aa84736ea9416e5ad34ec5a2e74894c3bd441732717853343e25",
+      "sha256": "5286ded991cd90de9f7a3bcd475476a70b4ed9f28a34074852430f14758a182c",
       "sources": [
         "226"
       ]
     },
     "05-span": {
       "key": "42-5-17-3-30",
-      "sha256": "127732fc0b965fe4b3ff42638358793820c0cfdf1655ca0e92762742a15da0cf",
+      "sha256": "5f406c8beb0f937446748a2315e95cbb83aa03a8416c7ebcd9da7497439320f7",
       "sources": [
         "1349"
       ]
     },
     "06-origin": {
       "key": "3-10-1023-0-512",
-      "sha256": "dd559a0bb0311f47295c0eb17afcb3f67a0f598a9102b2b0541ec56286f8bc27",
+      "sha256": "c017adf00a8e561ffab56410e7775f0d0f7f2d93b09cb42f26a932dbad999410",
       "sources": [
         "106"
       ]
     },
     "07-deepest-largest-frame": {
       "key": "18446744073709551615-31-2147483647-0-1073741824",
-      "sha256": "b325736efe99716c2cb22bf8ee55a2518d2892e7a2b0e7dfedfc3819b582d99b",
+      "sha256": "3ce9add151f73d018985ed36ff6352594efd4851a669704343128d6124abce43",
       "sources": [
         "18446744073709551615"
       ]
     },
     "08-cold": {
       "key": "1000-12-4095-4095-4095",
-      "sha256": "e722bed2e66c96e44389e9c9eb43c563ce6d897913cdaf1019907a1859792295",
+      "sha256": "ed1ba68aeb57d9fd06ab4d09c7c3d8022025605ccd773cd0601816f46014fb0e",
       "sources": [
         "32012"
       ]
     },
     "09-small-cube": {
       "key": "5-3-7-7-7",
-      "sha256": "a9cf96e60a4ec0fd6ba2373179a0c843da73c32e6c5bcb2efeba53ce16741dd9",
+      "sha256": "9dbf7ae326eeec211453ae025ea21abbb4cf4a680bd84e67e979f55a302151fb",
       "sources": [
         "163"
       ]
     },
     "10-dense-hot": {
       "key": "9-20-524288-1-1048575",
-      "sha256": "cd9b6d42b934944852ea994604f55015c1ff4dc5f883ac91f612469dbdfbd7fd",
+      "sha256": "cc75f73812b8ec4d790a354f64cc57c733286bc6ccc151610eaed38a27e93b34",
       "sources": [
         "308"
       ]

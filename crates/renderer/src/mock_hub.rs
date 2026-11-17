@@ -31,6 +31,13 @@
 //! key with fixed bytes, for a layer attached to no frames; with the core's
 //! example module ([`example_matter_layer`]) it makes a whole space without
 //! any compiler.
+//!
+//! A layer may also have every cell section stored before any client asks
+//! ([`MockLayer::stored`], [`stored_layer`]): directions answer `ready` for
+//! each of its cells, and the section bytes are made by the layer's
+//! [`SectionMaker`] the first time they are read. This is how tests serve
+//! synthetic worlds of any shape with every section already on the hub, as
+//! the budget measures them (`rendering.md` section 5).
 
 use crate::protocol::{
     Attachment, BuildDescription, LayerConfig, RawDirection, API_KEY_HEADER, CLAIM_HEADER,
@@ -84,6 +91,24 @@ pub struct MockLayer {
     pub span_seconds: u64,
     /// The module depends on the origin.
     pub uses_origin: bool,
+    /// Every cell section of this layer is stored already: made by this
+    /// on its first read. `None` for a layer whose sections are computed
+    /// by clients and uploaded.
+    pub stored: Option<SectionMaker>,
+}
+
+/// A function from a cell key to that cell's section bytes.
+pub type MakeSection = dyn Fn(&gx_core::key::CellKey) -> Vec<u8> + Send + Sync;
+
+/// Makes the section bytes of one cell for a [`MockLayer::stored`] layer.
+/// Must give the same bytes for the same key every time.
+#[derive(Clone)]
+pub struct SectionMaker(pub Arc<MakeSection>);
+
+impl std::fmt::Debug for SectionMaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SectionMaker")
+    }
 }
 
 impl MockLayer {
@@ -203,6 +228,9 @@ struct Counters {
 struct Space {
     origin: Option<i64>,
     sections: BTreeMap<String, Vec<u8>>,
+    /// Addresses of stored layers' cells answered `ready` but not read yet:
+    /// the layer's index in `State::layers` and the cell.
+    unmade: BTreeMap<String, (usize, gx_core::key::CellKey)>,
     claims: BTreeMap<String, Claim>,
     asked: BTreeSet<String>,
     next_token: u64,
@@ -274,6 +302,7 @@ impl MockHub {
             space: Mutex::new(Space {
                 origin: options.origin_utc_ms,
                 sections: BTreeMap::new(),
+                unmade: BTreeMap::new(),
                 claims: BTreeMap::new(),
                 asked: BTreeSet::new(),
                 next_token: 1,
@@ -518,8 +547,25 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
 fn blob(state: &State, path: &str) -> Option<Vec<u8>> {
     let c = &state.counters;
     let (counter, bytes) = if let Some(a) = path.strip_prefix("/section/") {
-        let sections = &state.space.lock().expect("space").sections;
-        (&c.section_reads, sections.get(a).cloned())
+        let (held, unmade) = {
+            let space = state.space.lock().expect("space");
+            (space.sections.get(a).cloned(), space.unmade.get(a).copied())
+        };
+        let bytes = match (held, unmade) {
+            (Some(b), _) => Some(b),
+            (None, Some((layer, cell))) => {
+                // Made outside the lock, so reads run in parallel.
+                let made = state.layers[layer].stored.as_ref().map(|m| (m.0)(&cell));
+                if let Some(b) = &made {
+                    let mut space = state.space.lock().expect("space");
+                    space.unmade.remove(a);
+                    space.sections.insert(a.to_string(), b.clone());
+                }
+                made
+            }
+            (None, None) => None,
+        };
+        (&c.section_reads, bytes)
     } else if let Some(h) = path.strip_prefix("/module/") {
         (&c.module_reads, state.modules.get(h).cloned())
     } else if let Some(h) = path.strip_prefix("/source-manifest/") {
@@ -591,7 +637,7 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
     let mut results = Vec::with_capacity(keys.len());
     for (key, name) in keys.iter().zip(&req.keys) {
         let mut layers = Vec::with_capacity(state.layers.len());
-        for l in &state.layers {
+        for (index, l) in state.layers.iter().enumerate() {
             let mut d = RawDirection {
                 layer: l.id.clone(),
                 state: "empty".into(),
@@ -624,7 +670,13 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
             d.address = Some(address.clone());
             let fresh = space.asked.insert(address.clone());
             let instant = Instant::now();
-            if space.sections.contains_key(&address) {
+            if let (Some(_), ChunkKey::Cell(cell)) = (&l.stored, key) {
+                if !space.sections.contains_key(&address) {
+                    space.unmade.insert(address.clone(), (index, *cell));
+                }
+                d.state = "ready".into();
+                c.ready_answers.fetch_add(1, Ordering::SeqCst);
+            } else if space.sections.contains_key(&address) {
                 d.state = "ready".into();
                 c.ready_answers.fetch_add(1, Ordering::SeqCst);
             } else {
@@ -816,6 +868,26 @@ pub fn registry_layer(id: &str, registry: &[u8]) -> MockLayer {
         max_depth: BTreeMap::new(),
         span_seconds: 0,
         uses_origin: false,
+        stored: None,
+    }
+}
+
+/// A layer on every frame, filled to `max_depth`, whose every cell section
+/// is stored already and made by `make` on its first read
+/// ([`MockLayer::stored`]). Its module answers only the registry key, with
+/// an empty registry.
+pub fn stored_layer(id: &str, max_depth: u8, make: SectionMaker) -> MockLayer {
+    let empty = gx_core::registry::encode(&gx_core::registry::Registry::empty());
+    MockLayer {
+        id: id.into(),
+        module: registry_module(&empty),
+        manifest: None,
+        attachment: Attachment::All,
+        exclusive: false,
+        max_depth: [("*".to_string(), max_depth)].into(),
+        span_seconds: 0,
+        uses_origin: false,
+        stored: Some(make),
     }
 }
 
@@ -866,6 +938,7 @@ pub fn example_matter_layer(
         max_depth: [("*".to_string(), max_depth)].into(),
         span_seconds: 0,
         uses_origin: false,
+        stored: None,
     };
     (layer, tiles)
 }

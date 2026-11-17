@@ -19,11 +19,11 @@ use crate::controls::Controls;
 use crate::extract::default_threads;
 use crate::render::gpu::{describe_adapter, present_mode, wanted_features, Renderer};
 use crate::render::overlay::{MatterStats, OverlayInfo};
-use crate::render::scene::{matter_scene, Scene};
+use crate::render::scene::{scene_with, Scene};
 use crate::seen::Seen;
 use crate::sim::Simulation;
 use crate::stream::FetchEvent;
-use crate::world::World;
+use crate::world::{DrawList, World, COMPOSITE_SLICE_SECONDS};
 use anyhow::{anyhow, Context, Result};
 use gx_core::units::Seconds;
 use std::cell::RefCell;
@@ -114,24 +114,37 @@ impl Gfx {
     }
 }
 
-/// Starts requests for the cells the world wants and applies every fetch
-/// event that has arrived.
-fn stream_step(world: &mut World, fetcher: &mut WebFetcher, sim: &Simulation, now: f64) {
+/// One step of the frame thread's matter work, as natively
+/// ([`crate::app::matter_step`]): composites what has arrived until the
+/// step's slice is spent, runs [`World::step`], hands the requests to the
+/// fetcher, and records the step's duration. Returns the draw list.
+fn matter_step(
+    world: &mut World,
+    fetcher: &mut WebFetcher,
+    sim: &Simulation,
+    seen: &Seen,
+    size: (u32, u32),
+    now: f64,
+) -> DrawList {
+    let started = crate::clock::now_seconds();
     fetcher.set_time_utc_ms(gx_core::timescale::tdb_seconds_to_utc_ms(
         sim.time().value(),
     ));
-    for event in fetcher.drain() {
-        match event {
-            FetchEvent::Completed { key, outcome, .. } => world.complete(key, outcome, now),
-            FetchEvent::Registry(_) => {}
-        }
-    }
-    for key in world.take_requests(now) {
-        if let Some(frame) = sim.system().tree().get(key.frame_id) {
+    let results = fetcher
+        .drain_until(started + COMPOSITE_SLICE_SECONDS)
+        .into_iter()
+        .filter_map(|e| match e {
+            FetchEvent::Completed { key, outcome, .. } => Some((key, outcome)),
+            FetchEvent::Registry(_) => None,
+        });
+    let (requests, draw) = world.step(seen, size, now, results, started);
+    for key in requests {
+        if let Some(frame) = seen.system().tree().get(key.frame_id) {
             fetcher.request(key, frame.root_extent);
         }
     }
-    world.pump();
+    world.record_step((crate::clock::now_seconds() - started) * 1e3);
+    draw
 }
 
 /// The browser application: the simulation, the camera, the matter
@@ -222,11 +235,15 @@ impl WebApp {
         self.sim.prepare_light(&self.camera);
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
-        self.world
-            .select(seen.system(), seen.camera(), size, t, false);
-        stream_step(&mut self.world, &mut self.fetcher, &self.sim, t);
-        self.world.evict(t);
-        let mut scene = matter_scene(&mut self.world, &seen, size, t);
+        let draw = matter_step(
+            &mut self.world,
+            &mut self.fetcher,
+            &self.sim,
+            &seen,
+            size,
+            t,
+        );
+        let mut scene = scene_with(&draw, &seen, size);
         scene.mesh_mode = self.controls.mesh_mode;
         if self.controls.hide_guides {
             scene.markers.clear();
@@ -277,6 +294,10 @@ impl WebApp {
                 volumes_drawn: scene.volumes.len(),
                 sprites_drawn: scene.sprites.len(),
                 lights_active: scene.lights.len(),
+                frame_step_p95_ms: self
+                    .world
+                    .step_times()
+                    .recent_percentile(crate::clock::OVERLAY_STEPS, 95.0),
                 ..MatterStats::from_stats(self.fetcher.stats())
             },
         }

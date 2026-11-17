@@ -51,8 +51,8 @@
 //! With either rule a density that continues across a face has no
 //! isovalue crossing there, so no wall is emitted at the face: two filled
 //! neighbors join without a seam, and a filled cell with no neighbor is
-//! open at its faces. A surface that crosses a face (a ground plane running
-//! from one cell into the next) continues into the straddling cubes, half
+//! open at its faces. A surface that crosses a face (a plane running from
+//! one cell into the next) continues into the straddling cubes, half
 //! a sample beyond the face; both cells draw that half sample, from the
 //! same samples, so the two meshes overlap there instead of leaving a gap.
 //! Where a coarser cell one depth up lies across a face, edge, or corner,
@@ -80,24 +80,21 @@
 //! isovalue is half the density of the matter just inside it: half the
 //! smallest density of the section's solid and fluid samples that lie at
 //! least four samples in from any boundary of that matter or of the
-//! section ([`surface_isovalue`]). A module may spread the edge of its
-//! matter over a few samples (the terrain module ramps it over up to about
-//! three and a half): the samples further in are full, and half their
-//! density is the middle of that ramp, where the field is linear.
-//! A partly filled sample on the boundary has a density between that and
-//! 0, so the surface passes through it about where its matter ends. Denser
-//! matter further in (a body's layers grow denser toward its center) stays
-//! above the isovalue and draws no surface inside. A section with no such
-//! sample (a thin shell) uses half its largest solid or fluid density. Gas
-//! and plasma samples take no part. That is each section's own isovalue;
-//! the world draws every cell of a frame at the smallest of its loaded
-//! cells' ([`FaceNeighbors::isovalue`],
-//! [`crate::stream::CellCache::frame_isovalue`]), so cells that hold
-//! different depths of matter do not draw the boundary at different
-//! densities. A cell at a
-//! coarse depth gives a coarse mesh: that is the compiler's chosen
-//! complexity, and nothing here smooths it.
+//! section ([`surface_isovalue`]). A section with no such sample (a thin
+//! shell) uses half its largest solid or fluid density. Gas and plasma
+//! samples take no part. That is each section's own isovalue; the world
+//! draws every cell of a frame at the smallest of its loaded cells'
+//! ([`FaceNeighbors::isovalue`],
+//! [`crate::stream::CellCache::frame_isovalue`]). A cell at a coarse depth
+//! gives a coarse mesh, and nothing here smooths it.
 //!
+//! This density rule predates the occupancy channel. The surface the
+//! format defines is the level set `occupancy = 0.5` (`matter-format.md`
+//! section 3.3, `rendering.md` section 2); extraction moves to it, with
+//! Transvoxel transitions in place of the skirts and fades above, when it
+//! is rewritten. Until then selection and asking ahead already follow
+//! occupancy ([`crate::stream`]).
+
 //! # Cubes and triangles
 //!
 //! A corner is inside when its density is strictly above the isovalue. The
@@ -407,8 +404,8 @@ fn trilinear(p: [f64; 3], section: &Section, samples: &Samples) -> f64 {
 /// drawn from both sides. Where a neighbor's surface meets this one a
 /// little higher or lower (a depth transition, two isovalue crossings a
 /// sample apart) the strip fills the crack; where they meet exactly it lies
-/// under the ground and never shows. The strip takes the edge's vertex
-/// attributes, so it shades like the ground above it.
+/// inside the matter and never shows. The strip takes the edge's vertex
+/// attributes, so it shades like the surface above it.
 fn add_skirts(
     positions: &mut Vec<[f64; 3]>,
     vertices: &mut Vec<SurfaceVertex>,
@@ -1530,6 +1527,7 @@ mod tests {
             roughness: Ratio::new(0.7),
             attenuation: Attenuation::new(0.0),
             radiating_temperature: Kelvin::new(300.0),
+            occupancy: Ratio::new(1.0),
         }
     }
 
@@ -1559,10 +1557,10 @@ mod tests {
     }
 
     #[test]
-    fn a_body_denser_inside_draws_only_its_outer_surface() {
-        // A dense core inside a lighter mantle: the surface is the
-        // boundary with vacuum, not where the density falls to half the
-        // core's.
+    fn matter_denser_inside_draws_only_its_outer_surface() {
+        // A dense inner ball inside a lighter outer layer: the surface is
+        // the boundary with vacuum, not where the density falls to half
+        // the inner ball's.
         let res = 32u8;
         let step = EDGE / f64::from(res);
         let radius = 3.5;
@@ -1883,7 +1881,7 @@ mod tests {
 
     #[test]
     fn gas_and_plasma_take_no_part() {
-        // A solid core inside a much denser hot gas shell: the surface
+        // A solid ball inside a much denser hot gas shell: the surface
         // follows the solid alone, at half the solid density.
         let res = 16;
         let step = EDGE / f64::from(res);
@@ -1901,6 +1899,7 @@ mod tests {
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(1.0),
                     radiating_temperature: Kelvin::new(4000.0),
+                    occupancy: Ratio::new(1.0),
                 }
             } else {
                 Sample::VACUUM
@@ -1941,6 +1940,7 @@ mod tests {
                     roughness: Ratio::new(0.0),
                     attenuation: Attenuation::new(1.0),
                     radiating_temperature: Kelvin::new(6000.0),
+                    occupancy: Ratio::new(1.0),
                 },
             ),
         )

@@ -30,7 +30,7 @@ pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 
-pub use job::{BlobKind, ComputeJob, FailureKind, TileRef, WorkerError};
+pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
 
 #[cfg(not(target_arch = "wasm32"))]

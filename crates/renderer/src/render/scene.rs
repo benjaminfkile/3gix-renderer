@@ -376,11 +376,18 @@ pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw
 /// and every lit frame lit from its emitters' retarded positions
 /// ([`crate::seen`], `space-model.md` section 6.4).
 pub fn matter_scene(world: &mut World, seen: &Seen, size: (u32, u32), now: f64) -> Scene {
+    let draw = world.draw_list(seen, size, now);
+    scene_with(&draw, seen, size)
+}
+
+/// The scene as `seen` sees it with a draw list already built (by
+/// [`World::step`]): frame markers plus the list's cells, lights, and
+/// sprites.
+pub fn scene_with(draw: &DrawList, seen: &Seen, size: (u32, u32)) -> Scene {
     let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
     let (system, camera) = (seen.system(), seen.camera());
     let mut scene = build_scene(system, camera, aspect);
-    let draw = world.draw_list(seen, size, now);
-    add_matter(&mut scene, system, camera, &draw);
+    add_matter(&mut scene, system, camera, draw);
     scene
 }
 

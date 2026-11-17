@@ -10,9 +10,10 @@
 //! 3. runs `gx_sources`, resolves the ids through the layer's manifest
 //!    (fetched and checked the same way), and gets every tile, checking
 //!    its length and hash,
-//! 4. runs `gx_compile` and validates the section with the library
-//!    validator,
-//! 5. hands the bytes to the caller at once, stores them in the local cache
+//! 4. runs `gx_compile` and validates the section by decoding it with the
+//!    library decoder (the one validation the section gets on its way in,
+//!    `rendering.md` section 3.5),
+//! 5. hands the bytes and the decoded section to the caller at once, stores them in the local cache
 //!    under their address, and starts the upload with the claim
 //!    ([`Uploader`]), which never holds up the next job.
 //!
@@ -22,7 +23,7 @@
 use crate::cache::DiskCache;
 use crate::job::{
     check_blob, check_section, check_tile, decode_manifest, resolve_tiles, BlobKind, ComputeJob,
-    WorkerError,
+    Computed, WorkerError,
 };
 use crate::stats::{UploadTicket, WorkerSnapshot, WorkerStats};
 use gx_core::sha256::to_hex;
@@ -189,7 +190,7 @@ impl ModuleRunner {
         job: &ComputeJob,
         blobs: &dyn Blobs,
         cache: Option<&DiskCache>,
-    ) -> Result<Vec<u8>, WorkerError> {
+    ) -> Result<Computed, WorkerError> {
         job.check_address()?;
         let module = self.module(&job.module, || {
             get_blob(BlobKind::Module, &job.module, blobs, cache, &self.flights)
@@ -214,14 +215,17 @@ impl ModuleRunner {
             tiles.push((r.id, bytes));
         }
         self.stats.module_run();
-        let section = module.compile(&job.request, &tiles).map_err(host_error)?;
-        check_section(&job.request.key, &section)?;
-        Ok(section)
+        let bytes = module.compile(&job.request, &tiles).map_err(host_error)?;
+        let section = check_section(&job.request.key, &bytes)?;
+        Ok(Computed {
+            bytes: Arc::from(bytes),
+            section: section.map(Arc::new),
+        })
     }
 }
 
 /// What the caller is told when a job ends.
-pub type JobResult = Result<Arc<[u8]>, WorkerError>;
+pub type JobResult = Result<Computed, WorkerError>;
 
 struct Task {
     job: ComputeJob,
@@ -336,9 +340,9 @@ fn run_task(shared: &Shared, task: Task) {
         .run(&job, shared.blobs.as_ref(), shared.cache.as_deref());
     stats.job_finished(result.is_ok());
     match result {
-        Ok(section) => {
-            let section: Arc<[u8]> = Arc::from(section);
-            done(Ok(Arc::clone(&section)));
+        Ok(computed) => {
+            let section = Arc::clone(&computed.bytes);
+            done(Ok(computed));
             let address = job.address_hex();
             if let Some(c) = &shared.cache {
                 if let Err(e) = c.put(BlobKind::Section, &address, &section) {

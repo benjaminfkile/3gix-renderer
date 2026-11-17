@@ -1,0 +1,17 @@
+[package]
+name = "perf-budget"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Checks the renderer's headless statistics against the performance budget and the committed baseline, for scripts/perf-budget.sh."
+
+[lib]
+name = "perf_budget"
+path = "src/lib.rs"
+
+[[bin]]
+name = "perf-budget"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

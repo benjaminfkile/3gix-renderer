@@ -849,7 +849,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1160,7 +1160,7 @@ dependencies = [
 [[package]]
 name = "gx-core"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#bf19604af2c939202712a42898aaa982fd831222"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#04d370ff96ca822308e3b9a56bf156657fc6963c"
 dependencies = [
  "wasm-bindgen",
  "zstd",
@@ -1169,7 +1169,7 @@ dependencies = [
 [[package]]
 name = "gx-module-host"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#bf19604af2c939202712a42898aaa982fd831222"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#04d370ff96ca822308e3b9a56bf156657fc6963c"
 dependencies = [
  "gx-core",
  "wasmparser 0.261.0",
@@ -1832,7 +1832,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2232,6 +2232,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "perf-budget"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2461,7 +2468,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2753,7 +2760,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2810,7 +2817,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4257,7 +4264,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

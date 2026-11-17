@@ -25,7 +25,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::timescale::utc_ms_to_tdb_seconds;
 use gx_core::units::Seconds;
-use renderer::app::{check_origin, render_headless_view, stream_step, HeadlessRun};
+use renderer::app::{check_origin, matter_step, render_headless_view, HeadlessRun};
 use renderer::camera::Camera;
 use renderer::config::{ApiKey, View};
 use renderer::extract::default_threads;
@@ -34,6 +34,7 @@ use renderer::mock_hub::{
     example_matter_layer, registry_layer, MockHub, MockHubOptions, MOCK_API_KEY, MOCK_SPACE_ID,
 };
 use renderer::protocol::Routes;
+use renderer::seen::Seen;
 use renderer::sim::{SimClock, Simulation};
 use renderer::stream::{CellState, FetchEvent, Fetcher, FetcherOptions, FetcherStats};
 use renderer::world::World;
@@ -117,15 +118,15 @@ fn stream_home(c: &mut Client) -> World {
     camera.update_parent(&c.system);
     let mut world = World::new(default_threads());
     let start = Instant::now();
-    world.select(&c.system, &camera, (WIDTH, HEIGHT), 0.0, true);
+    let seen = Seen::instant(&c.system, &camera);
     loop {
         let now = start.elapsed().as_secs_f64();
-        let events = c.fetcher.wait(Duration::from_millis(20));
-        stream_step(&mut world, &mut c.fetcher, &c.system, events, now);
+        matter_step(&mut world, &mut c.fetcher, &seen, (WIDTH, HEIGHT), now);
         if world.settled() {
             break;
         }
         assert!(now < 90.0, "the view did not settle");
+        c.fetcher.wait_for_events(Duration::from_millis(20));
     }
     let start = Instant::now();
     while c.fetcher.stats().worker.uploads_pending > 0 {
@@ -385,6 +386,17 @@ fn headless_render_at_now_and_at_the_origin() {
         assert_eq!(json["modules_loaded"], 2);
         assert_eq!(json["at_now"], !at_origin);
         assert!(m.directions_requests > 0);
+        // The budget statistics (`rendering.md` section 5.3): the view
+        // settled, and the frame steps and selections were counted.
+        let settle = json["settle_seconds"].as_f64().expect("settled");
+        assert!(settle > 0.0 && settle <= json["stream_seconds"].as_f64().unwrap() + 1.0);
+        assert!(json["frame_steps"].as_u64().unwrap() > 0);
+        let p50 = json["frame_step_ms_p50"].as_f64().unwrap();
+        let p95 = json["frame_step_ms_p95"].as_f64().unwrap();
+        let max = json["frame_step_ms_max"].as_f64().unwrap();
+        assert!(0.0 < p50 && p50 <= p95 && p95 <= max, "{p50} {p95} {max}");
+        assert!(json["selection_rounds"].as_u64().unwrap() > 0);
+        assert!(json["cells_requested_ahead"].as_u64().is_some());
     }
     assert!(c.fetcher.stats().worker.sections_computed > 0);
     let _ = std::fs::remove_dir_all(&dir);

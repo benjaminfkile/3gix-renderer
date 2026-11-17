@@ -71,6 +71,10 @@ pub struct MatterStats {
     pub uploads_failed: u64,
     /// Directions requests sent.
     pub directions_requests: u64,
+    /// 95th percentile of the frame thread's matter work per step over the
+    /// latest steps, milliseconds (`rendering.md` section 4), or `None`
+    /// before the first step.
+    pub frame_step_p95_ms: Option<f64>,
 }
 
 impl MatterStats {
@@ -162,9 +166,11 @@ impl OverlayInfo {
                 self.camera_frame, self.camera_distance, self.camera_speed,
             ),
             format!("frames {}", self.frame_count),
-            match self.fps {
-                Some(fps) => format!("fps {fps:.1}"),
-                None => "fps -".to_string(),
+            match (self.fps, self.matter.frame_step_p95_ms) {
+                (Some(fps), Some(step)) => format!("fps {fps:.1}  matter step p95 {step:.2} ms"),
+                (Some(fps), None) => format!("fps {fps:.1}"),
+                (None, Some(step)) => format!("fps -  matter step p95 {step:.2} ms"),
+                (None, None) => "fps -".to_string(),
             },
             match self.exposure_fixed {
                 Some(stops) => format!("exposure fixed {}", format_stops(stops)),
@@ -331,6 +337,7 @@ mod tests {
                 uploads_done: 3,
                 uploads_failed: 0,
                 directions_requests: 5,
+                frame_step_p95_ms: None,
             },
         }
     }
@@ -344,6 +351,9 @@ mod tests {
         assert_eq!(l[3], "camera frame 4  |p| 1.5000e8 m  speed 2.500e4 m/s");
         assert_eq!(l[4], "frames 6");
         assert_eq!(l[5], "fps 59.9");
+        let mut stepped = info();
+        stepped.matter.frame_step_p95_ms = Some(1.234);
+        assert_eq!(stepped.lines()[5], "fps 59.9  matter step p95 1.23 ms");
         assert_eq!(l[6], "exposure auto");
         assert_eq!(l[7], "cells selected 12  ready 9  pending 3");
         assert_eq!(l[8], "meshes 4  triangles 5120  lights 1");

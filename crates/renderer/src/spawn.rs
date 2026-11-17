@@ -11,8 +11,8 @@
 //! until the camera is flown.
 //!
 //! A spawned camera is attached to its frame: it moves and turns with it
-//! ([`crate::camera::advance`] with `attached`), so the ground stays under
-//! it, and it flies relative to the frame. Nothing else acts on it: no
+//! ([`crate::camera::advance`] with `attached`), so the matter it spawned
+//! over stays under it, and it flies relative to the frame. Nothing else acts on it: no
 //! gravity, no collision. `Home` and the number-key views detach it.
 
 use gx_core::frames::FrameSystem;
@@ -151,6 +151,8 @@ impl Spawner {
     /// refines the active spawn, and ends it once the camera is flown
     /// (`input` moves it) or detached (`controls.attached` cleared by
     /// `Home` or a view key). Sets `controls.attached` when it spawns.
+    /// Only where the controls exist (native, or the browser build).
+    #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
     pub fn frame(
         &mut self,
         system: &FrameSystem,

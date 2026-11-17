@@ -10,21 +10,28 @@
 //! again every [`SOCKET_RETRY_SECONDS`] when it closes. A computed section
 //! is handed over at once; its upload runs in the background, and a failed
 //! upload is logged and never blocks drawing.
+//!
+//! Every section is decoded once on its way in (`rendering.md` 3.5): a
+//! streamed one when it arrives, a computed one by the worker's check.
+//! Compositing a finished cell and deriving what the renderer keeps of it
+//! is time-sliced: [`WebFetcher::drain_until`] does it only until the
+//! frame's deadline and leaves the rest for the next frame
+//! (`rendering.md` section 4).
 
 use super::cache::WebCache;
 use super::hub::{now_seconds, sleep, ReadySocket, WebHub};
 use super::worker::{run_job, ModuleWorker};
-use crate::directions::{Action, Coordinator, Origin, StreamResult};
+use crate::directions::{Action, Arrived, Completion, Coordinator, Origin, StreamResult};
 use crate::protocol::DirectionsResponse;
 use crate::stream::{
-    decode_cell, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats,
+    cell_from_arrived, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats,
 };
 use anyhow::{anyhow, Result};
 use gx_core::frames::FrameSystem;
 use gx_core::key::{CellKey, ChunkKey};
 use gx_core::sha256::to_hex;
 use gx_core::units::Meters;
-use gx_worker::{BlobKind, ComputeJob, WorkerError, WorkerStats};
+use gx_worker::{BlobKind, ComputeJob, Computed, WorkerError, WorkerStats};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -49,7 +56,7 @@ enum Internal {
         key: ChunkKey,
         layer: usize,
         address: [u8; 32],
-        result: Result<Arc<[u8]>, WorkerError>,
+        result: Result<Computed, WorkerError>,
     },
 }
 
@@ -66,6 +73,7 @@ pub struct WebFetcher {
     jobs: VecDeque<(ChunkKey, usize, ComputeJob)>,
     job_running: Rc<Cell<bool>>,
     extents: BTreeMap<CellKey, Meters>,
+    completed: VecDeque<(CellKey, Completion, Meters, Duration)>,
     out: Vec<FetchEvent>,
     started: f64,
     wanted_utc_ms: Option<i64>,
@@ -90,6 +98,7 @@ impl WebFetcher {
             jobs: VecDeque::new(),
             job_running: Rc::new(Cell::new(false)),
             extents: BTreeMap::new(),
+            completed: VecDeque::new(),
             out: Vec::new(),
             started: now_seconds(),
             wanted_utc_ms: None,
@@ -215,7 +224,6 @@ impl WebFetcher {
             let address = job.address;
             let result = run_job(&job, &hub, cache.as_deref(), &worker, &stats).await;
             stats.job_finished(result.is_ok());
-            let result = result.map(Arc::<[u8]>::from);
             if let Err(e) = &result {
                 web_sys::console::warn_1(
                     &format!("gx-renderer: module job for {key} failed: {e}").into(),
@@ -228,7 +236,7 @@ impl WebFetcher {
                 result: result.clone(),
             });
             running.set(false);
-            let Ok(section) = result else {
+            let Ok(Computed { bytes: section, .. }) = result else {
                 return;
             };
             if let Some(c) = &cache {
@@ -285,21 +293,18 @@ impl WebFetcher {
                 }
             }
             Action::Complete(done) => match done.key {
-                ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done.sections))),
+                ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
+                    .sections
+                    .into_iter()
+                    .map(|a| a.bytes)
+                    .collect()))),
                 ChunkKey::Cell(key) => {
                     let Some(extent) = self.extents.remove(&key) else {
                         return;
                     };
                     let round_trip =
                         Duration::from_secs_f64((self.now() - done.requested_at).max(0.0));
-                    let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
-                    let outcome = decode_cell(&key, &done.sections, extent);
-                    self.out.push(FetchEvent::Completed {
-                        key,
-                        outcome,
-                        bytes,
-                        round_trip,
-                    });
+                    self.completed.push_back((key, done, extent, round_trip));
                 }
             },
             Action::Failed { key, reason } => match key {
@@ -318,9 +323,29 @@ impl WebFetcher {
     }
 
     /// Carries out everything due and returns every event since the last
-    /// call.
+    /// call, compositing every finished cell.
     pub fn drain(&mut self) -> Vec<FetchEvent> {
+        self.drain_until(f64::INFINITY)
+    }
+
+    /// [`WebFetcher::drain`], compositing finished cells only until the
+    /// clock ([`crate::clock::now_seconds`]) passes `deadline`; the rest
+    /// wait for a later call.
+    pub fn drain_until(&mut self, deadline: f64) -> Vec<FetchEvent> {
         self.pump();
+        while let Some((key, done, extent, round_trip)) = self.completed.pop_front() {
+            let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
+            let outcome = cell_from_arrived(&key, &done.sections, extent);
+            self.out.push(FetchEvent::Completed {
+                key,
+                outcome,
+                bytes,
+                round_trip,
+            });
+            if crate::clock::now_seconds() > deadline {
+                break;
+            }
+        }
         let events = std::mem::take(&mut self.out);
         self.tally.record(&events);
         events
@@ -360,8 +385,23 @@ impl WebFetcher {
     }
 }
 
-/// Streams the section at `address`: the cache first (validated, dropped if
-/// damaged), then the edge (validated, then cached).
+/// Decodes a cell's section, the one validation it gets on its way in
+/// (`rendering.md` 3.5); the registry key passes through as bytes.
+fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    match key {
+        ChunkKey::Cell(cell) => gx_core::matter::decode(&cell, &bytes)
+            .map(|s| Arrived {
+                bytes: bytes.clone(),
+                decoded: Some(Arc::new(s)),
+            })
+            .map_err(|e| e.to_string()),
+        ChunkKey::Registry => Ok(Arrived::raw(bytes)),
+    }
+}
+
+/// Streams the section at `address`: the cache first (decoded, dropped if
+/// damaged), then the edge (decoded, then cached).
 async fn stream_section(
     hub: &WebHub,
     cache: Option<&WebCache>,
@@ -369,30 +409,32 @@ async fn stream_section(
     address: [u8; 32],
 ) -> StreamResult {
     let name = to_hex(&address);
-    let key_text = key.to_string();
     if let Some(c) = cache {
         if let Some(bytes) = c.get(BlobKind::Section, &name).await {
-            if gx_core::validate(&key_text, &bytes).is_ok() {
-                return StreamResult::Bytes(Arc::from(bytes), Origin::Cache);
+            match decode_arrived(key, bytes) {
+                Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
+                Err(_) => c.remove(BlobKind::Section, &name).await,
             }
-            c.remove(BlobKind::Section, &name).await;
         }
     }
     match hub.get_blob(BlobKind::Section, &name).await {
         Ok(Some(bytes)) => {
-            if let Err(e) = gx_core::validate(&key_text, &bytes) {
-                return StreamResult::Failed(format!(
-                    "section {name} from the edge is invalid: {e}"
-                ));
-            }
+            let arrived = match decode_arrived(key, bytes) {
+                Ok(a) => a,
+                Err(e) => {
+                    return StreamResult::Failed(format!(
+                        "section {name} from the edge is invalid: {e}"
+                    ))
+                }
+            };
             if let Some(c) = cache {
-                if let Err(e) = c.put(BlobKind::Section, &name, &bytes).await {
+                if let Err(e) = c.put(BlobKind::Section, &name, &arrived.bytes).await {
                     web_sys::console::warn_1(
                         &format!("gx-renderer: caching section {name}: {e}").into(),
                     );
                 }
             }
-            StreamResult::Bytes(Arc::from(bytes), Origin::Edge)
+            StreamResult::Bytes(arrived, Origin::Edge)
         }
         Ok(None) => StreamResult::NotFound,
         Err(e) => StreamResult::Failed(format!("{e:#}")),

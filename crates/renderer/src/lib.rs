@@ -22,21 +22,27 @@
 //! - [`seen`]: every frame at its retarded state for the observer and every
 //!   light from its emitter's retarded position (`space-model.md` section
 //!   6.4).
+//! - [`clock`]: the monotonic clock and the step durations of the frame
+//!   thread's matter work (`rendering.md` section 4).
 //! - [`camera`]: the free camera parented to its nearest frame, the floating
 //!   origin of `space-model.md` section 5.
 //! - [`spawn`]: spawning the camera just above a frame's matter and
 //!   carrying it with that frame.
 //! - [`controls`]: keyboard and mouse bindings, shared by the window and the
 //!   browser canvas (native, or with the `web` feature).
-//! - [`stream`]: cell selection, the cell cache, decoding and compositing,
-//!   and the depth transition rule (`space-model.md` sections 2, 5, 7, 8).
+//! - [`stream`]: cell selection, asking ahead, the cell cache, decoding and
+//!   compositing (`space-model.md` sections 2, 5, 7, 8; `rendering.md`
+//!   section 3).
+//! - [`selector`]: the selection on its own thread natively, inline in the
+//!   browser (`rendering.md` sections 3.4 and 4).
 //! - [`extract`]: surface extraction by marching cubes on a worker pool.
 //! - [`volume`]: gas and plasma drawn by ray marching.
 //! - [`farfield`]: far frames drawn as point sprites.
 //! - [`light`]: lights and emission from hot matter (`matter-format.md`
 //!   section 3.3).
 //! - [`world`]: the matter pipeline from selection to drawable meshes and
-//!   lights.
+//!   lights, one bounded step of the frame thread (`rendering.md` section
+//!   4).
 //! - [`render`]: camera-relative scene data, the wgpu renderer, the overlay,
 //!   and the headless offscreen target.
 //! - [`app`]: the desktop window loop and the headless screenshot run
@@ -51,6 +57,7 @@
 #![warn(missing_docs)]
 
 pub mod camera;
+pub mod clock;
 pub mod config;
 #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
 pub mod controls;
@@ -61,6 +68,7 @@ pub mod light;
 pub mod protocol;
 pub mod render;
 pub mod seen;
+pub mod selector;
 pub mod sim;
 pub mod spawn;
 pub mod stream;
