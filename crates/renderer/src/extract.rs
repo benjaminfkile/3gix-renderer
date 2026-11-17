@@ -79,8 +79,11 @@
 //! The drawn surface is the boundary between matter and vacuum, so the
 //! isovalue is half the density of the matter just inside it: half the
 //! smallest density of the section's solid and fluid samples that lie at
-//! least two samples in from any boundary of that matter or of the
-//! section ([`surface_isovalue`]).
+//! least four samples in from any boundary of that matter or of the
+//! section ([`surface_isovalue`]). A module may spread the edge of its
+//! matter over a few samples (the terrain module ramps it over up to about
+//! three and a half): the samples further in are full, and half their
+//! density is the middle of that ramp, where the field is linear.
 //! A partly filled sample on the boundary has a density between that and
 //! 0, so the surface passes through it about where its matter ends. Denser
 //! matter further in (a body's layers grow denser toward its center) stays
@@ -990,7 +993,7 @@ pub fn surface_isovalue(section: &Section) -> Option<f64> {
     isovalues(section).map(|(own, _)| own)
 }
 
-/// Half the smallest density of the section's matter at least two samples
+/// Half the smallest density of the section's matter at least four samples
 /// in from every boundary, or `None` when it has none (a thin shell, whose
 /// own isovalue falls back to half its largest density). Only these set
 /// the isovalue shared by a frame
@@ -1015,10 +1018,10 @@ fn isovalues(section: &Section) -> Option<(f64, Option<f64>)> {
     if max <= 0.0 {
         return None;
     }
-    // Erode twice: a sample survives a pass when it and all 26 samples
-    // around it in the section were inside. What survives both is matter
-    // at least two samples in from any boundary in every direction, past
-    // the partly filled ones.
+    // Erode INNER_DEPTH times: a sample survives a pass when it and all 26
+    // samples around it in the section were inside. What survives is
+    // matter at least that many samples in from any boundary in every
+    // direction, past the partly filled ones.
     for _ in 0..INNER_DEPTH {
         let prev = inside.clone();
         for z in 0..n {
@@ -1051,7 +1054,7 @@ fn isovalues(section: &Section) -> Option<(f64, Option<f64>)> {
 
 /// How many samples in from every boundary the matter that sets the
 /// isovalue lies ([`surface_isovalue`]).
-const INNER_DEPTH: usize = 2;
+const INNER_DEPTH: usize = 4;
 
 /// Extracts the surface of the solid and fluid samples of a composited
 /// section, padding each face with the neighbor's samples where `neighbors`
