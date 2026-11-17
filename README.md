@@ -131,7 +131,29 @@ the wasm32 builds with the `web` feature off and on, and `web/build.sh`. The
 matter render tests save their images as `target/tmp/matter-render.png` and
 `target/tmp/full-scene.png` with pixel statistics beside them in `.txt`
 files. The browser build is not run in CI; it is verified by hand
-(`docs/web.md`).
+(`docs/web.md`). CI also runs the budget test in release
+(`cargo test --release -p renderer --test budget`): frame-thread step at
+4096 cells, refinement rounds, and no shape model, on synthetic worlds
+(`3GIXHub/docs/architecture/rendering.md` section 5.3).
+
+### Performance budget on a real stack
+
+```sh
+GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=... sh scripts/perf-budget.sh [--keep DIR]
+```
+
+Runs the benchmark views B1 to B4 of `rendering.md` section 5.1 headless,
+each with a fresh cache, and checks them against section 5.2 and
+`perf/baseline.json` (`tools/perf-budget`). Exits non-zero on any breach.
+Every change that can affect what is drawn or how fast puts its overall line
+in the commit message (`rendering.md` section 6).
+
+### Push hook
+
+`scripts/hooks/pre-push` runs format, clippy with `-D warnings`, the
+vocabulary lint, and the library unit tests before every push and refuses
+the push if any fails. Install it once per clone with
+`sh scripts/install-hooks.sh` (sets `core.hooksPath` locally).
 
 ## End to end
 
@@ -148,11 +170,13 @@ statistics are in `docs/e2e/`.
 
 - Architecture: `3GIXHub/docs/architecture/space-model.md` (v2)
 - Hub, client, and module contract: `3GIXHub/docs/architecture/client-compute.md`
-- Matter format v1: `3GIXHub/docs/architecture/matter-format.md`
+- Matter format 3: `3GIXHub/docs/architecture/matter-format.md`
+- Rendering contract and performance budget: `3GIXHub/docs/architecture/rendering.md`
 
 ## Contributing rules
 
 - No word from the core library's `scripts/vocab-banned.txt`, and no proper noun for any body, anywhere in this repository.
 - No infrastructure identifiers, secrets, hostnames, or LAN addresses in code, history, docs, or CI output. This repository is public.
 - No em or en dashes in any text.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and the vocabulary lint pass on every change.
+- `sh scripts/ci.sh` passes on every change, and the push hook is installed.
+- The rendering contract (`rendering.md`) holds: no shape model, no rule fitted to one compiler, surfaces only at occupancy 0.5, one fix attempt per visual problem.

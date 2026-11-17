@@ -31,6 +31,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "4. cargo test"
 cargo test --workspace
 
+step "4b. budget test (release, rendering.md section 5.3)"
+cargo test --release -p renderer --test budget
+
 step "5. vocab-lint"
 sh scripts/vocab-lint.sh
 if [ -n "${GX_CORE_DIR:-}" ]; then

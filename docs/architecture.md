@@ -43,7 +43,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every simulated day, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
 | `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
-| `stream` | Cell selection (refining only cells a surface crosses), the cell cache, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
+| `stream` | Cell selection (a target that asks up to three depths ahead from arrived occupancy, and the drawn selection pruned from it, `rendering.md` 3), the cell cache keyed by hash map, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
 | `extract` | Marching cubes over the solid and fluid samples of a composited section, the extraction worker pool | `space-model.md` 2 |
 | `volume` | Gas and plasma as 3D grids, the ray march and its CPU reference | `space-model.md` 2, `matter-format.md` 3.3 |
 | `farfield` | Frames too small on screen drawn as point sprites, the transition | `space-model.md` 1 and 2, `matter-format.md` 3.3 |
@@ -119,7 +119,7 @@ package builds for that target.
    (`gx_core::light::retarded_state`) and builds the frame system of
    retarded states, with the camera at the same place in space among them.
    Everything below reads it.
-5. Matter streams: selection (every 100 ms), requests, directions at the
+5. Matter streams: selection (on arrivals, camera moves, and every 100 ms; natively on its own thread, `selector`), requests, directions at the
    simulation time, streamed and computed sections, readiness notices,
    finished meshes, eviction. See "From selection to pixels" below.
 6. The scene is built camera-relative with the drawn cells and their lights
@@ -237,13 +237,7 @@ alone, least recently used first. A hit never touches the network.
 Each step knows physics and geometry only. A cell is a cell, a hot sample is
 a light, a dense sample is a surface.
 
-1. **Selection** (`stream::select_all`, every 100 ms). A frame takes part
-   when its `root_extent / 8` region is inside the view cone or within
-   `4 * root_extent` of the camera. For each such frame,
-   `gx_core::lod::select_cells` runs with the camera in the frame's
-   coordinates, a pixel error of 4, the viewport height, the vertical field
-   of view, at most 4096 cells, a pixel error of 512, only cells in view and above the horizon refined, and the result balanced so cells sharing a face differ by at most one depth. Each selected cell keeps its projected
-   size in pixels as its request priority.
+1. **Selection** (`stream::select_all`, run by `selector` on its own thread natively and inline in the browser, when results arrive, when the camera or view changes, and every 100 ms). Pixel error, view cone, and refinability from occupancy only; no occlusion culling and no shape model (`rendering.md` 1.1 and 3.1). It builds the target (asking up to three depths ahead of what has arrived, balanced 2:1) and the drawn selection (only arrived cells, split only when every child and its same-depth neighbors have arrived). The `stream` module docs have the details; `rendering.md` is the contract.
 2. **The cell cache** (`stream::CellCache`), keyed by
    `(frame_id, depth, x, y, z)`:
 
