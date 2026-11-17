@@ -327,10 +327,11 @@ pub fn frame_in_range(system: &FrameSystem, camera: &Camera, frame_id: u64, aspe
 pub fn select_all(
     system: &FrameSystem,
     camera: &Camera,
-    view_width_px: f64,
-    view_height_px: f64,
+    (view_width_px, view_height_px): (f64, f64),
     may_refine: impl Fn(CellKey) -> bool,
+    loaded: impl Fn(&CellKey) -> bool,
     occluders: &BTreeMap<u64, f64>,
+    wanted: &mut BTreeSet<CellKey>,
 ) -> Vec<SelectedCell> {
     let aspect = view_width_px / view_height_px.max(1.0);
     let params = SelectionParams {
@@ -399,8 +400,31 @@ pub fn select_all(
             let horizon = (r_cam * r_cam - r * r).sqrt() + (top * top - r * r).sqrt();
             near <= horizon
         };
-        let refine = |key: CellKey| may_refine(key) && in_view(key) && visible(key);
-        let selected = balance(select_cells_with(frame, cam, &params, refine).cells);
+        // A cell is split only once all its children have arrived, so
+        // everything selected is loaded and drawn as selected, and the
+        // fade between depths (crate::extract) matches what is on screen.
+        // Its children are asked for and kept (`wanted`) and replace their
+        // parent together when the last arrives.
+        let wanted_here = std::cell::RefCell::new(BTreeSet::new());
+        let refine = |key: CellKey| {
+            if !(may_refine(key) && in_view(key) && visible(key)) {
+                return false;
+            }
+            let Some(children) = key.children() else {
+                return false;
+            };
+            if children.iter().all(&loaded) {
+                return true;
+            }
+            // All of them: those that have arrived must stay until the
+            // last one does.
+            wanted_here.borrow_mut().extend(children);
+            false
+        };
+        let first = select_cells_with(frame, cam, &params, refine).cells;
+        let mut wanted_here = wanted_here.into_inner();
+        let selected = balance(first, &loaded, &mut wanted_here);
+        wanted.extend(wanted_here);
         for key in selected {
             let g = key.geometry(frame.root_extent);
             let e = g.edge.value();
@@ -420,26 +444,58 @@ pub fn select_all(
     out
 }
 
-/// Splits selected cells until no two cells sharing a face differ by more
-/// than one depth: a cell with a face neighbor region selected two or more
-/// depths finer is replaced by its eight children, until nothing changes
-/// (at most [`BALANCE_PASSES`] passes). Detail then steps by one level at a
-/// time across the ground instead of jumping several, which is what made
-/// patches of fine and coarse terrain sit side by side. Returns the cells in
+/// Evens out the selection until no two cells that touch (across a face,
+/// an edge, or a corner) differ by more than one depth, so detail steps by
+/// one level at a time and a cell only ever meets cells one depth coarser
+/// (the fade between depths, [`crate::extract`], assumes that). Where a
+/// cell touches one two or more depths coarser, the coarser one is split
+/// into its eight children when all of them are `loaded`; otherwise all
+/// eight go to `wanted` (fetched, and kept until the last arrives) and the finer side is merged into its parent instead (always
+/// loaded: the selection only refines loaded cells). Repeats until nothing
+/// changes (at most [`BALANCE_PASSES`] passes). Returns the cells in
 /// `(depth, x, y, z)` order.
-pub fn balance(cells: Vec<CellKey>) -> Vec<CellKey> {
+pub fn balance(
+    cells: Vec<CellKey>,
+    loaded: impl Fn(&CellKey) -> bool,
+    wanted: &mut BTreeSet<CellKey>,
+) -> Vec<CellKey> {
     let mut set: BTreeSet<CellKey> = cells.into_iter().collect();
+    let around: Vec<[i8; 3]> = diagonal_offsets()
+        .into_iter()
+        .chain([
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+        ])
+        .collect();
     for _ in 0..BALANCE_PASSES {
         let mut split: BTreeSet<CellKey> = BTreeSet::new();
+        let mut merge: BTreeSet<CellKey> = BTreeSet::new();
         for k in &set {
-            for across in face_neighbor_keys(k).into_iter().flatten() {
-                // The selected cell holding the region across this face, if
-                // it is coarser.
+            for &o in &around {
+                let Some(across) = offset_key(k, o) else {
+                    continue;
+                };
+                // The selected cell holding the region across, if coarser.
                 let mut up = across.parent();
                 while let Some(c) = up {
                     if set.contains(&c) {
                         if k.depth > c.depth + 1 {
-                            split.insert(c);
+                            match c.children() {
+                                Some(children) if children.iter().all(&loaded) => {
+                                    split.insert(c);
+                                }
+                                Some(children) => {
+                                    wanted.extend(children);
+                                    if let Some(p) = k.parent() {
+                                        merge.insert(p);
+                                    }
+                                }
+                                None => {}
+                            }
                         }
                         break;
                     }
@@ -447,10 +503,38 @@ pub fn balance(cells: Vec<CellKey>) -> Vec<CellKey> {
                 }
             }
         }
-        if split.is_empty() {
+        if split.is_empty() && merge.is_empty() {
             break;
         }
+        // Merges first: a merged parent drops everything below it.
+        let merge: Vec<CellKey> = merge
+            .iter()
+            .filter(|m| {
+                let mut up = m.parent();
+                while let Some(a) = up {
+                    if merge.contains(&a) {
+                        return false;
+                    }
+                    up = a.parent();
+                }
+                true
+            })
+            .copied()
+            .collect();
+        for m in &merge {
+            // What the merge drops stays cached (`wanted`): it comes back
+            // as soon as the coarser side has loaded.
+            let dropped: Vec<CellKey> = set.iter().filter(|k| is_below(k, m)).copied().collect();
+            for k in dropped {
+                set.remove(&k);
+                wanted.insert(k);
+            }
+            set.insert(*m);
+        }
         for c in split {
+            if !set.contains(&c) {
+                continue;
+            }
             if let Some(children) = c.children() {
                 set.remove(&c);
                 set.extend(children);
@@ -460,6 +544,21 @@ pub fn balance(cells: Vec<CellKey>) -> Vec<CellKey> {
     let mut out: Vec<CellKey> = set.into_iter().collect();
     out.sort_by_key(|k| (k.depth, k.x, k.y, k.z));
     out
+}
+
+/// `k` lies strictly below `a`.
+fn is_below(k: &CellKey, a: &CellKey) -> bool {
+    let mut up = k.parent();
+    while let Some(p) = up {
+        if p == *a {
+            return true;
+        }
+        if p.depth < a.depth {
+            return false;
+        }
+        up = p.parent();
+    }
+    false
 }
 
 /// Most passes of [`balance`].
@@ -615,6 +714,15 @@ impl CellCache {
         matches!(self.state(key), Some(CellState::Ready(c)) if c.refinable)
     }
 
+    /// Returns `true` when `key` has arrived (`Ready` or `Empty`) or is
+    /// known to hold no matter: the selection can stand on it.
+    pub fn loaded(&self, key: &CellKey) -> bool {
+        matches!(
+            self.state(key),
+            Some(CellState::Ready(_) | CellState::Empty)
+        ) || self.known_empty(key)
+    }
+
     /// Returns `true` when the cache knows that `key` holds no matter: it
     /// holds none itself (`Empty`, or `Ready` without a sample of density
     /// above 0), an ancestor holds none, or its descendants down to
@@ -674,11 +782,35 @@ impl CellCache {
     /// longer selected or pinned are dropped, since there is nothing to
     /// keep.
     pub fn set_selection(&mut self, cells: Vec<SelectedCell>, now: f64) {
+        self.set_selection_wanting(cells, &BTreeSet::new(), now);
+    }
+
+    /// [`CellCache::set_selection`], also asking for `wanted`: children of
+    /// selected cells that the selection waits for before splitting them
+    /// (see [`select_all`]). They are fetched and kept like support cells.
+    pub fn set_selection_wanting(
+        &mut self,
+        cells: Vec<SelectedCell>,
+        wanted: &BTreeSet<CellKey>,
+        now: f64,
+    ) {
         for e in self.entries.values_mut() {
             e.selected = false;
             e.support = false;
         }
-        for (k, px) in support_cells(&cells) {
+        let sel_px: BTreeMap<CellKey, f64> =
+            cells.iter().map(|c| (c.key, c.projected_px)).collect();
+        let mut needed = support_cells(&cells);
+        for w in wanted {
+            let px = w
+                .parent()
+                .and_then(|p| sel_px.get(&p).copied())
+                .unwrap_or(0.0)
+                * 0.5;
+            let e = needed.entry(*w).or_insert(0.0);
+            *e = e.max(px);
+        }
+        for (k, px) in needed {
             // Not asked for where nothing is known to be there; kept when it
             // has arrived (empty or not), or it would be dropped and asked
             // for again.

@@ -321,15 +321,17 @@ impl World {
             }
         }
         let cache = &self.cache;
+        let mut wanted = std::collections::BTreeSet::new();
         let cells = select_all(
             system,
             camera,
-            f64::from(view_px.0.max(1)),
-            f64::from(view_px.1.max(1)),
+            (f64::from(view_px.0.max(1)), f64::from(view_px.1.max(1))),
             |k| cache.refinable(&k),
+            |k| cache.loaded(k),
             &occluders,
+            &mut wanted,
         );
-        self.cache.set_selection(cells, now);
+        self.cache.set_selection_wanting(cells, &wanted, now);
         for f in system
             .tree()
             .frames()
