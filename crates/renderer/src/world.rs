@@ -443,6 +443,18 @@ impl World {
         }
     }
 
+    /// The cells wanted now, once per new selection (see
+    /// [`CellCache::take_wanted`]).
+    pub fn take_wanted(&mut self, now: f64) -> Option<Vec<(CellKey, f64)>> {
+        self.cache.take_wanted(now)
+    }
+
+    /// The surface tiles wanted now, once per selection (see
+    /// [`crate::tiles::Surfaces::take_wanted`]).
+    pub fn take_wanted_surfaces(&mut self) -> Option<Vec<(gx_core::key::SurfaceKey, f64)>> {
+        self.surfaces.take_wanted()
+    }
+
     /// The cells to request now (see [`CellCache::take_requests`]).
     pub fn take_requests(&mut self, now: f64) -> Vec<CellKey> {
         self.cache.take_requests(now)
@@ -499,8 +511,9 @@ impl World {
     /// [`EVICT_INTERVAL_SECONDS`], collects finished meshes, builds the
     /// draw list for `seen`, and then gathers extraction inputs until
     /// [`STEP_SLICE_SECONDS`] after `started` (seconds of
-    /// [`crate::clock::now_seconds`]). Returns the cells to request and the
-    /// draw list.
+    /// [`crate::clock::now_seconds`]). Returns the cells wanted now (once
+    /// per new selection, see [`World::take_wanted`]) and the draw list;
+    /// the surface tiles wanted come from [`World::take_wanted_surfaces`].
     pub fn step(
         &mut self,
         seen: &Seen,
@@ -508,13 +521,13 @@ impl World {
         now: f64,
         results: impl IntoIterator<Item = (CellKey, FetchOutcome)>,
         started: f64,
-    ) -> (Vec<CellKey>, DrawList) {
+    ) -> (Option<Vec<(CellKey, f64)>>, DrawList) {
         for (key, outcome) in results {
             self.complete(key, outcome, now);
         }
         self.select(seen.system(), seen.camera(), view_px, now, false);
         self.select_surfaces(seen.system(), seen.camera(), view_px);
-        let requests = self.take_requests(now);
+        let requests = self.take_wanted(now);
         if now - self.last_evict >= EVICT_INTERVAL_SECONDS {
             self.last_evict = now;
             self.evict(now);

@@ -323,6 +323,10 @@ pub struct Surfaces {
     has_surface: BTreeMap<u64, bool>,
     anchors: BTreeMap<u64, Anchor>,
     requests: Vec<SurfaceKey>,
+    /// The latest selection's wanted set (`client-compute.md` section
+    /// 2.8): every tile it asked for that has not arrived, with its
+    /// priority, in the order asked. `None` once taken.
+    wanted: Option<Vec<(SurfaceKey, f64)>>,
     drawn: Vec<TileDrawInfo>,
     /// Every tile the latest selection looked at: the tiles it walked and
     /// the children it checked or asked for. Eviction keeps them.
@@ -345,17 +349,43 @@ impl Surfaces {
         self.has_surface.get(&frame_id) == Some(&true)
     }
 
-    /// Asks for `key` unless it is cached or asked for already.
-    fn want(&mut self, key: SurfaceKey) {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.tiles.entry(key) {
-            e.insert(State::Requested);
-            self.requests.push(key);
+    /// Asks for `key` unless it is cached or asked for already, and adds
+    /// it to the wanted set with `priority` (projected size, pixels)
+    /// unless it has arrived.
+    fn want(&mut self, key: SurfaceKey, priority: f64) {
+        match self.tiles.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(State::Requested);
+                self.requests.push(key);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if !matches!(e.get(), State::Requested) {
+                    return;
+                }
+            }
         }
+        self.wanted
+            .get_or_insert_with(Vec::new)
+            .push((key, priority));
     }
 
     /// The keys to request now.
     pub fn take_requests(&mut self) -> Vec<SurfaceKey> {
         std::mem::take(&mut self.requests)
+    }
+
+    /// The latest selection's wanted set, once per selection: every tile
+    /// it wants that has not arrived, each with its projected size,
+    /// pixels, as priority (level-0 roots at
+    /// [`crate::directions::REQUESTED_PRIORITY`]). A tile asked for before
+    /// and left out of this set is forgotten, since the fetcher drops it.
+    pub fn take_wanted(&mut self) -> Option<Vec<(SurfaceKey, f64)>> {
+        self.requests.clear();
+        let wanted = self.wanted.take()?;
+        let keep: std::collections::HashSet<SurfaceKey> = wanted.iter().map(|(k, _)| *k).collect();
+        self.tiles
+            .retain(|k, s| !matches!(s, State::Requested) || keep.contains(k));
+        Some(wanted)
     }
 
     /// Applies a finished request.
@@ -419,15 +449,19 @@ impl Surfaces {
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
         self.used.clear();
+        self.wanted = Some(Vec::new());
         for &frame in frames {
             for face in 0..SURFACE_FACES {
-                self.want(SurfaceKey {
-                    frame_id: frame,
-                    face,
-                    level: 0,
-                    x: 0,
-                    y: 0,
-                });
+                self.want(
+                    SurfaceKey {
+                        frame_id: frame,
+                        face,
+                        level: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    crate::directions::REQUESTED_PRIORITY,
+                );
             }
             if !self.has_surface(frame) {
                 continue;
@@ -494,8 +528,10 @@ impl Surfaces {
             if let Some(ch) = children {
                 self.used.extend(ch);
                 if d < r * PREFETCH {
+                    // A child's projected edge: half the parent's.
+                    let px = 0.5 * geo.edge * focal / d.max(f64::MIN_POSITIVE);
                     for c in ch {
-                        self.want(c);
+                        self.want(c, px);
                     }
                 }
             }
@@ -787,7 +823,7 @@ mod tests {
     ) -> Vec<TileDrawInfo> {
         let cone = 0.9;
         for face in 0..SURFACE_FACES {
-            s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap());
+            s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap(), 1.0);
         }
         for _ in 0..64 {
             for key in s.take_requests() {

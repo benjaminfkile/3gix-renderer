@@ -44,8 +44,12 @@
 //! # Asking ahead (`rendering.md` 3.2) and switching depth (3.3)
 //!
 //! Every cell of the target, leaves and the cells above them, that has not
-//! arrived is requested, largest projected size first, at most
-//! [`MAX_IN_FLIGHT`] at a time. Because the target reaches up to
+//! arrived is wanted: on every selection the cache hands the fetcher the
+//! wanted set, the largest [`MAX_IN_FLIGHT`] of those cells with each
+//! one's projected size as its priority
+//! ([`CellCache::take_wanted`], `client-compute.md` section 2.8), and the
+//! coordinator asks and streams largest first, dropping cells the view has
+//! left. Because the target reaches up to
 //! [`AHEAD_DEPTHS`] depths below the arrived cells, refinement takes about
 //! one round trip per three depths. The drawn selection switches a region to
 //! finer cells only when everything it needs there has arrived; the coarser
@@ -96,8 +100,10 @@
 //! 2.8): bounded at 64, oldest dropped when full, offered once from a task
 //! of its own with the section 2.5 headers, a failure counted and never
 //! retried. A `local` section is never offered. Uploads never delay a
-//! result reaching the renderer. The browser has its own fetcher with the
-//! same coordinator (`crate::web`).
+//! result reaching the renderer. The frame loop hands the fetcher the
+//! wanted cells and surface tiles on every selection
+//! ([`Fetcher::set_wanted_cells`], [`Fetcher::set_wanted_surfaces`]). The
+//! browser has its own fetcher with the same coordinator (`crate::web`).
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::directions::Arrived;
@@ -1246,6 +1252,9 @@ pub struct CellCache {
     in_flight: usize,
     pinned: BTreeSet<CellKey>,
     requested_ahead: u64,
+    /// A selection or a pin changed what is wanted since
+    /// [`CellCache::take_wanted`] last ran.
+    wanted_changed: bool,
 }
 
 impl CellCache {
@@ -1410,6 +1419,7 @@ impl CellCache {
         self.target = selection.target;
         self.target_cells = selection.target_cells;
         self.needed = selection.needed;
+        self.wanted_changed = true;
     }
 
     /// Replaces the selection with these cells as both the drawn selection
@@ -1441,6 +1451,7 @@ impl CellCache {
             .entry(key)
             .or_insert_with(|| CellEntry::new(now));
         self.pinned.insert(key);
+        self.wanted_changed = true;
         !std::mem::replace(&mut e.pinned, true)
     }
 
@@ -1487,6 +1498,71 @@ impl CellCache {
             out.push(k);
         }
         out
+    }
+
+    /// The wanted set (`client-compute.md` section 2.8), once per new
+    /// selection or pin: the needed cells of the target that have not
+    /// arrived, largest projected size first with it as priority, then
+    /// pinned cells not yet fetched at
+    /// [`crate::directions::REQUESTED_PRIORITY`], at most [`MAX_IN_FLIGHT`]
+    /// of them. The cap keeps a selection from asking for more than one
+    /// round trip brings in, which the per-frame budget of [`select_all`]
+    /// adapts to (`tests/budget.rs`); the rest is wanted by a later
+    /// selection once these have arrived. Marks
+    /// them `Requested`; a cell requested before and left out now goes
+    /// back to `Missing`, since the fetcher drops it. `None` when nothing
+    /// changed since the last call.
+    pub fn take_wanted(&mut self, now: f64) -> Option<Vec<(CellKey, f64)>> {
+        if !std::mem::take(&mut self.wanted_changed) {
+            return None;
+        }
+        let mut out: Vec<(CellKey, f64)> = Vec::new();
+        let mut seen = CellSet::default();
+        let candidates: Vec<(CellKey, f64)> = self
+            .needed
+            .iter()
+            .map(|c| (c.key, c.projected_px))
+            .chain(
+                self.pinned
+                    .iter()
+                    .map(|k| (*k, crate::directions::REQUESTED_PRIORITY)),
+            )
+            .collect();
+        for (k, p) in candidates {
+            if out.len() >= MAX_IN_FLIGHT {
+                break;
+            }
+            if !seen.insert(k) {
+                continue;
+            }
+            let ahead = k
+                .parent()
+                .is_some_and(|p| !self.state(&p).is_some_and(CellState::arrived));
+            let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
+            match e.state {
+                CellState::Missing => {
+                    e.state = CellState::Requested;
+                    e.requested_at = now;
+                    self.in_flight += 1;
+                    if ahead {
+                        self.requested_ahead += 1;
+                    }
+                }
+                CellState::Requested => {}
+                _ => continue,
+            }
+            e.last_used = now;
+            out.push((k, p));
+        }
+        let mut dropped = 0;
+        for (k, e) in self.entries.iter_mut() {
+            if e.state == CellState::Requested && !seen.contains(k) {
+                e.state = CellState::Missing;
+                dropped += 1;
+            }
+        }
+        self.in_flight = self.in_flight.saturating_sub(dropped);
+        Some(out)
     }
 
     /// Applies the result of a request for `key`.
@@ -2063,6 +2139,29 @@ mod native {
             self.extents.insert(key, root_extent);
             let now = self.now();
             self.coordinator.request(ChunkKey::Cell(key), now);
+        }
+
+        /// Replaces the wanted cells (`client-compute.md` section 2.8) with
+        /// `cells`, each a cell of a frame of edge `root_extent` with its
+        /// priority (projected size, pixels). Directions and streams follow
+        /// the wanted set, highest priority first; a cell left out that has
+        /// nothing in flight is dropped.
+        pub fn set_wanted_cells(&mut self, cells: Vec<(CellKey, Meters, f64)>) {
+            let now = self.now();
+            let mut wanted = Vec::with_capacity(cells.len());
+            for (key, root_extent, priority) in cells {
+                self.extents.insert(key, root_extent);
+                wanted.push((key, priority));
+            }
+            self.coordinator.set_wanted_cells(wanted, now);
+        }
+
+        /// Replaces the wanted surface tiles with `tiles`, each with its
+        /// priority (projected size, pixels), like
+        /// [`Self::set_wanted_cells`].
+        pub fn set_wanted_surfaces(&mut self, tiles: Vec<(gx_core::key::SurfaceKey, f64)>) {
+            let now = self.now();
+            self.coordinator.set_wanted_surfaces(tiles, now);
         }
 
         /// Queues a request for a surface tile; the result arrives as

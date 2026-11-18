@@ -8,13 +8,38 @@
 //! returns. Everything here is deterministic in its inputs, so the whole
 //! protocol is tested without a network.
 //!
-//! For each requested key (a cell or the registry, which is just another
-//! key):
+//! # The work list (`client-compute.md` section 2.8)
+//!
+//! The coordinator follows a wanted set: on every selection the cells
+//! ([`Coordinator::set_wanted_cells`]) and the surface tiles
+//! ([`Coordinator::set_wanted_surfaces`]) hand it every key they want now,
+//! each with its priority (projected size on screen, pixels), and it
+//! replaces its wanted set of that kind. [`Coordinator::request`] wants a
+//! key (the registry, a pinned cell) at the highest priority until it
+//! completes, whatever the selections say.
+//!
+//! - Directions batches are filled from wanted keys whose answer is
+//!   unknown, highest priority first (ties in key order). Streams start
+//!   highest priority first. Both orders are taken afresh on every
+//!   [`Coordinator::poll`], so they follow the latest wanted set.
+//! - A key that leaves the wanted set and has nothing in flight is
+//!   dropped: no directions are asked and no stream is started for it.
+//!   A directions answer or a stream already in flight completes. The
+//!   answer is kept by key ([`Coordinator::cached_answers`]) and a streamed
+//!   section lands in the driver's section cache, but neither starts
+//!   anything more for an unwanted key.
+//! - A key that comes back into the wanted set reuses its kept answer
+//!   instead of asking the hub again.
+//!
+//! Compute jobs are started as their answers arrive, in arrival order.
+//!
+//! For each wanted key (a cell, a surface tile, or the registry, which is
+//! just another key):
 //!
 //! 1. The key is asked about in a directions batch of at most
 //!    [`MAX_DIRECTION_KEYS`] keys, at most [`MAX_DIRECTIONS_IN_FLIGHT`]
-//!    batches at a time, in request order. A key already in flight is not
-//!    asked about twice.
+//!    batches at a time, highest priority first. A key already in flight
+//!    is not asked about twice.
 //! 2. Per layer (`client-compute.md` section 2.4): `empty` contributes
 //!    nothing; `ready` is streamed by its address and the hash of the
 //!    stored bytes, `GET /section/{address}?sha256={hex}` (from the local
@@ -32,10 +57,10 @@
 //!    the sections in the build's layer order, for compositing.
 
 use crate::protocol::{Direction, DirectionsResponse, MAX_DIRECTION_KEYS};
-use gx_core::key::ChunkKey;
+use gx_core::key::{CellKey, ChunkKey, SurfaceKey};
 use gx_core::matter::Section;
 use gx_worker::{ComputeJob, Computed, FailureKind, WorkerError};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Most directions requests in flight at once.
@@ -204,7 +229,6 @@ impl Slot {
 
 #[derive(Clone, Debug)]
 struct Entry {
-    seq: u64,
     requested_at: f64,
     /// One slot per layer; empty until the first answer.
     slots: Vec<Slot>,
@@ -215,6 +239,16 @@ struct Entry {
 }
 
 impl Entry {
+    /// `true` while a directions request, a stream, or a job for the key
+    /// is running.
+    fn busy(&self) -> bool {
+        self.asking
+            || self
+                .slots
+                .iter()
+                .any(|s| matches!(s, Slot::Streaming(..) | Slot::Computing(_)))
+    }
+
     /// When the key is due for directions, if at all.
     fn due_at(&self) -> Option<f64> {
         if self.asking {
@@ -259,14 +293,27 @@ pub struct DirectionStats {
     pub keys_failed: u64,
 }
 
-/// The state of every key in flight.
+/// Priority of a key wanted through [`Coordinator::request`]: above every
+/// projected size.
+pub const REQUESTED_PRIORITY: f64 = f64::INFINITY;
+
+/// The state of every key in flight, and the wanted set.
 #[derive(Debug, Default)]
 pub struct Coordinator {
     keys: BTreeMap<ChunkKey, Entry>,
-    stream_queue: VecDeque<(ChunkKey, usize, [u8; 32], [u8; 32])>,
+    stream_queue: Vec<(ChunkKey, usize, [u8; 32], [u8; 32])>,
     streams_in_flight: usize,
     directions_in_flight: usize,
-    next_seq: u64,
+    /// Every wanted key and its priority.
+    wanted: BTreeMap<ChunkKey, f64>,
+    /// Keys wanted through [`Coordinator::request`].
+    requested: BTreeSet<ChunkKey>,
+    /// Keys that completed or failed and are still in the wanted set: the
+    /// selection has not seen their result yet, so they are not started
+    /// again.
+    finished: BTreeSet<ChunkKey>,
+    /// The latest directions answer per key.
+    answers: BTreeMap<ChunkKey, Vec<Direction>>,
     origin_utc_ms: Option<i64>,
     stats: DirectionStats,
 }
@@ -297,17 +344,102 @@ impl Coordinator {
         self.keys.contains_key(key)
     }
 
-    /// Adds a key. A key already in flight is not added twice.
+    /// Wants `key` at [`REQUESTED_PRIORITY`] until it completes or fails,
+    /// whatever the selections say. A key already in flight is not added
+    /// twice.
     pub fn request(&mut self, key: ChunkKey, now: f64) {
+        self.requested.insert(key);
+        self.finished.remove(&key);
+        self.wanted.insert(key, REQUESTED_PRIORITY);
+        self.start(key, now);
+    }
+
+    /// Replaces the wanted cells with `cells`, each with its priority
+    /// (projected size, pixels). See the module docs.
+    pub fn set_wanted_cells(&mut self, cells: impl IntoIterator<Item = (CellKey, f64)>, now: f64) {
+        self.set_wanted(
+            |k| matches!(k, ChunkKey::Cell(_)),
+            cells.into_iter().map(|(k, p)| (ChunkKey::Cell(k), p)),
+            now,
+        );
+    }
+
+    /// Replaces the wanted surface tiles with `tiles`, each with its
+    /// priority (projected size, pixels). See the module docs.
+    pub fn set_wanted_surfaces(
+        &mut self,
+        tiles: impl IntoIterator<Item = (SurfaceKey, f64)>,
+        now: f64,
+    ) {
+        self.set_wanted(
+            |k| matches!(k, ChunkKey::Surface(_)),
+            tiles.into_iter().map(|(k, p)| (ChunkKey::Surface(k), p)),
+            now,
+        );
+    }
+
+    /// Replaces the wanted keys of one kind (`kind`) with `keys`, then
+    /// drops every key no longer wanted that has nothing in flight.
+    fn set_wanted(
+        &mut self,
+        kind: impl Fn(&ChunkKey) -> bool,
+        keys: impl IntoIterator<Item = (ChunkKey, f64)>,
+        now: f64,
+    ) {
+        let requested = &self.requested;
+        self.wanted.retain(|k, _| !kind(k) || requested.contains(k));
+        for (k, p) in keys {
+            let p = if self.requested.contains(&k) {
+                REQUESTED_PRIORITY
+            } else {
+                p
+            };
+            self.wanted.insert(k, p);
+        }
+        let wanted = &self.wanted;
+        self.finished.retain(|k| wanted.contains_key(k));
+        let fresh: Vec<ChunkKey> = self
+            .wanted
+            .keys()
+            .filter(|k| kind(k) && !self.finished.contains(k))
+            .copied()
+            .collect();
+        for k in fresh {
+            self.start(k, now);
+        }
+        let idle: Vec<ChunkKey> = self
+            .keys
+            .iter()
+            .filter(|(k, e)| !self.wanted.contains_key(k) && !e.busy())
+            .map(|(k, _)| *k)
+            .collect();
+        for k in idle {
+            self.keys.remove(&k);
+        }
+    }
+
+    /// The wanted set: every wanted key and its priority, in key order.
+    pub fn wanted(&self) -> &BTreeMap<ChunkKey, f64> {
+        &self.wanted
+    }
+
+    /// The kept directions answers, by key.
+    pub fn cached_answers(&self) -> &BTreeMap<ChunkKey, Vec<Direction>> {
+        &self.answers
+    }
+
+    fn priority(&self, key: &ChunkKey) -> f64 {
+        self.wanted.get(key).copied().unwrap_or(f64::NEG_INFINITY)
+    }
+
+    /// Adds an entry for a wanted key not in flight.
+    fn start(&mut self, key: ChunkKey, now: f64) {
         if self.keys.contains_key(&key) {
             return;
         }
-        let seq = self.next_seq;
-        self.next_seq += 1;
         self.keys.insert(
             key,
             Entry {
-                seq,
                 requested_at: now,
                 slots: Vec::new(),
                 asking: false,
@@ -317,20 +449,41 @@ impl Coordinator {
         );
     }
 
+    /// Drops `key` if it is no longer wanted and has nothing in flight.
+    fn drop_if_unwanted(&mut self, key: &ChunkKey) {
+        if !self.wanted.contains_key(key) && self.keys.get(key).is_some_and(|e| !e.busy()) {
+            self.keys.remove(key);
+        }
+    }
+
     /// The actions due at `now`: directions batches and streams.
     pub fn poll(&mut self, now: f64) -> Vec<Action> {
         let mut out = Vec::new();
+        // A wanted key with a kept answer and no slots yet takes it
+        // instead of asking again.
+        let reuse: Vec<ChunkKey> = self
+            .keys
+            .iter()
+            .filter(|(k, e)| e.slots.is_empty() && !e.asking && self.answers.contains_key(k))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in reuse {
+            let directions = self.answers[&k].clone();
+            self.apply(&k, directions, &mut out);
+        }
         while self.directions_in_flight < MAX_DIRECTIONS_IN_FLIGHT {
-            let mut due: Vec<(u64, ChunkKey)> = self
+            let mut due: Vec<(f64, ChunkKey)> = self
                 .keys
                 .iter()
-                .filter(|(_, e)| e.due_at().is_some_and(|t| t <= now))
-                .map(|(k, e)| (e.seq, *k))
+                .filter(|(k, e)| {
+                    self.wanted.contains_key(k) && e.due_at().is_some_and(|t| t <= now)
+                })
+                .map(|(k, _)| (self.priority(k), *k))
                 .collect();
             if due.is_empty() {
                 break;
             }
-            due.sort_unstable();
+            due.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
             due.truncate(MAX_DIRECTION_KEYS);
             let keys: Vec<ChunkKey> = due.into_iter().map(|(_, k)| k).collect();
             for k in &keys {
@@ -342,16 +495,30 @@ impl Coordinator {
             self.stats.largest_batch = self.stats.largest_batch.max(keys.len() as u64);
             out.push(Action::Directions(keys));
         }
+        // Queued streams of keys still wanted, highest priority first.
+        let mut queue = std::mem::take(&mut self.stream_queue);
+        queue.retain(|(key, layer, address, sha256)| {
+            self.keys
+                .get(key)
+                .and_then(|e| e.slots.get(*layer))
+                .is_some_and(|s| *s == Slot::StreamQueued(*address, *sha256))
+        });
+        queue.sort_by(|a, b| {
+            self.priority(&b.0)
+                .total_cmp(&self.priority(&a.0))
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+        });
+        let mut queue = queue.into_iter();
         while self.streams_in_flight < MAX_STREAMS_IN_FLIGHT {
-            let Some((key, layer, address, sha256)) = self.stream_queue.pop_front() else {
+            let Some((key, layer, address, sha256)) = queue.next() else {
                 break;
             };
-            let Some(slot) = self.slot_mut(&key, layer) else {
-                continue;
-            };
-            if *slot != Slot::StreamQueued(address, sha256) {
+            if !self.wanted.contains_key(&key) {
+                self.stream_queue.push((key, layer, address, sha256));
                 continue;
             }
+            let slot = self.slot_mut(&key, layer).expect("kept above");
             *slot = Slot::Streaming(address, sha256);
             self.streams_in_flight += 1;
             out.push(Action::Stream {
@@ -361,6 +528,7 @@ impl Coordinator {
                 sha256,
             });
         }
+        self.stream_queue.extend(queue);
         out
     }
 
@@ -371,8 +539,9 @@ impl Coordinator {
             return None;
         }
         self.keys
-            .values()
-            .filter_map(Entry::due_at)
+            .iter()
+            .filter(|(k, _)| self.wanted.contains_key(k))
+            .filter_map(|(_, e)| e.due_at())
             .min_by(f64::total_cmp)
     }
 
@@ -396,6 +565,7 @@ impl Coordinator {
                 tracing::debug!(keys = keys.len(), "directions failed: {reason}");
                 for k in keys {
                     self.hold(k, now);
+                    self.drop_if_unwanted(k);
                 }
                 return out;
             }
@@ -411,6 +581,7 @@ impl Coordinator {
             let Some(result) = by_key.get(name.as_str()) else {
                 tracing::debug!(key = %key, "directions left the key out");
                 self.hold(key, now);
+                self.drop_if_unwanted(key);
                 continue;
             };
             let parsed: Result<Vec<Direction>, String> = result
@@ -423,10 +594,18 @@ impl Coordinator {
                 Err(e) => {
                     tracing::warn!(key = %key, "directions are malformed: {e}");
                     self.hold(key, now);
+                    self.drop_if_unwanted(key);
                     continue;
                 }
             };
-            self.apply(key, directions, &mut out);
+            self.answers.insert(*key, directions.clone());
+            if self.wanted.contains_key(key) {
+                self.apply(key, directions, &mut out);
+            } else if let Some(e) = self.keys.get_mut(key) {
+                // Kept, and starts nothing.
+                e.asking = false;
+                self.drop_if_unwanted(key);
+            }
         }
         out
     }
@@ -483,6 +662,7 @@ impl Coordinator {
         }
         self.stream_queue.extend(streams);
         self.finish_if_done(key, out);
+        self.drop_if_unwanted(key);
     }
 
     /// Applies the outcome of a stream of `address` checked against
@@ -527,6 +707,7 @@ impl Coordinator {
             }
         }
         self.finish_if_done(key, &mut out);
+        self.drop_if_unwanted(key);
         out
     }
 
@@ -565,13 +746,25 @@ impl Coordinator {
                 self.fail(key, e.message, &mut out);
             }
         }
+        self.drop_if_unwanted(key);
         out
     }
 
     fn fail(&mut self, key: &ChunkKey, reason: String, out: &mut Vec<Action>) {
         if self.keys.remove(key).is_some() {
+            self.settle(key);
             self.stats.keys_failed += 1;
             out.push(Action::Failed { key: *key, reason });
+        }
+    }
+
+    /// A key completed or failed: a requested key is no longer wanted, a
+    /// selected one is not started again until a selection leaves it out.
+    fn settle(&mut self, key: &ChunkKey) {
+        if self.requested.remove(key) {
+            self.wanted.remove(key);
+        } else if self.wanted.contains_key(key) {
+            self.finished.insert(*key);
         }
     }
 
@@ -584,6 +777,7 @@ impl Coordinator {
             return;
         }
         let e = self.keys.remove(key).expect("checked above");
+        self.settle(key);
         let sections = e
             .slots
             .into_iter()
@@ -923,5 +1117,298 @@ mod tests {
         bad.address = Some("nope".into());
         c.directions_done(&[k, j], answer(vec![(j, vec![bad])]), 0.0);
         assert_eq!(c.poll(0.25), vec![Action::Directions(vec![k, j])]);
+    }
+
+    fn cell_key(i: u32) -> CellKey {
+        CellKey::new(12, 12, i, 0, 0).unwrap()
+    }
+
+    fn tile_key(i: u32) -> SurfaceKey {
+        SurfaceKey::new(4, 0, 10, i, 0).unwrap()
+    }
+
+    /// The keys `[i, i + 24)` along the line, nearest (`i + 12`) largest.
+    fn view_along(i: u32) -> Vec<(u32, f64)> {
+        (i..i + 24)
+            .map(|j| (j, 1000.0 / (1.0 + f64::from(j.abs_diff(i + 12)))))
+            .collect()
+    }
+
+    /// Drives a coordinator through a flight along a line: 50 selections,
+    /// each answered in part, with the rest still in flight when the next
+    /// selection lands. Checks that nothing starts for an unwanted key,
+    /// that no key is asked about twice, and that after the last selection
+    /// its keys go first, highest priority first.
+    fn fly(chunk: impl Fn(u32) -> ChunkKey, set: impl Fn(&mut Coordinator, Vec<(u32, f64)>)) {
+        let mut c = Coordinator::new();
+        let mut asked: BTreeMap<ChunkKey, u32> = BTreeMap::new();
+        let mut directions: Vec<Vec<ChunkKey>> = Vec::new();
+        let mut streams: Vec<(ChunkKey, usize, [u8; 32], [u8; 32])> = Vec::new();
+        let mut completed = Vec::new();
+        let check = |c: &Coordinator,
+                     a: &[Action],
+                     asked: &mut BTreeMap<ChunkKey, u32>,
+                     directions: &mut Vec<Vec<ChunkKey>>,
+                     streams: &mut Vec<(ChunkKey, usize, [u8; 32], [u8; 32])>,
+                     completed: &mut Vec<ChunkKey>| {
+            for a in a {
+                match a {
+                    Action::Directions(keys) => {
+                        for k in keys {
+                            assert!(c.wanted().contains_key(k), "asked about {k}");
+                            *asked.entry(*k).or_default() += 1;
+                            assert_eq!(asked[k], 1, "{k} asked twice");
+                        }
+                        directions.push(keys.clone());
+                    }
+                    Action::Stream {
+                        key,
+                        layer,
+                        address,
+                        sha256,
+                    } => {
+                        assert!(c.wanted().contains_key(key), "streamed {key}");
+                        streams.push((*key, *layer, *address, *sha256));
+                    }
+                    Action::Complete(done) => completed.push(done.key),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        for step in 0..50u32 {
+            let now = f64::from(step) * 0.1;
+            set(&mut c, view_along(step));
+            // Half of what is in flight answers after the view moved.
+            let n = directions.len().div_ceil(2);
+            for keys in directions.drain(..n).collect::<Vec<_>>() {
+                let rows = keys
+                    .iter()
+                    .map(|k| (*k, vec![ready("a", 1), empty("b")]))
+                    .collect();
+                let a = c.directions_done(&keys, answer(rows), now);
+                check(
+                    &c,
+                    &a,
+                    &mut asked,
+                    &mut directions,
+                    &mut streams,
+                    &mut completed,
+                );
+            }
+            let n = streams.len().div_ceil(2);
+            for (k, layer, address, sha256) in streams.drain(..n).collect::<Vec<_>>() {
+                let r = StreamResult::Bytes(bytes(1), Origin::Edge);
+                let a = c.stream_done(&k, layer, address, sha256, r, now);
+                check(
+                    &c,
+                    &a,
+                    &mut asked,
+                    &mut directions,
+                    &mut streams,
+                    &mut completed,
+                );
+            }
+            let a = c.poll(now);
+            check(
+                &c,
+                &a,
+                &mut asked,
+                &mut directions,
+                &mut streams,
+                &mut completed,
+            );
+        }
+        // Everything still in flight finishes; only the last view's keys
+        // start anything, highest priority first.
+        let last: BTreeMap<ChunkKey, f64> = view_along(49)
+            .into_iter()
+            .map(|(i, p)| (chunk(i), p))
+            .collect();
+        let before = completed.len();
+        let mut started = Vec::new();
+        while !directions.is_empty() || !streams.is_empty() {
+            for keys in std::mem::take(&mut directions) {
+                let rows = keys
+                    .iter()
+                    .map(|k| (*k, vec![ready("a", 1), empty("b")]))
+                    .collect();
+                let a = c.directions_done(&keys, answer(rows), 10.0);
+                check(
+                    &c,
+                    &a,
+                    &mut asked,
+                    &mut directions,
+                    &mut streams,
+                    &mut completed,
+                );
+            }
+            let a = c.poll(10.0);
+            check(
+                &c,
+                &a,
+                &mut asked,
+                &mut directions,
+                &mut streams,
+                &mut completed,
+            );
+            for (k, layer, address, sha256) in std::mem::take(&mut streams) {
+                started.push(k);
+                let r = StreamResult::Bytes(bytes(1), Origin::Edge);
+                let a = c.stream_done(&k, layer, address, sha256, r, 10.0);
+                check(
+                    &c,
+                    &a,
+                    &mut asked,
+                    &mut directions,
+                    &mut streams,
+                    &mut completed,
+                );
+            }
+            let a = c.poll(10.0);
+            check(
+                &c,
+                &a,
+                &mut asked,
+                &mut directions,
+                &mut streams,
+                &mut completed,
+            );
+        }
+        assert!(started.iter().all(|k| last.contains_key(k)));
+        // Streams started after a wanted-set change follow its priority.
+        let firsts: Vec<f64> = started
+            .iter()
+            .take(MAX_STREAMS_IN_FLIGHT)
+            .map(|k| last[k])
+            .collect();
+        assert!(firsts.windows(2).all(|w| w[0] >= w[1]), "{firsts:?}");
+        // Every key of the last view finished; none of the others started
+        // anything after the last selection.
+        assert!(!started.is_empty());
+        // Every key of the last view finished, each exactly once.
+        for k in last.keys() {
+            assert_eq!(completed.iter().filter(|d| *d == k).count(), 1, "{k}");
+        }
+        // The keys completing after the last selection are the last view's.
+        assert!(completed[before..].iter().all(|k| last.contains_key(k)));
+        assert_eq!(c.in_flight(), 0);
+    }
+
+    #[test]
+    fn cells_follow_the_view() {
+        fly(
+            |i| ChunkKey::Cell(cell_key(i)),
+            |c, v| c.set_wanted_cells(v.into_iter().map(|(i, p)| (cell_key(i), p)), 0.0),
+        );
+    }
+
+    #[test]
+    fn tiles_follow_the_view() {
+        fly(
+            |i| ChunkKey::Surface(tile_key(i)),
+            |c, v| c.set_wanted_surfaces(v.into_iter().map(|(i, p)| (tile_key(i), p)), 0.0),
+        );
+    }
+
+    #[test]
+    fn highest_priority_is_asked_first() {
+        let mut c = Coordinator::new();
+        c.set_wanted_cells((0..600).map(|i| (cell_key(i), f64::from(i))), 0.0);
+        let a = c.poll(0.0);
+        let Action::Directions(first) = &a[0] else {
+            panic!()
+        };
+        assert_eq!(first.len(), MAX_DIRECTION_KEYS);
+        assert_eq!(first[0], ChunkKey::Cell(cell_key(599)));
+        assert_eq!(first[MAX_DIRECTION_KEYS - 1], ChunkKey::Cell(cell_key(88)));
+        let Action::Directions(second) = &a[1] else {
+            panic!()
+        };
+        assert_eq!(second.len(), 88);
+    }
+
+    #[test]
+    fn a_key_that_leaves_and_returns_is_not_asked_twice() {
+        for surface in [false, true] {
+            let mut c = Coordinator::new();
+            let (k, other) = if surface {
+                (
+                    ChunkKey::Surface(tile_key(1)),
+                    ChunkKey::Surface(tile_key(2)),
+                )
+            } else {
+                (ChunkKey::Cell(cell_key(1)), ChunkKey::Cell(cell_key(2)))
+            };
+            let set = |c: &mut Coordinator, keys: &[ChunkKey]| {
+                if surface {
+                    c.set_wanted_surfaces(
+                        keys.iter().map(|k| match k {
+                            ChunkKey::Surface(t) => (*t, 1.0),
+                            _ => unreachable!(),
+                        }),
+                        0.0,
+                    )
+                } else {
+                    c.set_wanted_cells(
+                        keys.iter().map(|k| match k {
+                            ChunkKey::Cell(t) => (*t, 1.0),
+                            _ => unreachable!(),
+                        }),
+                        0.0,
+                    )
+                }
+            };
+            set(&mut c, &[k]);
+            assert_eq!(c.poll(0.0), vec![Action::Directions(vec![k])]);
+            // The view moves on while the answer is in flight.
+            set(&mut c, &[other]);
+            assert_eq!(c.poll(0.0), vec![Action::Directions(vec![other])]);
+            let a = c.directions_done(&[k], answer(vec![(k, vec![ready("a", 1)])]), 0.0);
+            assert!(a.is_empty(), "an unwanted key starts nothing: {a:?}");
+            assert!(c.poll(0.0).is_empty());
+            assert!(!c.contains(&k), "dropped once idle");
+            assert!(c.cached_answers().contains_key(&k), "the answer is kept");
+            // Back in view: the kept answer streams, no directions.
+            set(&mut c, &[k]);
+            let a = c.poll(0.0);
+            assert_eq!(
+                a,
+                vec![Action::Stream {
+                    key: k,
+                    layer: 0,
+                    address: [1; 32],
+                    sha256: [101; 32],
+                }]
+            );
+            // A stream in flight when the key leaves finishes and is kept.
+            set(&mut c, &[]);
+            let a = c.stream_done(
+                &k,
+                0,
+                [1; 32],
+                [101; 32],
+                StreamResult::Bytes(bytes(1), Origin::Edge),
+                0.0,
+            );
+            assert!(matches!(&a[..], [Action::Complete(done)] if done.key == k));
+            assert!(!c.contains(&k));
+            assert!(c.poll(0.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn cells_and_tiles_are_wanted_apart() {
+        let mut c = Coordinator::new();
+        c.request(ChunkKey::Registry, 0.0);
+        c.set_wanted_surfaces([(tile_key(1), 5.0)], 0.0);
+        c.set_wanted_cells([(cell_key(1), 9.0)], 0.0);
+        c.set_wanted_cells([], 0.0);
+        assert_eq!(
+            c.poll(0.0),
+            vec![Action::Directions(vec![
+                ChunkKey::Registry,
+                ChunkKey::Surface(tile_key(1))
+            ])]
+        );
     }
 }

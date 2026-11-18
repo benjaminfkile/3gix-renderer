@@ -139,6 +139,29 @@ impl WebFetcher {
         self.coordinator.request(ChunkKey::Cell(key), now);
     }
 
+    /// Replaces the wanted cells (`client-compute.md` section 2.8) with
+    /// `cells`, each a cell of a frame of edge `root_extent` with its
+    /// priority (projected size, pixels). Directions and streams follow
+    /// the wanted set, highest priority first; a cell left out that has
+    /// nothing in flight is dropped.
+    pub fn set_wanted_cells(&mut self, cells: Vec<(CellKey, Meters, f64)>) {
+        let now = self.now();
+        let mut wanted = Vec::with_capacity(cells.len());
+        for (key, root_extent, priority) in cells {
+            self.extents.insert(key, root_extent);
+            wanted.push((key, priority));
+        }
+        self.coordinator.set_wanted_cells(wanted, now);
+    }
+
+    /// Replaces the wanted surface tiles with `tiles`, each with its
+    /// priority (projected size, pixels), like
+    /// [`Self::set_wanted_cells`].
+    pub fn set_wanted_surfaces(&mut self, tiles: Vec<(gx_core::key::SurfaceKey, f64)>) {
+        let now = self.now();
+        self.coordinator.set_wanted_surfaces(tiles, now);
+    }
+
     /// Queues a request for a surface tile; the result arrives as
     /// [`FetchEvent::Surface`] through [`WebFetcher::drain`].
     pub fn request_surface(&mut self, key: gx_core::key::SurfaceKey) {
