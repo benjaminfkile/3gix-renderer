@@ -753,6 +753,28 @@ impl World {
     /// when no drawn mesh of the frame crosses it.
     pub fn surface_along(&self, frame_id: u64, direction: Vec3) -> Option<f64> {
         let d = [direction.x, direction.y, direction.z];
+        // A frame drawn from surface tiles: the drawn tiles' triangles.
+        if self.surfaces.has_surface(frame_id) {
+            let indices = crate::tiles::TileGeometry::indices();
+            let mut best: Option<f64> = None;
+            for t in self.surfaces.drawn() {
+                let g = &t.geometry;
+                if g.key.frame_id != frame_id
+                    || crate::spawn::ray_box(g.bounds.0, g.bounds.1, direction).is_none()
+                {
+                    continue;
+                }
+                for tri in indices.as_chunks::<3>().0 {
+                    let [a, b, c] = tri.map(|i| g.positions[i as usize]);
+                    if let Some(t) = ray_triangle(d, a, b, c) {
+                        if best.is_none_or(|r| t > r) {
+                            best = Some(t);
+                        }
+                    }
+                }
+            }
+            return best;
+        }
         let mut best: Option<f64> = None;
         for key in self.cache.draw_set(|k| self.drawable(k)) {
             if key.frame_id != frame_id {
