@@ -357,7 +357,7 @@ fn assert_nothing_held_back(rig: &Rig, world: &World, cam: &Camera, view: (u32, 
         "the cell cap held cells back"
     );
     for s in c.selection() {
-        let wanted = wants_refinement(seen.system(), seen.camera(), view, &s.key);
+        let wanted = wants_refinement(seen.system(), seen.camera(), view, c, &s.key);
         assert!(
             !(wanted && c.refinable(&s.key)),
             "cell {} could be refined and is not",
@@ -438,7 +438,8 @@ fn rounds_at_depth(depth: u8) {
             );
             for k in &far {
                 assert!(
-                    k.depth >= 2 && !wants_refinement(seen.system(), seen.camera(), view, k),
+                    k.depth >= 2
+                        && !wants_refinement(seen.system(), seen.camera(), view, world.cache(), k),
                     "{}: far side cell {k} is held back",
                     shape.name()
                 );

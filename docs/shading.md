@@ -119,9 +119,11 @@ the compiler's resolution decides how fine it is, as for surfaces.
 
 ## Far field
 
-A frame with mass above 0 whose `root_extent / 8` region projects to `p`
-pixels (region over distance to its origin, times the focal length in
-pixels) is drawn as follows:
+A frame with mass above 0 whose matter projects to `p` pixels (radius over
+distance to its origin, times the focal length in pixels; the radius is
+that of the ball of the volume its depth-0 cell's matter fills,
+`farfield::matter_radius`, and before that cell arrives the ball around
+the frame's cube, which its matter cannot exceed) is drawn as follows:
 
 | `p` | Drawn as |
 |---|---|
@@ -136,15 +138,19 @@ or volume blends in.
 The sprite's brightness comes from the frame's depth-0 cell, which the cell
 cache fetches once for this purpose and keeps (pinned, never evicted):
 
-- **Hot** (the cell has an emitter, see "Lights" above): the irradiance of
+The sprite's irradiance is the sum of what the frame emits and what it
+reflects of the other frames' lights:
+
+- **Emitted** (the cell has an emitter, see "Lights" above): the irradiance of
   a point source of intensity `I = band_power / (4 pi)` at the camera
   distance `D`: `E = I / D^2` per band. The emitter also stays a point
   light whenever none of the frame's drawn cells is hot: for a sprite-only
   frame, and for a frame in the transition whose cells are beyond the
   selection range (`gx_core::lod` culls cells farther than
   `4 * root_extent`), so a far hot frame keeps lighting the rest.
-- **Cold**: the active lights reflected by a Lambertian ball of radius
-  `R = root_extent / 8` with the mass-weighted mean albedo `a` of the cell:
+- **Reflected**: the active lights of other frames reflected by a
+  Lambertian ball of the matter's radius `R` with the mass-weighted mean
+  albedo `a` of the cell:
   `E = sum (2/3) a E_l R^2 phi(alpha) / D^2`, with `E_l` the irradiance from
   the light at the frame, `alpha` the phase angle (at the frame, between the
   light and the camera), and `phi(alpha) = (sin alpha + (pi - alpha)

@@ -103,7 +103,9 @@ package builds for that target.
    rate, clamped between the origin and now; at now it follows now.
 2. Every frame is integrated to the clock's time with
    `gx_core::integrate::Scheme::Relativistic` (first post-Newtonian gravity,
-   oblateness, rotation with torques) in steps of at most 600 s, read from a
+   oblateness, rotation with torques) in steps of at most 600 s and at most
+   1/256 of the shortest dynamical time `sqrt(d^3 / (G (m1 + m2)))` of two
+   frames (`sim::max_step`), read from a
    fine `gx_core::history::History` that is rebuilt from a coarse one
    (checkpoints every simulated day from the origin) whenever the time
    leaves it. A jump anywhere costs at most one coarse interval.
@@ -288,16 +290,20 @@ a light, a dense sample is a surface.
    (fetched once, never evicted). That cell holds all of the frame's
    matter, so its boundary is the frame's boundary with space, and the
    light escaping it is the light the frame sends out:
-   `gx_core::emission::summarize(section, 1000 K)`, radiative transfer
+   `gx_core::emission::summarize(section, 0 K)`, radiative transfer
    through the section (opaque solids and fluids radiate from their exposed
    faces, gas and plasma by their extinction) at each sample's radiating
    temperature (`matter-format.md` 3.3). Finer cells give no lights: their
-   boundaries face other matter of the same frame. The eight strongest
+   boundaries face other matter of the same frame. There is no temperature
+   cutoff: an emitter is a light when its light, at its own matter's
+   radius, reaches the faintest radiance the exposure pass shows
+   (`light::MIN_LIGHT_RADIANCE`). The eight strongest
    frame emitters become point lights of radiant intensity
    `band_power / (4 pi)` per band.
 6. **Draw set** (`stream::CellCache::draw_set`), with the depth transition
    rule below, and the **far field** (`farfield`): a frame with mass whose
-   `root_extent / 8` region projects to under 2 px has no cells selected
+   matter (the ball of the volume its depth-0 cell fills; before that cell
+   arrives, the ball around its cube) projects to under 2 px has no cells selected
    and is a point sprite instead; between 2 and 8 px the sprite fades out
    as the cells fade in. The sprite's brightness comes from the frame's
    pinned depth-0 cell (`docs/shading.md`).

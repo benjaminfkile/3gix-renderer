@@ -605,14 +605,16 @@ pub fn camera_in_frame(system: &FrameSystem, camera: &Camera, frame_id: u64) -> 
     system.root_orientation(frame_id).conjugate().rotate(v)
 }
 
-/// Returns `true` when `frame_id`'s `root_extent / 8` region is within
+/// Returns `true` when the ball around `frame_id`'s cube (all its matter is
+/// inside it, [`crate::farfield::unknown_radius`]) is within
 /// `4 * root_extent` of the camera or inside the view cone.
 pub fn frame_in_range(system: &FrameSystem, camera: &Camera, frame_id: u64, aspect: f64) -> bool {
     let Some(frame) = system.tree().get(frame_id) else {
         return false;
     };
     let extent = frame.root_extent.value();
-    let region = extent / 8.0;
+    // The frame's matter lies inside its cube: the ball around the cube.
+    let region = crate::farfield::unknown_radius(frame);
     let rel = camera.relative(system, Vec3::zero(), frame_id);
     let d = rel.length();
     if d - region <= 4.0 * extent {
@@ -663,11 +665,13 @@ pub fn select_all(
 ) -> Selection {
     let aspect = view_width_px / view_height_px.max(1.0);
     let focal = focal_px(view_height_px);
-    let sprites: BTreeSet<u64> = far_frames(system, camera, view_height_px)
-        .iter()
-        .filter(|f| f.sprite_only())
-        .map(|f| f.frame_id)
-        .collect();
+    let sprites: BTreeSet<u64> = far_frames(system, camera, view_height_px, |f| {
+        depth_zero_radius(cache, f)
+    })
+    .iter()
+    .filter(|f| f.sprite_only())
+    .map(|f| f.frame_id)
+    .collect();
     let mut out = Selection::default();
     for frame in system.tree().frames() {
         if sprites.contains(&frame.frame_id)
@@ -765,15 +769,18 @@ pub fn wants_refinement(
     system: &FrameSystem,
     camera: &Camera,
     (view_width_px, view_height_px): (f64, f64),
+    cache: &impl CellStates,
     key: &CellKey,
 ) -> bool {
     let aspect = view_width_px / view_height_px.max(1.0);
     let Some(frame) = system.tree().get(key.frame_id) else {
         return false;
     };
-    let sprite = far_frames(system, camera, view_height_px)
-        .iter()
-        .any(|f| f.frame_id == key.frame_id && f.sprite_only());
+    let sprite = far_frames(system, camera, view_height_px, |f| {
+        depth_zero_radius(cache, f)
+    })
+    .iter()
+    .any(|f| f.frame_id == key.frame_id && f.sprite_only());
     if sprite || !frame_in_range(system, camera, key.frame_id, aspect) {
         return false;
     }
@@ -1106,6 +1113,15 @@ fn by_depth<'a>(keys: impl Iterator<Item = &'a CellKey>) -> Vec<Vec<CellKey>> {
         buckets[d].push(*k);
     }
     buckets
+}
+
+/// The matter radius of `frame_id` from its depth-0 cell in `cache`, once
+/// it has arrived ([`crate::farfield::matter_radius`]).
+pub fn depth_zero_radius(cache: &impl CellStates, frame_id: u64) -> Option<f64> {
+    match cache.cell_state(&crate::farfield::depth_zero_key(frame_id)) {
+        Some(CellState::Ready(c)) => Some(c.radius),
+        _ => None,
+    }
 }
 
 /// What the selection reads of the cells: their fetch states. The cache

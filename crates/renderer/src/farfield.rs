@@ -13,7 +13,10 @@
 //! # Which frames
 //!
 //! Only frames with mass above 0 take part. A frame's size on screen is the
-//! projected size of its `root_extent / 8` region ([`region_projected_px`]):
+//! projected size of the ball of the volume its matter fills, from its
+//! depth-0 cell ([`matter_radius`]); until that cell has arrived, of the
+//! ball around its whole cube ([`unknown_radius`]), which its matter cannot
+//! exceed ([`region_projected_px`]):
 //!
 //! | Projected size | Drawn as |
 //! |---|---|
@@ -88,17 +91,24 @@ pub fn focal_px(view_height_px: f64) -> f64 {
     view_height_px / (2.0 * (0.5 * FIELD_OF_VIEW_Y).tan())
 }
 
-/// The projected size, pixels, of `frame`'s `root_extent / 8` region seen
-/// from `camera` in a view `view_height_px` tall: `region / D * f`, with `D`
-/// the distance to the frame origin. Infinite when the camera is inside the
-/// region.
+/// The radius of the ball around a frame's whole cube, meters: what its
+/// matter's size is taken as before its depth-0 cell has arrived.
+pub fn unknown_radius(frame: &Frame) -> f64 {
+    0.5 * 3.0f64.sqrt() * frame.root_extent.value()
+}
+
+/// The projected size, pixels, of a ball of `radius` about `frame`'s origin
+/// seen from `camera` in a view `view_height_px` tall: `radius / D * f`,
+/// with `D` the distance to the frame origin. Infinite when the camera is
+/// inside the ball.
 pub fn region_projected_px(
     system: &FrameSystem,
     camera: &Camera,
     frame: &Frame,
+    radius: f64,
     view_height_px: f64,
 ) -> f64 {
-    let region = frame.root_extent.value() / 8.0;
+    let region = radius;
     let d = camera
         .relative(system, Vec3::zero(), frame.frame_id)
         .length();
@@ -121,7 +131,7 @@ pub fn sprite_weight(projected_px: f64) -> f64 {
 pub struct FarFrame {
     /// The frame.
     pub frame_id: u64,
-    /// Projected size of its `root_extent / 8` region, pixels.
+    /// Projected size of its matter, pixels ([`region_projected_px`]).
     pub projected_px: f64,
     /// Weight of its sprite, 0 to 1 ([`sprite_weight`]).
     pub sprite_weight: f64,
@@ -140,16 +150,26 @@ impl FarFrame {
     }
 }
 
-/// Every frame with mass above 0 whose region projects to less than
-/// [`CELLS_ONLY_FROM_PX`], in ascending frame id order.
-pub fn far_frames(system: &FrameSystem, camera: &Camera, view_height_px: f64) -> Vec<FarFrame> {
+/// Every frame with mass above 0 whose matter projects to less than
+/// [`CELLS_ONLY_FROM_PX`], in ascending frame id order. `radius_of` gives a
+/// frame's matter radius from its depth-0 cell ([`matter_radius`]) once it
+/// has arrived; until then (or for 0) [`unknown_radius`] is used.
+pub fn far_frames(
+    system: &FrameSystem,
+    camera: &Camera,
+    view_height_px: f64,
+    radius_of: impl Fn(u64) -> Option<f64>,
+) -> Vec<FarFrame> {
     system
         .tree()
         .frames()
         .iter()
         .filter(|f| f.mass.value() > 0.0)
         .filter_map(|f| {
-            let px = region_projected_px(system, camera, f, view_height_px);
+            let radius = radius_of(f.frame_id)
+                .filter(|r| *r > 0.0)
+                .unwrap_or_else(|| unknown_radius(f));
+            let px = region_projected_px(system, camera, f, radius, view_height_px);
             (px < CELLS_ONLY_FROM_PX).then(|| FarFrame {
                 frame_id: f.frame_id,
                 projected_px: px,

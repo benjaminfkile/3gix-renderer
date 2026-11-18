@@ -878,7 +878,9 @@ impl World {
     pub fn draw_list(&mut self, seen: &Seen, view_px: (u32, u32), now: f64) -> DrawList {
         let (system, camera) = (seen.system(), seen.camera());
         let view_height = f64::from(view_px.1.max(1));
-        let far = far_frames(system, camera, view_height);
+        let far = far_frames(system, camera, view_height, |f| {
+            crate::stream::depth_zero_radius(&self.cache, f)
+        });
         let cell_weights: BTreeMap<u64, f32> = far
             .iter()
             .map(|f| (f.frame_id, f.cell_weight() as f32))

@@ -1,9 +1,10 @@
 //! Far field sprites through the whole pipeline: selection, the pinned
 //! depth-0 cell, the draw list, and the sprite pass.
 //!
-//! A massive frame 2000 m away with a `root_extent / 8` region of 1 m
-//! projects to well under 2 pixels, so its cells are not selected and it is
-//! drawn as one point sprite worked out from its depth-0 cell.
+//! A massive frame 2000 m away whose matter fills a ball of about 2.5 m
+//! (its depth-0 cell: 2 x 2 x 2 samples of 2 m) projects to well under 2
+//! pixels, so its cells are not selected and it is drawn as one point
+//! sprite worked out from its depth-0 cell.
 
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
@@ -25,6 +26,11 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;
 const ROOT: u64 = 1;
 const EXTENT: f64 = 8.0;
+
+/// Radius of the ball of the volume [`cell`] fills: eight samples of 2 m.
+fn matter_r() -> f64 {
+    (3.0 * 64.0 / (4.0 * std::f64::consts::PI)).cbrt()
+}
 
 fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: Vec3) -> Frame {
     Frame {
@@ -146,7 +152,7 @@ fn stream(system: &FrameSystem, chunks: &BTreeMap<CellKey, Vec<Vec<u8>>>) -> (Sc
 fn far_hot_frame_is_a_sprite_where_it_projects() {
     let system = system(&[Vec3::new(30.0, 2000.0, 15.0)]);
     let camera = camera();
-    let far = far_frames(&system, &camera, f64::from(HEIGHT));
+    let far = far_frames(&system, &camera, f64::from(HEIGHT), |_| Some(matter_r()));
     assert_eq!(far.len(), 1);
     assert!(far[0].sprite_only(), "{far:?}");
     assert!(far[0].projected_px < 2.0);
@@ -287,14 +293,20 @@ fn far_cold_frame_needs_light_from_its_side() {
 
 #[test]
 fn transition_blends_the_sprite_out_as_the_cells_blend_in() {
-    // Region 1 m at 31.2 m: about 5 px, halfway through the transition.
+    // Matter filling a ball of 1 m (eight samples of 2 m, each a share
+    // pi / 48 filled) at 31.2 m: about 5 px, halfway through the
+    // transition, and within the 4 root extents cells are selected in.
     let system = system(&[Vec3::new(0.0, 31.2, 0.0)]);
-    let far = far_frames(&system, &camera(), f64::from(HEIGHT));
+    let far = far_frames(&system, &camera(), f64::from(HEIGHT), |_| Some(1.0));
     assert_eq!(far.len(), 1);
     let w = far[0].sprite_weight;
     assert!(!far[0].sprite_only() && w > 0.4 && w < 0.6, "{far:?}");
 
-    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, hot()))].into();
+    let thin = Sample {
+        occupancy: Ratio::new(std::f64::consts::PI / 48.0),
+        ..hot()
+    };
+    let chunks: BTreeMap<CellKey, Vec<Vec<u8>>> = [(depth_zero_key(2), cell(2, thin))].into();
     let (scene, _) = stream(&system, &chunks);
     assert_eq!(scene.volumes.len(), 1);
     assert_eq!(scene.sprites.len(), 1);
