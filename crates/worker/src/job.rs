@@ -86,6 +86,9 @@ pub enum FailureKind {
     /// The module or the job itself is at fault. By the determinism rule
     /// the same job fails the same way again.
     Permanent,
+    /// The job's key left the wanted set before the job started, so it
+    /// never ran (`client-compute.md` section 2.8). Nothing went wrong.
+    Dropped,
 }
 
 /// Why a job failed.
@@ -103,6 +106,14 @@ impl WorkerError {
         WorkerError {
             kind: FailureKind::Transient,
             message: message.into(),
+        }
+    }
+
+    /// A job removed from the queue before it started.
+    pub fn dropped() -> WorkerError {
+        WorkerError {
+            kind: FailureKind::Dropped,
+            message: "dropped: the key is no longer wanted".into(),
         }
     }
 

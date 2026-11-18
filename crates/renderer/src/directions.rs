@@ -31,7 +31,14 @@
 //! - A key that comes back into the wanted set reuses its kept answer
 //!   instead of asking the hub again.
 //!
-//! Compute jobs are started as their answers arrive, in arrival order.
+//! - Compute jobs carry their key's priority ([`Action::Compute`]). The
+//!   driver's worker starts the highest first and, after every change of
+//!   the wanted set, gives each waiting job its key's priority
+//!   ([`Coordinator::compute_priority`]), removing a job whose key left
+//!   the set before it starts. A removed job is reported as
+//!   [`FailureKind::Dropped`]: its layer goes back to unknown and starts
+//!   again from the kept answer if the key comes back. A running job
+//!   finishes and its section is cached.
 //!
 //! For each wanted key (a cell, a surface tile, or the registry, which is
 //! just another key):
@@ -184,6 +191,10 @@ pub enum Action {
         layer: usize,
         /// The job.
         job: ComputeJob,
+        /// The key's priority now (projected size on screen, pixels); the
+        /// worker starts the highest first and follows later changes
+        /// through [`Coordinator::compute_priority`].
+        priority: f64,
     },
     /// The key is complete.
     Complete(Completion),
@@ -423,6 +434,13 @@ impl Coordinator {
         &self.wanted
     }
 
+    /// The priority a waiting compute job for `key` should have now, or
+    /// `None` when the key is no longer wanted and the job is to be dropped
+    /// before it starts (`client-compute.md` section 2.8).
+    pub fn compute_priority(&self, key: &ChunkKey) -> Option<f64> {
+        self.wanted.get(key).copied()
+    }
+
     /// The kept directions answers, by key.
     pub fn cached_answers(&self) -> &BTreeMap<ChunkKey, Vec<Direction>> {
         &self.answers
@@ -464,7 +482,12 @@ impl Coordinator {
         let reuse: Vec<ChunkKey> = self
             .keys
             .iter()
-            .filter(|(k, e)| e.slots.is_empty() && !e.asking && self.answers.contains_key(k))
+            .filter(|(k, e)| {
+                (e.slots.is_empty() || e.slots.contains(&Slot::Unknown))
+                    && !e.asking
+                    && self.wanted.contains_key(k)
+                    && self.answers.contains_key(k)
+            })
             .map(|(k, _)| *k)
             .collect();
         for k in reuse {
@@ -630,6 +653,7 @@ impl Coordinator {
             entry.slots = vec![Slot::Unknown; directions.len()];
         }
         let mut streams = Vec::new();
+        let priority = self.wanted.get(key).copied().unwrap_or(f64::NEG_INFINITY);
         for (layer, d) in directions.into_iter().enumerate() {
             let slot = &mut entry.slots[layer];
             // An answer already being acted on, or finished, stands.
@@ -655,6 +679,7 @@ impl Coordinator {
                         key: *key,
                         layer,
                         job,
+                        priority,
                     });
                     Slot::Computing(address)
                 }
@@ -735,6 +760,11 @@ impl Coordinator {
                 *slot = Slot::Done(computed.into());
                 self.stats.sections_computed += 1;
                 self.finish_if_done(key, &mut out);
+            }
+            Err(e) if e.kind == FailureKind::Dropped => {
+                // Never started; taken up again from the kept answer if
+                // the key comes back.
+                *slot = Slot::Unknown;
             }
             Err(e) if e.kind == FailureKind::Transient => {
                 entry.failures += 1;

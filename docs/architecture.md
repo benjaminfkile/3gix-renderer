@@ -28,6 +28,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 |---|---|---|
 | `job` | The job (`missing` or `local` direction, with its layer and whether it is shared), the address check, blob hash checks, manifest and tile resolution, section validation; shared by both platforms | `client-compute.md` 1, 3, 4, 5.2 |
 | `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then offering `missing` sections to the upload lane | `client-compute.md` 1, 4 |
+| `queue` | The work order: the three lanes (computes, uploads, checks) and the compute queue, highest priority first, reprioritized and pruned by the wanted set | `client-compute.md` 2.8 |
 | `upload` | The upload lane: bounded at 64, oldest dropped when full, one try per offer, and the outcome of each status (`201` stored, `200` matched, `202` disputed) | `client-compute.md` 2.5, 2.8 |
 | `cache` | The native local cache directory, keyed by kind and hash or address, evicted least recently used by size (default 20 GB) | `client-compute.md` 6 |
 | `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, offered, stored, matched, disputed, dropped, failed | |
@@ -238,6 +239,18 @@ delay a result reaching the renderer. A `local` section is never offered.
 Natively the modules run on a pool of threads with `gx-module-host`
 (1 GiB and 60 s per call); in the browser in a dedicated Web Worker with
 the browser's `WebAssembly` (`docs/web.md`).
+
+Work order (`client-compute.md` 2.8, `gx_worker::queue`): three lanes,
+strictly ordered: wanted computes, then uploads, then checks. A lower lane
+starts work only when no higher lane has any waiting, and a free thread
+never waits while a compute does. Computes start highest priority first
+(the key's projected size on screen); on every new wanted set the waiting
+ones take their key's new priority, and those whose key left the set are
+removed before they start and reported as dropped, so the coordinator
+takes them up again from the kept answer if the key comes back. A
+running job finishes and its section is cached. Natively uploads run on
+the pool's threads; in the browser an upload starts only while no
+compute waits.
 
 The local cache (`client-compute.md` 6) holds modules, manifests, tiles,
 and sections keyed by kind and hash or address. Natively it is a

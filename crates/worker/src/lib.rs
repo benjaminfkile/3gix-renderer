@@ -13,6 +13,9 @@
 //! - [`job`]: the job, the blob kinds, and the checks on every byte read
 //!   and returned, shared by both platforms.
 //! - [`stats`]: counters for the overlay.
+//! - [`queue`]: the work list's order: three lanes (computes, uploads,
+//!   checks) and the compute queue, highest priority first, shared by
+//!   both platforms.
 //! - [`upload`]: the bounded upload lane and the outcome of each offer,
 //!   shared by both platforms.
 //! - [`cache`]: the native local cache directory (native only).
@@ -26,6 +29,7 @@
 #![warn(missing_docs)]
 
 pub mod job;
+pub mod queue;
 pub mod stats;
 pub mod upload;
 
@@ -35,10 +39,11 @@ pub mod cache;
 pub mod native;
 
 pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
+pub use queue::{ComputeQueue, Lane};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
 pub use upload::{UploadLane, UploadOffer, UploadOutcome, UPLOAD_LANE_CAPACITY};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use cache::DiskCache;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{default_threads, Blobs, ModuleRunner, Uploader, WorkerPool};
+pub use native::{default_threads, Blobs, LaneSource, ModuleRunner, Uploader, WorkerPool};
