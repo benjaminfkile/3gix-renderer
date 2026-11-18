@@ -41,9 +41,13 @@ pub mod native;
 pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
 pub use queue::{ComputeQueue, Lane};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
-pub use upload::{UploadLane, UploadOffer, UploadOutcome, UPLOAD_LANE_CAPACITY};
+pub use upload::{
+    UploadLane, UploadOffer, UploadOutcome, MAX_UPLOADS_IN_FLIGHT, UPLOAD_LANE_CAPACITY,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use cache::DiskCache;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{default_threads, Blobs, LaneSource, ModuleRunner, Uploader, WorkerPool};
+pub use native::{
+    default_threads, Blobs, LaneSource, ModuleRunner, PoolWaker, Uploader, WorkerPool,
+};

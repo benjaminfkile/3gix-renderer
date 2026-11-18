@@ -12,6 +12,9 @@
 //! - a cached copy whose hash differs from the `sha256` of a `ready`
 //!   answer is discarded and the new version streamed;
 //! - a revoked key's offers are counted as failed and never retried;
+//! - with a hub that never answers uploads, every wanted compute still
+//!   runs on the pool and finishes, and at most four uploads are in
+//!   flight at once;
 //! - two clients at once both compute what they need; the hub stores the
 //!   first copy and matches the second; directions go out in batches of
 //!   at most 512 keys;
@@ -29,6 +32,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
 use gx_core::timescale::utc_ms_to_tdb_seconds;
 use gx_core::units::Seconds;
+use gx_worker::MAX_UPLOADS_IN_FLIGHT;
 use renderer::app::{check_origin, matter_step, render_headless_view, HeadlessRun};
 use renderer::camera::Camera;
 use renderer::config::{ApiKey, View};
@@ -116,6 +120,18 @@ fn connect(rt: &tokio::runtime::Runtime, hub: &MockHub, cache: Option<&PathBuf>)
 /// Streams the `Home` view's selection and pinned cells until every one is
 /// resolved, then waits for the uploads to finish. Returns the world.
 fn stream_home(c: &mut Client) -> World {
+    let world = settle_home(c);
+    let start = Instant::now();
+    while c.fetcher.stats().worker.uploads_pending > 0 {
+        assert!(start.elapsed() < Duration::from_secs(30), "uploads hang");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    world
+}
+
+/// Streams the `Home` view's selection and pinned cells until every one is
+/// resolved, without waiting for uploads. Returns the world.
+fn settle_home(c: &mut Client) -> World {
     let mut camera = Camera::home(&c.system);
     camera.update_parent(&c.system);
     let mut world = World::new(default_threads());
@@ -129,11 +145,6 @@ fn stream_home(c: &mut Client) -> World {
         }
         assert!(now < 90.0, "the view did not settle");
         c.fetcher.wait_for_events(Duration::from_millis(20));
-    }
-    let start = Instant::now();
-    while c.fetcher.stats().worker.uploads_pending > 0 {
-        assert!(start.elapsed() < Duration::from_secs(30), "uploads hang");
-        std::thread::sleep(Duration::from_millis(10));
     }
     world
 }
@@ -355,6 +366,49 @@ fn a_revoked_key_counts_failures_and_never_retries() {
     assert_eq!(s.uploads_failed, s.uploads_offered, "{s:?}");
     assert_eq!(n.uploads_refused, s.uploads_offered, "one try each");
     assert!(hub.sections().is_empty());
+}
+
+#[test]
+fn a_hub_that_never_answers_uploads_holds_no_compute_thread() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    hub.hold_uploads();
+    let mut a = connect(&rt, &hub, None);
+    // Every missing section is computed on the pool's two threads while
+    // the first uploads hang; with uploads on those threads the view
+    // would never settle.
+    let world = settle_home(&mut a);
+    assert!(!matter(&world).is_empty(), "drawing never waits on uploads");
+    let n = hub.counts();
+    let s = a.fetcher.stats().worker;
+    assert!(
+        n.missing_answers > MAX_UPLOADS_IN_FLIGHT as u64,
+        "enough sections to fill the upload slots: {n:?}"
+    );
+    assert!(s.sections_computed >= n.missing_answers, "{s:?}");
+    assert_eq!(s.jobs_failed, 0, "{s:?}");
+    assert_eq!(s.uploads_offered, n.missing_answers, "{s:?}");
+    // The first four reach the hub and hang there; the rest wait in the
+    // lane.
+    let start = Instant::now();
+    while hub.counts().uploads_held < MAX_UPLOADS_IN_FLIGHT as u64 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "uploads never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let n = hub.counts();
+    assert_eq!(n.most_uploads_held, MAX_UPLOADS_IN_FLIGHT as u64, "{n:?}");
+    assert_eq!(n.uploads_stored + n.uploads_refused, 0, "{n:?}");
+    let s = a.fetcher.stats().worker;
+    assert_eq!(
+        s.uploads_pending,
+        s.uploads_offered - s.uploads_dropped,
+        "{s:?}"
+    );
+    assert_eq!(s.uploads_stored + s.uploads_failed, 0, "{s:?}");
 }
 
 #[test]

@@ -12,7 +12,8 @@
 //!   `sha256` and a `checkRate` of `max(1 / (1 + c), 0.01)` for `c`
 //!   matches, or `missing`.
 //! - `PUT /space/{s}/build/{b}/section/{address}` (section 2.5) with
-//!   `X-Layer`, `X-Key`, `X-Span-Index`, and `X-Content-Sha256`: `403` for a
+//!   `X-Layer`, `X-Key`, `X-Span-Index`, and `X-Content-Sha256`: never
+//!   answered once [`MockHub::hold_uploads`] was called; `403` for a
 //!   revoked key ([`MockHub::revoke`]), `400` for an unknown layer, a bad
 //!   key or span index, a key the layer is `empty` for, or an address that
 //!   is not the one the headers name, `403` for an unshared layer; for a
@@ -189,6 +190,10 @@ pub struct MockCounts {
     pub uploads_disputed: u64,
     /// Uploads refused (`400` or `403`).
     pub uploads_refused: u64,
+    /// Uploads being held now ([`MockHub::hold_uploads`]).
+    pub uploads_held: u64,
+    /// The most uploads held at once.
+    pub most_uploads_held: u64,
     /// `GET /section/...` answered `200`.
     pub section_reads: u64,
     /// `GET /module/...` answered `200`.
@@ -210,6 +215,8 @@ struct Counters {
     uploads_matched: AtomicU64,
     uploads_disputed: AtomicU64,
     uploads_refused: AtomicU64,
+    uploads_held: AtomicU64,
+    most_uploads_held: AtomicU64,
     section_reads: AtomicU64,
     module_reads: AtomicU64,
     source_reads: AtomicU64,
@@ -238,6 +245,8 @@ struct Space {
     origin: Option<i64>,
     sections: BTreeMap<String, Stored>,
     revoked: bool,
+    /// Uploads are read and then never answered.
+    holding: bool,
 }
 
 struct State {
@@ -305,6 +314,7 @@ impl MockHub {
                 origin: options.origin_utc_ms,
                 sections: BTreeMap::new(),
                 revoked: false,
+                holding: false,
             }),
             layers,
             options,
@@ -364,6 +374,12 @@ impl MockHub {
         self.state.space.lock().expect("space").revoked = true;
     }
 
+    /// Holds every later upload: the request is read and the connection
+    /// kept open without an answer for as long as the mock runs.
+    pub fn hold_uploads(&self) {
+        self.state.space.lock().expect("space").holding = true;
+    }
+
     /// The build's description as served.
     pub fn build(&self) -> BuildDescription {
         build_description(&self.state)
@@ -383,11 +399,22 @@ impl MockHub {
             uploads_matched: l(&c.uploads_matched),
             uploads_disputed: l(&c.uploads_disputed),
             uploads_refused: l(&c.uploads_refused),
+            uploads_held: l(&c.uploads_held),
+            most_uploads_held: l(&c.most_uploads_held),
             section_reads: l(&c.section_reads),
             module_reads: l(&c.module_reads),
             source_reads: l(&c.source_reads),
             manifest_reads: l(&c.manifest_reads),
         }
+    }
+}
+
+/// Counts a held upload down when its connection ends.
+struct Held<'a>(&'a AtomicU64);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -538,6 +565,13 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
             json(&mut stream, status, &answer).await
         }
         "PUT" if path.starts_with(&format!("{build}/section/")) => {
+            if state.space.lock().expect("space").holding {
+                let c = &state.counters;
+                let _held = Held(&c.uploads_held);
+                let now = c.uploads_held.fetch_add(1, Ordering::SeqCst) + 1;
+                c.most_uploads_held.fetch_max(now, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
             let address = &path[build.len() + "/section/".len()..];
             let (status, answer) = upload(&state, address, &head, &body);
             json(&mut stream, status, &answer).await
