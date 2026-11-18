@@ -97,9 +97,12 @@
 //! worker pool ([`gx_worker::WorkerPool`]), which hands each section over
 //! decoded at once. A computed `missing` section then enters the upload
 //! lane ([`gx_worker::UploadLane`], `client-compute.md` sections 2.5 and
-//! 2.8): bounded at 64, oldest dropped when full, offered once from a task
-//! of its own with the section 2.5 headers, a failure counted and never
-//! retried. A `local` section is never offered. Uploads never delay a
+//! 2.8): bounded at 64, oldest dropped when full, offered once by a pool
+//! thread with the section 2.5 headers when no compute waits (the pool's
+//! upload lane, [`gx_worker::Lane`]), a failure counted and never
+//! retried. Compute jobs start highest priority first, and on every new
+//! wanted set the waiting ones are reprioritized and those whose key left
+//! it dropped before they start. A `local` section is never offered. Uploads never delay a
 //! result reaching the renderer. The frame loop hands the fetcher the
 //! wanted cells and surface tiles on every selection
 //! ([`Fetcher::set_wanted_cells`], [`Fetcher::set_wanted_surfaces`]). The
@@ -1927,8 +1930,8 @@ mod native {
     use gx_core::units::Meters;
     use gx_module_host::HostConfig;
     use gx_worker::{
-        BlobKind, Blobs, ComputeJob, Computed, DiskCache, UploadLane, UploadOffer, UploadOutcome,
-        Uploader, WorkerError, WorkerPool, WorkerStats,
+        BlobKind, Blobs, ComputeJob, Computed, DiskCache, Lane, LaneSource, UploadLane,
+        UploadOffer, UploadOutcome, Uploader, WorkerError, WorkerPool, WorkerStats,
     };
     use std::collections::BTreeMap;
     use std::sync::mpsc;
@@ -1973,11 +1976,11 @@ mod native {
         }
     }
 
-    /// Puts computed `missing` sections into the upload lane and wakes the
-    /// task that sends them. Never blocks the worker.
+    /// Puts computed `missing` sections into the upload lane. Never blocks
+    /// the worker: the offer is sent later by a pool thread when no compute
+    /// waits ([`UploadSender`]).
     struct HubUploader {
         lane: Arc<UploadLane>,
-        wake: tokio::sync::mpsc::UnboundedSender<()>,
     }
 
     impl Uploader for HubUploader {
@@ -1986,21 +1989,25 @@ mod native {
                 job: job.clone(),
                 bytes: section,
             });
-            let _ = self.wake.send(());
         }
     }
 
-    /// Sends the lane's offers one at a time, each once, until the
-    /// uploader is dropped and the lane is empty.
-    async fn send_uploads(
+    /// The pool's upload lane (`client-compute.md` section 2.8): each offer
+    /// sent once, on a pool thread, only when no wanted compute waits.
+    struct UploadSender {
+        handle: tokio::runtime::Handle,
         client: Arc<HubClient>,
         lane: Arc<UploadLane>,
-        mut wake: tokio::sync::mpsc::UnboundedReceiver<()>,
-    ) {
-        loop {
-            while let Some((offer, ticket)) = lane.take() {
+    }
+
+    impl LaneSource for UploadSender {
+        fn next(&self) -> Option<Box<dyn FnOnce() + Send>> {
+            let (offer, ticket) = self.lane.take()?;
+            let (handle, client) = (self.handle.clone(), self.client.clone());
+            Some(Box::new(move || {
                 let key = offer.job.key();
-                let outcome = match client.upload(&offer.job, offer.bytes.to_vec()).await {
+                let outcome = match handle.block_on(client.upload(&offer.job, offer.bytes.to_vec()))
+                {
                     Ok(status) => {
                         tracing::debug!(key = %key, status, "section offered");
                         UploadOutcome::from_status(status)
@@ -2011,10 +2018,7 @@ mod native {
                     }
                 };
                 ticket.finish(outcome);
-            }
-            if wake.recv().await.is_none() && lane.is_empty() {
-                return;
-            }
+            }))
         }
     }
 
@@ -2067,8 +2071,6 @@ mod native {
         ) -> Result<Fetcher> {
             let stats = WorkerStats::new();
             let lane = Arc::new(UploadLane::new(Arc::clone(&stats)));
-            let (wake, woken) = tokio::sync::mpsc::unbounded_channel();
-            handle.spawn(send_uploads(client.clone(), Arc::clone(&lane), woken));
             let pool = WorkerPool::with_stats(
                 options.worker_threads,
                 options.host,
@@ -2077,10 +2079,20 @@ mod native {
                     client: client.clone(),
                 }),
                 options.cache.clone(),
-                Arc::new(HubUploader { lane, wake }),
+                Arc::new(HubUploader {
+                    lane: Arc::clone(&lane),
+                }),
                 stats,
             )
             .map_err(|e| anyhow!("starting the worker: {e}"))?;
+            pool.set_lane(
+                Lane::Upload,
+                Arc::new(UploadSender {
+                    handle: handle.clone(),
+                    client: client.clone(),
+                    lane,
+                }),
+            );
             tracing::info!(threads = pool.size(), "worker started");
             let (tx, rx) = mpsc::channel();
             client.keep_clock(&handle);
@@ -2154,6 +2166,15 @@ mod native {
                 wanted.push((key, priority));
             }
             self.coordinator.set_wanted_cells(wanted, now);
+            self.follow_wanted();
+        }
+
+        /// Gives the worker's waiting jobs their keys' new priorities and
+        /// drops those whose key left the wanted set; each dropped job
+        /// reports back through the queue like any other.
+        fn follow_wanted(&mut self) {
+            let coordinator = &self.coordinator;
+            self.pool.reprioritize(|k| coordinator.compute_priority(k));
         }
 
         /// Replaces the wanted surface tiles with `tiles`, each with its
@@ -2162,6 +2183,7 @@ mod native {
         pub fn set_wanted_surfaces(&mut self, tiles: Vec<(gx_core::key::SurfaceKey, f64)>) {
             let now = self.now();
             self.coordinator.set_wanted_surfaces(tiles, now);
+            self.follow_wanted();
         }
 
         /// Queues a request for a surface tile; the result arrives as
@@ -2268,10 +2290,15 @@ mod native {
                         });
                     });
                 }
-                Action::Compute { key, layer, job } => {
+                Action::Compute {
+                    key,
+                    layer,
+                    job,
+                    priority,
+                } => {
                     let tx = self.tx.clone();
                     let address = job.address;
-                    self.pool.submit(job, move |result| {
+                    self.pool.submit(job, priority, move |result| {
                         let _ = tx.send(Internal::Compute {
                             key,
                             layer,

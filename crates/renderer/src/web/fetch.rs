@@ -9,10 +9,13 @@
 //! directions carried (a cached copy that differs is discarded and fetched
 //! again), and `missing` and `local` jobs on the Web Worker
 //! ([`ModuleWorker`], one at a time so a queued call never runs into
-//! another's time limit). A computed section is handed over at once. A
+//! another's time limit, the highest priority waiting job first, see
+//! [`gx_worker::queue`]; a waiting job whose key left the wanted set is
+//! dropped before it starts). A computed section is handed over at once. A
 //! `missing` one then enters the upload lane ([`UploadLane`],
 //! `client-compute.md` sections 2.5 and 2.8): bounded at 64, oldest
-//! dropped when full, sent one at a time and once each, a failure counted
+//! dropped when full, sent one at a time and once each, and only while no
+//! compute waits, a failure counted
 //! and never retried. A `local` section is never offered. Nothing waits
 //! on another client, so there is no readiness socket.
 //!
@@ -37,8 +40,8 @@ use gx_core::key::{CellKey, ChunkKey};
 use gx_core::sha256::{sha256, to_hex};
 use gx_core::units::Meters;
 use gx_worker::{
-    BlobKind, ComputeJob, Computed, UploadLane, UploadOffer, UploadOutcome, WorkerError,
-    WorkerStats,
+    BlobKind, ComputeJob, ComputeQueue, Computed, UploadLane, UploadOffer, UploadOutcome,
+    WorkerError, WorkerStats,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -76,7 +79,7 @@ pub struct WebFetcher {
     lane: Rc<UploadLane>,
     uploading: Rc<Cell<bool>>,
     inbox: Rc<RefCell<VecDeque<Internal>>>,
-    jobs: VecDeque<(ChunkKey, usize, ComputeJob)>,
+    jobs: ComputeQueue<(usize, ComputeJob)>,
     job_running: Rc<Cell<bool>>,
     extents: BTreeMap<CellKey, Meters>,
     completed: VecDeque<(CellKey, Completion, Meters, Duration)>,
@@ -101,7 +104,7 @@ impl WebFetcher {
             stats,
             coordinator: Coordinator::new(),
             inbox: Rc::default(),
-            jobs: VecDeque::new(),
+            jobs: ComputeQueue::new(),
             job_running: Rc::new(Cell::new(false)),
             extents: BTreeMap::new(),
             completed: VecDeque::new(),
@@ -152,6 +155,23 @@ impl WebFetcher {
             wanted.push((key, priority));
         }
         self.coordinator.set_wanted_cells(wanted, now);
+        self.follow_wanted();
+    }
+
+    /// Gives the waiting jobs their keys' new priorities and drops those
+    /// whose key left the wanted set, reporting each as dropped.
+    fn follow_wanted(&mut self) {
+        let coordinator = &self.coordinator;
+        let dropped = self.jobs.reprioritize(|k| coordinator.compute_priority(k));
+        let mut inbox = self.inbox.borrow_mut();
+        for (layer, job) in dropped {
+            inbox.push_back(Internal::Compute {
+                key: job.key(),
+                layer,
+                address: job.address,
+                result: Err(WorkerError::dropped()),
+            });
+        }
     }
 
     /// Replaces the wanted surface tiles with `tiles`, each with its
@@ -160,6 +180,7 @@ impl WebFetcher {
     pub fn set_wanted_surfaces(&mut self, tiles: Vec<(gx_core::key::SurfaceKey, f64)>) {
         let now = self.now();
         self.coordinator.set_wanted_surfaces(tiles, now);
+        self.follow_wanted();
     }
 
     /// Queues a request for a surface tile; the result arrives as
@@ -221,12 +242,12 @@ impl WebFetcher {
         }
     }
 
-    /// Starts the next queued job if none is running.
+    /// Starts the queued job of the highest priority if none is running.
     fn start_job(&mut self) {
         if self.job_running.get() {
             return;
         }
-        let Some((key, layer, job)) = self.jobs.pop_front() else {
+        let Some((key, (layer, job))) = self.jobs.pop() else {
             return;
         };
         self.job_running.set(true);
@@ -269,10 +290,12 @@ impl WebFetcher {
         });
     }
 
-    /// Sends the upload lane's oldest offer if none is being sent. Each
-    /// offer is sent once; a failure is counted and dropped.
+    /// Sends the upload lane's oldest offer if none is being sent and no
+    /// wanted compute waits (`client-compute.md` section 2.8: uploads are
+    /// below computes). Each offer is sent once; a failure is counted and
+    /// dropped.
     fn start_upload(&mut self) {
-        if self.uploading.get() {
+        if self.uploading.get() || !self.jobs.is_empty() {
             return;
         }
         let Some((offer, ticket)) = self.lane.take() else {
@@ -323,7 +346,12 @@ impl WebFetcher {
                     });
                 });
             }
-            Action::Compute { key, layer, job } => self.jobs.push_back((key, layer, job)),
+            Action::Compute {
+                key,
+                layer,
+                job,
+                priority,
+            } => self.jobs.push(key, priority, (layer, job)),
             Action::Complete(done) => match done.key {
                 ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
                     .sections

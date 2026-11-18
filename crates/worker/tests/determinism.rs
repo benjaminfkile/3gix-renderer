@@ -179,7 +179,7 @@ fn pool_runs_jobs_end_to_end_and_caches_everything() {
         for (job, sha) in &jobs {
             let tx = tx.clone();
             let sha = sha.clone();
-            pool.submit(job.clone(), move |r| tx.send((r, sha)).unwrap());
+            pool.submit(job.clone(), 0.0, move |r| tx.send((r, sha)).unwrap());
         }
         for _ in 0..jobs.len() {
             let (r, sha) = rx.recv_timeout(Duration::from_secs(120)).unwrap();

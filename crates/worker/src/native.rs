@@ -18,6 +18,16 @@
 //!    it to the upload lane ([`Uploader`]), which never holds up the next
 //!    job. A `local` section is never offered.
 //!
+//! Jobs wait in one queue per pool (`client-compute.md` section 2.8,
+//! [`crate::queue`]): a free thread takes the waiting compute of the
+//! highest priority; only when no compute waits does it take work from the
+//! upload lane, and only when no upload waits from the check lane
+//! ([`WorkerPool::set_lane`]). [`WorkerPool::reprioritize`] follows the
+//! wanted set: waiting jobs take their key's new priority, and a job whose
+//! key left it is removed before it starts and told
+//! [`crate::FailureKind::Dropped`]. A running job finishes and its section
+//! is cached.
+//!
 //! The worker sees modules, requests, tile bytes, and section bytes, and
 //! nothing else.
 
@@ -26,12 +36,13 @@ use crate::job::{
     check_blob, check_section, check_tile, decode_manifest, resolve_tiles, BlobKind, ComputeJob,
     Computed, WorkerError,
 };
+use crate::queue::{ComputeQueue, Lane};
 use crate::stats::{WorkerSnapshot, WorkerStats};
+use gx_core::key::ChunkKey;
 use gx_core::sha256::to_hex;
 use gx_module_host::{HostConfig, HostError, LoadedModule, ModuleHost};
 use std::collections::BTreeMap;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 /// Where the worker gets content-addressed bytes it does not have cached:
@@ -311,9 +322,59 @@ struct Task {
     done: Box<dyn FnOnce(JobResult) + Send>,
 }
 
+/// A lower lane's work (uploads, checks): a pool thread asks it for the
+/// next piece of work only when no higher lane has any waiting.
+pub trait LaneSource: Send + Sync {
+    /// The next piece of work, or `None` when nothing waits. Must not
+    /// block; the work itself may.
+    fn next(&self) -> Option<Box<dyn FnOnce() + Send>>;
+}
+
+/// What the pool's threads wait on.
+struct State {
+    computes: ComputeQueue<Task>,
+    /// The upload and check lanes, by [`Lane`].
+    lanes: Vec<(Lane, Arc<dyn LaneSource>)>,
+    stopping: bool,
+}
+
+/// The queue and the signal that something was queued.
+struct Queue {
+    state: Mutex<State>,
+    ready: Condvar,
+}
+
+/// One piece of work taken by a thread.
+enum Work {
+    Compute(Task),
+    Lower(Box<dyn FnOnce() + Send>),
+}
+
+impl Queue {
+    /// Blocks until there is work, highest lane first, or the pool stops
+    /// with nothing left (`None`).
+    fn take(&self) -> Option<Work> {
+        let mut state = self.state.lock().expect("job queue");
+        loop {
+            if let Some((_, task)) = state.computes.pop() {
+                return Some(Work::Compute(task));
+            }
+            for (_, source) in &state.lanes {
+                if let Some(work) = source.next() {
+                    return Some(Work::Lower(work));
+                }
+            }
+            if state.stopping {
+                return None;
+            }
+            state = self.ready.wait(state).expect("job queue");
+        }
+    }
+}
+
 /// The pool of worker threads.
 pub struct WorkerPool {
-    tx: Option<mpsc::Sender<Task>>,
+    queue: Arc<Queue>,
     threads: Vec<JoinHandle<()>>,
     stats: Arc<WorkerStats>,
     size: usize,
@@ -357,27 +418,34 @@ impl WorkerPool {
             cache,
             uploader,
         });
-        let (tx, rx) = mpsc::channel::<Task>();
-        let rx = Arc::new(Mutex::new(rx));
+        let queue = Arc::new(Queue {
+            state: Mutex::new(State {
+                computes: ComputeQueue::new(),
+                lanes: Vec::new(),
+                stopping: false,
+            }),
+            ready: Condvar::new(),
+        });
         let size = threads.max(1);
         let threads = (0..size)
             .map(|i| {
-                let rx = Arc::clone(&rx);
+                let queue = Arc::clone(&queue);
                 let shared = Arc::clone(&shared);
                 std::thread::Builder::new()
                     .name(format!("gx-worker-{i}"))
-                    .spawn(move || loop {
-                        let task = { rx.lock().expect("job queue").recv() };
-                        match task {
-                            Ok(task) => run_task(&shared, task),
-                            Err(_) => break,
+                    .spawn(move || {
+                        while let Some(work) = queue.take() {
+                            match work {
+                                Work::Compute(task) => run_task(&shared, task),
+                                Work::Lower(work) => work(),
+                            }
                         }
                     })
                     .expect("spawning a worker thread")
             })
             .collect();
         Ok(WorkerPool {
-            tx: Some(tx),
+            queue,
             threads,
             stats,
             size,
@@ -389,18 +457,74 @@ impl WorkerPool {
         self.size
     }
 
-    /// Queues `job`; `done` is called on a worker thread with the section
-    /// (before it is offered for upload) or the failure.
-    pub fn submit(&self, job: ComputeJob, done: impl FnOnce(JobResult) + Send + 'static) {
+    /// Takes `lane`'s work ([`Lane::Upload`] or [`Lane::Check`]) from
+    /// `source`, below every higher lane, replacing an earlier source for
+    /// it. [`Lane::Compute`] is the pool's own queue and is ignored here.
+    pub fn set_lane(&self, lane: Lane, source: Arc<dyn LaneSource>) {
+        if lane == Lane::Compute {
+            return;
+        }
+        let mut state = self.queue.state.lock().expect("job queue");
+        state.lanes.retain(|(l, _)| *l != lane);
+        state.lanes.push((lane, source));
+        state.lanes.sort_by_key(|(l, _)| *l);
+        drop(state);
+        self.queue.ready.notify_all();
+    }
+
+    /// Tells idle threads that a lane source has new work. Work offered
+    /// from a pool thread (a finished job's upload) needs no call: the
+    /// thread looks again before it waits.
+    pub fn wake(&self) {
+        self.queue.ready.notify_all();
+    }
+
+    /// Queues `job` at `priority` (larger starts sooner; the key's
+    /// projected size on screen, pixels); `done` is called on a worker
+    /// thread with the section (before it is offered for upload) or the
+    /// failure, [`crate::FailureKind::Dropped`] if the job was removed by
+    /// [`WorkerPool::reprioritize`] before it started.
+    pub fn submit(
+        &self,
+        job: ComputeJob,
+        priority: f64,
+        done: impl FnOnce(JobResult) + Send + 'static,
+    ) {
         let task = Task {
             job,
             done: Box::new(done),
         };
-        if let Some(tx) = &self.tx {
-            if let Err(mpsc::SendError(task)) = tx.send(task) {
-                (task.done)(Err(WorkerError::transient("the worker pool has stopped")));
-            }
+        let mut state = self.queue.state.lock().expect("job queue");
+        if state.stopping {
+            drop(state);
+            (task.done)(Err(WorkerError::transient("the worker pool has stopped")));
+            return;
         }
+        state.computes.push(task.job.key(), priority, task);
+        drop(state);
+        self.queue.ready.notify_one();
+    }
+
+    /// Follows a new wanted set: every waiting job takes its key's
+    /// priority from `priority`, and every waiting job whose key gets
+    /// `None` is removed and its `done` told
+    /// [`crate::FailureKind::Dropped`] (on this thread). Running jobs are
+    /// not affected. Returns how many were dropped.
+    pub fn reprioritize(&self, priority: impl Fn(&ChunkKey) -> Option<f64>) -> usize {
+        let dropped = {
+            let mut state = self.queue.state.lock().expect("job queue");
+            state.computes.reprioritize(priority)
+        };
+        let n = dropped.len();
+        for task in dropped {
+            (task.done)(Err(WorkerError::dropped()));
+        }
+        n
+    }
+
+    /// Compute jobs waiting to start.
+    pub fn waiting(&self) -> usize {
+        self.queue.state.lock().expect("job queue").computes.len()
     }
 
     /// The counters now.
@@ -415,8 +539,11 @@ impl WorkerPool {
 }
 
 impl Drop for WorkerPool {
+    /// Lets the threads finish what is queued in every lane, then joins
+    /// them.
     fn drop(&mut self) {
-        self.tx = None;
+        self.queue.state.lock().expect("job queue").stopping = true;
+        self.queue.ready.notify_all();
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
