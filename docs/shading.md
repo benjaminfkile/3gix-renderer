@@ -131,6 +131,11 @@ the frame's cube, which its matter cannot exceed) is drawn as follows:
 | 2 to 8 | the sprite with weight `(8 - p) / 6`, its cells with the rest |
 | 8 and up | its cells only |
 
+Cells farther than `4 * root_extent` from the frame's cube are never
+selected (`gx_core::lod`), so beyond that a frame is a sprite only at full
+weight whatever its size (`farfield::cells_out_of_reach`); otherwise a
+large frame between that reach and 8 px would show nothing.
+
 The cells' weight multiplies the radiance of their surfaces and the glow
 and opacity of their volumes, so the sprite blends out as the depth-0 mesh
 or volume blends in.

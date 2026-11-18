@@ -91,6 +91,22 @@ pub fn focal_px(view_height_px: f64) -> f64 {
     view_height_px / (2.0 * (0.5 * FIELD_OF_VIEW_Y).tan())
 }
 
+/// How far from a frame's cube, in root extents, cells are selected:
+/// `gx_core::lod::select_cells_with` culls every cell farther than this
+/// (tested against it). Beyond it a frame can only be a sprite.
+pub const CELL_REACH_EXTENTS: f64 = 4.0;
+
+/// Whether `frame`'s cells are beyond the selection's reach from `camera`:
+/// the camera is more than [`CELL_REACH_EXTENTS`] root extents from the
+/// frame's cube (its depth-0 cell).
+pub fn cells_out_of_reach(system: &FrameSystem, camera: &Camera, frame: &Frame) -> bool {
+    let extent = frame.root_extent.value();
+    let c = crate::stream::camera_in_frame(system, camera, frame.frame_id);
+    let gap = |v: f64| (v.abs() - 0.5 * extent).max(0.0);
+    let d = Vec3::new(gap(c.x), gap(c.y), gap(c.z)).length();
+    d > CELL_REACH_EXTENTS * extent
+}
+
 /// The radius of the ball around a frame's whole cube, meters: what its
 /// matter's size is taken as before its depth-0 cell has arrived.
 pub fn unknown_radius(frame: &Frame) -> f64 {
@@ -133,15 +149,19 @@ pub struct FarFrame {
     pub frame_id: u64,
     /// Projected size of its matter, pixels ([`region_projected_px`]).
     pub projected_px: f64,
-    /// Weight of its sprite, 0 to 1 ([`sprite_weight`]).
+    /// Weight of its sprite, 0 to 1 ([`sprite_weight`]; 1 when its cells
+    /// are out of reach).
     pub sprite_weight: f64,
+    /// Its cells are beyond the selection's reach ([`cells_out_of_reach`]):
+    /// it is a sprite only, whatever its size.
+    pub out_of_reach: bool,
 }
 
 impl FarFrame {
     /// Returns `true` when the frame is a sprite only and its cells are not
     /// selected.
     pub fn sprite_only(&self) -> bool {
-        self.projected_px < SPRITE_ONLY_BELOW_PX
+        self.out_of_reach || self.projected_px < SPRITE_ONLY_BELOW_PX
     }
 
     /// The weight its cells are drawn with: `1 - sprite_weight`.
@@ -151,7 +171,8 @@ impl FarFrame {
 }
 
 /// Every frame with mass above 0 whose matter projects to less than
-/// [`CELLS_ONLY_FROM_PX`], in ascending frame id order. `radius_of` gives a
+/// [`CELLS_ONLY_FROM_PX`], or whose cells are out of the selection's reach
+/// (then a sprite only, at full weight), in ascending frame id order. `radius_of` gives a
 /// frame's matter radius from its depth-0 cell ([`matter_radius`]) once it
 /// has arrived; until then (or for 0) [`unknown_radius`] is used.
 pub fn far_frames(
@@ -170,10 +191,12 @@ pub fn far_frames(
                 .filter(|r| *r > 0.0)
                 .unwrap_or_else(|| unknown_radius(f));
             let px = region_projected_px(system, camera, f, radius, view_height_px);
-            (px < CELLS_ONLY_FROM_PX).then(|| FarFrame {
+            let out_of_reach = cells_out_of_reach(system, camera, f);
+            (px < CELLS_ONLY_FROM_PX || out_of_reach).then(|| FarFrame {
                 frame_id: f.frame_id,
                 projected_px: px,
-                sprite_weight: sprite_weight(px),
+                sprite_weight: if out_of_reach { 1.0 } else { sprite_weight(px) },
+                out_of_reach,
             })
         })
         .collect()
@@ -396,9 +419,59 @@ mod tests {
             frame_id: 1,
             projected_px: 1.5,
             sprite_weight: sprite_weight(1.5),
+            out_of_reach: false,
         };
         assert!(f.sprite_only());
         assert_eq!(f.cell_weight(), 0.0);
+    }
+
+    #[test]
+    fn cell_reach_is_the_selections() {
+        // The core selection culls the depth-0 cell exactly where
+        // CELL_REACH_EXTENTS says the cells are out of reach.
+        use gx_core::lod::{select_cells_with, SelectionParams};
+        use gx_core::registry::{Registry, ROOT_PARENT};
+        let frame = Frame {
+            frame_id: 1,
+            parent_frame_id: ROOT_PARENT,
+            root_extent: Meters::new(10.0),
+            max_depth: 0,
+            mass: gx_core::units::Kilograms::new(1.0),
+            position: Vec3::zero(),
+            velocity: Vec3::zero(),
+            orientation: gx_core::units::Quat::identity(),
+            angular_velocity: Vec3::zero(),
+            j2: 0.0,
+            reference_radius: Meters::new(0.0),
+            principal_moments: Vec3::zero(),
+        };
+        let params = SelectionParams {
+            pixel_error: 512.0,
+            view_height_px: 720.0,
+            vertical_fov_rad: 1.0,
+            max_cells: 16,
+        };
+        let reg = Registry::new(gx_core::units::Seconds::new(0.0), vec![frame]).unwrap();
+        let system =
+            FrameSystem::from_tree(gx_core::registry::FrameTree::from_registries(&[reg]).unwrap());
+        for (x, reach) in [(44.9, true), (45.1, false)] {
+            let selected = !select_cells_with(&frame, Vec3::new(x, 0.0, 0.0), &params, |_| false)
+                .cells
+                .is_empty();
+            let camera = Camera {
+                frame_id: 1,
+                position: Vec3::new(x, 0.0, 0.0),
+                orientation: gx_core::units::Quat::identity(),
+                speed: 1.0,
+                cruise: 1.0,
+            };
+            assert_eq!(selected, reach, "x {x}");
+            assert_eq!(
+                cells_out_of_reach(&system, &camera, &frame),
+                !reach,
+                "x {x}"
+            );
+        }
     }
 
     #[test]
