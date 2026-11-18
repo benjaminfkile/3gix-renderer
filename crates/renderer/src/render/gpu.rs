@@ -5,7 +5,8 @@
 //! One frame is:
 //!
 //! 1. the surface pass: every drawn cell's mesh with `shaders/surface.wgsl`
-//!    into an `Rgba32Float` target holding radiance per band, with the
+//!    into an `Rgba16Float` target holding radiance per band times the
+//!    pre-exposure (below), with the
 //!    reversed-z `Depth32Float` depth buffer cleared to 0 and a
 //!    greater-or-equal test (see [`crate::render::scene`]);
 //! 2. the volume pass: every drawn cell's gas and plasma with
@@ -22,11 +23,16 @@
 //!    pass's depth, then the overlay: a crosshair at the screen center
 //!    (the view direction, where the forward key flies) and the text.
 //!
-//! Blending into an `Rgba32Float` target needs the `FLOAT32_BLENDABLE`
-//! device feature, which every desktop driver and current WebGPU browsers
-//! offer; the device is opened with it when the adapter has it
-//! ([`wanted_features`]). Without it volumes and sprites are written
-//! unblended: a volume then hides what is behind it.
+//! # Pre-exposure
+//!
+//! The radiance target is half float (8 bytes a pixel, half the memory
+//! traffic of 32-bit floats). Radiance spans far more than half floats hold
+//! (hot plasma shows about 1e7 W m^-2 sr^-1), so every pass that writes it
+//! multiplies by the pre-exposure: the exposure of a recent frame, read
+//! back from the GPU without waiting ([`Renderer::pre_exposure`]), which
+//! keeps what the eye sees near 1. Values are clamped to [`RADIANCE_MAX`].
+//! The exposure pass and the tone curve divide it out again, so the image
+//! does not depend on it. Half floats blend on every device.
 //!
 //! The lighting model, the volume model, the far field, exposure, and the
 //! tone curve are described in `docs/shading.md`.
@@ -49,7 +55,11 @@ use wgpu_text::{BrushBuilder, TextBrush};
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Format of the surface pass target: radiance per band, W m^-2 sr^-1.
-pub const RADIANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+pub const RADIANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The largest value written to the radiance target (pre-exposed), below
+/// the half float maximum of 65504. Repeated in the shaders.
+pub const RADIANCE_MAX: f32 = 60000.0;
 
 /// The value the depth buffer clears to: the far end in reversed-z.
 pub const DEPTH_CLEAR: f32 = 0.0;
@@ -100,11 +110,43 @@ const MODEL_STRIDE: u64 = 256;
 /// dropped.
 const MESH_IDLE_FRAMES: u64 = 600;
 
+/// Bytes of mesh and tile buffers kept on the GPU beyond what the frame
+/// draws: past this (or past 1.5 times what one frame draws, if more), the
+/// copies drawn longest ago go first. Tile copies made for an anchor its
+/// frame has moved on from are dropped at once: they are never drawn again.
+const GPU_CACHE_BYTES: u64 = 512 << 20;
+
 /// The device features the renderer uses when the adapter has them:
-/// `FLOAT32_BLENDABLE`, for blending volumes and sprites into the float
-/// radiance target.
-pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    adapter.features() & wgpu::Features::FLOAT32_BLENDABLE
+/// No optional features: the half float radiance target blends on every
+/// device.
+pub fn wanted_features(_adapter: &wgpu::Adapter) -> wgpu::Features {
+    wgpu::Features::empty()
+}
+
+/// Which idle copies to drop: `idle` holds (last drawn, bytes, is a tile,
+/// index) of everything not drawn this frame, `total` the bytes of all
+/// copies, `drawn` those drawn this frame. Drops the ones drawn longest ago
+/// until the total is within [`GPU_CACHE_BYTES`] or 1.5 times `drawn`,
+/// whichever is more; never anything drawn this frame.
+fn evictions(
+    mut idle: Vec<(u64, u64, bool, usize)>,
+    mut total: u64,
+    drawn: u64,
+) -> Vec<(bool, usize)> {
+    let budget = GPU_CACHE_BYTES.max(drawn + drawn / 2);
+    let mut out = Vec::new();
+    if total <= budget {
+        return out;
+    }
+    idle.sort_by_key(|e| (e.0, e.2, e.3));
+    for (_, b, tile, i) in idle {
+        if total <= budget {
+            break;
+        }
+        out.push((tile, i));
+        total -= b;
+    }
+    out
 }
 
 /// One line naming an adapter: its name, backend, and kind.
@@ -215,6 +257,8 @@ struct LightGpu {
 struct SurfaceGlobals {
     view_proj: [[f32; 4]; 4],
     counts: [u32; 4],
+    /// x: the pre-exposure.
+    params: [f32; 4],
     lights: [LightGpu; MAX_LIGHTS],
 }
 
@@ -271,6 +315,8 @@ struct SurfaceGpuVertex {
 struct VolumeGlobals {
     view_proj: [[f32; 4]; 4],
     forward: [f32; 4],
+    /// x: the pre-exposure.
+    params: [f32; 4],
 }
 
 #[repr(C)]
@@ -298,6 +344,9 @@ struct ExposureParams {
     alpha: f32,
     partial_count: u32,
     fixed: u32,
+    /// The pre-exposure the radiance target was written with.
+    pre: f32,
+    pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -412,6 +461,16 @@ pub struct Renderer {
     targets: Targets,
     stats: FrameStats,
     brush: TextBrush<FontRef<'static>>,
+    /// The pre-exposure of the next frame (module docs).
+    pre: f32,
+    /// The pre-exposure the last frame was written with.
+    pre_used: f32,
+    /// Where the exposure state is read back, without waiting.
+    exposure_readback: wgpu::Buffer,
+    /// The state read back, once the map has finished; `None` while a map
+    /// is in flight or none was started.
+    readback_result: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
+    readback_in_flight: bool,
 }
 
 /// A vertex buffer that grows to fit what is written to it.
@@ -568,7 +627,11 @@ impl Renderer {
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, false)],
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                false,
+            )],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
@@ -832,9 +895,7 @@ impl Renderer {
 
         // Volumes and sprites, blended into the radiance target when the
         // device can blend 32-bit floats.
-        let blendable = device
-            .features()
-            .contains(wgpu::Features::FLOAT32_BLENDABLE);
+        let blendable = true;
         let over = blendable.then_some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -1138,6 +1199,16 @@ impl Renderer {
             targets,
             stats: FrameStats::default(),
             brush,
+            pre: 1.0,
+            pre_used: 1.0,
+            exposure_readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("exposure readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            readback_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            readback_in_flight: false,
         }
     }
 
@@ -1223,9 +1294,10 @@ impl Renderer {
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let radiance = radiance_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The exposure pass reads every second pixel each way.
         let groups = (
-            width.div_ceil(LUMINANCE_BLOCK),
-            height.div_ceil(LUMINANCE_BLOCK),
+            width.div_ceil(2 * LUMINANCE_BLOCK),
+            height.div_ceil(2 * LUMINANCE_BLOCK),
         );
         let partial_count = groups.0 * groups.1;
         let partials = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1524,12 +1596,15 @@ impl Renderer {
         exposure: Exposure,
     ) {
         self.frame += 1;
+        self.take_readback();
+        let pre = self.pre;
+        self.pre_used = pre;
         let aspect = self.width as f32 / self.height as f32;
         let view_proj = scene.view_projection(aspect).to_cols_array_2d();
         let globals = Globals {
             view_proj,
             viewport: [self.width as f32, self.height as f32],
-            pad: [0.0; 2],
+            pad: [pre, 0.0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -1544,6 +1619,7 @@ impl Renderer {
         let surface_globals = SurfaceGlobals {
             view_proj,
             counts: [light_count as u32, 0, 0, 0],
+            params: [pre, 0.0, 0.0, 0.0],
             lights,
         };
         self.queue.write_buffer(
@@ -1611,6 +1687,7 @@ impl Renderer {
             .retain(|_, t| frame - t.last_drawn <= MESH_IDLE_FRAMES);
         self.volumes
             .retain(|_, v| frame - v.last_drawn <= MESH_IDLE_FRAMES);
+        self.keep_gpu_budget();
         self.sync_emission();
         // The view direction (camera -z) in root axes: minus the third row
         // of the rotation from root into camera axes.
@@ -1618,6 +1695,7 @@ impl Renderer {
         let volume_globals = VolumeGlobals {
             view_proj,
             forward: [-vr[0][2], -vr[1][2], -vr[2][2], scene.near],
+            params: [pre, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.volume_globals, 0, bytemuck::bytes_of(&volume_globals));
@@ -1684,6 +1762,8 @@ impl Renderer {
             alpha: exposure.alpha(),
             partial_count: self.targets.partial_count,
             fixed: u32::from(exposure.fixed_stops.is_some()),
+            pre,
+            pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.exposure_params, 0, bytemuck::bytes_of(&params));
@@ -1895,6 +1975,10 @@ impl Renderer {
             pass.dispatch_workgroups(1, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&self.exposure_state, 0, &self.exposure_applied, 0, 16);
+        let start_readback = !self.readback_in_flight;
+        if start_readback {
+            encoder.copy_buffer_to_buffer(&self.exposure_state, 0, &self.exposure_readback, 0, 16);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("display pass"),
@@ -1942,5 +2026,143 @@ impl Renderer {
         }
         self.queue.submit([encoder.finish()]);
         self.stats = stats;
+        if start_readback {
+            self.readback_in_flight = true;
+            let result = std::sync::Arc::clone(&self.readback_result);
+            let buffer = self.exposure_readback.clone();
+            self.exposure_readback
+                .map_async(wgpu::MapMode::Read, .., move |r| {
+                    let mut value = None;
+                    if r.is_ok() {
+                        if let Ok(data) = buffer.get_mapped_range(..) {
+                            // State: adapted, exposure, pixels, pre.
+                            value = Some(f32::from_le_bytes([data[4], data[5], data[6], data[7]]));
+                        }
+                        buffer.unmap();
+                    }
+                    *result.lock().expect("readback") = Some(value.unwrap_or(f32::NAN));
+                });
+        }
+    }
+
+    /// Drops tile copies of anchors their frame has moved on from, then the
+    /// mesh and tile copies drawn longest ago while the total is over
+    /// [`GPU_CACHE_BYTES`] (or 1.5 times what this frame draws).
+    fn keep_gpu_budget(&mut self) {
+        let frame = self.frame;
+        let mut current: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for (k, t) in &self.tiles {
+            if t.last_drawn == frame {
+                let g = current.entry(k.0.frame_id).or_insert(k.2);
+                *g = (*g).max(k.2);
+            }
+        }
+        self.tiles.retain(|k, t| {
+            t.last_drawn == frame || current.get(&k.0.frame_id).is_none_or(|&g| k.2 >= g)
+        });
+        let mesh_bytes = |m: &GpuMesh| m.vertices.size() + m.indices.size() + m.edges.size();
+        let mut drawn = 0u64;
+        let mut total = 0u64;
+        // (last drawn, is a tile, index) of everything not drawn now.
+        let mut idle: Vec<(u64, u64, bool, usize)> = Vec::new();
+        let tile_keys: Vec<TileCopyKey> = self.tiles.keys().copied().collect();
+        for (i, k) in tile_keys.iter().enumerate() {
+            let t = &self.tiles[k];
+            let b = t.vertices.size();
+            total += b;
+            if t.last_drawn == frame {
+                drawn += b;
+            } else {
+                idle.push((t.last_drawn, b, true, i));
+            }
+        }
+        let mesh_keys: Vec<CellKey> = self.meshes.keys().copied().collect();
+        for (i, k) in mesh_keys.iter().enumerate() {
+            let m = &self.meshes[k];
+            let b = mesh_bytes(m);
+            total += b;
+            if m.last_drawn == frame {
+                drawn += b;
+            } else {
+                idle.push((m.last_drawn, b, false, i));
+            }
+        }
+        for (tile, i) in evictions(idle, total, drawn) {
+            if tile {
+                self.tiles.remove(&tile_keys[i]);
+            } else {
+                self.meshes.remove(&mesh_keys[i]);
+            }
+        }
+    }
+
+    /// Bytes of mesh and tile buffers on the GPU now.
+    pub fn gpu_cache_bytes(&self) -> u64 {
+        self.tiles.values().map(|t| t.vertices.size()).sum::<u64>()
+            + self
+                .meshes
+                .values()
+                .map(|m| m.vertices.size() + m.indices.size() + m.edges.size())
+                .sum::<u64>()
+    }
+
+    /// Picks up a finished exposure readback (without waiting) and takes
+    /// the exposure it read as the next pre-exposure.
+    fn take_readback(&mut self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let done = self.readback_result.lock().expect("readback").take();
+        if let Some(e) = done {
+            self.readback_in_flight = false;
+            if e.is_finite() && e > 0.0 {
+                self.pre = e;
+            }
+        }
+    }
+
+    /// Waits for the exposure readback in flight and takes it as the next
+    /// pre-exposure: for a render that must be exact in one frame
+    /// (headless), render once, call this, and render again.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn settle_pre_exposure(&mut self) {
+        if self.readback_in_flight {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        self.take_readback();
+    }
+
+    /// Starts the next frame from a pre-exposure of 1, whatever came
+    /// before (after waiting for any readback in flight, which it drops).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reset_pre_exposure(&mut self) {
+        self.settle_pre_exposure();
+        self.pre = 1.0;
+    }
+
+    /// The pre-exposure the last frame's radiance target was written with
+    /// (module docs): divide the target by it for radiance.
+    pub fn pre_exposure(&self) -> f32 {
+        self.pre_used
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn evicts_oldest_idle_copies_down_to_the_budget() {
+        let mb = 1u64 << 20;
+        // 600 MB idle in six copies, nothing drawn: down to 512 MB, oldest first.
+        let idle: Vec<_> = (0..6)
+            .map(|i| (i as u64, 100 * mb, i % 2 == 0, i))
+            .collect();
+        let out = evictions(idle.clone(), 600 * mb, 0);
+        assert_eq!(out, vec![(true, 0)]);
+        // Within budget: nothing.
+        assert!(evictions(idle.clone(), 500 * mb, 0).is_empty());
+        // A frame drawing 1000 MB keeps 1.5 times that.
+        assert!(evictions(idle.clone(), 1400 * mb, 1000 * mb).is_empty());
+        let out = evictions(idle, 1700 * mb, 1000 * mb);
+        assert_eq!(out, vec![(true, 0), (false, 1)]);
     }
 }

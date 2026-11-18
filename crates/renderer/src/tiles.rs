@@ -6,7 +6,8 @@
 //! cube face, the way continuous level of detail selects a height field: a tile
 //! of level `l` is split into its four children while the camera is
 //! within [`range`]`(l)` of it, so every drawn tile's quads are about
-//! [`PIXELS_PER_QUAD`] pixels or smaller. Each vertex moves continuously
+//! [`PIXELS_PER_QUAD`] pixels or smaller, or finer where the seamless
+//! morph needs a longer range ([`range`]). Each vertex moves continuously
 //! from its own position to its parent level's position (the morph) as
 //! its distance from the camera goes from [`MORPH_START`] of its parent's
 //! range to the whole range, so a tile meets a coarser neighbor with that
@@ -29,15 +30,20 @@ use gx_core::units::Vec3;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-/// Largest projected quad edge, pixels, at the distance a tile is split.
-pub const PIXELS_PER_QUAD: f64 = 4.0;
+/// Largest projected quad edge, pixels, at the distance a tile is split
+/// (unless the morph needs the split farther out, [`range`]).
+pub const PIXELS_PER_QUAD: f64 = 8.0;
 
 /// Fraction of a tile's parent range where its morph toward the parent
 /// begins. A tile meets a coarser neighbor only where the neighbor is out
 /// of the tile's parent range, so the tile is fully morphed there; the
 /// neighbor must not have started its own morph there, which holds while
-/// `(2 MORPH_START - 1) range(l)` exceeds a tile's diagonal (tested).
-pub const MORPH_START: f64 = 0.85;
+/// `(2 MORPH_START - 1) range(l)` exceeds a tile's diagonal ([`range`]
+/// keeps it so; tested).
+pub const MORPH_START: f64 = 0.9;
+
+/// Margin on the tile diagonal in the morph condition ([`range`]).
+pub const SEAM_MARGIN: f64 = 1.05;
 
 /// Children are asked for while the camera is within this multiple of a
 /// tile's range, so they have usually arrived when they are needed.
@@ -78,6 +84,11 @@ pub struct TileGeometry {
     /// Length of the tile's edge along the reference shape, meters
     /// (approximately: a quarter of the equator over `2^level`).
     pub edge: f64,
+    /// The longest a tile edge of this level can be, meters: at a face's
+    /// center, where the cube's face coordinate is stretched least, on the
+    /// larger radius: `2 max(a, c) / 2^level`. A function of the level and
+    /// the frame only, so neighbors agree.
+    pub max_edge: f64,
     /// Radius of a ball about the frame origin that the frame's surface
     /// never dips into: the reference shape's smaller radius plus the
     /// tile's `height_floor` (`matter-format.md` 10.3), the lowest height
@@ -222,6 +233,7 @@ impl TileGeometry {
             temperature: t.temperature.clone(),
             bounds: (lo, hi),
             edge: std::f64::consts::FRAC_PI_2 * a / (1u64 << key.level) as f64,
+            max_edge: 2.0 * a.max(c) / (1u64 << key.level) as f64,
             occluder: a.min(c) + t.height_floor,
         }
     }
@@ -257,10 +269,16 @@ pub fn decode_tile(
     Ok(None)
 }
 
-/// The distance within which a tile of `edge` meters is split: where its
-/// quads (`edge / TILE_QUADS`) project to [`PIXELS_PER_QUAD`] pixels.
-pub fn range(edge: f64, focal: f64) -> f64 {
-    edge / TILE_QUADS as f64 * focal / PIXELS_PER_QUAD
+/// The distance within which a tile is split: where its quads
+/// (`edge / TILE_QUADS`) project to [`PIXELS_PER_QUAD`] pixels, but at
+/// least far enough out that `(2 MORPH_START - 1)` of it exceeds the
+/// longest tile diagonal of the level (`sqrt 2 max_edge`, times
+/// [`SEAM_MARGIN`]), so tiles still meet without gaps. In small views the
+/// second bound decides and quads end up finer than [`PIXELS_PER_QUAD`].
+pub fn range(edge: f64, max_edge: f64, focal: f64) -> f64 {
+    let pixels = edge / TILE_QUADS as f64 * focal / PIXELS_PER_QUAD;
+    let seams = std::f64::consts::SQRT_2 * max_edge * SEAM_MARGIN / (2.0 * MORPH_START - 1.0);
+    pixels.max(seams)
 }
 
 /// Where a tile is in its fetch.
@@ -471,7 +489,7 @@ impl Surfaces {
                 continue;
             }
             let d = box_distance(cam, geo.bounds);
-            let r = range(geo.edge, focal);
+            let r = range(geo.edge, geo.max_edge, focal);
             let children = key.children();
             if let Some(ch) = children {
                 self.used.extend(ch);
@@ -756,7 +774,17 @@ mod tests {
         max_level: u8,
         floor: f64,
     ) -> Vec<TileDrawInfo> {
-        let focal = focal_px(720.0);
+        settle_full(s, cam, forward, max_level, floor, focal_px(720.0))
+    }
+
+    fn settle_full(
+        s: &mut Surfaces,
+        cam: [f64; 3],
+        forward: [f64; 3],
+        max_level: u8,
+        floor: f64,
+        focal: f64,
+    ) -> Vec<TileDrawInfo> {
         let cone = 0.9;
         for face in 0..SURFACE_FACES {
             s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap());
@@ -832,6 +860,17 @@ mod tests {
     /// tiles meet with no gap, whatever their levels.
     #[test]
     fn drawn_tiles_meet_without_gaps() {
+        // A 720 px view (the morph bound sets the ranges) and a 1620 px one
+        // (the pixel bound does), along a face edge and over a face center,
+        // where tiles are largest.
+        for focal in [focal_px(720.0), focal_px(1620.0)] {
+            for (face, i0, j) in [(4u8, 20i64, 9i64), (0, 26, 32)] {
+                meet_without_gaps(focal, face, i0, j);
+            }
+        }
+    }
+
+    fn meet_without_gaps(focal: f64, face: u8, i0: i64, j0: i64) {
         let (a, c) = (6_378_137.0, 6_356_752.3);
         let n = TILE_VERTICES;
         let boundary: Vec<usize> = (0..n)
@@ -843,15 +882,15 @@ mod tests {
             let mut s = Surfaces::new();
             // 3 km up, moving along the surface, looking down 25 degrees.
             let d = gx_core::surface::vertex_direction(
-                &SurfaceKey::new(4, 4, 0, 0, 0).unwrap(),
-                20 + step,
-                9,
+                &SurfaceKey::new(4, face, 0, 0, 0).unwrap(),
+                i0 + step,
+                j0,
             );
             let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
             let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 3000.0 * nrm[k]);
             let east = unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from);
             let forward: [f64; 3] = core::array::from_fn(|k| 0.9 * east[k] - 0.42 * nrm[k]);
-            let drawn = settle(&mut s, cam, forward, 11);
+            let drawn = settle_full(&mut s, cam, forward, 11, -400.0, focal);
             assert!(drawn.len() > 20, "{} tiles drawn", drawn.len());
             let placed: Vec<Vec<[f64; 3]>> = drawn.iter().map(|t| morphed(t, cam)).collect();
             for (ti, t) in drawn.iter().enumerate() {

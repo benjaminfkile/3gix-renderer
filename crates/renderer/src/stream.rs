@@ -1857,7 +1857,7 @@ mod native {
     pub struct FetcherOptions {
         /// The local cache, or `None` to keep nothing on disk.
         pub cache: Option<Arc<DiskCache>>,
-        /// Worker threads ([`gx_worker::default_threads`] by default).
+        /// Worker threads ([`crate::extract::worker_threads`] by default).
         pub worker_threads: usize,
         /// Memory and time limits of each module call.
         pub host: HostConfig,
@@ -1867,7 +1867,7 @@ mod native {
         fn default() -> FetcherOptions {
             FetcherOptions {
                 cache: None,
-                worker_threads: gx_worker::default_threads(),
+                worker_threads: crate::extract::worker_threads(),
                 host: HostConfig::default(),
             }
         }

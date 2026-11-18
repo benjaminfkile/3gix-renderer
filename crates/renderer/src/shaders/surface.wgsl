@@ -30,6 +30,8 @@ const PI: f32 = 3.14159265358979;
 const F0: f32 = 0.04;
 const MIN_ALPHA: f32 = 0.002;
 const MAX_LIGHTS: u32 = 8u;
+// The largest pre-exposed value written (RADIANCE_MAX in render::gpu).
+const RADIANCE_MAX: f32 = 60000.0;
 const EMISSION_TABLE_WIDTH: u32 = 1024u;
 
 struct Light {
@@ -44,6 +46,8 @@ struct Globals {
     view_proj: mat4x4<f32>,
     // x: number of lights in use.
     counts: vec4<u32>,
+    // x: the pre-exposure (render::gpu): what the output is multiplied by.
+    params: vec4<f32>,
     lights: array<Light, 8>,
 };
 
@@ -150,7 +154,7 @@ fn vs_tile(in: TileIn) -> VsOut {
 // Debug drawing of a mesh's vertices or edges: a fixed unlit color.
 @fragment
 fn fs_mesh_debug(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(30.0, 100.0, 60.0, 1.0);
+    return vec4<f32>(min(vec3<f32>(30.0, 100.0, 60.0) * globals.params.x, vec3<f32>(RADIANCE_MAX)), 1.0);
 }
 
 @fragment
@@ -187,5 +191,5 @@ fn fs_surface(in: VsOut) -> @location(0) vec4<f32> {
         let specular = d * g * f / (4.0 * ndl * ndv);
         color += (in.albedo / PI + vec3<f32>(specular)) * irradiance;
     }
-    return vec4<f32>(color * in.weight, 1.0);
+    return vec4<f32>(min(color * in.weight * globals.params.x, vec3<f32>(RADIANCE_MAX)), 1.0);
 }

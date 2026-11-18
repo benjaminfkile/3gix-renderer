@@ -11,6 +11,7 @@ struct Globals {
     view_proj: mat4x4<f32>,
     // Render target size in pixels.
     viewport: vec2<f32>,
+    // x: the pre-exposure (render::gpu): what the output is multiplied by.
     pad: vec2<f32>,
 };
 
@@ -55,5 +56,5 @@ fn fs_sprite(in: SpriteOut) -> @location(0) vec4<f32> {
     if dot(in.corner, in.corner) > 1.0 {
         discard;
     }
-    return vec4<f32>(in.radiance, 1.0);
+    return vec4<f32>(min(in.radiance * globals.pad.x, vec3<f32>(60000.0)), 1.0);
 }

@@ -61,8 +61,11 @@ Flags: `--start <now|origin>` (default now), `--start-offset-seconds <f64>`
 The renderer asks for the high performance adapter, so a machine with an
 integrated and a discrete GPU draws on the discrete one; `GX_ADAPTER` or
 `--adapter <name>` picks an adapter by a part of its name instead (the log
-names the one in use). The window presents one frame per display refresh;
-`--max-fps <u32>` caps it lower.
+names the one in use). The window draws a frame only when what it shows changes visibly
+(`src/redraw.rs`, `rendering.md` section 4): at most one per display refresh
+while you fly or matter streams in, about one a second (the overlay clock)
+when nothing moves; `--max-fps <u32>` caps it lower. The overlay's `fps` is
+frames drawn in the last second.
 
 Headless runs also take `--view <home|0-9>` (the `Home` view, the default,
 or the view a number key jumps to), `--view-distance-scale <f64>` (a factor

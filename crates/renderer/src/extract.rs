@@ -646,19 +646,33 @@ pub struct ExtractPool {
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
-/// The default worker count: every core but two (the frame thread's, and
-/// one for the selection thread, decoding, and the system), and zero on
-/// the web where there are no threads. Extraction is most of the work while
-/// a view settles (`rendering.md` 5.2), so it gets the rest of the cores;
-/// with one more, the frame thread's worst step went past 16 ms.
+/// The background thread budget: every core but two (the frame thread's,
+/// and one for the selection thread, the network, decoding, and the
+/// system), at least two. The module workers and the extraction pool share
+/// it instead of each taking all of it: two pools each sized to every core
+/// but two starved the frame thread (choppy frames while a place was being
+/// computed).
+fn background_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .saturating_sub(2)
+        .max(2)
+}
+
+/// Module worker threads: three quarters of [`background_threads`], at
+/// least one. Computing sections is what a first visit waits on.
+pub fn worker_threads() -> usize {
+    (background_threads() * 3 / 4).max(1)
+}
+
+/// The extraction pool size: the rest of [`background_threads`] after
+/// [`worker_threads`], at least one; zero on the web, where there are no
+/// threads. Surface tiles are built on it too.
 pub fn default_threads() -> usize {
     if cfg!(target_arch = "wasm32") {
         0
     } else {
-        std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .saturating_sub(2)
-            .max(1)
+        background_threads().saturating_sub(worker_threads()).max(1)
     }
 }
 

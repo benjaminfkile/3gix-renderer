@@ -683,7 +683,14 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
         next_frame: None,
         gfx: None,
         size: (config.width, config.height),
-        last_frame: None,
+        last_tick: None,
+        next_tick: Instant::now(),
+        last_draw: None,
+        force_draw: true,
+        redraw: crate::redraw::Redraw::new(),
+        pending: None,
+        occluded: false,
+        occluded_try: None,
         fps: Fps::default(),
         error: None,
     };
@@ -696,25 +703,33 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     }
 }
 
-/// Frames per second over half-second windows.
+/// Frames drawn in the last second. The loop draws only when something
+/// visible changes, so this is low when nothing does.
 #[derive(Default)]
 struct Fps {
-    window_start: Option<Instant>,
-    frames: u32,
-    value: Option<f64>,
+    draws: std::collections::VecDeque<Instant>,
 }
 
 impl Fps {
-    fn frame(&mut self, now: Instant) -> Option<f64> {
-        let start = *self.window_start.get_or_insert(now);
-        self.frames += 1;
-        let span = now - start;
-        if span >= Duration::from_millis(500) {
-            self.value = Some(f64::from(self.frames) / span.as_secs_f64());
-            self.window_start = Some(now);
-            self.frames = 0;
+    fn frame(&mut self, now: Instant) {
+        self.draws.push_back(now);
+        self.trim(now);
+    }
+
+    fn trim(&mut self, now: Instant) {
+        while self
+            .draws
+            .front()
+            .is_some_and(|t| now - *t > Duration::from_secs(1))
+        {
+            self.draws.pop_front();
         }
-        self.value
+    }
+
+    /// Draws in the last second.
+    fn value(&mut self, now: Instant) -> Option<f64> {
+        self.trim(now);
+        Some(self.draws.len() as f64)
     }
 }
 
@@ -804,23 +819,59 @@ struct App {
     next_frame: Option<Instant>,
     gfx: Option<Gfx>,
     size: (u32, u32),
-    last_frame: Option<Instant>,
+    /// When the last tick ran (input, simulation, streaming).
+    last_tick: Option<Instant>,
+    /// When the next tick is due.
+    next_tick: Instant,
+    /// When the last frame was drawn.
+    last_draw: Option<Instant>,
+    /// Draw the next tick's scene whatever it is (a window event came).
+    force_draw: bool,
+    /// What was drawn last and whether the next scene needs drawing
+    /// (`crate::redraw`).
+    redraw: crate::redraw::Redraw,
+    /// The scene a tick decided to draw, until the window draws it.
+    pending: Option<(Scene, String, crate::redraw::Need)>,
+    /// The window is hidden (minimized, covered, the display asleep): no
+    /// frame can be shown, so ticks go at the idle rate and a draw is
+    /// tried at most once a second until it shows again.
+    occluded: bool,
+    /// When a draw was last asked for while occluded.
+    occluded_try: Option<Instant>,
     fps: Fps,
     error: Option<anyhow::Error>,
 }
 
+/// Time between ticks while anything moves, streams, or settles: about one
+/// display frame.
+const ACTIVE_TICK: Duration = Duration::from_millis(16);
+
+/// Time between ticks while nothing changes: time still passes (the clock
+/// may move what is seen), cells and tiles may arrive, so the loop looks
+/// ten times a second; it draws only if something visible changed.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
 impl App {
-    fn frame(&mut self) {
+    /// One tick: input, the simulation, streaming, and the scene; draws
+    /// only when the scene differs visibly from the last one drawn
+    /// (`crate::redraw`). Schedules the next tick.
+    fn tick(&mut self) {
         let now = Instant::now();
         let dt = self
-            .last_frame
+            .last_tick
             .map_or(0.0, |t| (now - t).as_secs_f64().min(MAX_FRAME_SECONDS));
-        self.last_frame = Some(now);
-        self.next_frame = self.frame_interval.map(|i| now + i);
-        let fps = self.fps.frame(now);
+        self.last_tick = Some(now);
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
         let input = self.controls.take_flight();
+        let flying = input.forward
+            || input.back
+            || input.left
+            || input.right
+            || input.up
+            || input.down
+            || input.look != (0.0, 0.0)
+            || input.wheel != 0.0;
         self.spawner.frame(
             self.sim.system(),
             &self.world,
@@ -839,6 +890,7 @@ impl App {
         );
 
         let Some(gfx) = self.gfx.as_mut() else {
+            self.next_tick = now + ACTIVE_TICK;
             return;
         };
         let size = gfx.renderer.size();
@@ -860,7 +912,7 @@ impl App {
                 &self.sim,
                 &seen,
                 &self.camera,
-                fps,
+                self.fps.value(now),
                 self.controls.exposure_fixed,
                 stats,
             )
@@ -881,22 +933,106 @@ impl App {
             overlay.push('\n');
             overlay.push_str(&line);
         }
-        let exposure = self.controls.exposure(Some(dt));
+        let exposure = self.controls.exposure(None);
+        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)));
+        let need = self
+            .redraw
+            .decide(&scene, &overlay, &exposure, t, focal, self.force_draw);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Some((last, _, _)) = self.redraw.last() {
+                tracing::debug!(
+                    reason = crate::redraw::change_reason(last, &scene, focal),
+                    "change"
+                );
+            }
+        }
+        self.force_draw = false;
+        if need.draw() {
+            self.pending = Some((scene, overlay, need));
+            let retry = self
+                .occluded_try
+                .is_none_or(|t| now - t >= Duration::from_secs(1));
+            if !self.occluded || retry {
+                if self.occluded {
+                    self.occluded_try = Some(now);
+                }
+                gfx.window.request_redraw();
+            }
+        }
+        let busy = flying
+            || (self.pending.is_some() && !self.occluded)
+            || self.world.busy()
+            || (self.redraw.settling(t) && !self.occluded);
+        tracing::debug!(
+            ?need,
+            flying,
+            unsettled = self.world.unsettled(),
+            settling = self.redraw.settling(t),
+            occluded = self.occluded,
+            "tick"
+        );
+        self.next_tick = now + if busy { ACTIVE_TICK } else { IDLE_TICK };
+        // With a frame cap, the next draw waits for its slot.
+        if let Some(next) = self.next_frame {
+            if self.pending.is_some() && next > self.next_tick {
+                self.next_tick = next;
+            }
+        }
+    }
+
+    /// Draws the pending scene, or the last one again when the window asks
+    /// without a tick having asked.
+    fn draw(&mut self) {
+        let now = Instant::now();
+        if let Some(next) = self.next_frame {
+            if now < next && self.pending.is_some() {
+                // Capped: the tick at the slot asks again.
+                return;
+            }
+        }
+        let (scene, overlay, need) = match self.pending.take() {
+            Some(p) => p,
+            None => match self.redraw.last() {
+                Some((s, o, _)) => (s.clone(), o.clone(), crate::redraw::Need::Change),
+                None => return,
+            },
+        };
+        let Some(gfx) = self.gfx.as_mut() else {
+            return;
+        };
+        // The exposure adapts over the wall-clock time since the last draw.
+        let adapt = self
+            .last_draw
+            .map_or(0.0, |t| (now - t).as_secs_f64().min(MAX_FRAME_SECONDS));
+        self.last_draw = Some(now);
+        self.next_frame = self.frame_interval.map(|i| now + i);
+        self.fps.frame(now);
+        let exposure = self.controls.exposure(Some(adapt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gfx.surface.configure(&gfx.device, &gfx.surface_config);
+                self.force_draw = true;
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                // Keep the scene pending; ticks slow down until the window
+                // shows again (`WindowEvent::Occluded(false)` or a retry).
+                self.occluded = true;
                 return;
             }
             _ => return,
         };
+        self.occluded = false;
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         gfx.renderer.render(&view, &scene, Some(&overlay), exposure);
         gfx.window.pre_present_notify();
         gfx.queue.present(texture);
+        let t = self.started.elapsed().as_secs_f64();
+        self.redraw.drawn(scene, overlay, exposure, t, need);
     }
 }
 
@@ -924,32 +1060,52 @@ impl ApplicationHandler for App {
                 if let Some(gfx) = self.gfx.as_mut() {
                     gfx.resize(size.width, size.height);
                 }
+                self.force_draw = true;
+                self.next_tick = Instant::now();
             }
-            WindowEvent::RedrawRequested => self.frame(),
+            WindowEvent::RedrawRequested => self.draw(),
             other => {
+                if let WindowEvent::Occluded(o) = other {
+                    self.occluded = o;
+                }
+                let input = matches!(
+                    other,
+                    WindowEvent::KeyboardInput { .. }
+                        | WindowEvent::MouseInput { .. }
+                        | WindowEvent::MouseWheel { .. }
+                        | WindowEvent::CursorMoved { .. }
+                        | WindowEvent::Focused(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                        | WindowEvent::Occluded(false)
+                );
                 if self
                     .controls
                     .handle(&other, &mut self.sim, &mut self.camera)
                 {
                     event_loop.exit();
                 }
+                if input {
+                    // Tick now: the input may change what is seen. Keys and
+                    // buttons may change settings the scene does not show
+                    // (clock, exposure): draw for them.
+                    if !matches!(other, WindowEvent::CursorMoved { .. }) {
+                        self.force_draw = true;
+                    }
+                    self.next_tick = Instant::now();
+                }
             }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(gfx) = &self.gfx else {
+        if self.gfx.is_none() {
             return;
-        };
-        // With a frame cap, wait for the next slot instead of redrawing at
-        // once; the loop wakes at `next_frame` and comes back here.
-        if let Some(next) = self.next_frame {
-            if Instant::now() < next {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
-                return;
-            }
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
-        gfx.window.request_redraw();
+        // Tick when due; draw only what a tick decided to draw
+        // (`crate::redraw`). Between ticks the loop sleeps.
+        if Instant::now() >= self.next_tick {
+            self.tick();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
     }
 }

@@ -166,6 +166,12 @@ pub struct WebApp {
     started: f64,
     last_frame: Option<f64>,
     fps_window: (f64, u32, Option<f64>),
+    /// When the last frame was drawn.
+    last_draw: Option<f64>,
+    /// Draw the next frame's scene whatever it is (a window event came).
+    force_draw: bool,
+    /// What was drawn last (`crate::redraw`).
+    redraw: crate::redraw::Redraw,
 }
 
 impl WebApp {
@@ -186,15 +192,23 @@ impl WebApp {
             started: now_seconds(),
             last_frame: None,
             fps_window: (0.0, 0, None),
+            last_draw: None,
+            force_draw: true,
+            redraw: crate::redraw::Redraw::new(),
         }
     }
 
-    fn fps(&mut self, now: f64) -> Option<f64> {
+    /// Frames drawn per second over half-second windows; called every
+    /// display frame, `drew` when this one was drawn, so it falls when the
+    /// loop stops drawing.
+    fn fps(&mut self, now: f64, drew: bool) -> Option<f64> {
         let (start, frames, value) = &mut self.fps_window;
         if *frames == 0 && value.is_none() && *start == 0.0 {
             *start = now;
         }
-        *frames += 1;
+        if drew {
+            *frames += 1;
+        }
         if now - *start >= 0.5 {
             *value = Some(f64::from(*frames) / (now - *start));
             *start = now;
@@ -209,7 +223,7 @@ impl WebApp {
             .last_frame
             .map_or(0.0, |t| (now - t).clamp(0.0, MAX_FRAME_SECONDS));
         self.last_frame = Some(now);
-        let fps = self.fps(now);
+        let fps = self.fps(now, false);
 
         let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
         let input = self.controls.take_flight();
@@ -254,7 +268,28 @@ impl WebApp {
             scene.lines.clear();
         }
         let overlay = self.overlay(&seen, &scene, fps);
-        let exposure = self.controls.exposure(Some(dt));
+        // Draw only what differs visibly from the last frame drawn
+        // (`crate::redraw`); the browser still calls every display frame
+        // for input, streaming, and the simulation.
+        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)));
+        let need = self.redraw.decide(
+            &scene,
+            &overlay,
+            &self.controls.exposure(None),
+            t,
+            focal,
+            self.force_draw,
+        );
+        if !need.draw() {
+            return;
+        }
+        self.force_draw = false;
+        let adapt = self
+            .last_draw
+            .map_or(0.0, |d| (now - d).clamp(0.0, MAX_FRAME_SECONDS));
+        self.last_draw = Some(now);
+        self.fps_window.1 += 1;
+        let exposure = self.controls.exposure(Some(adapt));
         let texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -270,6 +305,7 @@ impl WebApp {
         });
         gfx.renderer.render(&view, &scene, Some(&overlay), exposure);
         gfx.queue.present(texture);
+        self.redraw.drawn(scene, overlay, exposure, t, need);
     }
 
     fn overlay(&self, seen: &Seen, scene: &Scene, fps: Option<f64>) -> String {
@@ -368,9 +404,19 @@ impl ApplicationHandler for WebApp {
                 if let Some(gfx) = self.gfx.borrow_mut().as_mut() {
                     gfx.resize(size.width, size.height);
                 }
+                self.force_draw = true;
             }
             WindowEvent::RedrawRequested => self.frame(),
             other => {
+                if matches!(
+                    other,
+                    WindowEvent::KeyboardInput { .. }
+                        | WindowEvent::MouseInput { .. }
+                        | WindowEvent::MouseWheel { .. }
+                        | WindowEvent::Focused(_)
+                ) {
+                    self.force_draw = true;
+                }
                 if self
                     .controls
                     .handle(&other, &mut self.sim, &mut self.camera)

@@ -837,6 +837,44 @@ impl World {
                 .all(|k| self.arrived(k) || self.cache.state(k) == Some(&CellState::Gone))
     }
 
+    /// What keeps [`World::settled`] false, for logs: the first unmet
+    /// condition, or `None` when settled.
+    pub fn unsettled(&self) -> Option<&'static str> {
+        let resolved =
+            |k: &CellKey| self.drawable(k) || self.cache.state(k) == Some(&CellState::Gone);
+        if !self.marks.is_empty() {
+            Some("marks")
+        } else if !self.dirty_queue.is_empty() {
+            Some("dirty queue")
+        } else if !self.extracting.is_empty() {
+            Some("extracting")
+        } else if !self.surfaces.settled() {
+            Some("surface tiles")
+        } else if self.cache.outstanding() != 0 {
+            Some("cells outstanding")
+        } else if !self.cache.selection().iter().all(|s| resolved(&s.key)) {
+            Some("selection not drawable")
+        } else if !self
+            .cache
+            .pinned()
+            .all(|k| self.arrived(k) || self.cache.state(k) == Some(&CellState::Gone))
+        {
+            Some("pinned cells")
+        } else if self.selector.busy() {
+            Some("selecting")
+        } else {
+            None
+        }
+    }
+
+    /// Whether anything is still on its way or being worked on, apart from
+    /// a selection in flight (one runs every
+    /// [`crate::stream::SELECT_INTERVAL_SECONDS`] anyway): the window loop
+    /// ticks at the display rate while this holds, and slowly otherwise.
+    pub fn busy(&self) -> bool {
+        !matches!(self.unsettled(), None | Some("selecting"))
+    }
+
     /// Returns `true` when every selected cell is drawn at its selected
     /// depth: the drawn selection is the target, every selected cell can
     /// be drawn, every pinned cell has arrived, and nothing is being

@@ -66,6 +66,7 @@ pub mod extract;
 pub mod farfield;
 pub mod light;
 pub mod protocol;
+pub mod redraw;
 pub mod render;
 pub mod seen;
 pub mod selector;

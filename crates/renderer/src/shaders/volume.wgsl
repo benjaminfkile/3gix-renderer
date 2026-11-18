@@ -36,6 +36,8 @@ struct Globals {
     // xyz: the view direction (camera -z) in root axes; w: the near plane,
     // meters.
     forward: vec4<f32>,
+    // x: the pre-exposure (render::gpu): what the output is multiplied by.
+    params: vec4<f32>,
 };
 
 struct Volume {
@@ -140,5 +142,5 @@ fn fs_volume(in: VsOut) -> @location(0) vec4<f32> {
         t *= exp(-k * ds);
     }
     let w = volume.offset.w;
-    return vec4<f32>(w * radiance, w * (1.0 - t));
+    return vec4<f32>(min(w * radiance * globals.params.x, vec3<f32>(60000.0)), w * (1.0 - t));
 }

@@ -23,7 +23,8 @@ Albedo uses the same order, so albedo band 0 is the red reflectance.
 ## Lighting model
 
 The surface pass writes radiance in W m^-2 sr^-1 per band into an
-`Rgba32Float` target. For a surface point with unit normal `n`, view
+`Rgba16Float` target, multiplied by the pre-exposure (see "Float target"
+below). For a surface point with unit normal `n`, view
 direction `v`, albedo `a`, and roughness `r`:
 
 ```
@@ -174,14 +175,16 @@ Sprites are added on top of surfaces and volumes (additive blending),
 tested against the surface depth, and mark their pixels as covered for the
 exposure.
 
-## Float blending
+## Float target
 
-Volumes and sprites blend into the `Rgba32Float` radiance target, which
-needs the `FLOAT32_BLENDABLE` device feature. Desktop drivers, the software
-Vulkan driver, and current WebGPU browsers have it, and the device is opened
-with it when the adapter offers it. Without it the two passes write without
-blending, so a volume hides what is behind it and sprites replace the pixel
-under them.
+The radiance target is `Rgba16Float`: half the memory traffic of 32-bit
+floats, and it blends on every device. Half floats hold up to 65504, far
+less than radiance spans, so every pass that writes the target multiplies
+by the pre-exposure, the exposure of a recent frame read back from the GPU
+without waiting, and clamps to 60000; the exposure pass and the tone curve
+divide it out, so the image does not depend on it. A headless render, which
+must be exact in one frame, renders once from a pre-exposure of 1 to learn
+the scene's exposure and again with it.
 
 ## Exposure
 
@@ -193,6 +196,8 @@ is automatic:
    `Y = 0.2126 R + 0.7152 G + 0.0722 B` (Rec. 709 weights on the bands).
    Empty space is not drawn and unlit matter carries no information about
    the exposure; counting either would drag the average toward black.
+   It reads every second pixel in each direction, a quarter of the target:
+   the average does not need every pixel.
 2. A second pass adds the block sums in a fixed order:
    `Y_avg = exp(sum / count)`, the log-average luminance.
 3. The adapted luminance moves toward `Y_avg` in log space by

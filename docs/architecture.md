@@ -55,6 +55,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `render::headless` | Offscreen RGBA8 target, readback of it and of the float radiance, PNG | |
 | `controls` | Keyboard and mouse bindings for the window and the canvas | |
 | `app` | Desktop window loop and the headless run | |
+| `redraw` | Whether a scene differs visibly from the last one drawn | `rendering.md` 4 |
 | `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, the Cache API cache, the Web Worker driver, the browser fetcher, `start` | `space-model.md` 2 and 10, `client-compute.md` 4 and 6 |
 
 Shaders: `src/shaders/surface.wgsl` (lit surfaces), `src/shaders/volume.wgsl`
@@ -97,6 +98,11 @@ or on; with it on, `web` adds the canvas loop and the browser fetch path
 package builds for that target.
 
 ## The frame loop
+
+The loop ticks: steps 1 to 5 below run about once per display frame while
+the camera flies, matter streams, or the exposure settles, and ten times a
+second otherwise. A tick builds the scene and draws it only when it differs
+visibly from the last one drawn (`redraw`, `rendering.md` section 4).
 
 1. The `SimClock` takes the hub's now (`protocol::ClockSync`, measured at
    start and every minute) and advances by the wall-clock delta times the

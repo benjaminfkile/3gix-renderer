@@ -155,7 +155,18 @@ impl Headless {
         overlay: Option<&str>,
         exposure: Exposure,
     ) -> Result<Image> {
+        if exposure.adapt_seconds.is_none() {
+            // One exact frame, the same every time: the radiance target is
+            // written pre-exposed (render::gpu), so render once from a
+            // fixed pre-exposure to learn this scene's exposure, then again
+            // with it.
+            self.renderer.reset_pre_exposure();
+        }
         self.renderer.render(&self.view, scene, overlay, exposure);
+        if exposure.adapt_seconds.is_none() {
+            self.renderer.settle_pre_exposure();
+            self.renderer.render(&self.view, scene, overlay, exposure);
+        }
         self.read_back()
     }
 
@@ -164,28 +175,33 @@ impl Headless {
         self.renderer.stats()
     }
 
-    /// Whether the device blends into the float radiance target (see
-    /// [`wanted_features`]).
+    /// Whether the device blends into the float radiance target: always,
+    /// it is half float.
     pub fn float_blending(&self) -> bool {
-        self.device
-            .features()
-            .contains(wgpu::Features::FLOAT32_BLENDABLE)
+        true
     }
 
     /// Reads back the float radiance target of the last frame: radiance
-    /// before exposure and the tone curve.
+    /// before exposure and the tone curve (the pre-exposure divided out;
+    /// alpha as written).
     pub fn read_radiance(&self) -> Result<RadianceImage> {
-        let bytes = self.copy_out(self.renderer.radiance_texture(), 16)?;
+        let bytes = self.copy_out(self.renderer.radiance_texture(), 8)?;
+        let pre = self.renderer.pre_exposure();
         Ok(RadianceImage {
             width: self.width,
             height: self.height,
             texels: bytes
-                .as_chunks::<16>()
+                .as_chunks::<8>()
                 .0
                 .iter()
                 .map(|t| {
                     core::array::from_fn(|i| {
-                        f32::from_le_bytes([t[4 * i], t[4 * i + 1], t[4 * i + 2], t[4 * i + 3]])
+                        let v = f16_to_f32(u16::from_le_bytes([t[2 * i], t[2 * i + 1]]));
+                        if i < 3 {
+                            v / pre
+                        } else {
+                            v
+                        }
                     })
                 })
                 .collect(),
@@ -261,5 +277,23 @@ impl Headless {
         }
         buffer.unmap();
         Ok(rgba)
+    }
+}
+
+/// An IEEE half float as `f32`.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let frac = f32::from(h & 0x3ff);
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 => {
+            if frac == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
     }
 }

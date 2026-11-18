@@ -1,8 +1,12 @@
 // Automatic exposure and the filmic tone curve.
 //
-// 1. cs_partial: every 16 x 16 block of the float target sums the natural
-//    log of the luminance of its covered, lit pixels (alpha 1 and luminance
-//    above MIN_LUMINANCE) and counts them. Uncovered pixels are empty space,
+// The float target holds radiance times the pre-exposure (render::gpu);
+// every read here divides it out.
+//
+// 1. cs_partial: every 16 x 16 block of every second pixel each way (a
+//    quarter of the target; the average does not need every pixel) sums
+//    the natural log of the luminance of its covered, lit pixels (alpha 1
+//    and luminance above MIN_LUMINANCE) and counts them. Uncovered pixels are empty space,
 //    which is not drawn, and unlit ones carry no information about the
 //    exposure; both would only drag the average toward black.
 // 2. cs_adapt: one workgroup adds the partial sums in a fixed order. The
@@ -35,9 +39,10 @@ struct State {
     adapted: f32,
     // Multiplier applied before the tone curve.
     exposure: f32,
-    // Lit pixels counted this frame.
+    // Lit pixels counted this frame (every second pixel each way).
     pixels: f32,
-    pad: f32,
+    // The pre-exposure this frame's target was written with.
+    pre: f32,
 };
 
 struct Params {
@@ -46,6 +51,11 @@ struct Params {
     alpha: f32,
     partial_count: u32,
     fixed: u32,
+    // The pre-exposure the target was written with.
+    pre: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
 };
 
 @group(0) @binding(0) var hdr: texture_2d<f32>;
@@ -67,9 +77,10 @@ fn cs_partial(
     let dims = textureDimensions(hdr);
     var s = 0.0;
     var c = 0.0;
-    if gid.x < dims.x && gid.y < dims.y {
-        let p = textureLoad(hdr, vec2<i32>(gid.xy), 0);
-        let lum = dot(p.rgb, LUMA);
+    let at = gid.xy * 2u;
+    if at.x < dims.x && at.y < dims.y {
+        let p = textureLoad(hdr, vec2<i32>(at), 0);
+        let lum = dot(p.rgb, LUMA) / params.pre;
         if p.a > 0.0 && lum > MIN_LUMINANCE {
             s = log(lum);
             c = 1.0;
@@ -128,7 +139,7 @@ fn cs_adapt(@builtin(local_invocation_index) li: u32) {
             state.exposure = exp2(params.stops);
         }
         state.pixels = total;
-        state.pad = 0.0;
+        state.pre = params.pre;
     }
 }
 
@@ -158,5 +169,5 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32>
 @fragment
 fn fs_tonemap(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let p = textureLoad(hdr, vec2<i32>(pos.xy), 0);
-    return vec4<f32>(filmic(p.rgb * applied.exposure), 1.0);
+    return vec4<f32>(filmic(p.rgb * (applied.exposure / applied.pre)), 1.0);
 }

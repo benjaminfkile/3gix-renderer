@@ -103,11 +103,9 @@ WebGPU is needed; there is no WebGL fallback. At the time of writing:
 | Firefox | 141 and later on Windows; other platforms in later versions or behind a flag |
 | Safari | 26 and later on macOS, iOS, and iPadOS |
 
-Volumes and sprites blend into a 32-bit float target, which needs the
-WebGPU `float32-blendable` feature (Chrome 132 and later, and current
-Firefox and Safari releases). Without it they are drawn unblended
-(`docs/shading.md`, "Float blending"). Check the browser's own WebGPU status
-page for the current state.
+Volumes and sprites blend into a half float target, which every WebGPU
+implementation supports (`docs/shading.md`, "Float target"). Check the
+browser's own WebGPU status page for the current state.
 
 ## Verification
 
