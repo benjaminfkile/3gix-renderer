@@ -139,13 +139,17 @@ fn matter_step(
         }
     }
     let (requests, draw) = world.step(seen, size, now, cells, started);
-    for key in requests {
-        if let Some(frame) = seen.system().tree().get(key.frame_id) {
-            fetcher.request(key, frame.root_extent);
-        }
+    if let Some(cells) = requests {
+        let tree = seen.system().tree();
+        fetcher.set_wanted_cells(
+            cells
+                .into_iter()
+                .filter_map(|(key, px)| tree.get(key.frame_id).map(|f| (key, f.root_extent, px)))
+                .collect(),
+        );
     }
-    for key in world.take_surface_requests() {
-        fetcher.request_surface(key);
+    if let Some(tiles) = world.take_wanted_surfaces() {
+        fetcher.set_wanted_surfaces(tiles);
     }
     world.record_step((crate::clock::now_seconds() - started) * 1e3);
     draw
