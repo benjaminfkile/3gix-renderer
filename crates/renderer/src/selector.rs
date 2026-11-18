@@ -77,6 +77,9 @@ pub struct SelectJob {
     /// Cell states that changed since the previous job, in the order they
     /// changed: the new state, or `None` for a cell that left the cache.
     pub changes: Vec<(CellKey, Option<CellState>)>,
+    /// Frames drawn from surface tiles (`crate::tiles`): no cells are
+    /// selected for them.
+    pub skip_frames: std::collections::BTreeSet<u64>,
 }
 
 /// A finished selection.
@@ -117,6 +120,7 @@ impl SelectorState {
             job.view_px,
             &self.states,
             &mut self.budgets,
+            &job.skip_frames,
         );
         let same = selection.drawn.len() == self.drawn.len()
             && selection

@@ -81,6 +81,7 @@ fn center_pixel_matches_the_cpu_integration() {
     scene.markers.clear();
     scene.lines.clear();
     let draw = DrawList {
+        tiles: Vec::new(),
         meshes: Vec::new(),
         volumes: vec![grid.clone()],
         lights: Vec::new(),
@@ -197,6 +198,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
     scene.markers.clear();
     scene.lines.clear();
     let draw = DrawList {
+        tiles: Vec::new(),
         meshes: vec![mesh],
         volumes: vec![grid.clone()],
         lights: Vec::new(),

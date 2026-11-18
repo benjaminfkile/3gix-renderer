@@ -654,6 +654,7 @@ pub fn select_all(
     (view_width_px, view_height_px): (f64, f64),
     cache: &impl CellStates,
     budgets: &mut BTreeMap<u64, usize>,
+    skip_frames: &BTreeSet<u64>,
 ) -> Selection {
     let aspect = view_width_px / view_height_px.max(1.0);
     let focal = focal_px(view_height_px);
@@ -665,6 +666,7 @@ pub fn select_all(
     let mut out = Selection::default();
     for frame in system.tree().frames() {
         if sprites.contains(&frame.frame_id)
+            || skip_frames.contains(&frame.frame_id)
             || !frame_in_range(system, camera, frame.frame_id, aspect)
         {
             continue;
@@ -1723,6 +1725,17 @@ pub enum FetchEvent {
     /// The registry key finished: every non-empty layer's registry section
     /// in layer order, or why it never can.
     Registry(Result<Vec<Arc<[u8]>>, String>),
+    /// A surface tile request finished (`matter-format.md` section 10):
+    /// the first layer's surface ready to draw, `None` when every layer's
+    /// tile is empty, or why it is invalid.
+    Surface {
+        /// The tile.
+        key: gx_core::key::SurfaceKey,
+        /// What came back, decoded into geometry.
+        outcome: Result<Option<Arc<crate::tiles::TileGeometry>>, String>,
+        /// Section bytes received.
+        bytes: u64,
+    },
 }
 
 /// Running totals over finished cell requests, for the overlay and the
@@ -1760,6 +1773,10 @@ impl FetchTally {
                 self.bytes += bytes;
                 self.first_round_trip.get_or_insert(*round_trip);
                 self.last_round_trip = Some(*round_trip);
+            }
+            // Surface tiles count toward the bytes received.
+            if let FetchEvent::Surface { bytes, .. } = e {
+                self.bytes += bytes;
             }
         }
     }
@@ -2003,6 +2020,13 @@ mod native {
             self.coordinator.request(ChunkKey::Cell(key), now);
         }
 
+        /// Queues a request for a surface tile; the result arrives as
+        /// [`FetchEvent::Surface`] through [`Fetcher::drain`].
+        pub fn request_surface(&mut self, key: gx_core::key::SurfaceKey) {
+            let now = self.now();
+            self.coordinator.request(ChunkKey::Surface(key), now);
+        }
+
         /// Sends what is queued and applies what has arrived, without
         /// waiting.
         pub fn flush(&mut self) {
@@ -2136,6 +2160,21 @@ mod native {
                             }));
                         });
                     }
+                    ChunkKey::Surface(key) => {
+                        let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
+                        let tx = self.tx.clone();
+                        self.decoding += 1;
+                        self.handle.spawn_blocking(move || {
+                            let sections: Vec<Arc<[u8]>> =
+                                done.sections.iter().map(|a| a.bytes.clone()).collect();
+                            let outcome = crate::tiles::decode_tile(&key, &sections);
+                            let _ = tx.send(Internal::Event(FetchEvent::Surface {
+                                key,
+                                outcome,
+                                bytes,
+                            }));
+                        });
+                    }
                 },
                 Action::Failed { key, reason } => match key {
                     ChunkKey::Registry => self.out.push(FetchEvent::Registry(Err(reason))),
@@ -2148,6 +2187,11 @@ mod native {
                             round_trip: Duration::ZERO,
                         });
                     }
+                    ChunkKey::Surface(key) => self.out.push(FetchEvent::Surface {
+                        key,
+                        outcome: Err(reason),
+                        bytes: 0,
+                    }),
                 },
             }
         }

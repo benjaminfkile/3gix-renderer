@@ -225,7 +225,34 @@ struct ModelGpu {
     offset: [f32; 4],
     /// Camera-relative light positions for this draw's frame.
     lights: [[f32; 4]; MAX_LIGHTS],
+    /// Surface tiles: morph start and end distances, meters.
+    morph: [f32; 4],
 }
+
+/// One vertex of a surface tile as the GPU reads it (`crate::tiles`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct TileGpuVertex {
+    /// Relative to the frame's anchor, frame axes, meters.
+    position: [f32; 3],
+    /// The parent level's surface at this vertex, relative to the anchor.
+    target: [f32; 3],
+    normal: [f32; 3],
+    target_normal: [f32; 3],
+    albedo: [f32; 3],
+    roughness: f32,
+    emission_index: u32,
+}
+
+/// A surface tile uploaded to the GPU for one anchor.
+struct GpuTile {
+    vertices: wgpu::Buffer,
+    last_drawn: u64,
+}
+
+/// What a GPU tile copy was made from: the tile, its geometry's identity,
+/// and the anchor generation.
+type TileCopyKey = (gx_core::key::SurfaceKey, usize, u64);
 
 /// One vertex of a surface mesh as the GPU reads it.
 #[repr(C)]
@@ -362,6 +389,10 @@ pub struct Renderer {
     emission_texture: wgpu::Texture,
     emission_uploaded: usize,
     meshes: BTreeMap<CellKey, GpuMesh>,
+    tile_pipeline: wgpu::RenderPipeline,
+    tile_indices: wgpu::Buffer,
+    tile_index_count: u32,
+    tiles: std::collections::HashMap<TileCopyKey, GpuTile>,
     volume_pipeline: wgpu::RenderPipeline,
     volume_globals: wgpu::Buffer,
     volume_globals_layout: wgpu::BindGroupLayout,
@@ -734,6 +765,56 @@ impl Renderer {
             wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::Face::Back),
         );
+        // Surface tiles (`crate::tiles`): their own vertex layout and
+        // vertex stage (the morph), the surfaces' lighting.
+        let tile_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("surface tiles"),
+            layout: Some(&surface_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &surface_shader,
+                entry_point: Some("vs_tile"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<TileGpuVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                        2 => Float32x3,
+                        3 => Float32x3,
+                        4 => Float32x3,
+                        5 => Float32,
+                        6 => Uint32
+                    ],
+                })],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_test.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &surface_shader,
+                entry_point: Some("fs_surface"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: RADIANCE_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            cache: None,
+            multiview_mask: None,
+        });
+        let tile_index_list = crate::tiles::TileGeometry::indices();
+        let tile_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("surface tile indices"),
+            contents: bytemuck::cast_slice(&tile_index_list),
+            usage: wgpu::BufferUsages::INDEX,
+        });
         // Debug drawing of the same meshes (`MeshMode`): their vertices as
         // points and their triangle edges as lines, unlit.
         let vertex_pipeline = surface_like(
@@ -1034,6 +1115,10 @@ impl Renderer {
             emission_texture: emission_tex,
             emission_uploaded: 0,
             meshes: BTreeMap::new(),
+            tile_pipeline,
+            tile_indices,
+            tile_index_count: tile_index_list.len() as u32,
+            tiles: std::collections::HashMap::new(),
             volume_pipeline,
             volume_globals,
             volume_globals_layout,
@@ -1291,6 +1376,40 @@ impl Renderer {
         }
     }
 
+    /// Uploads a surface tile relative to its frame's anchor.
+    fn upload_tile(&mut self, t: &crate::tiles::TileDrawInfo) -> GpuTile {
+        let g = &t.geometry;
+        let a = t.anchor.position;
+        let rel = |p: &[f64; 3]| -> [f32; 3] {
+            [
+                (p[0] - a[0]) as f32,
+                (p[1] - a[1]) as f32,
+                (p[2] - a[2]) as f32,
+            ]
+        };
+        let vertices: Vec<TileGpuVertex> = (0..g.positions.len())
+            .map(|i| TileGpuVertex {
+                position: rel(&g.positions[i]),
+                target: rel(&g.targets[i]),
+                normal: g.normals[i],
+                target_normal: g.target_normals[i],
+                albedo: g.albedo[i],
+                roughness: g.roughness[i],
+                emission_index: self.emission.index_for(f64::from(g.temperature[i])),
+            })
+            .collect();
+        GpuTile {
+            vertices: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface tile vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            last_drawn: self.frame,
+        }
+    }
+
     /// Uploads a volume: its samples as two `n^3` 3D textures (see
     /// [`VolumeGrid::texels`]), each temperature turned into an emission
     /// table index, and a uniform buffer for its placement.
@@ -1442,6 +1561,21 @@ impl Renderer {
                 m.last_drawn = self.frame;
             }
         }
+        for draw in &scene.tiles {
+            let t = &draw.tile;
+            let copy = (
+                t.geometry.key,
+                std::sync::Arc::as_ptr(&t.geometry) as usize,
+                t.anchor.generation,
+            );
+            if !self.tiles.contains_key(&copy) {
+                let gpu = self.upload_tile(t);
+                self.tiles.insert(copy, gpu);
+            }
+            if let Some(g) = self.tiles.get_mut(&copy) {
+                g.last_drawn = self.frame;
+            }
+        }
         for draw in &scene.volumes {
             let key = draw.grid.key;
             if !self.volumes.contains_key(&key) {
@@ -1473,6 +1607,8 @@ impl Renderer {
         let frame = self.frame;
         self.meshes
             .retain(|_, m| frame - m.last_drawn <= MESH_IDLE_FRAMES);
+        self.tiles
+            .retain(|_, t| frame - t.last_drawn <= MESH_IDLE_FRAMES);
         self.volumes
             .retain(|_, v| frame - v.last_drawn <= MESH_IDLE_FRAMES);
         self.sync_emission();
@@ -1495,7 +1631,7 @@ impl Renderer {
             })
             .collect();
         self.sprites.write(&self.device, &self.queue, &sprites);
-        let draws = scene.surfaces.len() as u64;
+        let draws = (scene.surfaces.len() + scene.tiles.len()) as u64;
         if draws * MODEL_STRIDE > self.models.size() {
             self.models = Self::model_buffer(&self.device, draws.next_power_of_two());
             self.model_bind =
@@ -1512,8 +1648,31 @@ impl Renderer {
                 ],
                 offset: [draw.offset[0], draw.offset[1], draw.offset[2], draw.weight],
                 lights: draw.lights.map(|p| [p[0], p[1], p[2], 0.0]),
+                morph: [0.0; 4],
             };
             let at = i * MODEL_STRIDE as usize;
+            model_bytes[at..at + std::mem::size_of::<ModelGpu>()]
+                .copy_from_slice(bytemuck::bytes_of(&m));
+        }
+        let first_tile = scene.surfaces.len();
+        for (i, draw) in scene.tiles.iter().enumerate() {
+            let r = draw.rotation;
+            // Level-0 tiles never morph: a start beyond any distance.
+            let morph = draw
+                .tile
+                .morph
+                .map(|v| if v.is_finite() { v } else { 3.0e38 });
+            let m = ModelGpu {
+                columns: [
+                    [r[0][0], r[0][1], r[0][2], 0.0],
+                    [r[1][0], r[1][1], r[1][2], 0.0],
+                    [r[2][0], r[2][1], r[2][2], 0.0],
+                ],
+                offset: [draw.offset[0], draw.offset[1], draw.offset[2], draw.weight],
+                lights: draw.lights.map(|p| [p[0], p[1], p[2], 0.0]),
+                morph: [morph[0], morph[1], 0.0, 0.0],
+            };
+            let at = (first_tile + i) * MODEL_STRIDE as usize;
             model_bytes[at..at + std::mem::size_of::<ModelGpu>()]
                 .copy_from_slice(bytemuck::bytes_of(&m));
         }
@@ -1616,6 +1775,31 @@ impl Renderer {
                 }
                 stats.meshes += 1;
                 stats.triangles += m.index_count as usize / 3;
+            }
+            if scene.mesh_mode == MeshMode::Surfaces && !scene.tiles.is_empty() {
+                pass.set_pipeline(&self.tile_pipeline);
+                pass.set_index_buffer(self.tile_indices.slice(..), wgpu::IndexFormat::Uint32);
+                let first_tile = scene.surfaces.len();
+                for (i, draw) in scene.tiles.iter().enumerate() {
+                    let t = &draw.tile;
+                    let copy = (
+                        t.geometry.key,
+                        std::sync::Arc::as_ptr(&t.geometry) as usize,
+                        t.anchor.generation,
+                    );
+                    let Some(g) = self.tiles.get(&copy) else {
+                        continue;
+                    };
+                    pass.set_bind_group(
+                        1,
+                        &self.model_bind,
+                        &[((first_tile + i) as u64 * MODEL_STRIDE) as u32],
+                    );
+                    pass.set_vertex_buffer(0, g.vertices.slice(..));
+                    pass.draw_indexed(0..self.tile_index_count, 0, 0..1);
+                    stats.meshes += 1;
+                    stats.triangles += self.tile_index_count as usize / 3;
+                }
             }
         }
         if !scene.volumes.is_empty() {

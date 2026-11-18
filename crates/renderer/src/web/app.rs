@@ -130,18 +130,22 @@ fn matter_step(
     fetcher.set_time_utc_ms(gx_core::timescale::tdb_seconds_to_utc_ms(
         sim.time().value(),
     ));
-    let results = fetcher
-        .drain_until(started + COMPOSITE_SLICE_SECONDS)
-        .into_iter()
-        .filter_map(|e| match e {
-            FetchEvent::Completed { key, outcome, .. } => Some((key, outcome)),
-            FetchEvent::Registry(_) => None,
-        });
-    let (requests, draw) = world.step(seen, size, now, results, started);
+    let mut cells = Vec::new();
+    for e in fetcher.drain_until(started + COMPOSITE_SLICE_SECONDS) {
+        match e {
+            FetchEvent::Completed { key, outcome, .. } => cells.push((key, outcome)),
+            FetchEvent::Surface { key, outcome, .. } => world.complete_surface(key, outcome),
+            FetchEvent::Registry(_) => {}
+        }
+    }
+    let (requests, draw) = world.step(seen, size, now, cells, started);
     for key in requests {
         if let Some(frame) = seen.system().tree().get(key.frame_id) {
             fetcher.request(key, frame.root_extent);
         }
+    }
+    for key in world.take_surface_requests() {
+        fetcher.request_surface(key);
     }
     world.record_step((crate::clock::now_seconds() - started) * 1e3);
     draw

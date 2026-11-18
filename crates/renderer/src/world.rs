@@ -79,6 +79,8 @@ pub const EVICT_INTERVAL_SECONDS: f64 = 1.0;
 pub struct DrawList {
     /// Non-empty meshes of the draw set, in key order.
     pub meshes: Vec<Arc<SurfaceMesh>>,
+    /// Surface tiles to draw (`crate::tiles`).
+    pub tiles: Vec<crate::tiles::TileDrawInfo>,
     /// Volumes of the draw set, in key order.
     pub volumes: Vec<Arc<VolumeGrid>>,
     /// The strongest lights, strongest first, where the observer sees
@@ -164,6 +166,9 @@ impl Pose {
     }
 }
 
+/// Surface tiles kept cached beyond those the selection uses.
+pub const SURFACE_TILES_KEPT: usize = 4096;
+
 /// Longest a selection waits for the one before it to be shown
 /// ([`World::select`]), seconds.
 pub const PACE_LIMIT_SECONDS: f64 = 1.0;
@@ -182,6 +187,8 @@ pub const PACE_LIMIT_SECONDS: f64 = 1.0;
 /// crack. While the selection changes faster than its cells are
 /// extracted, the last consistent set keeps drawing.
 pub struct World {
+    /// Surface tiles of frames that have them (`crate::tiles`).
+    surfaces: crate::tiles::Surfaces,
     /// The set drawn now ([`Shown`]); `None` until the first selection
     /// whose cells are all extracted.
     shown: Option<Shown>,
@@ -222,6 +229,7 @@ impl World {
     /// inline.
     pub fn new(threads: usize) -> World {
         World {
+            surfaces: crate::tiles::Surfaces::new(),
             shown: None,
             shown_switches: 0,
             building_since: None,
@@ -395,6 +403,7 @@ impl World {
             camera: *camera,
             view_px: (f64::from(view_px.0.max(1)), f64::from(view_px.1.max(1))),
             changes: std::mem::take(&mut self.changes),
+            skip_frames: self.surfaces.frames_with_surface().collect(),
         };
         let done = match self.selector.start(job) {
             Some(done) => Some(done),
@@ -439,6 +448,43 @@ impl World {
         self.cache.take_requests(now)
     }
 
+    /// Selects surface tiles for every frame with mass in range
+    /// ([`crate::tiles::Surfaces::select`]).
+    pub fn select_surfaces(&mut self, system: &FrameSystem, camera: &Camera, view_px: (u32, u32)) {
+        let aspect = f64::from(view_px.0.max(1)) / f64::from(view_px.1.max(1));
+        let frames: Vec<u64> = system
+            .tree()
+            .frames()
+            .iter()
+            .filter(|f| {
+                f.mass.value() > 0.0
+                    && crate::stream::frame_in_range(system, camera, f.frame_id, aspect)
+            })
+            .map(|f| f.frame_id)
+            .collect();
+        self.surfaces.select(system, camera, view_px, &frames);
+        self.surfaces.evict(SURFACE_TILES_KEPT);
+    }
+
+    /// Applies a finished surface tile request.
+    pub fn complete_surface(
+        &mut self,
+        key: gx_core::key::SurfaceKey,
+        outcome: Result<Option<Arc<crate::tiles::TileGeometry>>, String>,
+    ) {
+        self.surfaces.complete(key, outcome);
+    }
+
+    /// The surface tiles to request now.
+    pub fn take_surface_requests(&mut self) -> Vec<gx_core::key::SurfaceKey> {
+        self.surfaces.take_requests()
+    }
+
+    /// The surface tiles.
+    pub fn surfaces(&self) -> &crate::tiles::Surfaces {
+        &self.surfaces
+    }
+
     /// Applies a fetch result: the cell's state, and marks for the cells
     /// whose extraction inputs it can change.
     pub fn complete(&mut self, key: CellKey, outcome: FetchOutcome, now: f64) {
@@ -467,6 +513,7 @@ impl World {
             self.complete(key, outcome, now);
         }
         self.select(seen.system(), seen.camera(), view_px, now, false);
+        self.select_surfaces(seen.system(), seen.camera(), view_px);
         let requests = self.take_requests(now);
         if now - self.last_evict >= EVICT_INTERVAL_SECONDS {
             self.last_evict = now;
@@ -759,6 +806,7 @@ impl World {
         let resolved =
             |k: &CellKey| self.drawable(k) || self.cache.state(k) == Some(&CellState::Gone);
         self.extraction_idle()
+            && self.surfaces.settled()
             && self.cache.outstanding() == 0
             && self.cache.selection().iter().all(|s| resolved(&s.key))
             && self
@@ -776,6 +824,7 @@ impl World {
     /// ready.
     pub fn ready(&self) -> bool {
         self.extraction_idle()
+            && self.surfaces.settled()
             && !self.arrived_since_selection
             && self.cache.outstanding() == 0
             && self.cache.at_target()
@@ -851,6 +900,16 @@ impl World {
         for m in &meshes {
             lit(m.key.frame_id);
         }
+        let tiles: Vec<crate::tiles::TileDrawInfo> = self
+            .surfaces
+            .drawn()
+            .iter()
+            .filter(|t| weight(t.geometry.key.frame_id) > 0.0)
+            .cloned()
+            .collect();
+        for t in &tiles {
+            lit(t.geometry.key.frame_id);
+        }
         let sprites = far
             .iter()
             .filter_map(|f| match self.cache.state(&depth_zero_key(f.frame_id)) {
@@ -867,6 +926,7 @@ impl World {
             .collect();
         DrawList {
             meshes,
+            tiles,
             volumes,
             lights,
             frame_lights,

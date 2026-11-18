@@ -133,7 +133,14 @@ impl WebFetcher {
         self.coordinator.request(ChunkKey::Cell(key), now);
     }
 
-    /// Starts the request for the registry key.
+    /// Queues a request for a surface tile; the result arrives as
+    /// [`FetchEvent::Surface`] through [`WebFetcher::drain`].
+    pub fn request_surface(&mut self, key: gx_core::key::SurfaceKey) {
+        let now = self.now();
+        self.coordinator.request(ChunkKey::Surface(key), now);
+    }
+
+    /// Starts a request for the registry key.
     pub fn request_registry(&mut self) {
         let now = self.now();
         self.coordinator.request(ChunkKey::Registry, now);
@@ -306,9 +313,24 @@ impl WebFetcher {
                         Duration::from_secs_f64((self.now() - done.requested_at).max(0.0));
                     self.completed.push_back((key, done, extent, round_trip));
                 }
+                ChunkKey::Surface(key) => {
+                    let bytes = done.sections.iter().map(|s| s.bytes.len() as u64).sum();
+                    let sections: Vec<Arc<[u8]>> =
+                        done.sections.iter().map(|a| a.bytes.clone()).collect();
+                    self.out.push(FetchEvent::Surface {
+                        key,
+                        outcome: crate::tiles::decode_tile(&key, &sections),
+                        bytes,
+                    });
+                }
             },
             Action::Failed { key, reason } => match key {
                 ChunkKey::Registry => self.out.push(FetchEvent::Registry(Err(reason))),
+                ChunkKey::Surface(key) => self.out.push(FetchEvent::Surface {
+                    key,
+                    outcome: Err(reason),
+                    bytes: 0,
+                }),
                 ChunkKey::Cell(key) => {
                     self.extents.remove(&key);
                     self.out.push(FetchEvent::Completed {
@@ -396,7 +418,7 @@ fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
                 decoded: Some(Arc::new(s)),
             })
             .map_err(|e| e.to_string()),
-        ChunkKey::Registry => Ok(Arrived::raw(bytes)),
+        ChunkKey::Registry | ChunkKey::Surface(_) => Ok(Arrived::raw(bytes)),
     }
 }
 

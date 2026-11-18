@@ -58,6 +58,9 @@ struct Model {
     // it: from where the emitter was one light-travel time before the
     // frame is seen (src/seen.rs). w unused.
     lights: array<vec4<f32>, 8>,
+    // Surface tiles (vs_tile): camera distances where the morph toward
+    // the parent level begins (x) and is complete (y); zw unused.
+    morph: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -97,6 +100,46 @@ fn vs_surface(in: VsIn) -> VsOut {
     out.clip = globals.view_proj * vec4<f32>(rel, 1.0);
     out.rel = rel;
     out.normal = rot * in.normal;
+    out.albedo = in.albedo;
+    out.roughness = in.roughness;
+    out.emission = band * (vec3<f32>(1.0) - in.albedo);
+    out.weight = model.offset.w;
+    return out;
+}
+
+struct TileIn {
+    // Relative to the frame's anchor, frame axes, meters.
+    @location(0) position: vec3<f32>,
+    // The parent level's surface at this vertex, relative to the anchor.
+    @location(1) target_position: vec3<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) target_normal: vec3<f32>,
+    @location(4) albedo: vec3<f32>,
+    @location(5) roughness: f32,
+    @location(6) emission_index: u32,
+};
+
+// A surface tile vertex (src/tiles.rs): moved from its own position to the
+// parent level's as its distance from the camera goes from morph.x to
+// morph.y. Shared vertices of two tiles have the same inputs and the same
+// offset, so they are drawn at the same point.
+@vertex
+fn vs_tile(in: TileIn) -> VsOut {
+    let rot = mat3x3<f32>(model.c0.xyz, model.c1.xyz, model.c2.xyz);
+    let d = length(rot * in.position + model.offset.xyz);
+    let k = clamp((d - model.morph.x) / max(model.morph.y - model.morph.x, 1.0e-6), 0.0, 1.0);
+    let p = mix(in.position, in.target_position, k);
+    let rel = rot * p + model.offset.xyz;
+    let i = in.emission_index;
+    let band = textureLoad(
+        emission_table,
+        vec2<u32>(i % EMISSION_TABLE_WIDTH, i / EMISSION_TABLE_WIDTH),
+        0
+    ).rgb;
+    var out: VsOut;
+    out.clip = globals.view_proj * vec4<f32>(rel, 1.0);
+    out.rel = rel;
+    out.normal = rot * normalize(mix(in.normal, in.target_normal, k));
     out.albedo = in.albedo;
     out.roughness = in.roughness;
     out.emission = band * (vec3<f32>(1.0) - in.albedo);

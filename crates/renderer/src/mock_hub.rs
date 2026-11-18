@@ -643,13 +643,20 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
                 state: "empty".into(),
                 ..RawDirection::default()
             };
-            if let ChunkKey::Cell(cell) = key {
-                let owned_elsewhere = exclusive
-                    .get(&cell.frame_id)
-                    .is_some_and(|owner| *owner != l.id);
-                if !l.attachment.contains(cell.frame_id)
+            // Attachments, exclusivity, and maximum depths apply to cells
+            // and to surface tiles (their level as the depth), as the hub
+            // applies them. A layer of stored matter has no surface tiles.
+            let placed = match key {
+                ChunkKey::Cell(cell) => Some((cell.frame_id, cell.depth)),
+                ChunkKey::Surface(t) => Some((t.frame_id, t.level)),
+                ChunkKey::Registry => None,
+            };
+            if let Some((frame_id, depth)) = placed {
+                let owned_elsewhere = exclusive.get(&frame_id).is_some_and(|owner| *owner != l.id);
+                if !l.attachment.contains(frame_id)
                     || owned_elsewhere
-                    || cell.depth > l.max_depth_for(cell.frame_id)
+                    || depth > l.max_depth_for(frame_id)
+                    || (l.stored.is_some() && matches!(key, ChunkKey::Surface(_)))
                 {
                     layers.push(d);
                     continue;

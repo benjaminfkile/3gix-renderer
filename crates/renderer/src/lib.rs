@@ -72,6 +72,7 @@ pub mod selector;
 pub mod sim;
 pub mod spawn;
 pub mod stream;
+pub mod tiles;
 pub mod transvoxel;
 pub mod volume;
 pub mod world;

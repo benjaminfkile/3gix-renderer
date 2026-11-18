@@ -280,7 +280,7 @@ pub fn check_section(key: &ChunkKey, bytes: &[u8]) -> Result<Option<Section>, Wo
     };
     match key {
         ChunkKey::Cell(cell) => gx_core::matter::decode(cell, bytes).map(Some).map_err(fail),
-        ChunkKey::Registry => gx_core::validate(&key.to_string(), bytes)
+        ChunkKey::Registry | ChunkKey::Surface(_) => gx_core::validate(&key.to_string(), bytes)
             .map(|()| None)
             .map_err(fail),
     }

@@ -100,6 +100,25 @@ pub struct SurfaceDraw {
     pub lights: [[f32; 3]; MAX_LIGHTS],
 }
 
+/// One surface tile placed for drawing (`crate::tiles`): its geometry goes
+/// to the GPU relative to its frame's anchor, and each frame the anchor is
+/// made relative to the camera in `f64` and only that offset is cast to
+/// `f32`, the same for every tile of the frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileDraw {
+    /// The tile, its anchor, and its morph distances.
+    pub tile: crate::tiles::TileDrawInfo,
+    /// Anchor relative to the camera, root axes, meters.
+    pub offset: [f32; 3],
+    /// Columns of the rotation from the frame axes into root axes.
+    pub rotation: [[f32; 3]; 3],
+    /// Weight of the tile's radiance, as [`SurfaceDraw::weight`].
+    pub weight: f32,
+    /// The lights as the tile's frame receives them, as
+    /// [`SurfaceDraw::lights`].
+    pub lights: [[f32; 3]; MAX_LIGHTS],
+}
+
 /// One cell's volume placed for drawing, the same way as [`SurfaceDraw`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeDraw {
@@ -128,6 +147,8 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     /// Surfaces of the drawn cells, in key order.
     pub surfaces: Vec<SurfaceDraw>,
+    /// Surface tiles (`crate::tiles`).
+    pub tiles: Vec<TileDraw>,
     /// Volumes of the drawn cells, farthest first (ties in key order).
     pub volumes: Vec<VolumeDraw>,
     /// Point sprites of far frames.
@@ -274,6 +295,7 @@ pub fn build_scene(system: &FrameSystem, camera: &Camera, aspect: f64) -> Scene 
         markers,
         lines,
         surfaces: Vec::new(),
+        tiles: Vec::new(),
         volumes: Vec::new(),
         sprites: Vec::new(),
         lights: Vec::new(),
@@ -334,6 +356,25 @@ pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw
         }
         scene.surfaces.push(SurfaceDraw {
             mesh: mesh.clone(),
+            offset: to_f32(offset),
+            rotation: frame_rotation(system, frame),
+            weight: draw.cell_weight(frame),
+            lights,
+        });
+    }
+    for tile in &draw.tiles {
+        let g = &tile.geometry;
+        let frame = g.key.frame_id;
+        let a = tile.anchor.position;
+        let offset = camera.relative(system, Vec3::new(a[0], a[1], a[2]), frame);
+        let cam = camera_in(system, camera, frame);
+        nearest = nearest.min(box_distance(cam, g.bounds.0, g.bounds.1));
+        let mut lights = [[0.0; 3]; MAX_LIGHTS];
+        for (slot, l) in lights.iter_mut().zip(draw.lights_of(frame)) {
+            *slot = l.position;
+        }
+        scene.tiles.push(TileDraw {
+            tile: tile.clone(),
             offset: to_f32(offset),
             rotation: frame_rotation(system, frame),
             weight: draw.cell_weight(frame),

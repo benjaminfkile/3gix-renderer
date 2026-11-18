@@ -80,17 +80,24 @@ pub fn matter_step(
     now: f64,
 ) -> DrawList {
     let started = now_seconds();
-    let results = fetcher.drain().into_iter().filter_map(|e| match e {
-        FetchEvent::Completed { key, outcome, .. } => Some((key, outcome)),
-        // Loaded once at startup, before the integrator.
-        FetchEvent::Registry(_) => None,
-    });
-    let (requests, draw) = world.step(seen, view_px, now, results, started);
+    let mut cells = Vec::new();
+    for e in fetcher.drain() {
+        match e {
+            FetchEvent::Completed { key, outcome, .. } => cells.push((key, outcome)),
+            FetchEvent::Surface { key, outcome, .. } => world.complete_surface(key, outcome),
+            // Loaded once at startup, before the integrator.
+            FetchEvent::Registry(_) => {}
+        }
+    }
+    let (requests, draw) = world.step(seen, view_px, now, cells, started);
     let system = seen.system();
     for key in requests {
         if let Some(frame) = system.tree().get(key.frame_id) {
             fetcher.request(key, frame.root_extent);
         }
+    }
+    for key in world.take_surface_requests() {
+        fetcher.request_surface(key);
     }
     fetcher.flush();
     world.record_step((now_seconds() - started) * 1e3);
@@ -104,8 +111,13 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         cells_selected: counts.cache.selected,
         cells_ready: counts.cache.ready,
         cells_pending: counts.cache.pending,
-        meshes_drawn: scene.surfaces.len(),
-        triangles_drawn: scene.surfaces.iter().map(|d| d.mesh.triangle_count()).sum(),
+        meshes_drawn: scene.surfaces.len() + scene.tiles.len(),
+        triangles_drawn: scene
+            .surfaces
+            .iter()
+            .map(|d| d.mesh.triangle_count())
+            .sum::<usize>()
+            + scene.tiles.len() * gx_core::surface::TILE_QUADS * gx_core::surface::TILE_QUADS * 2,
         volumes_drawn: scene.volumes.len(),
         sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),
