@@ -97,11 +97,12 @@ FLAGS:
     --height <u32>                 render height in pixels (default 720)
     --view <home|0-9>              headless view: home (default) or the number key's view
     --view-distance-scale <f64>    multiplies the view's distance from its frame origin (default 1)
-    --start-on <frame>:<x>,<y>,<z>[@<m>[^<deg>]]
+    --start-on <frame>:<x>,<y>,<z>[@[+]<m>[^<deg>]]
                                    spawn the camera onto frame <frame> along the direction
-                                   x, y, z of its axes (as G does); with @<m>, only place it
-                                   <m> meters from the frame origin, looking at the origin
-                                   (with ^<deg>: <deg> degrees below level instead)
+                                   x, y, z of its axes (as G does); with @+<m>, <m> meters
+                                   above the drawn surface instead of 2 m; with @<m>, only
+                                   place it <m> meters from the frame origin, looking at the
+                                   origin (with ^<deg>: <deg> degrees below level instead)
     --wait-ready-seconds <f64>     headless: wait until every selected cell is ready, failing
                                    with a non-zero status after this many seconds
     --stats-json <path.json>       headless: write the overlay statistics as JSON
@@ -305,19 +306,23 @@ pub struct StartOn {
     pub frame_id: u64,
     /// Unit direction from the frame origin, frame axes.
     pub direction: gx_core::units::Vec3,
-    /// Distance from the frame origin, meters; `None` for the default.
+    /// Distance from the frame origin, meters (`@<m>`); `None` spawns
+    /// onto the drawn surface.
     pub distance: Option<f64>,
+    /// Height above the drawn surface when spawning, meters (`@+<m>`);
+    /// `None` for [`crate::spawn::SPAWN_HEIGHT`].
+    pub height: Option<f64>,
     /// With a distance: look this many degrees below level (toward the
     /// frame's `+z` heading) instead of at the frame origin.
     pub pitch_deg: Option<f64>,
 }
 
 impl StartOn {
-    /// Parses `<frame>:<x>,<y>,<z>[@<meters>[^<pitch degrees>]]`; the
-    /// direction must not be zero, the distance must be above zero, and the
-    /// pitch between -90 and 90.
+    /// Parses `<frame>:<x>,<y>,<z>[@[+]<meters>[^<pitch degrees>]]`; the
+    /// direction must not be zero, the distance or height must be above
+    /// zero, and the pitch between -90 and 90.
     pub fn parse(s: &str) -> Option<StartOn> {
-        let (place, distance, pitch_deg) = match s.split_once('@') {
+        let (place, mut distance, pitch_deg) = match s.split_once('@') {
             Some((p, rest)) => {
                 let (d, pitch) = match rest.split_once('^') {
                     Some((d, a)) => {
@@ -329,14 +334,26 @@ impl StartOn {
                     }
                     None => (rest, None),
                 };
-                let d: f64 = d.trim().parse().ok()?;
+                let (above, d) = match d.trim().strip_prefix('+') {
+                    Some(h) => (true, h),
+                    None => (false, d.trim()),
+                };
+                let d: f64 = d.parse().ok()?;
                 if !(d.is_finite() && d > 0.0) {
                     return None;
                 }
-                (p, Some(d), pitch)
+                (p, Some((above, d)), pitch)
             }
             None => (s, None, None),
         };
+        let height = match distance {
+            Some((true, h)) => {
+                distance = None;
+                Some(h)
+            }
+            _ => None,
+        };
+        let distance = distance.map(|(_, d)| d);
         let (frame, dir) = place.split_once(':')?;
         let frame_id = frame.trim().parse().ok()?;
         let v: Vec<f64> = dir
@@ -355,6 +372,7 @@ impl StartOn {
             frame_id,
             direction,
             distance,
+            height,
             pitch_deg,
         })
     }
@@ -864,17 +882,27 @@ mod tests {
         assert_eq!(s.frame_id, 4);
         assert!((s.direction.y - 0.6).abs() < 1e-12 && (s.direction.z - 0.8).abs() < 1e-12);
         assert_eq!(s.distance, None);
-        let s = parse_flags(["--start-on", "4:1,0,0@6.37e6"])
+        let s = parse_flags(["--start-on", "4:1,0,0@5e6"])
             .unwrap()
             .start_on
             .unwrap();
-        assert_eq!(s.distance, Some(6.37e6));
-        let s = parse_flags(["--start-on", "4:1,0,0@6.37e6^-20"])
+        assert_eq!(s.distance, Some(5e6));
+        let s = parse_flags(["--start-on", "4:1,0,0@5e6^-20"])
             .unwrap()
             .start_on
             .unwrap();
         assert_eq!(s.pitch_deg, Some(-20.0));
-        assert!(parse_flags(["--start-on", "4:1,0,0@6.37e6^-100"]).is_err());
+        assert!(parse_flags(["--start-on", "4:1,0,0@5e6^-100"]).is_err());
+        let s = parse_flags(["--start-on", "4:1,0,0@+1e4^20"])
+            .unwrap()
+            .start_on
+            .unwrap();
+        assert_eq!(
+            (s.distance, s.height, s.pitch_deg),
+            (None, Some(1e4), Some(20.0))
+        );
+        assert!(parse_flags(["--start-on", "4:1,0,0@+0"]).is_err());
+        assert!(parse_flags(["--start-on", "4:1,0,0@+-5"]).is_err());
     }
 
     #[test]

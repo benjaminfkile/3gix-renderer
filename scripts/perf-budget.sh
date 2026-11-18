@@ -41,13 +41,14 @@ else
     trap 'rm -rf "$out"' EXIT HUP INT TERM
 fi
 
-# rendering.md section 5.1. The direction is a unit vector in frame 4's axes.
+# rendering.md section 5.1. The direction is a unit vector in frame 4's axes;
+# @+<m> is a height above whatever surface is drawn on that line.
 dir='4:-0.278984895,-0.626786973,0.727533861'
 view_args() {
     case "$1" in
-        B1) echo "--start-on $dir@6378800^20" ;;
-        B2) echo "--start-on $dir@6378800" ;;
-        B3) echo "--start-on $dir@6778800^30" ;;
+        B1) echo "--start-on $dir@+10000^20" ;;
+        B2) echo "--start-on $dir@+10000^90" ;;
+        B3) echo "--start-on $dir@+400000^30" ;;
         B4) echo "--view home" ;;
     esac
 }

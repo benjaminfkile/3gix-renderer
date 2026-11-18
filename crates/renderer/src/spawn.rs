@@ -19,7 +19,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::registry::FrameTree;
 use gx_core::units::Vec3;
 
-use crate::camera::{look_rotation, Camera};
+use crate::camera::{pitched_look, Camera};
 use crate::farfield::depth_zero_key;
 use crate::stream::{CellCache, CellState};
 
@@ -90,19 +90,27 @@ pub struct Spawn {
     pub frame_id: u64,
     /// Unit direction from the frame origin, frame axes.
     pub direction: Vec3,
+    /// Height above the surface, meters.
+    pub height: f64,
+    /// Degrees below level the camera looks; `None` for level.
+    pub pitch_deg: Option<f64>,
     /// Session time after which the point is no longer refined, seconds.
     pub until: f64,
 }
 
 /// Spawns `camera` onto `frame_id` along `direction` (frame axes, or the
-/// line toward the camera when `None`), at session time `now`. Returns the
-/// spawn to keep refining, or `None` (changing nothing) when the frame
-/// shows no matter on that line yet.
+/// line toward the camera when `None`), `height` meters above the surface
+/// and looking `pitch_deg` below level (level when `None`), at session
+/// time `now`. Returns the spawn to keep refining, or `None` (changing
+/// nothing) when the frame shows no matter on that line yet.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     system: &FrameSystem,
     world: &crate::world::World,
     frame_id: u64,
     direction: Option<Vec3>,
+    height: f64,
+    pitch_deg: Option<f64>,
     camera: &mut Camera,
     now: f64,
 ) -> Option<Spawn> {
@@ -111,12 +119,15 @@ pub fn spawn(
         None => crate::stream::camera_in_frame(system, camera, frame_id).normalized()?,
     };
     let r = world.surface_along(frame_id, direction)?;
-    place(camera, frame_id, direction, r);
-    Some(Spawn {
+    let s = Spawn {
         frame_id,
         direction,
+        height,
+        pitch_deg,
         until: now + REFINE_SECONDS,
-    })
+    };
+    place(camera, &s, r);
+    Some(s)
 }
 
 /// Finds the point of `spawn` again with the cells loaded now and moves the
@@ -126,9 +137,9 @@ pub fn refine(world: &crate::world::World, spawn: &Spawn, camera: &mut Camera, n
         return false;
     }
     if let Some(r) = world.surface_along(spawn.frame_id, spawn.direction) {
-        let want = spawn.direction.scale(r + SPAWN_HEIGHT);
+        let want = spawn.direction.scale(r + spawn.height);
         if (camera.position - want).length() > 0.01 || camera.frame_id != spawn.frame_id {
-            place(camera, spawn.frame_id, spawn.direction, r);
+            place(camera, spawn, r);
         }
     }
     true
@@ -170,7 +181,7 @@ impl Spawner {
         if let Some(i) = picked {
             self.pending = None;
             if let Some(&f) = spawn_frames(world.cache(), system.tree()).get(i) {
-                if let Some(s) = spawn(system, world, f, None, camera, now) {
+                if let Some(s) = spawn(system, world, f, None, SPAWN_HEIGHT, None, camera, now) {
                     self.active = Some(s);
                     attached = true;
                 }
@@ -178,7 +189,17 @@ impl Spawner {
         }
         if let Some(p) = self.pending {
             if spawn_frames(world.cache(), system.tree()).contains(&p.frame_id) {
-                if let Some(s) = spawn(system, world, p.frame_id, Some(p.direction), camera, now) {
+                let height = p.height.unwrap_or(SPAWN_HEIGHT);
+                if let Some(s) = spawn(
+                    system,
+                    world,
+                    p.frame_id,
+                    Some(p.direction),
+                    height,
+                    p.pitch_deg,
+                    camera,
+                    now,
+                ) {
                     self.active = Some(s);
                     self.pending = None;
                     attached = true;
@@ -207,17 +228,13 @@ impl Spawner {
     }
 }
 
-/// Puts the camera in `frame_id`, [`SPAWN_HEIGHT`] beyond `r` along
-/// `direction`, looking level toward the frame's `+z` (or `+x` at a pole).
-fn place(camera: &mut Camera, frame_id: u64, direction: Vec3, r: f64) {
-    let up = direction;
-    let z = Vec3::new(0.0, 0.0, 1.0);
-    let forward = (z - up.scale(z.dot(up)))
-        .normalized()
-        .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
-    camera.frame_id = frame_id;
-    camera.position = direction.scale(r + SPAWN_HEIGHT);
-    camera.orientation = look_rotation(forward, up);
+/// Puts the camera in the spawn's frame, its height beyond `r` along its
+/// direction, looking its pitch below level toward the frame's `+z` (or
+/// `+x` at a pole).
+fn place(camera: &mut Camera, spawn: &Spawn, r: f64) {
+    camera.frame_id = spawn.frame_id;
+    camera.position = spawn.direction.scale(r + spawn.height);
+    camera.orientation = pitched_look(spawn.direction, spawn.pitch_deg.unwrap_or(0.0));
 }
 
 #[cfg(test)]

@@ -440,8 +440,16 @@ pub fn view_camera(system: &FrameSystem, view: View, distance_scale: f64) -> Res
     let camera = match view {
         View::Home => Camera::home(system),
         View::Over(s) => {
-            Camera::over_pitched(system, s.frame_id, s.direction, s.distance, s.pitch_deg)
-                .ok_or_else(|| anyhow!("frame {} is not in the registry", s.frame_id))?
+            // A spawn (no distance) looks at the frame until it lands; its
+            // pitch applies once it has spawned.
+            Camera::over_pitched(
+                system,
+                s.frame_id,
+                s.direction,
+                s.distance,
+                s.distance.and(s.pitch_deg),
+            )
+            .ok_or_else(|| anyhow!("frame {} is not in the registry", s.frame_id))?
         }
         View::Key(index) => Camera::view_of_index(system, index)
             .ok_or_else(|| anyhow!("no frame is bound to the number key of view {view}"))?,
@@ -650,7 +658,7 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
                 s.frame_id,
                 s.direction,
                 s.distance,
-                s.pitch_deg,
+                s.distance.and(s.pitch_deg),
             )
         })
         .unwrap_or_else(|| Camera::home(sim.system()));

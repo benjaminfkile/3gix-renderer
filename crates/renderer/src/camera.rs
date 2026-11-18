@@ -107,6 +107,20 @@ pub fn axis_angle(axis: Vec3, angle: f64) -> Quat {
     Quat::new(axis.x * s, axis.y * s, axis.z * s, c)
 }
 
+/// The orientation of a camera on the line `up` (unit, frame axes) from a
+/// frame's origin, looking `pitch_deg` degrees below level, level being
+/// toward the frame's `+z` heading (or `+x` at a pole), as in
+/// [`Camera::over_pitched`].
+pub fn pitched_look(up: Vec3, pitch_deg: f64) -> Quat {
+    let z = Vec3::new(0.0, 0.0, 1.0);
+    let level = (z - up.scale(z.dot(up)))
+        .normalized()
+        .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let a = pitch_deg.to_radians();
+    let forward = level.scale(a.cos()) - up.scale(a.sin());
+    look_rotation(forward, up)
+}
+
 /// The rotation whose camera looks along `forward` with its up axis as close
 /// to `up_hint` as possible, both given in the same axes. Falls back to
 /// another hint when the two are parallel.
@@ -358,15 +372,7 @@ impl Camera {
         let distance = distance.unwrap_or(3.0 * frame.root_extent.value() / 8.0);
         let look = match pitch_deg {
             None => look_rotation(direction.scale(-1.0), Vec3::new(0.0, 0.0, 1.0)),
-            Some(p) => {
-                let z = Vec3::new(0.0, 0.0, 1.0);
-                let level = (z - direction.scale(z.dot(direction)))
-                    .normalized()
-                    .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
-                let a = (-p).to_radians();
-                let forward = level.scale(a.cos()) - direction.scale(a.sin());
-                look_rotation(forward, direction)
-            }
+            Some(p) => pitched_look(direction, p),
         };
         Some(Camera {
             frame_id,
@@ -445,6 +451,23 @@ mod tests {
     use super::*;
     use gx_core::registry::{Frame, Registry, ROOT_PARENT};
     use gx_core::units::{Kilograms, Meters, Seconds};
+
+    #[test]
+    fn pitch_looks_below_level() {
+        let up = Vec3::new(0.3, -0.5, 0.8).normalized().unwrap();
+        for p in [20.0f64, 30.0, 90.0, -15.0] {
+            let forward = pitched_look(up, p).rotate(Vec3::new(0.0, 0.0, -1.0));
+            // Below level by p degrees: the component along up is -sin(p).
+            assert!(
+                (forward.dot(up) + p.to_radians().sin()).abs() < 1e-9,
+                "pitch {p}: forward . up = {}",
+                forward.dot(up)
+            );
+        }
+        // Level when 0.
+        let f = pitched_look(up, 0.0).rotate(Vec3::new(0.0, 0.0, -1.0));
+        assert!(f.dot(up).abs() < 1e-12);
+    }
 
     fn frame(id: u64, parent: u64, extent: f64, position: Vec3, orientation: Quat) -> Frame {
         Frame {
