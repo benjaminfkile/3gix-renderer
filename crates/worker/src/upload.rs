@@ -9,12 +9,19 @@
 //! section when it needs it. `local` sections never enter the lane. The
 //! native fetcher and the browser fetcher both drain one lane each through
 //! [`UploadLane::take`] and record the answer with
-//! [`crate::UploadTicket::finish`].
+//! [`crate::UploadTicket::finish`]. The native fetcher takes an offer only
+//! while fewer than [`MAX_UPLOADS_IN_FLIGHT`] are being sent and sends it
+//! on its async runtime, never on a pool thread; the browser sends one at
+//! a time from the page's event loop.
 
 use crate::job::ComputeJob;
 use crate::stats::{UploadTicket, WorkerStats};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+/// Most uploads a native client sends at once (`client-compute.md`
+/// section 2.8). While this many are in flight the rest wait in the lane.
+pub const MAX_UPLOADS_IN_FLIGHT: usize = 4;
 
 /// Most offers the lane holds (`client-compute.md` section 2.8: bounded).
 pub const UPLOAD_LANE_CAPACITY: usize = 64;

@@ -11,6 +11,13 @@
 //! priority, and a job whose key is no longer wanted is removed before it
 //! starts. A job already taken from the queue is not affected: it finishes
 //! and its section is cached.
+//!
+//! Uploads never hold a compute thread. A native pool thread that takes an
+//! upload only hands its request to the fetcher's async runtime and is free
+//! at once; at most [`crate::MAX_UPLOADS_IN_FLIGHT`] are in flight, and
+//! while that many are the upload lane gives nothing and keeps the rest
+//! (bounded, oldest dropped). In the browser uploads are async `fetch`
+//! calls on the page and never occupy the Web Worker.
 
 use gx_core::key::ChunkKey;
 

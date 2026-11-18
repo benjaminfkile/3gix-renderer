@@ -22,7 +22,11 @@
 //! [`crate::queue`]): a free thread takes the waiting compute of the
 //! highest priority; only when no compute waits does it take work from the
 //! upload lane, and only when no upload waits from the check lane
-//! ([`WorkerPool::set_lane`]). [`WorkerPool::reprioritize`] follows the
+//! ([`WorkerPool::set_lane`]). Lower-lane work never holds a thread on the
+//! network: the client's upload source only hands each request to its
+//! async runtime and returns, with at most four in flight; while four are
+//! in flight it gives the pool nothing and the offers stay in the bounded
+//! lane, and a finished request wakes the pool ([`PoolWaker`]). [`WorkerPool::reprioritize`] follows the
 //! wanted set: waiting jobs take their key's new priority, and a job whose
 //! key left it is removed before it starts and told
 //! [`crate::FailureKind::Dropped`]. A running job finishes and its section
@@ -325,8 +329,12 @@ struct Task {
 /// A lower lane's work (uploads, checks): a pool thread asks it for the
 /// next piece of work only when no higher lane has any waiting.
 pub trait LaneSource: Send + Sync {
-    /// The next piece of work, or `None` when nothing waits. Must not
-    /// block; the work itself may.
+    /// The next piece of work, or `None` when nothing waits or nothing
+    /// may start yet. Called with the pool's queue locked: must not block.
+    /// The work runs on the pool thread; an upload's work only hands the
+    /// request to an async runtime and returns, so no network wait ever
+    /// holds a compute thread. A source that returned `None` while work
+    /// waits calls [`PoolWaker::wake`] once that work may start.
     fn next(&self) -> Option<Box<dyn FnOnce() + Send>>;
 }
 
@@ -369,6 +377,23 @@ impl Queue {
             }
             state = self.ready.wait(state).expect("job queue");
         }
+    }
+}
+
+/// Wakes a pool's idle threads so they ask the lane sources again
+/// ([`WorkerPool::waker`]). Safe to call from any thread, after the pool
+/// is gone too.
+#[derive(Clone)]
+pub struct PoolWaker {
+    queue: Arc<Queue>,
+}
+
+impl PoolWaker {
+    /// Wakes every idle thread. Takes the queue's lock first, so a thread
+    /// that has just found nothing and is about to wait cannot miss it.
+    pub fn wake(&self) {
+        drop(self.queue.state.lock().expect("job queue"));
+        self.queue.ready.notify_all();
     }
 }
 
@@ -476,7 +501,16 @@ impl WorkerPool {
     /// from a pool thread (a finished job's upload) needs no call: the
     /// thread looks again before it waits.
     pub fn wake(&self) {
-        self.queue.ready.notify_all();
+        self.waker().wake();
+    }
+
+    /// A handle that wakes the pool's idle threads from anywhere, for a
+    /// lane source whose work becomes ready off the pool (an upload slot
+    /// freed on the async runtime).
+    pub fn waker(&self) -> PoolWaker {
+        PoolWaker {
+            queue: Arc::clone(&self.queue),
+        }
     }
 
     /// Queues `job` at `priority` (larger starts sooner; the key's
