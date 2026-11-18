@@ -306,6 +306,9 @@ pub struct Surfaces {
     anchors: BTreeMap<u64, Anchor>,
     requests: Vec<SurfaceKey>,
     drawn: Vec<TileDrawInfo>,
+    /// Every tile the latest selection looked at: the tiles it walked and
+    /// the children it checked or asked for. Eviction keeps them.
+    used: std::collections::HashSet<SurfaceKey>,
 }
 
 impl Surfaces {
@@ -397,6 +400,7 @@ impl Surfaces {
         let half_x = (half_y.tan() * aspect).atan();
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
+        self.used.clear();
         for &frame in frames {
             for face in 0..SURFACE_FACES {
                 self.want(SurfaceKey {
@@ -456,6 +460,7 @@ impl Surfaces {
             .fold(f64::INFINITY, f64::min);
         let occluder = if occluder.is_finite() { occluder } else { 0.0 };
         while let Some(key) = stack.pop() {
+            self.used.insert(key);
             let Some(geo) = self.ready(&key).cloned() else {
                 continue;
             };
@@ -469,6 +474,7 @@ impl Surfaces {
             let r = range(geo.edge, focal);
             let children = key.children();
             if let Some(ch) = children {
+                self.used.extend(ch);
                 if d < r * PREFETCH {
                     for c in ch {
                         self.want(c);
@@ -537,28 +543,19 @@ impl Surfaces {
         }
     }
 
-    /// Drops cached tiles the latest selection does not use, beyond
-    /// `keep` tiles (roots and the drawn tiles' ancestors stay).
+    /// Drops cached tiles the latest selection did not look at, beyond
+    /// `keep` tiles: roots, tiles asked for, and every tile the selection
+    /// walked or checked as a child stay. Keeping only what is drawn and
+    /// its ancestors is not enough: a split tile whose children are all
+    /// hidden draws nothing, and dropping its children would make its
+    /// parent draw coarse until they come back, again and again.
     pub fn evict(&mut self, keep: usize) {
         if self.tiles.len() <= keep {
             return;
         }
-        let mut needed: std::collections::HashSet<SurfaceKey> = std::collections::HashSet::new();
-        for d in &self.drawn {
-            let mut k = Some(d.geometry.key);
-            while let Some(x) = k {
-                if !needed.insert(x) {
-                    break;
-                }
-                // The children asked for around a drawn tile.
-                if let Some(ch) = x.children() {
-                    needed.extend(ch);
-                }
-                k = x.parent();
-            }
-        }
+        let used = &self.used;
         self.tiles
-            .retain(|k, s| k.level == 0 || matches!(s, State::Requested) || needed.contains(k));
+            .retain(|k, s| k.level == 0 || matches!(s, State::Requested) || used.contains(k));
     }
 }
 
@@ -648,6 +645,39 @@ mod tests {
             albedo: vec![[76, 71, 64]; VERTEX_COUNT],
             roughness: vec![230; VERTEX_COUNT],
             temperature: vec![288.0; VERTEX_COUNT],
+        }
+    }
+
+    #[test]
+    fn eviction_keeps_what_the_selection_uses() {
+        // Low camera looking level: some split tiles have every child
+        // hidden. Eviction at its most eager (keep nothing it may drop)
+        // must not change what is drawn from one selection to the next.
+        let (a, c) = (6_378_137.0, 6_356_752.3);
+        let d =
+            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
+        let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
+        let north = unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
+        let mut s = Surfaces::new();
+        let first = settle(&mut s, cam, north, 11);
+        let keys =
+            |d: &[TileDrawInfo]| -> Vec<SurfaceKey> { d.iter().map(|t| t.geometry.key).collect() };
+        let want = keys(&first);
+        for round in 0..6 {
+            s.evict(0);
+            let mut drawn = Vec::new();
+            s.select_in_frame(4, cam, north, focal_px(720.0), 0.9, &mut drawn);
+            assert_eq!(keys(&drawn), want, "round {round}: what is drawn changed");
+            // Serve whatever was asked for again, as the hub would.
+            for key in s.take_requests() {
+                let outcome = if key.level <= 11 {
+                    Ok(Some(Arc::new(TileGeometry::new(&tile(key)))))
+                } else {
+                    Ok(None)
+                };
+                s.complete(key, outcome);
+            }
         }
     }
 
