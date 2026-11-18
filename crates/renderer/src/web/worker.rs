@@ -281,6 +281,30 @@ pub async fn get_blob(
     Ok(bytes)
 }
 
+thread_local! {
+    /// Source manifests decoded this session, by hash: one lists every
+    /// source tile (tens of megabytes) and every section of its layer needs
+    /// it, so it is fetched, checked, and decoded once.
+    static MANIFESTS: RefCell<BTreeMap<[u8; 32], Rc<gx_core::manifest::Manifest>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// The source manifest `hash`, decoded once per session ([`MANIFESTS`]).
+async fn manifest(
+    hub: &WebHub,
+    cache: Option<&WebCache>,
+    hash: &[u8; 32],
+) -> Result<Rc<gx_core::manifest::Manifest>, WorkerError> {
+    if let Some(m) = MANIFESTS.with(|m| m.borrow().get(hash).cloned()) {
+        return Ok(m);
+    }
+    let m = Rc::new(decode_manifest(
+        &get_blob(hub, cache, BlobKind::Manifest, hash).await?,
+    )?);
+    MANIFESTS.with(|ms| ms.borrow_mut().insert(*hash, Rc::clone(&m)));
+    Ok(m)
+}
+
 /// Runs one job to a validated section: the address check, the module by
 /// hash, `gx_sources`, the manifest and tiles by hash, `gx_compile`, and
 /// the validator, which for a cell decodes the section once and hands it
@@ -304,12 +328,10 @@ pub async fn run_job(
     let ids = module_io::decode_source_ids(&ids)
         .map_err(|e| WorkerError::permanent(format!("gx_sources output is invalid: {e}")))?;
     let manifest = match &job.manifest {
-        Some(h) if !ids.is_empty() => Some(decode_manifest(
-            &get_blob(hub, cache, BlobKind::Manifest, h).await?,
-        )?),
+        Some(h) if !ids.is_empty() => Some(manifest(hub, cache, h).await?),
         _ => None,
     };
-    let refs = resolve_tiles(manifest.as_ref(), &ids)?;
+    let refs = resolve_tiles(manifest.as_deref(), &ids)?;
     let mut tiles = Vec::with_capacity(refs.len());
     for r in &refs {
         let bytes = get_blob(hub, cache, BlobKind::Source, &r.sha256).await?;

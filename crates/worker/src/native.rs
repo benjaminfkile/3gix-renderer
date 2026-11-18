@@ -132,10 +132,49 @@ fn get_blob_now(
     Ok(bytes)
 }
 
-/// The module host and every module admitted this session, by hash.
+/// Bytes of verified source tiles kept in memory ([`SourceMemory`]).
+pub const SOURCE_MEMORY_BYTES: usize = 512 << 20;
+
+/// Source tiles already fetched and checked this session, by hash, up to
+/// [`SOURCE_MEMORY_BYTES`]; the oldest go first. Neighboring sections read
+/// mostly the same tiles, so each is read from disk and hashed once.
+#[derive(Default)]
+struct SourceMemory {
+    tiles: BTreeMap<[u8; 32], Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    bytes: usize,
+}
+
+impl SourceMemory {
+    fn get(&self, hash: &[u8; 32]) -> Option<Arc<Vec<u8>>> {
+        self.tiles.get(hash).cloned()
+    }
+
+    fn put(&mut self, hash: [u8; 32], bytes: Arc<Vec<u8>>) {
+        if self.tiles.contains_key(&hash) {
+            return;
+        }
+        self.bytes += bytes.len();
+        self.tiles.insert(hash, bytes);
+        self.order.push_back(hash);
+        while self.bytes > SOURCE_MEMORY_BYTES {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(b) = self.tiles.remove(&old) {
+                self.bytes -= b.len();
+            }
+        }
+    }
+}
+
+/// The module host and every module admitted this session, by hash; the
+/// source manifests decoded this session, by hash; and recent source tiles.
 pub struct ModuleRunner {
     host: ModuleHost,
     loaded: Mutex<BTreeMap<[u8; 32], Arc<LoadedModule>>>,
+    manifests: Mutex<BTreeMap<[u8; 32], Arc<gx_core::manifest::Manifest>>>,
+    sources: Mutex<SourceMemory>,
     stats: Arc<WorkerStats>,
     flights: SingleFlight,
 }
@@ -147,8 +186,41 @@ impl ModuleRunner {
         Ok(ModuleRunner {
             host: ModuleHost::with_config(config).map_err(host_error)?,
             loaded: Mutex::new(BTreeMap::new()),
+            manifests: Mutex::new(BTreeMap::new()),
+            sources: Mutex::new(SourceMemory::default()),
             stats,
             flights: SingleFlight::default(),
+        })
+    }
+
+    /// The source manifest `hash`, fetched, checked, and decoded the first
+    /// time and kept for the session: it lists every source tile (tens of
+    /// megabytes), and every section of its layer needs it.
+    fn manifest(
+        &self,
+        hash: &[u8; 32],
+        blobs: &dyn Blobs,
+        cache: Option<&DiskCache>,
+    ) -> Result<Arc<gx_core::manifest::Manifest>, WorkerError> {
+        let known = || self.manifests.lock().expect("manifests").get(hash).cloned();
+        if let Some(m) = known() {
+            return Ok(m);
+        }
+        self.flights.run(None, hash, || {
+            if let Some(m) = known() {
+                return Ok(m);
+            }
+            let m = Arc::new(decode_manifest(&get_blob_now(
+                BlobKind::Manifest,
+                hash,
+                blobs,
+                cache,
+            )?)?);
+            self.manifests
+                .lock()
+                .expect("manifests")
+                .insert(*hash, Arc::clone(&m));
+            Ok(m)
         })
     }
 
@@ -198,21 +270,27 @@ impl ModuleRunner {
         self.stats.module_run();
         let ids = module.sources(&job.request).map_err(host_error)?;
         let manifest = match &job.manifest {
-            Some(h) if !ids.is_empty() => Some(decode_manifest(&get_blob(
-                BlobKind::Manifest,
-                h,
-                blobs,
-                cache,
-                &self.flights,
-            )?)?),
+            Some(h) if !ids.is_empty() => Some(self.manifest(h, blobs, cache)?),
             _ => None,
         };
-        let refs = resolve_tiles(manifest.as_ref(), &ids)?;
+        let refs = resolve_tiles(manifest.as_deref(), &ids)?;
         let mut tiles = Vec::with_capacity(refs.len());
         for r in &refs {
-            let bytes = get_blob(BlobKind::Source, &r.sha256, blobs, cache, &self.flights)?;
-            check_tile(r, &bytes)?;
-            tiles.push((r.id, bytes));
+            let remembered = self.sources.lock().expect("source memory").get(&r.sha256);
+            let bytes = match remembered {
+                Some(b) if b.len() as u64 == r.length => b,
+                _ => {
+                    let bytes = get_blob(BlobKind::Source, &r.sha256, blobs, cache, &self.flights)?;
+                    check_tile(r, &bytes)?;
+                    let bytes = Arc::new(bytes);
+                    self.sources
+                        .lock()
+                        .expect("source memory")
+                        .put(r.sha256, Arc::clone(&bytes));
+                    bytes
+                }
+            };
+            tiles.push((r.id, bytes.as_ref().clone()));
         }
         self.stats.module_run();
         let bytes = module.compile(&job.request, &tiles).map_err(host_error)?;
