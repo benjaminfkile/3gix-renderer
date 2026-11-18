@@ -30,7 +30,12 @@
 //! between the origin and now integrates at most one checkpoint interval
 //! from the nearest checkpoint before it.
 //!
-//! A second, fine history (checkpoints every [`MAX_STEP_SECONDS`]) covers
+//! The integration step is [`max_step`]: at most [`MAX_STEP_SECONDS`], and
+//! at most [`STEPS_PER_DYNAMICAL_TIME`] steps per the shortest dynamical
+//! time between two frames, so a tight orbit gets as many steps as a wide
+//! one.
+//!
+//! A second, fine history (checkpoints every step or more) covers
 //! the simulation time and the light-travel time before it: every retarded
 //! time the frames are drawn and lit at ([`crate::seen`]) lies in it, so
 //! each pass of the light-time solution costs at most one integration step.
@@ -54,8 +59,12 @@ use gx_core::units::{Seconds, Vec3};
 /// rotation with torques (`space-model.md` sections 6.1 and 6.2).
 pub const SCHEME: Scheme = Scheme::Relativistic;
 
-/// The longest integration step, seconds.
+/// The longest integration step, seconds ([`max_step`]).
 pub const MAX_STEP_SECONDS: f64 = 600.0;
+
+/// Integration steps at least per dynamical time `sqrt(d^3 / (G (m1 + m2)))`
+/// of any two frames ([`max_step`]): about 1600 per circular orbit.
+pub const STEPS_PER_DYNAMICAL_TIME: f64 = 256.0;
 
 /// Simulated seconds between two checkpoints of the coarse history: one
 /// day.
@@ -72,13 +81,52 @@ pub const RECENT_CAPACITY: usize = 1024;
 /// is built for, seconds.
 pub const RECENT_SLACK_SECONDS: f64 = 21_600.0;
 
-/// How far before the origin the histories reach, seconds: two days. The
-/// origin starts the recorded time a client can go back to, not the
-/// universe: light reaching an observer just after the origin left its
-/// frames before it. The registry is integrated backwards this far (the
-/// laws allow it), which covers the light-travel time across the whole root
-/// frame (its far corner is about 16 light-hours from its center).
-pub const BEFORE_ORIGIN_SECONDS: f64 = 172_800.0;
+/// How far before the origin the histories reach, seconds: the light-travel
+/// time across the larger of the root frame's cube (corner to corner) and
+/// twice the farthest frame origin from the root origin at `system`'s time,
+/// plus [`LIGHT_TIME_MARGIN`]. The origin starts the recorded time a client
+/// can go back to, not the universe: light reaching an observer just after
+/// the origin left its frames before it. The registry is integrated
+/// backwards this far (the laws allow it).
+pub fn before_origin(system: &FrameSystem) -> f64 {
+    let tree = system.tree();
+    let farthest = tree
+        .frames()
+        .iter()
+        .map(|f| system.root_position(f.frame_id).length())
+        .fold(0.0, f64::max);
+    let across = (tree.root().root_extent.value() * 3.0f64.sqrt()).max(2.0 * farthest);
+    across / C * (1.0 + LIGHT_TIME_MARGIN)
+}
+
+/// The integration step for `system`, seconds: [`MAX_STEP_SECONDS`], or
+/// less where two frames with mass are close enough that their dynamical
+/// time `sqrt(d^3 / (G (m1 + m2)))` (distance `d` at the system's time)
+/// over [`STEPS_PER_DYNAMICAL_TIME`] is shorter (a massless frame counts:
+/// it moves in the other's field). The root frame is the coordinate origin
+/// and is left out. Nothing about the frames but their masses and
+/// positions is used.
+pub fn max_step(system: &FrameSystem) -> f64 {
+    // The root is the coordinate origin, not a body: it does not move.
+    let frames: Vec<_> = system
+        .tree()
+        .frames()
+        .iter()
+        .filter(|f| !f.is_root())
+        .collect();
+    let mut step = MAX_STEP_SECONDS;
+    for (i, a) in frames.iter().enumerate() {
+        for b in &frames[i + 1..] {
+            let gm = gx_core::gravity::G * (a.mass.value() + b.mass.value());
+            let d = (system.root_position(a.frame_id) - system.root_position(b.frame_id)).length();
+            if gm > 0.0 && d > 0.0 {
+                let t = (d * d * d / gm).sqrt();
+                step = step.min(t / STEPS_PER_DYNAMICAL_TIME);
+            }
+        }
+    }
+    step
+}
 
 /// Relative margin on the light-travel time the fine history covers:
 /// frames move at a small fraction of the speed of light, so their
@@ -303,34 +351,37 @@ pub struct Simulation {
     recent: History,
     /// Every frame at the clock's time.
     system: FrameSystem,
+    /// The integration step, seconds ([`max_step`]).
+    step: Seconds,
 }
 
 impl Simulation {
     /// The simulation of `system`, a frame system at the registry epoch
     /// (the origin), on `clock`.
     pub fn new(system: FrameSystem, clock: SimClock) -> Simulation {
+        let step = Seconds::new(max_step(&system));
+        tracing::info!(
+            step_seconds = step.value(),
+            before_origin_seconds = before_origin(&system),
+            "integration"
+        );
         let mut early = system.clone();
-        let start = early.time() - Seconds::new(BEFORE_ORIGIN_SECONDS);
-        advance(&mut early, start, Seconds::new(MAX_STEP_SECONDS), SCHEME);
+        let start = early.time() - Seconds::new(before_origin(&system));
+        advance(&mut early, start, step, SCHEME);
         let history = History::new(
             early,
             Seconds::new(CHECKPOINT_SECONDS),
-            Seconds::new(MAX_STEP_SECONDS),
+            step,
             SCHEME,
             CHECKPOINT_CAPACITY,
         );
-        let recent = History::new(
-            system.clone(),
-            Seconds::new(MAX_STEP_SECONDS),
-            Seconds::new(MAX_STEP_SECONDS),
-            SCHEME,
-            RECENT_CAPACITY,
-        );
+        let recent = History::new(system.clone(), step, step, SCHEME, RECENT_CAPACITY);
         let mut sim = Simulation {
             clock,
             history,
             recent,
             system,
+            step,
         };
         sim.sync();
         sim
@@ -448,8 +499,12 @@ impl Simulation {
     fn cover(&mut self, lo: Seconds, t: Seconds) {
         let first = self.history.epoch();
         let lo = if lo < first { first } else { lo };
+        let step = self.step;
         let wanted = |span: Seconds| {
-            Seconds::new(MAX_STEP_SECONDS.max(span.value() / (RECENT_CAPACITY / 4) as f64))
+            Seconds::new(
+                step.value()
+                    .max(span.value() / (RECENT_CAPACITY / 4) as f64),
+            )
         };
         let epoch = self.recent.epoch();
         let interval = self.recent.interval().value();
@@ -466,7 +521,7 @@ impl Simulation {
             self.recent = History::new(
                 self.history.state_at(start),
                 interval,
-                Seconds::new(MAX_STEP_SECONDS),
+                self.step,
                 SCHEME,
                 RECENT_CAPACITY,
             );
@@ -625,6 +680,32 @@ mod tests {
     }
 
     #[test]
+    fn step_follows_the_shortest_dynamical_time() {
+        // Wide pair: the cap.
+        assert_eq!(max_step(&system()), MAX_STEP_SECONDS);
+        // A one-hour orbit: far more steps than the cap would give.
+        let gm = gx_core::gravity::G * 6.0e24;
+        let d = (gm * (3600.0 / (2.0 * std::f64::consts::PI)).powi(2)).cbrt();
+        let mut tree = system().tree().frames().to_vec();
+        let mut close = tree[1];
+        close.frame_id = 3;
+        close.parent_frame_id = 2;
+        close.mass = Kilograms::new(1.0e3);
+        close.position = Vec3::new(d, 0.0, 0.0);
+        close.root_extent = Meters::new(1.0e6);
+        tree.push(close);
+        let reg = Registry::new(Seconds::new(EPOCH), tree).unwrap();
+        let sys = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let step = max_step(&sys);
+        let t = (d * d * d / (gm + gx_core::gravity::G * 1.0e3)).sqrt();
+        assert!(
+            (step - t / STEPS_PER_DYNAMICAL_TIME).abs() < 1e-9 * step,
+            "{step}"
+        );
+        assert!(3600.0 / step > 1000.0);
+    }
+
+    #[test]
     fn jumps_match_direct_integration() {
         let now = EPOCH + 30.0 * CHECKPOINT_SECONDS + 1234.5;
         let mut sim = Simulation::at_now(system(), s(now));
@@ -658,10 +739,11 @@ mod tests {
     fn light_history_reaches_back_one_light_time() {
         let now = EPOCH + 3.0 * CHECKPOINT_SECONDS;
         let mut sim = Simulation::at_now(system(), s(now));
-        // From 10 light-hours away the fine history reaches back further.
-        let far = Vec3::new(0.0, 0.0, C * 36_000.0);
+        // From 40 light-minutes away (inside the root frame) the fine
+        // history reaches back further.
+        let far = Vec3::new(0.0, 0.0, C * 2_400.0);
         let h = sim.light_history(far);
-        assert!(h.epoch() <= s(now - 36_000.0 * (1.0 + LIGHT_TIME_MARGIN)));
+        assert!(h.epoch() <= s(now - 2_400.0 * (1.0 + LIGHT_TIME_MARGIN)));
         assert!(h.latest() <= s(now) && h.latest() + h.interval() > s(now));
         // Just after the origin the light left before it: the fine history
         // reaches back before the origin, as far as the light needs.
@@ -672,8 +754,8 @@ mod tests {
             1.0,
         ));
         let h = sim.light_history(far);
-        assert!(h.epoch() <= s(EPOCH + 60.0 - 36_000.0 * (1.0 + LIGHT_TIME_MARGIN)));
-        assert!(h.epoch() >= s(EPOCH - BEFORE_ORIGIN_SECONDS));
+        assert!(h.epoch() <= s(EPOCH + 60.0 - 2_400.0 * (1.0 + LIGHT_TIME_MARGIN)));
+        assert!(h.epoch() >= s(EPOCH - before_origin(&system())));
         // The clock itself never goes before the origin.
         sim.apply(ClockAction::StepBack);
         assert_eq!(sim.time(), s(EPOCH));

@@ -30,13 +30,13 @@
 //! for this purpose and kept by the cell cache (it is pinned and never
 //! evicted). From it ([`FarFieldCell`]):
 //!
-//! - a hot frame (its depth-0 cell has an emitter, see
-//!   [`crate::light::cell_emitter`]) delivers the irradiance of a point source
-//!   of intensity `band_power / (4 pi)` at the camera: `I / D^2`
-//!   ([`hot_irradiance`]);
-//! - a cold frame reflects the active lights as a Lambertian ball of
-//!   radius `R = root_extent / 8` with the mass-weighted mean albedo `a` of
-//!   its depth-0 cell: `(2/3) a E_l R^2 phi(alpha) / D^2` per light, with
+//! - the light its matter emits (its depth-0 cell's emitter, see
+//!   [`crate::light::cell_emitter`]) arrives as from a point source of
+//!   intensity `band_power / (4 pi)`: `I / D^2` ([`hot_irradiance`]);
+//! - and it reflects every active light of another frame as a Lambertian
+//!   ball of the volume its matter fills (radius `R` from the depth-0
+//!   cell's occupancy, [`matter_radius`]) with the mass-weighted mean
+//!   albedo `a` of its depth-0 cell: `(2/3) a E_l R^2 phi(alpha) / D^2` per light, with
 //!   `E_l = I_l / d_l^2` the irradiance from the light, `alpha` the phase
 //!   angle (at the frame, between the light and the camera), and
 //!   `phi(alpha) = (sin alpha + (pi - alpha) cos alpha) / pi` the phase
@@ -168,10 +168,30 @@ pub fn depth_zero_key(frame_id: u64) -> CellKey {
 /// What the far field needs from a frame's depth-0 cell.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct FarFieldCell {
-    /// Its hot matter as one emitter, if any.
+    /// The light its matter emits, as one emitter, if any.
     pub emitter: Option<Emitter>,
     /// Mass-weighted mean albedo of its samples, three bands.
     pub mean_albedo: [f64; 3],
+    /// Radius of the ball of the volume its matter fills, meters
+    /// ([`matter_radius`]).
+    pub radius: f64,
+}
+
+/// Radius, meters, of the ball whose volume is the volume a section's
+/// matter fills: `(3 V / (4 pi))^(1/3)` with `V` the sum of every sample's
+/// occupancy times its sub-cube's volume; 0 for an empty section. Sums run
+/// in sample order.
+pub fn matter_radius(section: &Section) -> f64 {
+    let Some(samples) = section.samples() else {
+        return 0.0;
+    };
+    let n = usize::from(section.resolution());
+    let step = section.edge().value() / n as f64;
+    let filled: f64 = (0..samples.len())
+        .map(|i| samples.occupancy(i).value())
+        .sum();
+    let volume = filled * step * step * step;
+    (3.0 * volume / (4.0 * std::f64::consts::PI)).cbrt()
 }
 
 /// Mass-weighted mean albedo of a section's samples, three bands; 0 for an
@@ -309,20 +329,23 @@ pub fn frame_sprite(
     if far.sprite_weight <= 0.0 {
         return None;
     }
-    let frame = system.tree().get(far.frame_id)?;
+    system.tree().get(far.frame_id)?;
     let rel = camera.relative(system, Vec3::zero(), far.frame_id);
-    let irradiance = match &cell.emitter {
-        Some(e) => {
-            let at = camera.relative(system, e.position, far.frame_id);
-            hot_irradiance(e, at.length())
+    // What it emits plus what it reflects of the other frames' lights
+    // (its own light does not light it from outside).
+    let others: Vec<PointLight> = lights
+        .iter()
+        .filter(|l| l.frame_id != far.frame_id)
+        .copied()
+        .collect();
+    let mut irradiance = reflected_irradiance(cell.mean_albedo, cell.radius, rel, &others);
+    if let Some(e) = &cell.emitter {
+        let at = camera.relative(system, e.position, far.frame_id);
+        let hot = hot_irradiance(e, at.length());
+        for b in 0..3 {
+            irradiance[b] += hot[b];
         }
-        None => reflected_irradiance(
-            cell.mean_albedo,
-            frame.root_extent.value() / 8.0,
-            rel,
-            lights,
-        ),
-    };
+    }
     let y = luminance(irradiance);
     if y.is_nan() || y <= 0.0 {
         return None;

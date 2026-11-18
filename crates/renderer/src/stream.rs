@@ -96,7 +96,7 @@
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::directions::Arrived;
 use crate::farfield::focal_px;
-use crate::farfield::{far_frames, mean_albedo, FarFieldCell};
+use crate::farfield::{far_frames, matter_radius, mean_albedo, FarFieldCell};
 use crate::light::cell_emitter;
 use crate::volume::VolumeGrid;
 use gx_core::emission::Emitter;
@@ -416,6 +416,9 @@ pub struct ReadyCell {
     /// Mass-weighted mean albedo, for the far field
     /// ([`crate::farfield::mean_albedo`]).
     pub mean_albedo: [f64; 3],
+    /// Radius of the ball of the volume its matter fills, for the far field
+    /// ([`crate::farfield::matter_radius`]).
+    pub radius: f64,
     /// Some sample has a density above 0. A composite can hold samples and
     /// still no matter; such a cell counts as empty for
     /// [`CellCache::known_empty`].
@@ -456,6 +459,7 @@ impl ReadyCell {
             },
             volume,
             mean_albedo: mean_albedo(&section),
+            radius: matter_radius(&section),
             has_matter: section
                 .samples()
                 .is_some_and(|s| (0..s.len()).any(|i| s.density(i).value() > 0.0)),
@@ -470,6 +474,7 @@ impl ReadyCell {
         FarFieldCell {
             emitter: self.emitter,
             mean_albedo: self.mean_albedo,
+            radius: self.radius,
         }
     }
 }

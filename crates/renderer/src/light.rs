@@ -12,8 +12,12 @@
 //! 1. The depth-0 cell of every frame (pinned, see [`crate::world`]) holds
 //!    all of the frame's matter, so the light escaping it is the light the
 //!    frame sends into space: [`gx_core::emission::summarize`], radiative
-//!    transfer through the section, with `min_temperature` 1000 K
-//!    ([`cell_emitter`]). Finer cells give none.
+//!    transfer through the section, from every sample that holds matter:
+//!    all matter radiates at its temperature, and how much reaches the
+//!    visible bands is the blackbody law's business, not a temperature
+//!    cutoff ([`cell_emitter`]). An emitter that cannot light anything to
+//!    a radiance the renderer can show, even at its own surface, is no
+//!    light ([`MIN_LIGHT_RADIANCE`]). Finer cells give none.
 //! 2. The emitters of one frame are merged ([`merge_frame_emitters`]): the
 //!    band powers add, and the position is the centroid weighted by total
 //!    power.
@@ -50,17 +54,35 @@ use gx_core::radiance::band_radiance;
 use gx_core::units::{Kelvin, Vec3};
 use std::collections::BTreeMap;
 
-/// Samples at or above this radiating temperature, kelvin, become light
-/// sources (colder matter still absorbs).
-pub const MIN_EMITTER_TEMPERATURE: f64 = 1000.0;
+/// The faintest radiance, W m^-2 sr^-1, the renderer shows: the floor of
+/// the exposure pass (`MIN_LUMINANCE` in `shaders/exposure.wgsl`). An
+/// emitter whose light, at the distance of its own matter's radius (the
+/// most it can deliver to anything outside it), would reflect off a white
+/// surface below this in every band, or show its own surface below it, is
+/// not a light ([`cell_emitter`]).
+pub const MIN_LIGHT_RADIANCE: f64 = 1.0e-12;
 
 /// Most point lights in a scene.
 pub const MAX_LIGHTS: usize = 8;
 
-/// The light escaping one cell's composited section, or `None` when nothing
-/// hot enough shows.
+/// The light escaping one cell's composited section, or `None` when it
+/// holds no matter, none of its light escapes, or what escapes is below
+/// what the renderer can show ([`MIN_LIGHT_RADIANCE`]).
 pub fn cell_emitter(section: &Section) -> Option<Emitter> {
-    summarize(section, Kelvin::new(MIN_EMITTER_TEMPERATURE))
+    let e = summarize(section, Kelvin::new(0.0))?;
+    let r = e.radius.value();
+    if r > 0.0 {
+        // Irradiance I / r^2 on a white Lambertian surface reflects
+        // I / (pi r^2); its own surface shows P / (4 pi^2 r^2), less.
+        let peak = radiant_intensity(e.band_power)
+            .into_iter()
+            .fold(0.0, f64::max)
+            / (core::f64::consts::PI * r * r);
+        if peak.is_nan() || peak < MIN_LIGHT_RADIANCE {
+            return None;
+        }
+    }
+    Some(e)
 }
 
 /// The merged emitters of one frame.
@@ -334,6 +356,32 @@ mod tests {
         let merged = merge_frame_emitters([(3, &e)]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].band_power, e.band_power);
+    }
+
+    #[test]
+    fn matter_too_faint_to_show_is_no_light() {
+        // Room-temperature matter radiates, but its visible light at its
+        // own surface is far below what the renderer shows; a 1500 K ball
+        // of the same size is a light. No temperature cutoff decides it.
+        let ball = |t: f64| {
+            Section::new(
+                CellKey::new(5, 0, 0, 0, 0).unwrap(),
+                Vec3::new(-4.0, -4.0, -4.0),
+                Meters::new(8.0),
+                4,
+                Samples::from_fn(4, |x, y, z| {
+                    if (1..3).contains(&x) && (1..3).contains(&y) && (1..3).contains(&z) {
+                        hot(t)
+                    } else {
+                        Sample::VACUUM
+                    }
+                }),
+            )
+            .unwrap()
+        };
+        assert!(summarize(&ball(288.0), Kelvin::new(0.0)).is_some());
+        assert_eq!(cell_emitter(&ball(288.0)), None);
+        assert!(cell_emitter(&ball(1500.0)).is_some());
     }
 
     #[test]

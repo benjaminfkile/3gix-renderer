@@ -22,7 +22,8 @@
 
 const LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 // W m^-2 sr^-1. Far below anything visible; above thermal glow at room
-// temperature in the visible bands.
+// temperature in the visible bands. Also the floor below which matter is
+// no light (MIN_LIGHT_RADIANCE in light.rs): keep the two equal.
 const MIN_LUMINANCE: f32 = 1.0e-12;
 // Middle grey: the log-average luminance maps here before the bias.
 const KEY: f32 = 0.18;

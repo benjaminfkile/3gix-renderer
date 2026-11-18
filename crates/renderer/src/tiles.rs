@@ -78,15 +78,12 @@ pub struct TileGeometry {
     /// Length of the tile's edge along the reference shape, meters
     /// (approximately: a quarter of the equator over `2^level`).
     pub edge: f64,
-    /// Radius of a ball about the frame origin that the surface never dips
-    /// into: the reference shape's smaller radius minus [`OCCLUDER_DEPTH`].
-    /// Tiles behind it from the camera are hidden.
+    /// Radius of a ball about the frame origin that the frame's surface
+    /// never dips into: the reference shape's smaller radius plus the
+    /// tile's `height_floor` (`matter-format.md` 10.3), the lowest height
+    /// its compiler declares for the frame's whole surface.
     pub occluder: f64,
 }
-
-/// How far below the reference shape's smaller radius the occluding ball
-/// is taken, meters: deeper than any surface height a tile may have.
-pub const OCCLUDER_DEPTH: f64 = 20_000.0;
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -225,7 +222,7 @@ impl TileGeometry {
             temperature: t.temperature.clone(),
             bounds: (lo, hi),
             edge: std::f64::consts::FRAC_PI_2 * a / (1u64 << key.level) as f64,
-            occluder: a.min(c) - OCCLUDER_DEPTH,
+            occluder: a.min(c) + t.height_floor,
         }
     }
 
@@ -451,14 +448,20 @@ impl Surfaces {
                 y: 0,
             })
             .collect();
+        // The ball the frame's surface never dips into, from its level-0
+        // tiles' declared floor (`rendering.md` 7.2); none, no hiding.
+        let occluder = stack
+            .iter()
+            .filter_map(|k| self.ready(k).map(|g| g.occluder))
+            .fold(f64::INFINITY, f64::min);
+        let occluder = if occluder.is_finite() { occluder } else { 0.0 };
         while let Some(key) = stack.pop() {
             let Some(geo) = self.ready(&key).cloned() else {
                 continue;
             };
             // Outside the view, or behind the reference shape as seen
             // from the camera, nothing is drawn or refined.
-            if !in_cone(cam, forward, geo.bounds, cone)
-                || below_horizon(cam, geo.bounds, geo.occluder)
+            if !in_cone(cam, forward, geo.bounds, cone) || below_horizon(cam, geo.bounds, occluder)
             {
                 continue;
             }
@@ -613,6 +616,11 @@ mod tests {
     /// with parent heights the same function at the parent's level (the
     /// same direction, so the same values at shared vertices).
     fn tile(key: SurfaceKey) -> SurfaceTile {
+        tile_with_floor(key, -400.0)
+    }
+
+    /// [`tile`] declaring `floor` as the frame's lowest height.
+    fn tile_with_floor(key: SurfaceKey, floor: f64) -> SurfaceTile {
         let h = |k: &SurfaceKey, i: i64, j: i64| {
             let d = gx_core::surface::vertex_direction(k, i, j);
             (300.0 * (7.0 * d[0]).sin() * (5.0 * d[1]).cos() + 80.0 * (23.0 * d[2]).sin()) as f32
@@ -634,12 +642,35 @@ mod tests {
             key,
             radius_equatorial: 6_378_137.0,
             radius_polar: 6_356_752.3,
+            height_floor: floor,
             heights,
             parent_heights,
             albedo: vec![[76, 71, 64]; VERTEX_COUNT],
             roughness: vec![230; VERTEX_COUNT],
             temperature: vec![288.0; VERTEX_COUNT],
         }
+    }
+
+    #[test]
+    fn hiding_follows_the_declared_floor() {
+        // The same relief, low camera looking level: with the floor the
+        // compiler declares (just under the relief) tiles past the horizon
+        // are hidden; declared far deeper, the occluding ball shrinks and
+        // they are not. Nothing but the declared value differs.
+        let (a, c) = (6_378_137.0, 6_356_752.3);
+        let d =
+            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
+        let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
+        let north = unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
+        let shallow = settle_with_floor(&mut Surfaces::new(), cam, north, 9, -400.0);
+        let deep = settle_with_floor(&mut Surfaces::new(), cam, north, 9, -3.0e6);
+        assert!(
+            deep.len() > shallow.len(),
+            "{} tiles with a deep floor, {} with the declared one",
+            deep.len(),
+            shallow.len()
+        );
     }
 
     #[test]
@@ -685,6 +716,16 @@ mod tests {
         forward: [f64; 3],
         max_level: u8,
     ) -> Vec<TileDrawInfo> {
+        settle_with_floor(s, cam, forward, max_level, -400.0)
+    }
+
+    fn settle_with_floor(
+        s: &mut Surfaces,
+        cam: [f64; 3],
+        forward: [f64; 3],
+        max_level: u8,
+        floor: f64,
+    ) -> Vec<TileDrawInfo> {
         let focal = focal_px(720.0);
         let cone = 0.9;
         for face in 0..SURFACE_FACES {
@@ -693,7 +734,9 @@ mod tests {
         for _ in 0..64 {
             for key in s.take_requests() {
                 let outcome = if key.level <= max_level {
-                    Ok(Some(Arc::new(TileGeometry::new(&tile(key)))))
+                    Ok(Some(Arc::new(TileGeometry::new(&tile_with_floor(
+                        key, floor,
+                    )))))
                 } else {
                     Ok(None)
                 };
