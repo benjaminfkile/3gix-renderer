@@ -21,7 +21,7 @@ path = "src/bin/gx-mock-hub.rs"
 
 [features]
 # The browser build: winit on a canvas, wgpu on WebGPU, reqwest's fetch
-# client and a web-sys WebSocket for the hub, wasm-bindgen-futures for async,
+# client for the hub, wasm-bindgen-futures for async,
 # and console_error_panic_hook. Only takes effect on wasm32-unknown-unknown;
 # the library also builds for that target without it.
 web = [
@@ -53,8 +53,6 @@ winit = "0.30"
 pollster = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 png = "0.18"
@@ -81,7 +79,6 @@ web-sys = { version = "0.3", optional = true, features = [
     "Performance",
     "Request",
     "Response",
-    "WebSocket",
     "Window",
     "Worker",
     "WorkerOptions",

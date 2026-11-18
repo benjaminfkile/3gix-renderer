@@ -7,10 +7,14 @@
 //! - a second client with a fresh cache streams every one of them and runs
 //!   the module zero times, ending with the same matter;
 //! - a third client reusing that cache reads everything locally;
-//! - `pending` claims of another client are waited out (honoring
-//!   `retryMs`) and then computed; two clients at once compute each
-//!   section once between them; directions go out in batches of at most
-//!   512 keys;
+//! - a `missing` section is computed and offered once with the section
+//!   2.5 headers, and stored; a `local` one is computed and never offered;
+//! - a cached copy whose hash differs from the `sha256` of a `ready`
+//!   answer is discarded and the new version streamed;
+//! - a revoked key's offers are counted as failed and never retried;
+//! - two clients at once both compute what they need; the hub stores the
+//!   first copy and matches the second; directions go out in batches of
+//!   at most 512 keys;
 //! - a headless render against the mock hub, entered at now and at the
 //!   origin, produces a non-empty image each time, saved as
 //!   `target/tmp/mock-hub-home-now.png` and `target/tmp/mock-hub-home-origin.png`.
@@ -54,11 +58,11 @@ const HEIGHT: u32 = 180;
 /// The deepest cell the matter layer fills.
 const MATTER_DEPTH: u8 = 1;
 
-fn space(foreign_claim_ms: Option<u64>) -> MockHubOptions {
-    space_with_registry(foreign_claim_ms, common::registry_bytes())
+fn space() -> MockHubOptions {
+    space_with_registry(common::registry_bytes())
 }
 
-fn space_with_registry(foreign_claim_ms: Option<u64>, registry: Vec<u8>) -> MockHubOptions {
+fn space_with_registry(registry: Vec<u8>) -> MockHubOptions {
     let (matter, tiles) = example_matter_layer(
         "matter",
         EXAMPLE_MODULE,
@@ -70,9 +74,7 @@ fn space_with_registry(foreign_claim_ms: Option<u64>, registry: Vec<u8>) -> Mock
         20.0,
         6000.0,
     );
-    let mut options = MockHubOptions::new(vec![registry_layer("frames", &registry), matter], tiles);
-    options.foreign_claim_ms = foreign_claim_ms;
-    options
+    MockHubOptions::new(vec![registry_layer("frames", &registry), matter], tiles)
 }
 
 fn cache_dir(tag: &str) -> PathBuf {
@@ -155,7 +157,7 @@ fn matter(world: &World) -> BTreeMap<CellKey, Vec<f64>> {
 #[test]
 fn first_run_computes_and_uploads_second_run_streams_with_zero_module_runs() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let hub = rt.block_on(MockHub::start(space(None))).unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
     assert_eq!(
         hub.origin_utc_ms(),
         None,
@@ -181,20 +183,21 @@ fn first_run_computes_and_uploads_second_run_streams_with_zero_module_runs() {
     assert!(!cells_a.is_empty(), "the view has matter");
     // Every address the hub directed this client to compute was computed
     // here, uploaded, and stored; nothing was streamed.
-    assert!(after_a.compute_answers >= 3, "{after_a:?}");
+    assert!(after_a.missing_answers >= 3, "{after_a:?}");
     assert_eq!(
-        after_a.uploads_stored, after_a.compute_answers,
+        after_a.uploads_stored, after_a.missing_answers,
         "{after_a:?}"
     );
     assert_eq!(after_a.uploads_refused, 0);
-    assert_eq!(sa.worker.sections_computed, after_a.compute_answers);
-    assert_eq!(sa.worker.uploads_done, after_a.compute_answers);
-    assert_eq!(sa.worker.uploads_failed, 0);
+    assert_eq!(sa.worker.sections_computed, after_a.missing_answers);
+    assert_eq!(sa.worker.uploads_offered, after_a.missing_answers);
+    assert_eq!(sa.worker.uploads_stored, after_a.missing_answers);
+    assert_eq!(sa.worker.uploads_failed + sa.worker.uploads_dropped, 0);
     assert_eq!(
         sa.worker.modules_loaded, 2,
         "the registry module and the example module"
     );
-    assert_eq!(sa.worker.module_runs, 2 * after_a.compute_answers);
+    assert_eq!(sa.worker.module_runs, 2 * after_a.missing_answers);
     assert_eq!(
         sa.directions.sections_streamed + sa.directions.sections_cached,
         0
@@ -219,7 +222,7 @@ fn first_run_computes_and_uploads_second_run_streams_with_zero_module_runs() {
     assert_eq!(sb.worker.modules_loaded, 0);
     assert_eq!(sb.worker.sections_computed, 0);
     assert_eq!(sb.directions.sections_streamed, stored.len() as u64);
-    assert_eq!(after_b.compute_answers, after_a.compute_answers);
+    assert_eq!(after_b.missing_answers, after_a.missing_answers);
     assert_eq!(after_b.uploads_stored, after_a.uploads_stored);
     assert_eq!(
         after_b.module_reads, after_a.module_reads,
@@ -244,25 +247,120 @@ fn first_run_computes_and_uploads_second_run_streams_with_zero_module_runs() {
 }
 
 #[test]
-fn pending_claims_are_waited_out_then_computed() {
+fn missing_is_computed_and_offered_with_the_section_headers() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // Every address is first held by another client for 300 ms.
-    let hub = rt.block_on(MockHub::start(space(Some(300)))).unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    let mut a = connect(&rt, &hub, None);
+    let world = stream_home(&mut a);
+    assert!(!matter(&world).is_empty());
+    let n = hub.counts();
+    let s = a.fetcher.stats().worker;
+    assert!(n.missing_answers > 0);
+    // The mock recomputes each address from `X-Layer`, `X-Key`, and
+    // `X-Span-Index` and checks the body against `X-Content-Sha256`; any
+    // wrong header is a refusal.
+    assert_eq!(n.uploads_refused, 0, "{n:?}");
+    assert_eq!(n.uploads_stored, n.missing_answers, "{n:?}");
+    assert_eq!(s.uploads_offered, n.missing_answers);
+    assert_eq!(
+        (s.uploads_stored, s.uploads_failed, s.uploads_pending),
+        (n.uploads_stored, 0, 0)
+    );
+}
+
+#[test]
+fn local_is_computed_and_never_offered() {
+    let mut options = space();
+    for l in &mut options.layers {
+        if l.id == "matter" {
+            l.shared = false;
+        }
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt.block_on(MockHub::start(options)).unwrap();
     let mut a = connect(&rt, &hub, None);
     let world = stream_home(&mut a);
     assert!(!matter(&world).is_empty());
     let n = hub.counts();
     let s = a.fetcher.stats();
-    assert!(n.pending_answers >= n.compute_answers, "{n:?}");
-    assert!(s.directions.pending_answers > 0);
-    assert_eq!(n.uploads_stored, n.compute_answers);
-    assert_eq!(s.worker.sections_computed, n.compute_answers);
+    assert!(n.local_answers > 0, "{n:?}");
+    assert_eq!(s.directions.local_answers, n.local_answers);
+    // Only the shared registry layer's section was offered and stored.
+    assert_eq!(n.missing_answers, 1, "{n:?}");
+    assert_eq!(s.worker.uploads_offered, 1);
+    assert_eq!(n.uploads_stored, 1);
+    assert_eq!(hub.sections().len(), 1);
+    assert_eq!(
+        s.worker.sections_computed,
+        n.local_answers + n.missing_answers
+    );
+    drop(a);
+    // A second client computes the local layer again.
+    let mut b = connect(&rt, &hub, None);
+    stream_home(&mut b);
+    let sb = b.fetcher.stats();
+    assert!(sb.worker.sections_computed > 0);
+    assert_eq!(sb.worker.uploads_offered, 0);
 }
 
 #[test]
-fn two_clients_at_once_compute_each_section_once() {
+fn a_stale_cached_copy_is_discarded_on_a_hash_change() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let hub = Arc::new(rt.block_on(MockHub::start(space(None))).unwrap());
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    let dir = cache_dir("stale");
+    drop(connect(&rt, &hub, Some(&dir)));
+    let first = hub.counts();
+    // The hub replaces the frames layer's registry after a dispute: same
+    // address, other bytes, so a new hash in the directions.
+    let registry = common::registry_bytes();
+    let frames = registry_layer("frames", &registry);
+    let address = gx_core::sha256::to_hex(&gx_core::address::section_address(
+        &gx_core::sha256::sha256(&frames.module),
+        None,
+        0,
+        0,
+        0,
+        &gx_core::key::ChunkKey::Registry,
+    ));
+    assert!(hub.sections().contains_key(&address));
+    let replaced = gx_core::registry::encode(&common::registry_at(Seconds::new(1.0)));
+    assert_ne!(replaced, registry);
+    hub.replace_section(&address, replaced.clone());
+    let b = connect(&rt, &hub, Some(&dir));
+    let s = b.fetcher.stats();
+    // The matter layer's registry section is still read from the cache;
+    // the replaced one is streamed again from the edge.
+    assert_eq!(s.directions.sections_streamed, 1, "{s:?}");
+    assert_eq!(s.directions.sections_cached, 1, "{s:?}");
+    assert_eq!(hub.counts().section_reads, first.section_reads + 1);
+    let cache = gx_worker::DiskCache::open(&dir, 1 << 30).unwrap();
+    assert_eq!(
+        cache.get(gx_worker::BlobKind::Section, &address).as_deref(),
+        Some(&replaced[..])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_revoked_key_counts_failures_and_never_retries() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    hub.revoke();
+    let mut a = connect(&rt, &hub, None);
+    let world = stream_home(&mut a);
+    assert!(!matter(&world).is_empty(), "drawing never waits on uploads");
+    let n = hub.counts();
+    let s = a.fetcher.stats().worker;
+    assert_eq!(s.uploads_offered, n.missing_answers);
+    assert_eq!(s.uploads_failed, s.uploads_offered, "{s:?}");
+    assert_eq!(n.uploads_refused, s.uploads_offered, "one try each");
+    assert!(hub.sections().is_empty());
+}
+
+#[test]
+fn two_clients_at_once_both_compute_and_the_hub_keeps_the_first() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = Arc::new(rt.block_on(MockHub::start(space())).unwrap());
     let rt = Arc::new(rt);
     let runs: Vec<_> = (0..2)
         .map(|_| {
@@ -278,19 +376,19 @@ fn two_clients_at_once_compute_each_section_once() {
     let n = hub.counts();
     assert_eq!(results[0].0, results[1].0, "both see the same matter");
     let computed: u64 = results.iter().map(|r| r.1.worker.sections_computed).sum();
-    assert_eq!(computed, n.compute_answers, "{n:?}");
+    let offered: u64 = results.iter().map(|r| r.1.worker.uploads_offered).sum();
+    assert_eq!(computed, n.missing_answers, "{n:?}");
+    assert_eq!(offered, n.missing_answers);
     assert_eq!(n.uploads_stored, hub.sections().len() as u64);
-    assert_eq!(
-        n.uploads_stored, n.compute_answers,
-        "each section computed once"
-    );
-    assert_eq!(n.uploads_refused, 0);
+    // Deterministic modules: a second copy always matches the first.
+    assert_eq!(n.uploads_stored + n.uploads_matched, offered, "{n:?}");
+    assert_eq!((n.uploads_disputed, n.uploads_refused), (0, 0));
 }
 
 #[test]
 fn directions_are_batched_and_empty_cells_need_nothing() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let hub = rt.block_on(MockHub::start(space(None))).unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
     let mut c = connect(&rt, &hub, None);
     let before = hub.counts();
     // 600 cells deeper than any layer fills: every layer is empty there.
@@ -317,7 +415,7 @@ fn directions_are_batched_and_empty_cells_need_nothing() {
     let after = hub.counts();
     assert_eq!(after.directions_requests - before.directions_requests, 2);
     assert_eq!(after.largest_batch, 512);
-    assert_eq!(after.compute_answers, before.compute_answers);
+    assert_eq!(after.missing_answers, before.missing_answers);
     assert_eq!(
         c.fetcher.stats().directions.keys_asked,
         601,
@@ -336,7 +434,7 @@ fn headless_render_at_now_and_at_the_origin() {
         - 2 * 86_400_000;
     let epoch = Seconds::new(utc_ms_to_tdb_seconds(origin_ms));
     let registry = gx_core::registry::encode(&common::registry_at(epoch));
-    let mut options = space_with_registry(None, registry);
+    let mut options = space_with_registry(registry);
     options.origin_utc_ms = Some(origin_ms);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let hub = rt.block_on(MockHub::start(options)).unwrap();

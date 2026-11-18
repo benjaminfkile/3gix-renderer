@@ -123,15 +123,19 @@ impl fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
-/// One `compute` direction (`client-compute.md` section 2.4): the section
-/// to produce, the claim to upload it with, and everything that goes into
-/// it.
+/// One `missing` or `local` direction (`client-compute.md` section 2.4):
+/// the section to produce, whether to offer it to the hub afterwards, and
+/// everything that goes into it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComputeJob {
     /// The section's address.
     pub address: [u8; 32],
-    /// The claim token the hub gave this client, sent as `X-Claim`.
-    pub claim: String,
+    /// The layer id, sent as `X-Layer` with an upload.
+    pub layer: String,
+    /// `true` for a `missing` direction: once computed, the section is
+    /// offered to the hub (section 2.5). `false` for `local`: computed,
+    /// kept, never uploaded.
+    pub share: bool,
     /// SHA-256 of the module to run.
     pub module: [u8; 32],
     /// SHA-256 of the layer's source manifest, if the layer reads sources.
@@ -301,7 +305,8 @@ mod tests {
         let module = sha256(b"module");
         ComputeJob {
             address: section_address(&module, None, 0, 0, 0, &request.key),
-            claim: "c".into(),
+            layer: "l".into(),
+            share: true,
             module,
             manifest: None,
             request,

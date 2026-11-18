@@ -62,8 +62,7 @@
 //! [`CellCache`] holds one [`CellEntry`] per cell key, in a hash map keyed
 //! by cell ([`CellMap`]): every lookup the selection and the extraction
 //! inputs make is constant time. A request stays `Requested` until the
-//! fetcher has every layer's section, however long the hub keeps it
-//! `pending`; the fetcher retries on its own. Sections are decoded once on
+//! fetcher has every layer's section; the fetcher retries on its own. Sections are decoded once on
 //! their way in, off the frame thread (`rendering.md` 3.5), and composited
 //! with [`gx_core::matter::composite`] into `Ready` or, when the composite
 //! holds no matter, `Empty`. Sections that fail validation, or a module
@@ -86,12 +85,19 @@
 //!
 //! [`Fetcher`] (native) runs [`crate::directions::Coordinator`] on the
 //! frame loop's thread and carries out its actions on a tokio runtime:
-//! directions through [`crate::hub::HubClient`], sections from the local
-//! cache ([`gx_worker::DiskCache`]) or the edge, decoded on a blocking task,
-//! `compute` jobs on the worker pool ([`gx_worker::WorkerPool`]), which
-//! hands each section over decoded at once and uploads it with its claim in
-//! the background, and readiness notices from the socket. The browser has
-//! its own fetcher with the same coordinator (`crate::web`).
+//! directions through [`crate::hub::HubClient`]; `ready` sections from the
+//! local cache ([`gx_worker::DiskCache`]) or the edge (`GET
+//! /section/{address}?sha256={hex}`), checked against the hash the
+//! directions carried (a cached copy that differs is discarded and fetched
+//! again) and decoded on a blocking task; `missing` and `local` jobs on the
+//! worker pool ([`gx_worker::WorkerPool`]), which hands each section over
+//! decoded at once. A computed `missing` section then enters the upload
+//! lane ([`gx_worker::UploadLane`], `client-compute.md` sections 2.5 and
+//! 2.8): bounded at 64, oldest dropped when full, offered once from a task
+//! of its own with the section 2.5 headers, a failure counted and never
+//! retried. A `local` section is never offered. Uploads never delay a
+//! result reaching the renderer. The browser has its own fetcher with the
+//! same coordinator (`crate::web`).
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::directions::Arrived;
@@ -1835,17 +1841,18 @@ mod native {
         cell_from_arrived, directions_time, FetchEvent, FetchOutcome, FetchTally, FetcherStats,
     };
     use crate::directions::{Action, Arrived, Coordinator, Origin, StreamResult};
-    use crate::hub::{HubClient, ReadySubscription};
+    use crate::hub::HubClient;
     use crate::protocol::DirectionsResponse;
     use anyhow::{anyhow, Result};
     use gx_core::frames::FrameSystem;
     use gx_core::key::{CellKey, ChunkKey};
+    use gx_core::sha256::sha256;
     use gx_core::sha256::to_hex;
     use gx_core::units::Meters;
     use gx_module_host::HostConfig;
     use gx_worker::{
-        BlobKind, Blobs, ComputeJob, Computed, DiskCache, UploadTicket, Uploader, WorkerError,
-        WorkerPool,
+        BlobKind, Blobs, ComputeJob, Computed, DiskCache, UploadLane, UploadOffer, UploadOutcome,
+        Uploader, WorkerError, WorkerPool, WorkerStats,
     };
     use std::collections::BTreeMap;
     use std::sync::mpsc;
@@ -1890,28 +1897,48 @@ mod native {
         }
     }
 
-    /// Uploads on the runtime; failures are logged and never wait.
+    /// Puts computed `missing` sections into the upload lane and wakes the
+    /// task that sends them. Never blocks the worker.
     struct HubUploader {
-        handle: tokio::runtime::Handle,
-        client: Arc<HubClient>,
+        lane: Arc<UploadLane>,
+        wake: tokio::sync::mpsc::UnboundedSender<()>,
     }
 
     impl Uploader for HubUploader {
-        fn upload(&self, job: &ComputeJob, section: Arc<[u8]>, ticket: UploadTicket) {
-            let client = self.client.clone();
-            let (address, claim, key) = (job.address, job.claim.clone(), job.key());
-            self.handle.spawn(async move {
-                match client.upload(&address, &claim, section.to_vec()).await {
+        fn offer(&self, job: &ComputeJob, section: Arc<[u8]>) {
+            self.lane.offer(UploadOffer {
+                job: job.clone(),
+                bytes: section,
+            });
+            let _ = self.wake.send(());
+        }
+    }
+
+    /// Sends the lane's offers one at a time, each once, until the
+    /// uploader is dropped and the lane is empty.
+    async fn send_uploads(
+        client: Arc<HubClient>,
+        lane: Arc<UploadLane>,
+        mut wake: tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        loop {
+            while let Some((offer, ticket)) = lane.take() {
+                let key = offer.job.key();
+                let outcome = match client.upload(&offer.job, offer.bytes.to_vec()).await {
                     Ok(status) => {
-                        tracing::debug!(key = %key, status, "section uploaded");
-                        ticket.finish(true);
+                        tracing::debug!(key = %key, status, "section offered");
+                        UploadOutcome::from_status(status)
                     }
                     Err(e) => {
-                        tracing::warn!(key = %key, "upload failed: {e:#}");
-                        ticket.finish(false);
+                        tracing::debug!(key = %key, "upload failed, not retried: {e:#}");
+                        UploadOutcome::Failed
                     }
-                }
-            });
+                };
+                ticket.finish(outcome);
+            }
+            if wake.recv().await.is_none() && lane.is_empty() {
+                return;
+            }
         }
     }
 
@@ -1922,6 +1949,7 @@ mod native {
             key: ChunkKey,
             layer: usize,
             address: [u8; 32],
+            sha256: [u8; 32],
             result: StreamResult,
         },
         Compute {
@@ -1930,7 +1958,6 @@ mod native {
             address: [u8; 32],
             result: Result<Computed, WorkerError>,
         },
-        Ready([u8; 32]),
         Event(FetchEvent),
     }
 
@@ -1943,7 +1970,6 @@ mod native {
         cache: Option<Arc<DiskCache>>,
         pool: WorkerPool,
         coordinator: Coordinator,
-        socket: ReadySubscription,
         tx: mpsc::Sender<Internal>,
         rx: mpsc::Receiver<Internal>,
         extents: BTreeMap<CellKey, Meters>,
@@ -1955,15 +1981,19 @@ mod native {
     }
 
     impl Fetcher {
-        /// Starts a fetcher on `handle`: the worker pool, the readiness
-        /// socket, and the task that keeps the hub's clock measured
+        /// Starts a fetcher on `handle`: the worker pool, the upload lane
+        /// and its task, and the task that keeps the hub's clock measured
         /// ([`HubClient::keep_clock`]).
         pub fn new(
             handle: tokio::runtime::Handle,
             client: Arc<HubClient>,
             options: FetcherOptions,
         ) -> Result<Fetcher> {
-            let pool = WorkerPool::new(
+            let stats = WorkerStats::new();
+            let lane = Arc::new(UploadLane::new(Arc::clone(&stats)));
+            let (wake, woken) = tokio::sync::mpsc::unbounded_channel();
+            handle.spawn(send_uploads(client.clone(), Arc::clone(&lane), woken));
+            let pool = WorkerPool::with_stats(
                 options.worker_threads,
                 options.host,
                 Arc::new(EdgeBlobs {
@@ -1971,17 +2001,12 @@ mod native {
                     client: client.clone(),
                 }),
                 options.cache.clone(),
-                Arc::new(HubUploader {
-                    handle: handle.clone(),
-                    client: client.clone(),
-                }),
+                Arc::new(HubUploader { lane, wake }),
+                stats,
             )
             .map_err(|e| anyhow!("starting the worker: {e}"))?;
             tracing::info!(threads = pool.size(), "worker started");
             let (tx, rx) = mpsc::channel();
-            let notices = tx.clone();
-            let socket =
-                client.subscribe_ready(&handle, move |a| notices.send(Internal::Ready(a)).is_ok());
             client.keep_clock(&handle);
             Ok(Fetcher {
                 handle,
@@ -1989,7 +2014,6 @@ mod native {
                 cache: options.cache,
                 pool,
                 coordinator: Coordinator::new(),
-                socket,
                 tx,
                 rx,
                 extents: BTreeMap::new(),
@@ -2070,10 +2094,11 @@ mod native {
                     key,
                     layer,
                     address,
+                    sha256,
                     result,
                 } => self
                     .coordinator
-                    .stream_done(&key, layer, address, result, now),
+                    .stream_done(&key, layer, address, sha256, result, now),
                 Internal::Compute {
                     key,
                     layer,
@@ -2082,7 +2107,6 @@ mod native {
                 } => self
                     .coordinator
                     .compute_done(&key, layer, address, result, now),
-                Internal::Ready(a) => self.coordinator.ready_notice(&a),
                 Internal::Event(e) => {
                     self.decoding = self.decoding.saturating_sub(1);
                     self.out.push(e);
@@ -2129,16 +2153,18 @@ mod native {
                     key,
                     layer,
                     address,
+                    sha256,
                 } => {
                     let client = self.client.clone();
                     let cache = self.cache.clone();
                     let tx = self.tx.clone();
                     self.handle.spawn(async move {
-                        let result = stream_section(&client, cache, key, address).await;
+                        let result = stream_section(&client, cache, key, address, sha256).await;
                         let _ = tx.send(Internal::Stream {
                             key,
                             layer,
                             address,
+                            sha256,
                             result,
                         });
                     });
@@ -2155,7 +2181,6 @@ mod native {
                         });
                     });
                 }
-                Action::Subscribe(address) => self.socket.subscribe(address),
                 Action::Complete(done) => match done.key {
                     ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
                         .sections
@@ -2370,6 +2395,7 @@ mod native {
         cache: Option<Arc<DiskCache>>,
         key: ChunkKey,
         address: [u8; 32],
+        expected: [u8; 32],
     ) -> StreamResult {
         let name = to_hex(&address);
         if let Some(c) = &cache {
@@ -2379,16 +2405,27 @@ mod native {
                 .ok()
                 .flatten();
             if let Some(bytes) = cached {
-                match decode_arrived(key, bytes).await {
-                    Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
-                    Err(e) => {
-                        tracing::warn!(name, "dropping a damaged cached section: {e}");
-                        c.remove(BlobKind::Section, &name);
+                if sha256(&bytes) != expected {
+                    // Another version: computed here, or replaced by the
+                    // hub after a dispute. The stored one wins.
+                    tracing::debug!(name, "discarding a cached section of another version");
+                    c.remove(BlobKind::Section, &name);
+                } else {
+                    match decode_arrived(key, bytes).await {
+                        Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
+                        Err(e) => {
+                            tracing::warn!(name, "dropping a damaged cached section: {e}");
+                            c.remove(BlobKind::Section, &name);
+                        }
                     }
                 }
             }
         }
-        match client.get_blob(BlobKind::Section, &name).await {
+        match client.get_section(&address, &expected).await {
+            Ok(Some(bytes)) if sha256(&bytes) != expected => StreamResult::Failed(format!(
+                "section {name} from the edge does not hash to {}",
+                to_hex(&expected)
+            )),
             Ok(Some(bytes)) => match decode_arrived(key, bytes).await {
                 Ok(a) => {
                     if let Some(c) = cache {

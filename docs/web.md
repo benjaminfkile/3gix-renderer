@@ -9,9 +9,9 @@ from one codebase). The browser-only code is the `web` module
 - `winit` draws on a canvas element instead of a window, and wgpu runs on
   the browser's WebGPU.
 - The hub client (`web::hub`) uses `reqwest`'s wasm client (the browser's
-  `fetch`) for the clock, the build, directions, edge reads, and uploads,
-  and a `web_sys::WebSocket` for readiness notices. Futures run on the
-  page's event loop through `wasm-bindgen-futures`.
+  `fetch`) for the clock, the build, directions, edge reads, and uploads.
+  Futures run on the page's event loop through `wasm-bindgen-futures`.
+  There is no readiness socket.
 - The client loop (`web::fetch`) is the same `directions::Coordinator` the
   desktop drives, so batching, deduplication, retries, and compositing are
   identical.
@@ -84,14 +84,11 @@ keyboard focus. `Escape` stops the frame loop.
 ## What the hub must allow
 
 - **CORS.** The page sends `GET`, `POST` (directions), and `PUT`
-  (uploads) requests with the `X-API-Key` and `X-Claim` headers from its
-  own origin, so the hub (and the edge) must answer the preflight and allow
-  that origin, those methods, and those headers.
-- **The readiness socket.** A browser cannot set headers on a WebSocket
-  upgrade, so the socket opens without the API key. If the hub refuses it,
-  a `pending` key is still asked about again after the hub's `retryMs`, so
-  everything still arrives, more slowly. A closed socket is opened again
-  every 5 s and subscribes again to every address still awaited.
+  (uploads) requests with the `X-API-Key`, `X-Layer`, `X-Key`,
+  `X-Span-Index`, and `X-Content-Sha256` headers from its own origin, so
+  the hub (and the edge) must answer the preflight and allow that origin,
+  those methods, and those headers. A page cannot send `Expect:
+  100-continue`, so a browser upload always carries its body.
 
 ## Browsers
 

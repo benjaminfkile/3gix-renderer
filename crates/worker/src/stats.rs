@@ -1,9 +1,12 @@
 //! Running counts of what the worker did, for the overlay
-//! (`client-compute.md` section 1: sections computed here, uploads pending,
-//! modules loaded).
+//! (`client-compute.md` section 1: sections computed here, modules
+//! loaded; section 2.8: uploads offered, stored, matched, disputed,
+//! dropped, and failed).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use crate::upload::UploadOutcome;
 
 /// Counters shared by the worker's threads and whoever reports them.
 #[derive(Debug, Default)]
@@ -13,7 +16,11 @@ pub struct WorkerStats {
     sections_computed: AtomicU64,
     jobs_failed: AtomicU64,
     uploads_pending: AtomicU64,
-    uploads_done: AtomicU64,
+    uploads_offered: AtomicU64,
+    uploads_stored: AtomicU64,
+    uploads_matched: AtomicU64,
+    uploads_disputed: AtomicU64,
+    uploads_dropped: AtomicU64,
     uploads_failed: AtomicU64,
 }
 
@@ -28,12 +35,19 @@ pub struct WorkerSnapshot {
     pub sections_computed: u64,
     /// Jobs that failed.
     pub jobs_failed: u64,
-    /// Uploads started and not yet answered.
+    /// Offers in the upload lane or being sent.
     pub uploads_pending: u64,
-    /// Uploads the hub accepted (`201`, or `200` for a section already
-    /// stored).
-    pub uploads_done: u64,
-    /// Uploads that failed. Logged; drawing never waits for them.
+    /// Sections put into the upload lane.
+    pub uploads_offered: u64,
+    /// Offers the hub stored (`201`).
+    pub uploads_stored: u64,
+    /// Offers that matched a stored copy (`200`).
+    pub uploads_matched: u64,
+    /// Offers that differed from a stored copy (`202`).
+    pub uploads_disputed: u64,
+    /// Offers dropped from a full lane, never sent.
+    pub uploads_dropped: u64,
+    /// Offers sent that failed. Counted, never retried.
     pub uploads_failed: u64,
 }
 
@@ -62,9 +76,21 @@ impl WorkerStats {
         }
     }
 
-    /// Starts an upload; the ticket ends it.
-    pub fn upload_started(self: &Arc<Self>) -> UploadTicket {
+    /// Records a section put into the upload lane.
+    pub fn upload_offered(&self) {
+        self.uploads_offered.fetch_add(1, Ordering::Relaxed);
         self.uploads_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an offer dropped from a full lane.
+    pub fn upload_dropped(&self) {
+        self.uploads_dropped.fetch_add(1, Ordering::Relaxed);
+        self.uploads_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Starts sending an offer already counted by
+    /// [`WorkerStats::upload_offered`]; the ticket ends it.
+    pub fn upload_started(self: &Arc<Self>) -> UploadTicket {
         UploadTicket {
             stats: Some(Arc::clone(self)),
         }
@@ -72,19 +98,35 @@ impl WorkerStats {
 
     /// The counters now.
     pub fn snapshot(&self) -> WorkerSnapshot {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
         WorkerSnapshot {
-            modules_loaded: self.modules_loaded.load(Ordering::Relaxed),
-            module_runs: self.module_runs.load(Ordering::Relaxed),
-            sections_computed: self.sections_computed.load(Ordering::Relaxed),
-            jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
-            uploads_pending: self.uploads_pending.load(Ordering::Relaxed),
-            uploads_done: self.uploads_done.load(Ordering::Relaxed),
-            uploads_failed: self.uploads_failed.load(Ordering::Relaxed),
+            modules_loaded: l(&self.modules_loaded),
+            module_runs: l(&self.module_runs),
+            sections_computed: l(&self.sections_computed),
+            jobs_failed: l(&self.jobs_failed),
+            uploads_pending: l(&self.uploads_pending),
+            uploads_offered: l(&self.uploads_offered),
+            uploads_stored: l(&self.uploads_stored),
+            uploads_matched: l(&self.uploads_matched),
+            uploads_disputed: l(&self.uploads_disputed),
+            uploads_dropped: l(&self.uploads_dropped),
+            uploads_failed: l(&self.uploads_failed),
         }
+    }
+
+    fn upload_finished(&self, outcome: UploadOutcome) {
+        self.uploads_pending.fetch_sub(1, Ordering::Relaxed);
+        let counter = match outcome {
+            UploadOutcome::Stored => &self.uploads_stored,
+            UploadOutcome::Matched => &self.uploads_matched,
+            UploadOutcome::Disputed => &self.uploads_disputed,
+            UploadOutcome::Failed => &self.uploads_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// One upload in progress. [`UploadTicket::finish`] records the outcome;
+/// One upload being sent. [`UploadTicket::finish`] records the outcome;
 /// a ticket dropped unfinished counts as a failed upload.
 #[derive(Debug)]
 pub struct UploadTicket {
@@ -93,14 +135,9 @@ pub struct UploadTicket {
 
 impl UploadTicket {
     /// Records the outcome of the upload.
-    pub fn finish(mut self, ok: bool) {
+    pub fn finish(mut self, outcome: UploadOutcome) {
         if let Some(s) = self.stats.take() {
-            s.uploads_pending.fetch_sub(1, Ordering::Relaxed);
-            if ok {
-                s.uploads_done.fetch_add(1, Ordering::Relaxed);
-            } else {
-                s.uploads_failed.fetch_add(1, Ordering::Relaxed);
-            }
+            s.upload_finished(outcome);
         }
     }
 }
@@ -108,8 +145,7 @@ impl UploadTicket {
 impl Drop for UploadTicket {
     fn drop(&mut self) {
         if let Some(s) = self.stats.take() {
-            s.uploads_pending.fetch_sub(1, Ordering::Relaxed);
-            s.uploads_failed.fetch_add(1, Ordering::Relaxed);
+            s.upload_finished(UploadOutcome::Failed);
         }
     }
 }
@@ -121,17 +157,27 @@ mod tests {
     #[test]
     fn tickets_count_pending_and_outcomes() {
         let s = WorkerStats::new();
+        for _ in 0..4 {
+            s.upload_offered();
+        }
         let a = s.upload_started();
         let b = s.upload_started();
         let c = s.upload_started();
-        assert_eq!(s.snapshot().uploads_pending, 3);
-        a.finish(true);
-        b.finish(false);
+        assert_eq!(s.snapshot().uploads_pending, 4);
+        a.finish(UploadOutcome::Matched);
+        b.finish(UploadOutcome::Disputed);
         drop(c);
+        s.upload_dropped();
         let n = s.snapshot();
         assert_eq!(
-            (n.uploads_pending, n.uploads_done, n.uploads_failed),
-            (0, 1, 2)
+            (
+                n.uploads_pending,
+                n.uploads_matched,
+                n.uploads_disputed,
+                n.uploads_failed,
+                n.uploads_dropped
+            ),
+            (0, 1, 1, 1, 1)
         );
     }
 }

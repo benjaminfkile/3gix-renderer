@@ -7,11 +7,11 @@
 //! section 10: "Native desktop and WebAssembly from one codebase"); only the
 //! platform glue lives here:
 //!
-//! - [`hub`]: the hub client over `fetch` and a browser `WebSocket`.
+//! - [`hub`]: the hub client over `fetch`.
 //! - [`cache`]: the local cache in the Cache API.
 //! - [`worker`]: modules run in a dedicated Web Worker.
-//! - [`fetch`]: the client loop (directions, streams, compute) on the
-//!   page's event loop.
+//! - [`fetch`]: the client loop (directions, streams, compute, and the
+//!   upload lane) on the page's event loop.
 //! - [`app`]: the canvas frame loop.
 //!
 //! There is no browser in CI. The build is checked there; running it is

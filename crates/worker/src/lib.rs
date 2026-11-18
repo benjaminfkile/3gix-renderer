@@ -3,15 +3,18 @@
 //!
 //! The worker is generic: it runs any module and knows nothing about what a
 //! module computes. It only ever sees modules, requests, tile bytes, and
-//! section bytes. Given one `compute` direction it fetches the module and
-//! the source tiles the module asks for, all by hash and all checked, runs
-//! `gx_sources` then `gx_compile`, validates the section with the library
-//! validator, hands it to the renderer at once, and uploads it with the
-//! claim.
+//! section bytes. Given one `missing` or `local` direction it fetches the
+//! module and the source tiles the module asks for, all by hash and all
+//! checked, runs `gx_sources` then `gx_compile`, validates the section
+//! with the library validator, and hands it to the renderer at once. A
+//! `missing` section is then offered to the hub once from the bounded
+//! upload lane; a `local` one never leaves the client.
 //!
 //! - [`job`]: the job, the blob kinds, and the checks on every byte read
 //!   and returned, shared by both platforms.
 //! - [`stats`]: counters for the overlay.
+//! - [`upload`]: the bounded upload lane and the outcome of each offer,
+//!   shared by both platforms.
 //! - [`cache`]: the native local cache directory (native only).
 //! - [`native`]: the thread pool running modules with `gx-module-host`
 //!   (native only).
@@ -24,6 +27,7 @@
 
 pub mod job;
 pub mod stats;
+pub mod upload;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cache;
@@ -32,6 +36,7 @@ pub mod native;
 
 pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
+pub use upload::{UploadLane, UploadOffer, UploadOutcome, UPLOAD_LANE_CAPACITY};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use cache::DiskCache;
