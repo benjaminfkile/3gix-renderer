@@ -12,7 +12,7 @@
 //! - [`config`]: environment and command line configuration.
 //! - [`protocol`]: the hub's wire protocol without I/O, shared by the
 //!   native and browser clients.
-//! - [`hub`]: the hub client for chunks, the readiness WebSocket, and the
+//! - [`hub`]: the hub client for directions, sections, uploads, and the
 //!   frame registry (native only).
 //! - [`mock_hub`]: a small in-process hub for tests and local runs (native
 //!   only).

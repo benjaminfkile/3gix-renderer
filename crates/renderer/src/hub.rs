@@ -1,6 +1,7 @@
 //! The native hub client, version 2: the clock, the build and its layers,
-//! directions, content-addressed reads through the edge, uploads with a
-//! claim, and the readiness socket keyed by address.
+//! directions, content-addressed reads through the edge, and uploads with
+//! the section 2.5 headers. There is no readiness socket: nothing waits on
+//! another client.
 //!
 //! Implements the client side of `client-compute.md` sections 2.3 to 2.5
 //! over [`crate::protocol`]:
@@ -14,12 +15,14 @@
 //!   [`HubClient::keep_clock`] ([`crate::protocol::ClockSync`],
 //!   `space-model.md` section 7).
 //! - [`HubClient::directions`] posts one batch of at most 512 keys.
-//! - [`HubClient::get_blob`] reads `/section/{address}`, `/module/{hash}`,
-//!   `/source/{hash}`, and `/source-manifest/{hash}` from the edge.
-//! - [`HubClient::upload`] puts a computed section with `X-Claim`.
-//! - [`HubClient::subscribe_ready`] keeps the readiness socket open,
-//!   reconnecting with a backoff and subscribing again to every address
-//!   still awaited.
+//! - [`HubClient::get_blob`] reads `/module/{hash}`, `/source/{hash}`,
+//!   and `/source-manifest/{hash}` from the edge, and
+//!   [`HubClient::get_section`] reads `/section/{address}?sha256={hex}`,
+//!   one version of a stored section.
+//! - [`HubClient::upload`] offers a computed `missing` section once, with
+//!   `X-Layer`, `X-Key`, `X-Span-Index`, `X-Content-Sha256`, and `Expect:
+//!   100-continue`, and returns the hub's status (`201` stored, `200`
+//!   matched, `202` disputed).
 //!
 //! The batching, retries, and per-layer flow live in
 //! [`crate::directions`]; the fetcher that drives them is
@@ -29,22 +32,16 @@
 use crate::config::{ApiKey, Config};
 pub use crate::protocol::API_KEY_HEADER;
 use crate::protocol::{
-    parse_ready_frame, status_problem, subscribe_frame, ActiveBuild, BuildDescription, Clock,
-    ClockSync, DirectionsRequest, DirectionsResponse, Routes, CLAIM_HEADER, MAX_DIRECTION_KEYS,
+    status_problem, upload_headers, ActiveBuild, BuildDescription, Clock, ClockSync,
+    DirectionsRequest, DirectionsResponse, Routes, MAX_DIRECTION_KEYS,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use futures_util::{SinkExt, StreamExt};
 use gx_core::key::ChunkKey;
 use gx_core::sha256::to_hex;
-use gx_worker::BlobKind;
+use gx_worker::{BlobKind, ComputeJob};
 use serde::de::DeserializeOwned;
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
 
 /// A connection to one build of one space.
 pub struct HubClient {
@@ -250,166 +247,74 @@ impl HubClient {
     /// Reads `name` of `kind` from the edge: `Some` bytes for `200`, `None`
     /// for `404`.
     pub async fn get_blob(&self, kind: BlobKind, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get_url(&self.routes.blob(kind, name), &format!("{kind} {name}"))
+            .await
+    }
+
+    /// Reads the version of the section at `address` whose bytes hash to
+    /// `sha256`: `GET /section/{address}?sha256={hex}` on the edge. `Some`
+    /// bytes for `200`, `None` for `404`. The caller checks the hash.
+    pub async fn get_section(
+        &self,
+        address: &[u8; 32],
+        sha256: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let address = to_hex(address);
+        self.get_url(
+            &self.routes.section(&address, &to_hex(sha256)),
+            &format!("section {address}"),
+        )
+        .await
+    }
+
+    async fn get_url(&self, url: &str, what: &str) -> Result<Option<Vec<u8>>> {
         let resp = self
             .http
-            .get(self.routes.blob(kind, name))
+            .get(url)
             .header(API_KEY_HEADER, self.api_key.expose())
             .send()
             .await
-            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
         let status = resp.status().as_u16();
         if status == 404 {
             return Ok(None);
         }
         if let Some(p) = status_problem(status) {
-            bail!("{kind} {name}: {p}");
+            bail!("{what}: {p}");
         }
         let body = resp
             .bytes()
             .await
-            .map_err(|e| anyhow!("{kind} {name}: {}", e.without_url()))?;
+            .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
         Ok(Some(body.to_vec()))
     }
 
-    /// Uploads a computed section with its claim. Returns the status:
-    /// `201` stored, `200` already stored. Anything else is an error with
+    /// Offers a computed section for `job` once (`client-compute.md`
+    /// section 2.5). Returns the status: `201` stored, `200` matched a
+    /// stored copy, `202` differed from it. Anything else is an error with
     /// the hub's reason.
-    pub async fn upload(&self, address: &[u8; 32], claim: &str, bytes: Vec<u8>) -> Result<u16> {
-        let address = to_hex(address);
-        let resp = self
+    pub async fn upload(&self, job: &ComputeJob, bytes: Vec<u8>) -> Result<u16> {
+        let address = job.address_hex();
+        let mut req = self
             .http
             .put(self.routes.upload(self.build_id(), &address))
             .header(API_KEY_HEADER, self.api_key.expose())
-            .header(CLAIM_HEADER, claim)
             .header("Content-Type", "application/octet-stream")
+            .header("Expect", "100-continue");
+        for (name, value) in upload_headers(job, &bytes) {
+            req = req.header(name, value);
+        }
+        let resp = req
             .body(bytes)
             .send()
             .await
             .map_err(|e| anyhow!("upload {address}: {}", e.without_url()))?;
         let status = resp.status().as_u16();
-        if status == 200 || status == 201 {
+        if matches!(status, 200..=202) {
             return Ok(status);
         }
         let body = resp.bytes().await.unwrap_or_default();
         let detail = String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned();
         bail!("upload {address}: hub answered {status}: {detail}")
-    }
-
-    async fn open_socket(
-        &self,
-    ) -> Result<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    > {
-        let mut request = self
-            .routes
-            .ready(self.build_id())
-            .into_client_request()
-            .context("readiness URL")?;
-        let key = HeaderValue::from_str(self.api_key.expose())
-            .context("API key is not a valid header value")?;
-        request.headers_mut().insert(API_KEY_HEADER, key);
-        let (socket, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .context("opening the readiness socket")?;
-        Ok(socket)
-    }
-
-    /// Starts the readiness socket on `runtime`: addresses sent to the
-    /// returned subscription are subscribed to, and `on_ready` is called
-    /// with every address the hub reports stored. The socket reconnects
-    /// with a backoff after it closes, subscribing again to every address
-    /// not yet reported; it stops once `on_ready` returns `false` or the
-    /// subscription is dropped. A client that cannot reach it still completes
-    /// every key, by asking for directions again after each `retryMs`.
-    pub fn subscribe_ready(
-        self: &std::sync::Arc<Self>,
-        runtime: &tokio::runtime::Handle,
-        on_ready: impl Fn([u8; 32]) -> bool + Send + 'static,
-    ) -> ReadySubscription {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<[u8; 32]>();
-        let client = std::sync::Arc::clone(self);
-        runtime.spawn(async move {
-            let mut wanted: BTreeSet<[u8; 32]> = BTreeSet::new();
-            let mut failures = 0u32;
-            loop {
-                let socket = match client.open_socket().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        failures += 1;
-                        if failures == 1 {
-                            tracing::warn!("readiness socket unavailable ({e:#}); asking again after each retryMs");
-                        }
-                        let wait = crate::directions::backoff_seconds(failures).max(1.0);
-                        let sleep = tokio::time::sleep(Duration::from_secs_f64(wait));
-                        tokio::pin!(sleep);
-                        loop {
-                            tokio::select! {
-                                _ = &mut sleep => break,
-                                a = out_rx.recv() => match a {
-                                    Some(a) => { wanted.insert(a); }
-                                    None => return,
-                                },
-                            }
-                        }
-                        continue;
-                    }
-                };
-                failures = 0;
-                let (mut write, mut read) = socket.split();
-                let mut ok = true;
-                for a in &wanted {
-                    if write.send(Message::text(subscribe_frame(&to_hex(a)))).await.is_err() {
-                        ok = false;
-                        break;
-                    }
-                }
-                while ok {
-                    tokio::select! {
-                        a = out_rx.recv() => match a {
-                            Some(a) => {
-                                if wanted.insert(a)
-                                    && write.send(Message::text(subscribe_frame(&to_hex(&a)))).await.is_err()
-                                {
-                                    ok = false;
-                                }
-                            }
-                            None => {
-                                let _ = write.send(Message::Close(None)).await;
-                                return;
-                            }
-                        },
-                        m = read.next() => match m {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Some(a) = parse_ready_frame(text.as_str()) {
-                                    wanted.remove(&a);
-                                    if !on_ready(a) {
-                                        return;
-                                    }
-                                }
-                            }
-                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => ok = false,
-                            Some(Ok(_)) => {}
-                        },
-                    }
-                }
-                tracing::debug!("readiness socket closed, reconnecting");
-            }
-        });
-        ReadySubscription { out: out_tx }
-    }
-}
-
-/// The readiness socket's subscription side. Dropping it closes the
-/// socket.
-pub struct ReadySubscription {
-    out: mpsc::UnboundedSender<[u8; 32]>,
-}
-
-impl ReadySubscription {
-    /// Registers interest in `address`.
-    pub fn subscribe(&self, address: [u8; 32]) {
-        let _ = self.out.send(address);
     }
 }

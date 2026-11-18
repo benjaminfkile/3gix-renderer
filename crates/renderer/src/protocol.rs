@@ -1,10 +1,11 @@
 //! The hub's client routes, without any I/O: URLs, the clock, builds and
-//! layer configs, directions, the readiness socket's frames, and the frame
-//! registry built from every layer's registry section.
+//! layer configs, directions, upload headers, and the frame registry built
+//! from every layer's registry section.
 //!
 //! Implements the wire side of `client-compute.md` sections 2.2 (layer
-//! config), 2.3 (client routes), and 2.4 (directions), and the readiness
-//! socket keyed by address. Shared by the native client ([`crate::hub`])
+//! config), 2.3 (client routes), 2.4 (directions: `ready`, `missing`,
+//! `local`, `empty`), and 2.5 (the upload headers). There is no readiness
+//! socket: nothing waits on another client. Shared by the native client ([`crate::hub`])
 //! and the browser client (`crate::web`), which differ only in how they
 //! send requests.
 //!
@@ -18,6 +19,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::key::{ChunkKey, REGISTRY_KEY};
 use gx_core::module_io::ModuleRequest;
 use gx_core::registry::{self, FrameTree, Registry};
+use gx_core::sha256::{sha256, to_hex};
 use gx_worker::job::parse_hash;
 use gx_worker::{BlobKind, ComputeJob};
 use serde::{Deserialize, Serialize};
@@ -27,8 +29,30 @@ use std::sync::Arc;
 /// The header that carries the API key.
 pub const API_KEY_HEADER: &str = "X-API-Key";
 
-/// The header that carries the claim on an upload.
-pub const CLAIM_HEADER: &str = "X-Claim";
+/// Upload header: the layer id (`client-compute.md` section 2.5).
+pub const LAYER_HEADER: &str = "X-Layer";
+
+/// Upload header: the chunk key.
+pub const KEY_HEADER: &str = "X-Key";
+
+/// Upload header: the span index.
+pub const SPAN_INDEX_HEADER: &str = "X-Span-Index";
+
+/// Upload header: SHA-256 of the body, lowercase hex.
+pub const CONTENT_SHA256_HEADER: &str = "X-Content-Sha256";
+
+/// The section 2.5 headers of an upload of `bytes` for `job`, in a fixed
+/// order: `X-Layer`, `X-Key`, `X-Span-Index`, `X-Content-Sha256`. The
+/// `Expect: 100-continue` header is added by the native client; the
+/// browser's fetch does not let a page set it.
+pub fn upload_headers(job: &ComputeJob, bytes: &[u8]) -> [(&'static str, String); 4] {
+    [
+        (LAYER_HEADER, job.layer.clone()),
+        (KEY_HEADER, job.key().to_string()),
+        (SPAN_INDEX_HEADER, job.request.span_index.to_string()),
+        (CONTENT_SHA256_HEADER, to_hex(&sha256(bytes))),
+    ]
+}
 
 /// Most keys one directions request may carry (`client-compute.md`
 /// section 2.3).
@@ -199,6 +223,14 @@ pub struct LayerConfig {
     /// The module's output depends on the origin.
     #[serde(default)]
     pub uses_origin: bool,
+    /// `false` for an unshared layer: directions answer `local`, and its
+    /// sections are never uploaded (`client-compute.md` section 2.2).
+    #[serde(default = "shared_by_default")]
+    pub shared: bool,
+}
+
+fn shared_by_default() -> bool {
+    true
 }
 
 impl LayerConfig {
@@ -258,45 +290,42 @@ pub struct DirectionsRequest {
 
 /// One layer's answer for one key, as sent. See [`Direction`] for the
 /// checked form.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawDirection {
     /// The layer id.
     pub layer: String,
-    /// `empty`, `ready`, `compute`, or `pending`.
+    /// `ready`, `missing`, `local`, or `empty`.
     pub state: String,
     /// The section's address (all but `empty`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// The claim token (`compute`).
+    /// SHA-256 of the stored bytes (`ready`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim: Option<String>,
-    /// The claim's lease, milliseconds (`compute`).
+    pub sha256: Option<String>,
+    /// The probability this download should be checked (`ready`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_ms: Option<u64>,
-    /// The module hash (`compute`).
+    pub check_rate: Option<f64>,
+    /// The module hash (`missing`, `local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
-    /// The source manifest hash or `null` (`compute`).
+    /// The source manifest hash or `null` (`missing`, `local`).
     #[serde(default)]
     pub source_manifest: Option<String>,
     /// The origin the module receives, 0 when the layer does not use it
-    /// (`compute`).
+    /// (`missing`, `local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_utc_ms: Option<i64>,
-    /// The span index (`compute`).
+    /// The span index (`missing`, `local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_index: Option<u64>,
-    /// The span length, seconds (`compute`).
+    /// The span length, seconds (`missing`, `local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_seconds: Option<u64>,
-    /// When to ask again, milliseconds (`pending`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_ms: Option<u64>,
 }
 
 /// One key's answers.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyDirections {
     /// The chunk key.
@@ -306,7 +335,7 @@ pub struct KeyDirections {
 }
 
 /// The directions response.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectionsResponse {
     /// The universe's origin, UTC milliseconds.
@@ -316,24 +345,27 @@ pub struct DirectionsResponse {
 }
 
 /// One layer's answer for one key, checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Direction {
     /// The layer contributes nothing to this cell.
     Empty,
-    /// The section is stored: stream it by its address.
+    /// The section is stored: stream it by its address and check the
+    /// bytes against `sha256`.
     Ready {
         /// The section's address.
         address: [u8; 32],
+        /// SHA-256 of the stored bytes.
+        sha256: [u8; 32],
+        /// The probability this download should be checked (section 2.6),
+        /// clamped to `[0, 1]`.
+        check_rate: f64,
     },
-    /// Nobody has computed it; this client holds the claim.
-    Compute(ComputeJob),
-    /// Another client holds the claim.
-    Pending {
-        /// The section's address.
-        address: [u8; 32],
-        /// Milliseconds after which to ask again.
-        retry_ms: u64,
-    },
+    /// No section is stored: compute it, then offer it to the hub. The
+    /// job's `share` is `true`.
+    Missing(ComputeJob),
+    /// The layer is unshared: compute it and keep it, never upload it. The
+    /// job's `share` is `false`.
+    Local(ComputeJob),
 }
 
 impl RawDirection {
@@ -345,66 +377,41 @@ impl RawDirection {
                 .ok_or_else(|| anyhow!("{} direction without {field}", self.state))?;
             parse_hash(s).ok_or_else(|| anyhow!("{field} {s:?} is not 64 lowercase hex"))
         };
+        let job = |share: bool| -> Result<ComputeJob> {
+            let manifest = match &self.source_manifest {
+                Some(_) => Some(hash("sourceManifest", &self.source_manifest)?),
+                None => None,
+            };
+            Ok(ComputeJob {
+                address: hash("address", &self.address)?,
+                layer: self.layer.clone(),
+                share,
+                module: hash("module", &self.module)?,
+                manifest,
+                request: ModuleRequest {
+                    origin_utc_ms: self.origin_utc_ms.unwrap_or(0),
+                    span_seconds: self.span_seconds.unwrap_or(0),
+                    span_index: self.span_index.unwrap_or(0),
+                    key: *key,
+                },
+            })
+        };
         Ok(match self.state.as_str() {
             "empty" => Direction::Empty,
             "ready" => Direction::Ready {
                 address: hash("address", &self.address)?,
+                sha256: hash("sha256", &self.sha256)?,
+                check_rate: self
+                    .check_rate
+                    .filter(|r| r.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0),
             },
-            "pending" => Direction::Pending {
-                address: hash("address", &self.address)?,
-                retry_ms: self.retry_ms.unwrap_or(1000),
-            },
-            "compute" => {
-                let manifest = match &self.source_manifest {
-                    Some(_) => Some(hash("sourceManifest", &self.source_manifest)?),
-                    None => None,
-                };
-                Direction::Compute(ComputeJob {
-                    address: hash("address", &self.address)?,
-                    claim: self
-                        .claim
-                        .clone()
-                        .filter(|c| !c.is_empty())
-                        .ok_or_else(|| anyhow!("compute direction without a claim"))?,
-                    module: hash("module", &self.module)?,
-                    manifest,
-                    request: ModuleRequest {
-                        origin_utc_ms: self.origin_utc_ms.unwrap_or(0),
-                        span_seconds: self.span_seconds.unwrap_or(0),
-                        span_index: self.span_index.unwrap_or(0),
-                        key: *key,
-                    },
-                })
-            }
+            "missing" => Direction::Missing(job(true)?),
+            "local" => Direction::Local(job(false)?),
             other => bail!("unknown direction state {other:?}"),
         })
     }
-}
-
-/// The readiness socket frame the client sends.
-#[derive(Serialize)]
-struct SubscribeFrame<'a> {
-    subscribe: &'a str,
-}
-
-/// The readiness socket frame the hub pushes.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadyFrame {
-    section_ready: String,
-}
-
-/// The text of a subscription, `{"subscribe":"<address>"}`.
-pub fn subscribe_frame(address: &str) -> String {
-    serde_json::to_string(&SubscribeFrame { subscribe: address }).expect("a string serializes")
-}
-
-/// Parses a readiness notice, `{"sectionReady":"<address>"}`, or `None`
-/// for anything else.
-pub fn parse_ready_frame(text: &str) -> Option<[u8; 32]> {
-    serde_json::from_str::<ReadyFrame>(text)
-        .ok()
-        .and_then(|f| parse_hash(&f.section_ready))
 }
 
 /// Builds the hub's URLs. Content-addressed reads (sections, modules,
@@ -465,26 +472,22 @@ impl Routes {
         format!("{}/build/{build_id}/section/{address}", self.space())
     }
 
+    /// `POST /space/{spaceId}/build/{buildId}/section/{address}/check`
+    /// (`client-compute.md` section 2.6).
+    pub fn check(&self, build_id: &str, address: &str) -> String {
+        format!("{}/check", self.upload(build_id, address))
+    }
+
+    /// `GET /section/{address}?sha256={hex}` on the edge: one version of a
+    /// stored section's bytes (`client-compute.md` sections 2.4 and 8).
+    pub fn section(&self, address: &str, sha256: &str) -> String {
+        format!("{}?sha256={sha256}", self.blob(BlobKind::Section, address))
+    }
+
     /// `GET /{kind}/{name}` on the edge: `/section/{address}`,
     /// `/module/{hash}`, `/source/{hash}`, `/source-manifest/{hash}`.
     pub fn blob(&self, kind: BlobKind, name: &str) -> String {
         format!("{}/{}/{name}", self.edge, kind.segment())
-    }
-
-    /// The readiness socket: the hub URL with `http` replaced by `ws` (or
-    /// `https` by `wss`), then `/space/{spaceId}/build/{buildId}/sections/ready`.
-    pub fn ready(&self, build_id: &str) -> String {
-        let base = if let Some(rest) = self.hub.strip_prefix("https://") {
-            format!("wss://{rest}")
-        } else if let Some(rest) = self.hub.strip_prefix("http://") {
-            format!("ws://{rest}")
-        } else {
-            self.hub.clone()
-        };
-        format!(
-            "{base}/space/{}/build/{build_id}/sections/ready",
-            self.space_id
-        )
     }
 }
 
@@ -578,10 +581,11 @@ mod tests {
         let resp: DirectionsResponse = serde_json::from_str(&format!(
             r#"{{"originUtcMs":1763130000000,"results":[{{"key":"4-12-1024-2048-3071","layers":[
                 {{"layer":"system","state":"empty"}},
-                {{"layer":"matter","state":"compute","address":"{a}","claim":"tok","leaseMs":120000,
-                  "module":"{m}","sourceManifest":"{s}","originUtcMs":0,"spanIndex":0,"spanSeconds":0}},
-                {{"layer":"x","state":"pending","address":"{a}","retryMs":250}},
-                {{"layer":"y","state":"ready","address":"{a}"}}]}}]}}"#,
+                {{"layer":"matter","state":"missing","address":"{a}",
+                  "module":"{m}","sourceManifest":"{s}","originUtcMs":0,"spanIndex":4,"spanSeconds":60}},
+                {{"layer":"x","state":"local","address":"{a}","module":"{m}","sourceManifest":null,
+                  "originUtcMs":0,"spanIndex":0,"spanSeconds":0}},
+                {{"layer":"y","state":"ready","address":"{a}","sha256":"{s}","checkRate":0.5}}]}}]}}"#,
             a = "1".repeat(64),
             m = "2".repeat(64),
             s = "3".repeat(64)
@@ -590,49 +594,63 @@ mod tests {
         let l = &resp.results[0].layers;
         assert_eq!(l[0].parse(&key).unwrap(), Direction::Empty);
         match l[1].parse(&key).unwrap() {
-            Direction::Compute(job) => {
-                assert_eq!(job.claim, "tok");
+            Direction::Missing(job) => {
+                assert_eq!(job.layer, "matter");
+                assert!(job.share);
                 assert_eq!(job.module, [0x22; 32]);
                 assert_eq!(job.manifest, Some([0x33; 32]));
                 assert_eq!(job.request.key, key);
+                let h = upload_headers(&job, b"abc");
+                assert_eq!(h[0], (LAYER_HEADER, "matter".to_string()));
+                assert_eq!(h[1], (KEY_HEADER, "4-12-1024-2048-3071".to_string()));
+                assert_eq!(h[2], (SPAN_INDEX_HEADER, "4".to_string()));
+                assert_eq!(
+                    h[3],
+                    (
+                        CONTENT_SHA256_HEADER,
+                        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()
+                    )
+                );
             }
             other => panic!("{other:?}"),
         }
+        match l[2].parse(&key).unwrap() {
+            Direction::Local(job) => assert!(!job.share && job.manifest.is_none()),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
-            l[2].parse(&key).unwrap(),
-            Direction::Pending {
+            l[3].parse(&key).unwrap(),
+            Direction::Ready {
                 address: [0x11; 32],
-                retry_ms: 250
+                sha256: [0x33; 32],
+                check_rate: 0.5
             }
         );
-        assert!(matches!(l[3].parse(&key).unwrap(), Direction::Ready { .. }));
+        let no_hash = RawDirection {
+            state: "ready".into(),
+            address: Some("1".repeat(64)),
+            ..RawDirection::default()
+        };
+        assert!(no_hash.parse(&key).is_err());
         let bad = RawDirection {
             state: "ready".into(),
             address: Some("XYZ".into()),
             ..RawDirection::default()
         };
         assert!(bad.parse(&key).is_err());
-        let odd = RawDirection {
-            state: "later".into(),
-            ..RawDirection::default()
-        };
-        assert!(odd.parse(&key).is_err());
+        for removed in ["compute", "pending", "later"] {
+            let odd = RawDirection {
+                state: removed.into(),
+                address: Some("1".repeat(64)),
+                ..RawDirection::default()
+            };
+            assert!(odd.parse(&key).is_err(), "{removed}");
+        }
     }
 
     #[test]
-    fn socket_frames_and_urls() {
-        let a = "ab".repeat(32);
-        assert_eq!(subscribe_frame(&a), format!(r#"{{"subscribe":"{a}"}}"#));
-        assert_eq!(
-            parse_ready_frame(&format!(r#"{{"sectionReady":"{a}"}}"#)),
-            Some([0xab; 32])
-        );
-        assert_eq!(parse_ready_frame(r#"{"chunkReady":"x"}"#), None);
+    fn urls() {
         let r = Routes::new("https://hub.invalid/", None, "s");
-        assert_eq!(
-            r.ready("b"),
-            "wss://hub.invalid/space/s/build/b/sections/ready"
-        );
         assert_eq!(r.clock(), "https://hub.invalid/space/s/clock");
         assert_eq!(
             r.directions("b"),
@@ -641,6 +659,10 @@ mod tests {
         assert_eq!(
             r.upload("b", "x"),
             "https://hub.invalid/space/s/build/b/section/x"
+        );
+        assert_eq!(
+            r.check("b", "x"),
+            "https://hub.invalid/space/s/build/b/section/x/check"
         );
         assert_eq!(
             r.blob(BlobKind::Manifest, "h"),
@@ -652,8 +674,8 @@ mod tests {
             "http://edge.invalid/section/a"
         );
         assert_eq!(
-            r.ready("b"),
-            "ws://hub.invalid/space/s/build/b/sections/ready"
+            r.section("a", "f0"),
+            "http://edge.invalid/section/a?sha256=f0"
         );
     }
 

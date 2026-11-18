@@ -63,11 +63,19 @@ pub struct MatterStats {
     pub module_runs: u64,
     /// Distinct modules the worker has loaded.
     pub modules_loaded: u64,
-    /// Uploads started and not yet answered.
+    /// Offers in the upload lane or being sent.
     pub uploads_pending: u64,
-    /// Uploads the hub accepted.
-    pub uploads_done: u64,
-    /// Uploads that failed (logged; drawing never waits for them).
+    /// Sections offered to the upload lane.
+    pub uploads_offered: u64,
+    /// Offers the hub stored (`201`).
+    pub uploads_stored: u64,
+    /// Offers that matched a stored copy (`200`).
+    pub uploads_matched: u64,
+    /// Offers that differed from a stored copy (`202`).
+    pub uploads_disputed: u64,
+    /// Offers dropped from a full lane.
+    pub uploads_dropped: u64,
+    /// Offers that failed (counted, never retried; drawing never waits).
     pub uploads_failed: u64,
     /// Directions requests sent.
     pub directions_requests: u64,
@@ -94,7 +102,11 @@ impl MatterStats {
             module_runs: s.worker.module_runs,
             modules_loaded: s.worker.modules_loaded,
             uploads_pending: s.worker.uploads_pending,
-            uploads_done: s.worker.uploads_done,
+            uploads_offered: s.worker.uploads_offered,
+            uploads_stored: s.worker.uploads_stored,
+            uploads_matched: s.worker.uploads_matched,
+            uploads_disputed: s.worker.uploads_disputed,
+            uploads_dropped: s.worker.uploads_dropped,
             uploads_failed: s.worker.uploads_failed,
             directions_requests: s.directions.directions_requests,
             ..MatterStats::default()
@@ -334,7 +346,11 @@ mod tests {
                 module_runs: 8,
                 modules_loaded: 2,
                 uploads_pending: 1,
-                uploads_done: 3,
+                uploads_offered: 3,
+                uploads_stored: 3,
+                uploads_matched: 0,
+                uploads_disputed: 0,
+                uploads_dropped: 0,
                 uploads_failed: 0,
                 directions_requests: 5,
                 frame_step_p95_ms: None,

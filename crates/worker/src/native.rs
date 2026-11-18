@@ -14,8 +14,9 @@
 //!    library decoder (the one validation the section gets on its way in,
 //!    `rendering.md` section 3.5),
 //! 5. hands the bytes and the decoded section to the caller at once, stores them in the local cache
-//!    under their address, and starts the upload with the claim
-//!    ([`Uploader`]), which never holds up the next job.
+//!    under their address, and, for a `missing` direction only, offers
+//!    it to the upload lane ([`Uploader`]), which never holds up the next
+//!    job. A `local` section is never offered.
 //!
 //! The worker sees modules, requests, tile bytes, and section bytes, and
 //! nothing else.
@@ -25,7 +26,7 @@ use crate::job::{
     check_blob, check_section, check_tile, decode_manifest, resolve_tiles, BlobKind, ComputeJob,
     Computed, WorkerError,
 };
-use crate::stats::{UploadTicket, WorkerSnapshot, WorkerStats};
+use crate::stats::{WorkerSnapshot, WorkerStats};
 use gx_core::sha256::to_hex;
 use gx_module_host::{HostConfig, HostError, LoadedModule, ModuleHost};
 use std::collections::BTreeMap;
@@ -41,13 +42,13 @@ pub trait Blobs: Send + Sync {
     fn fetch(&self, kind: BlobKind, hash: &[u8; 32]) -> Result<Vec<u8>, WorkerError>;
 }
 
-/// Uploads a computed section with its claim (`PUT
-/// /space/{s}/build/{b}/section/{address}` with `X-Claim`). Must not block:
-/// start the upload and return. Finish the ticket with the outcome; log
-/// failures, which never block drawing.
+/// Takes a computed `missing` section into the upload lane
+/// (`client-compute.md` sections 2.5 and 2.8, [`crate::upload`]). Must
+/// not block: queue the offer and return. The section has already been
+/// handed to the renderer.
 pub trait Uploader: Send + Sync {
-    /// Starts the upload of `section` for `job`.
-    fn upload(&self, job: &ComputeJob, section: Arc<[u8]>, ticket: UploadTicket);
+    /// Offers `section` for `job`, once.
+    fn offer(&self, job: &ComputeJob, section: Arc<[u8]>);
 }
 
 /// The default pool size: the number of cores minus two, at least one.
@@ -329,7 +330,7 @@ struct Shared {
 impl WorkerPool {
     /// Starts `threads` workers (at least one) with the host limits in
     /// `config`, fetching through `blobs`, caching in `cache`, and
-    /// uploading through `uploader`.
+    /// offering `missing` sections to `uploader`.
     pub fn new(
         threads: usize,
         config: HostConfig,
@@ -337,7 +338,19 @@ impl WorkerPool {
         cache: Option<Arc<DiskCache>>,
         uploader: Arc<dyn Uploader>,
     ) -> Result<WorkerPool, WorkerError> {
-        let stats = WorkerStats::new();
+        WorkerPool::with_stats(threads, config, blobs, cache, uploader, WorkerStats::new())
+    }
+
+    /// [`WorkerPool::new`], counting into `stats`, which an upload lane
+    /// ([`crate::UploadLane`]) may share.
+    pub fn with_stats(
+        threads: usize,
+        config: HostConfig,
+        blobs: Arc<dyn Blobs>,
+        cache: Option<Arc<DiskCache>>,
+        uploader: Arc<dyn Uploader>,
+        stats: Arc<WorkerStats>,
+    ) -> Result<WorkerPool, WorkerError> {
         let shared = Arc::new(Shared {
             runner: ModuleRunner::new(config, Arc::clone(&stats))?,
             blobs,
@@ -377,7 +390,7 @@ impl WorkerPool {
     }
 
     /// Queues `job`; `done` is called on a worker thread with the section
-    /// (before its upload starts) or the failure.
+    /// (before it is offered for upload) or the failure.
     pub fn submit(&self, job: ComputeJob, done: impl FnOnce(JobResult) + Send + 'static) {
         let task = Task {
             job,
@@ -427,8 +440,9 @@ fn run_task(shared: &Shared, task: Task) {
                     tracing::warn!(address, "could not cache the section: {e}");
                 }
             }
-            let ticket = stats.upload_started();
-            shared.uploader.upload(&job, section, ticket);
+            if job.share {
+                shared.uploader.offer(&job, section);
+            }
         }
         Err(e) => {
             tracing::warn!(key = %job.key(), address = job.address_hex(), "module job failed: {e}");

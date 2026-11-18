@@ -1,31 +1,34 @@
-//! A small in-process hub for tests and local runs, speaking the v2 client
-//! routes (`client-compute.md` sections 2.3 to 2.5) with the shapes of the
-//! real hub's coordinator, blob, and readiness controllers:
+//! A small in-process hub for tests and local runs, speaking the client
+//! routes of `client-compute.md` sections 2.3 to 2.5 with the shapes of
+//! the real hub's controllers:
 //!
 //! - `GET /space/{s}/clock`, `GET /space/{s}/build/active`, `GET
 //!   /space/{s}/build/{b}` (the layers, ordered by layer id).
-//! - `POST /space/{s}/build/{b}/directions`: sets the origin on the first
-//!   call, refuses times past now or before the origin (both with 2 s of
-//!   tolerance) with `422`, and answers `empty`, `ready`, `compute` (with a
-//!   claim of a 120 s lease), or `pending` per key and layer, applying
-//!   attachment, exclusivity, and max depth. With
-//!   [`MockHubOptions::foreign_claim_ms`], every address is first held by a
-//!   claim of another client for that long, so a client sees `pending`
-//!   before it may compute.
-//! - `PUT /space/{s}/build/{b}/section/{address}` with `X-Claim`: `200` for
-//!   a stored address, `409` without the live claim, `400` when the library
-//!   validator rejects the bytes for the address's chunk key, else stores,
-//!   drops the claim, notifies, and answers `201`.
-//! - `GET /section/{address}`, `/module/{hash}`, `/source/{hash}`,
+//! - `POST /space/{s}/build/{b}/directions` (section 2.4): sets the origin
+//!   on the first call, refuses times past now or before the origin (both
+//!   with 2 s of tolerance) with `422`, and answers per key and layer
+//!   `empty` (attachment, exclusivity, max depth), `local` for an unshared
+//!   layer ([`MockLayer::shared`]), `ready` with the stored bytes'
+//!   `sha256` and a `checkRate` of `max(1 / (1 + c), 0.01)` for `c`
+//!   matches, or `missing`.
+//! - `PUT /space/{s}/build/{b}/section/{address}` (section 2.5) with
+//!   `X-Layer`, `X-Key`, `X-Span-Index`, and `X-Content-Sha256`: `403` for a
+//!   revoked key ([`MockHub::revoke`]), `400` for an unknown layer, a bad
+//!   key or span index, a key the layer is `empty` for, or an address that
+//!   is not the one the headers name, `403` for an unshared layer; for a
+//!   stored address `200 {"result":"match"}` or `202
+//!   {"result":"disputed"}` by the header's hash; else `400` when the body
+//!   does not hash to the header or the library validator rejects it, and
+//!   `201` once stored. `Expect: 100-continue` is answered with `100
+//!   Continue` before the body is read.
+//! - `GET /section/{address}` (any `?sha256=` query is ignored, as the
+//!   origin ignores it), `/module/{hash}`, `/source/{hash}`,
 //!   `/source-manifest/{hash}`: `200` immutable, or `404`.
-//! - `WS /space/{s}/build/{b}/sections/ready`: `{"subscribe": address}` in,
-//!   `{"sectionReady": address}` out once stored, at once for an address
-//!   already stored.
 //!
-//! Every request must carry the configured key in `X-API-Key`, or the mock
-//! answers `401`. It speaks just enough HTTP/1.1 for one request per
-//! connection. Its state outlives client sessions, so a second client sees
-//! what the first uploaded.
+//! There is no readiness socket. Every request must carry the configured
+//! key in `X-API-Key`, or the mock answers `401`. It speaks just enough
+//! HTTP/1.1 for one request per connection. Its state outlives client
+//! sessions, so a second client sees what the first uploaded.
 //!
 //! [`registry_module`] builds a module that only ever answers the registry
 //! key with fixed bytes, for a layer attached to no frames; with the core's
@@ -35,29 +38,27 @@
 //! A layer may also have every cell section stored before any client asks
 //! ([`MockLayer::stored`], [`stored_layer`]): directions answer `ready` for
 //! each of its cells, and the section bytes are made by the layer's
-//! [`SectionMaker`] the first time they are read. This is how tests serve
-//! synthetic worlds of any shape with every section already on the hub, as
-//! the budget measures them (`rendering.md` section 5).
+//! [`SectionMaker`] the first time a directions request names them (their
+//! hash is part of the answer). This is how tests serve synthetic worlds
+//! of any shape with every section already on the hub, as the budget
+//! measures them (`rendering.md` section 5).
 
 use crate::protocol::{
-    Attachment, BuildDescription, LayerConfig, RawDirection, API_KEY_HEADER, CLAIM_HEADER,
-    DEEPEST_DEPTH,
+    Attachment, BuildDescription, LayerConfig, RawDirection, API_KEY_HEADER, CONTENT_SHA256_HEADER,
+    DEEPEST_DEPTH, KEY_HEADER, LAYER_HEADER, SPAN_INDEX_HEADER,
 };
-use futures_util::{SinkExt, StreamExt};
 use gx_core::address::{section_address, span_index};
 use gx_core::key::ChunkKey;
 use gx_core::manifest::{self, Entry, Manifest};
 use gx_core::sha256::{sha256, to_hex};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::Message;
 
 /// The space id the mock serves by default.
 pub const MOCK_SPACE_ID: &str = "00000000-0000-0000-0000-00000000000a";
@@ -65,9 +66,6 @@ pub const MOCK_SPACE_ID: &str = "00000000-0000-0000-0000-00000000000a";
 pub const MOCK_BUILD_ID: &str = "00000000-0000-0000-0000-00000000000b";
 /// The API key the mock accepts by default. Not a secret.
 pub const MOCK_API_KEY: &str = "mock-key";
-
-/// A claim's lease, milliseconds.
-pub const LEASE_MS: u64 = 120_000;
 
 /// Clock skew tolerance on directions times, milliseconds.
 pub const TOLERANCE_MS: i64 = 2_000;
@@ -95,6 +93,9 @@ pub struct MockLayer {
     /// on its first read. `None` for a layer whose sections are computed
     /// by clients and uploaded.
     pub stored: Option<SectionMaker>,
+    /// `false` for an unshared layer: directions answer `local` and
+    /// uploads are refused with `403`.
+    pub shared: bool,
 }
 
 /// A function from a cell key to that cell's section bytes.
@@ -122,6 +123,7 @@ impl MockLayer {
             max_depth: self.max_depth.clone(),
             span_seconds: self.span_seconds,
             uses_origin: self.uses_origin,
+            shared: self.shared,
         }
     }
 
@@ -150,9 +152,6 @@ pub struct MockHubOptions {
     pub sources: Vec<Vec<u8>>,
     /// The origin, if it was set before the mock started.
     pub origin_utc_ms: Option<i64>,
-    /// Hold every address under another client's claim for this long the
-    /// first time it is asked about.
-    pub foreign_claim_ms: Option<u64>,
 }
 
 impl MockHubOptions {
@@ -165,7 +164,6 @@ impl MockHubOptions {
             layers,
             sources,
             origin_utc_ms: None,
-            foreign_claim_ms: None,
         }
     }
 }
@@ -177,17 +175,19 @@ pub struct MockCounts {
     pub directions_requests: u64,
     /// The most keys one directions request carried.
     pub largest_batch: u64,
-    /// `compute` answers.
-    pub compute_answers: u64,
-    /// `pending` answers.
-    pub pending_answers: u64,
+    /// `missing` answers.
+    pub missing_answers: u64,
+    /// `local` answers.
+    pub local_answers: u64,
     /// `ready` answers.
     pub ready_answers: u64,
     /// Uploads stored (`201`).
     pub uploads_stored: u64,
-    /// Uploads of an address already stored (`200`).
-    pub uploads_repeated: u64,
-    /// Uploads refused (`400` or `409`).
+    /// Uploads matching a stored copy (`200`).
+    pub uploads_matched: u64,
+    /// Uploads differing from a stored copy (`202`).
+    pub uploads_disputed: u64,
+    /// Uploads refused (`400` or `403`).
     pub uploads_refused: u64,
     /// `GET /section/...` answered `200`.
     pub section_reads: u64,
@@ -197,43 +197,47 @@ pub struct MockCounts {
     pub source_reads: u64,
     /// `GET /source-manifest/...` answered `200`.
     pub manifest_reads: u64,
-    /// `sectionReady` notices pushed.
-    pub notices: u64,
-}
-
-#[derive(Clone, Debug)]
-struct Claim {
-    token: String,
-    key: String,
-    expires: Instant,
 }
 
 #[derive(Default)]
 struct Counters {
     directions_requests: AtomicU64,
     largest_batch: AtomicU64,
-    compute_answers: AtomicU64,
-    pending_answers: AtomicU64,
+    missing_answers: AtomicU64,
+    local_answers: AtomicU64,
     ready_answers: AtomicU64,
     uploads_stored: AtomicU64,
-    uploads_repeated: AtomicU64,
+    uploads_matched: AtomicU64,
+    uploads_disputed: AtomicU64,
     uploads_refused: AtomicU64,
     section_reads: AtomicU64,
     module_reads: AtomicU64,
     source_reads: AtomicU64,
     manifest_reads: AtomicU64,
-    notices: AtomicU64,
+}
+
+/// One stored section.
+struct Stored {
+    bytes: Vec<u8>,
+    sha256: [u8; 32],
+    /// `200` answers to uploads of it.
+    matches: u64,
+}
+
+impl Stored {
+    fn new(bytes: Vec<u8>) -> Stored {
+        Stored {
+            sha256: sha256(&bytes),
+            bytes,
+            matches: 0,
+        }
+    }
 }
 
 struct Space {
     origin: Option<i64>,
-    sections: BTreeMap<String, Vec<u8>>,
-    /// Addresses of stored layers' cells answered `ready` but not read yet:
-    /// the layer's index in `State::layers` and the cell.
-    unmade: BTreeMap<String, (usize, gx_core::key::CellKey)>,
-    claims: BTreeMap<String, Claim>,
-    asked: BTreeSet<String>,
-    next_token: u64,
+    sections: BTreeMap<String, Stored>,
+    revoked: bool,
 }
 
 struct State {
@@ -245,8 +249,6 @@ struct State {
     sources: BTreeMap<String, Vec<u8>>,
     space: Mutex<Space>,
     counters: Counters,
-    /// Every stored address, for the readiness sockets.
-    stored: watch::Sender<BTreeSet<String>>,
 }
 
 /// A running mock hub. Stops when dropped.
@@ -302,15 +304,11 @@ impl MockHub {
             space: Mutex::new(Space {
                 origin: options.origin_utc_ms,
                 sections: BTreeMap::new(),
-                unmade: BTreeMap::new(),
-                claims: BTreeMap::new(),
-                asked: BTreeSet::new(),
-                next_token: 1,
+                revoked: false,
             }),
             layers,
             options,
             counters: Counters::default(),
-            stored: watch::channel(BTreeSet::new()).0,
         });
         let serving = state.clone();
         let task = tokio::spawn(async move {
@@ -343,7 +341,27 @@ impl MockHub {
 
     /// Every stored section by address.
     pub fn sections(&self) -> BTreeMap<String, Vec<u8>> {
-        self.state.space.lock().expect("space").sections.clone()
+        let space = self.state.space.lock().expect("space");
+        space
+            .sections
+            .iter()
+            .map(|(a, s)| (a.clone(), s.bytes.clone()))
+            .collect()
+    }
+
+    /// Stores `bytes` at `address` in place of whatever was there, as the
+    /// hub does after settling a dispute (`client-compute.md` section
+    /// 2.7): directions then answer `ready` with the new hash.
+    pub fn replace_section(&self, address: &str, bytes: Vec<u8>) {
+        let mut space = self.state.space.lock().expect("space");
+        space
+            .sections
+            .insert(address.to_string(), Stored::new(bytes));
+    }
+
+    /// Revokes the API key: every later upload is refused with `403`.
+    pub fn revoke(&self) {
+        self.state.space.lock().expect("space").revoked = true;
     }
 
     /// The build's description as served.
@@ -358,17 +376,17 @@ impl MockHub {
         MockCounts {
             directions_requests: l(&c.directions_requests),
             largest_batch: l(&c.largest_batch),
-            compute_answers: l(&c.compute_answers),
-            pending_answers: l(&c.pending_answers),
+            missing_answers: l(&c.missing_answers),
+            local_answers: l(&c.local_answers),
             ready_answers: l(&c.ready_answers),
             uploads_stored: l(&c.uploads_stored),
-            uploads_repeated: l(&c.uploads_repeated),
+            uploads_matched: l(&c.uploads_matched),
+            uploads_disputed: l(&c.uploads_disputed),
             uploads_refused: l(&c.uploads_refused),
             section_reads: l(&c.section_reads),
             module_reads: l(&c.module_reads),
             source_reads: l(&c.source_reads),
             manifest_reads: l(&c.manifest_reads),
-            notices: l(&c.notices),
         }
     }
 }
@@ -397,8 +415,7 @@ impl Head {
     }
 }
 
-/// Peeks at the request head without consuming it, so a WebSocket upgrade
-/// can hand the untouched stream to the handshake.
+/// Peeks at the request head without consuming it.
 async fn peek_head(stream: &TcpStream) -> std::io::Result<Option<Head>> {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -475,14 +492,14 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
     let o = &state.options;
     let authorized = head.header(API_KEY_HEADER) == Some(o.api_key.as_str());
     let build = format!("/space/{}/build/{}", o.space_id, o.build_id);
-    let upgrade = head
-        .header("Upgrade")
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    if upgrade && authorized && head.path == format!("{build}/sections/ready") {
-        return serve_socket(stream, state).await;
-    }
     let mut sink = vec![0u8; head.len];
     stream.read_exact(&mut sink).await?;
+    if head
+        .header("Expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+    {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
     let len: usize = head
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
@@ -493,7 +510,7 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
         return respond(&mut stream, "401 Unauthorized", &[NO_STORE], b"").await;
     }
     let space = format!("/space/{}", o.space_id);
-    let path = head.path.as_str();
+    let path = head.path.split('?').next().unwrap_or("");
     match head.method.as_str() {
         "GET" if path == format!("{space}/clock") => {
             let origin = state.space.lock().expect("space").origin;
@@ -522,8 +539,8 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
         }
         "PUT" if path.starts_with(&format!("{build}/section/")) => {
             let address = &path[build.len() + "/section/".len()..];
-            let (status, reason) = upload(&state, address, head.header(CLAIM_HEADER), &body);
-            respond(&mut stream, status, &[NO_STORE], reason.as_bytes()).await
+            let (status, answer) = upload(&state, address, &head, &body);
+            json(&mut stream, status, &answer).await
         }
         "GET" => {
             let found = blob(&state, path);
@@ -547,25 +564,11 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
 fn blob(state: &State, path: &str) -> Option<Vec<u8>> {
     let c = &state.counters;
     let (counter, bytes) = if let Some(a) = path.strip_prefix("/section/") {
-        let (held, unmade) = {
-            let space = state.space.lock().expect("space");
-            (space.sections.get(a).cloned(), space.unmade.get(a).copied())
-        };
-        let bytes = match (held, unmade) {
-            (Some(b), _) => Some(b),
-            (None, Some((layer, cell))) => {
-                // Made outside the lock, so reads run in parallel.
-                let made = state.layers[layer].stored.as_ref().map(|m| (m.0)(&cell));
-                if let Some(b) = &made {
-                    let mut space = state.space.lock().expect("space");
-                    space.unmade.remove(a);
-                    space.sections.insert(a.to_string(), b.clone());
-                }
-                made
-            }
-            (None, None) => None,
-        };
-        (&c.section_reads, bytes)
+        let space = state.space.lock().expect("space");
+        (
+            &c.section_reads,
+            space.sections.get(a).map(|s| s.bytes.clone()),
+        )
     } else if let Some(h) = path.strip_prefix("/module/") {
         (&c.module_reads, state.modules.get(h).cloned())
     } else if let Some(h) = path.strip_prefix("/source-manifest/") {
@@ -582,6 +585,61 @@ fn blob(state: &State, path: &str) -> Option<Vec<u8>> {
 
 fn refusal(reason: &str) -> serde_json::Value {
     serde_json::json!({ "error": reason })
+}
+
+/// The frames owned by an exclusive layer, and their owner.
+fn exclusive_owners(state: &State) -> BTreeMap<u64, &str> {
+    state
+        .layers
+        .iter()
+        .filter(|l| l.exclusive)
+        .flat_map(|l| match &l.attachment {
+            Attachment::Frames(f) => f.iter().map(|&id| (id, l.id.as_str())).collect(),
+            Attachment::All => Vec::new(),
+        })
+        .collect()
+}
+
+/// `true` when layer `l` is `empty` for `key`: attachments, exclusivity,
+/// and maximum depths apply to cells and to surface tiles (their level as
+/// the depth), as the hub applies them. A layer of stored matter has no
+/// surface tiles. The registry key is never empty.
+fn is_empty_for(l: &MockLayer, key: &ChunkKey, exclusive: &BTreeMap<u64, &str>) -> bool {
+    let placed = match key {
+        ChunkKey::Cell(cell) => Some((cell.frame_id, cell.depth)),
+        ChunkKey::Surface(t) => Some((t.frame_id, t.level)),
+        ChunkKey::Registry => None,
+    };
+    let Some((frame_id, depth)) = placed else {
+        return false;
+    };
+    let owned_elsewhere = exclusive.get(&frame_id).is_some_and(|owner| *owner != l.id);
+    !l.attachment.contains(frame_id)
+        || owned_elsewhere
+        || depth > l.max_depth_for(frame_id)
+        || (l.stored.is_some() && matches!(key, ChunkKey::Surface(_)))
+}
+
+/// The inputs of layer `l`'s section for `key` at span `span`: module,
+/// manifest, the origin it receives, and the address.
+fn address_of(
+    l: &MockLayer,
+    key: &ChunkKey,
+    origin: i64,
+    span: u64,
+) -> ([u8; 32], Option<[u8; 32]>, i64, [u8; 32]) {
+    let address_origin = if l.uses_origin { origin } else { 0 };
+    let module = sha256(&l.module);
+    let manifest = l.manifest.as_ref().map(|m| sha256(m));
+    let address = section_address(
+        &module,
+        manifest.as_ref(),
+        address_origin,
+        l.span_seconds,
+        span,
+        key,
+    );
+    (module, manifest, address_origin, address)
 }
 
 /// Answers a directions request (`client-compute.md` section 2.4).
@@ -609,8 +667,10 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
         }
     }
     let now = now_utc_ms();
-    let mut space = state.space.lock().expect("space");
-    let origin = *space.origin.get_or_insert(now);
+    let origin = {
+        let mut space = state.space.lock().expect("space");
+        *space.origin.get_or_insert(now)
+    };
     if req.t_utc_ms < origin - TOLERANCE_MS {
         return (
             "422 Unprocessable Entity",
@@ -625,108 +685,81 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
     c.directions_requests.fetch_add(1, Ordering::SeqCst);
     c.largest_batch
         .fetch_max(keys.len() as u64, Ordering::SeqCst);
-    let exclusive: BTreeMap<u64, &str> = state
-        .layers
-        .iter()
-        .filter(|l| l.exclusive)
-        .flat_map(|l| match &l.attachment {
-            Attachment::Frames(f) => f.iter().map(|&id| (id, l.id.as_str())).collect(),
-            Attachment::All => Vec::new(),
+    let exclusive = exclusive_owners(state);
+    // Every answer per key and layer: `None` for empty, else the address
+    // and its inputs.
+    let mut placed = Vec::with_capacity(keys.len());
+    let mut unmade = Vec::new();
+    {
+        let space = state.space.lock().expect("space");
+        for key in &keys {
+            let mut row = Vec::with_capacity(state.layers.len());
+            for (index, l) in state.layers.iter().enumerate() {
+                if is_empty_for(l, key, &exclusive) {
+                    row.push(None);
+                    continue;
+                }
+                let address_origin = if l.uses_origin { origin } else { 0 };
+                let span = span_index(t, address_origin, l.span_seconds).unwrap_or(0);
+                let inputs = address_of(l, key, origin, span);
+                let hex = to_hex(&inputs.3);
+                if let (Some(_), ChunkKey::Cell(cell)) = (&l.stored, key) {
+                    if !space.sections.contains_key(&hex) {
+                        unmade.push((hex.clone(), index, *cell));
+                    }
+                }
+                row.push(Some((index, span, inputs, hex)));
+            }
+            placed.push(row);
+        }
+    }
+    // Stored layers' sections are made outside the lock, so requests run
+    // in parallel; their hash is part of the answer.
+    let made: Vec<(String, Stored)> = unmade
+        .into_iter()
+        .filter_map(|(hex, index, cell)| {
+            let maker = state.layers[index].stored.as_ref()?;
+            Some((hex, Stored::new((maker.0)(&cell))))
         })
         .collect();
+    let mut space = state.space.lock().expect("space");
+    for (hex, s) in made {
+        space.sections.entry(hex).or_insert(s);
+    }
     let mut results = Vec::with_capacity(keys.len());
-    for (key, name) in keys.iter().zip(&req.keys) {
+    for (row, name) in placed.into_iter().zip(&req.keys) {
         let mut layers = Vec::with_capacity(state.layers.len());
-        for (index, l) in state.layers.iter().enumerate() {
+        for (l, answer) in state.layers.iter().zip(row) {
             let mut d = RawDirection {
                 layer: l.id.clone(),
                 state: "empty".into(),
                 ..RawDirection::default()
             };
-            // Attachments, exclusivity, and maximum depths apply to cells
-            // and to surface tiles (their level as the depth), as the hub
-            // applies them. A layer of stored matter has no surface tiles.
-            let placed = match key {
-                ChunkKey::Cell(cell) => Some((cell.frame_id, cell.depth)),
-                ChunkKey::Surface(t) => Some((t.frame_id, t.level)),
-                ChunkKey::Registry => None,
+            let Some((_, span, (module, manifest, address_origin, _), hex)) = answer else {
+                layers.push(d);
+                continue;
             };
-            if let Some((frame_id, depth)) = placed {
-                let owned_elsewhere = exclusive.get(&frame_id).is_some_and(|owner| *owner != l.id);
-                if !l.attachment.contains(frame_id)
-                    || owned_elsewhere
-                    || depth > l.max_depth_for(frame_id)
-                    || (l.stored.is_some() && matches!(key, ChunkKey::Surface(_)))
-                {
-                    layers.push(d);
-                    continue;
+            d.address = Some(hex.clone());
+            match space.sections.get(&hex) {
+                Some(stored) if l.shared => {
+                    d.state = "ready".into();
+                    d.sha256 = Some(to_hex(&stored.sha256));
+                    d.check_rate = Some((1.0 / (1.0 + stored.matches as f64)).max(0.01));
+                    c.ready_answers.fetch_add(1, Ordering::SeqCst);
                 }
-            }
-            let address_origin = if l.uses_origin { origin } else { 0 };
-            let span = span_index(t, address_origin, l.span_seconds).unwrap_or(0);
-            let module = sha256(&l.module);
-            let manifest = l.manifest.as_ref().map(|m| sha256(m));
-            let address = to_hex(&section_address(
-                &module,
-                manifest.as_ref(),
-                address_origin,
-                l.span_seconds,
-                span,
-                key,
-            ));
-            d.address = Some(address.clone());
-            let fresh = space.asked.insert(address.clone());
-            let instant = Instant::now();
-            if let (Some(_), ChunkKey::Cell(cell)) = (&l.stored, key) {
-                if !space.sections.contains_key(&address) {
-                    space.unmade.insert(address.clone(), (index, *cell));
-                }
-                d.state = "ready".into();
-                c.ready_answers.fetch_add(1, Ordering::SeqCst);
-            } else if space.sections.contains_key(&address) {
-                d.state = "ready".into();
-                c.ready_answers.fetch_add(1, Ordering::SeqCst);
-            } else {
-                if fresh {
-                    if let Some(ms) = state.options.foreign_claim_ms {
-                        space.claims.insert(
-                            address.clone(),
-                            Claim {
-                                token: "held-by-another-client".into(),
-                                key: name.clone(),
-                                expires: instant + Duration::from_millis(ms),
-                            },
-                        );
-                    }
-                }
-                match space.claims.get(&address) {
-                    Some(claim) if claim.expires > instant => {
-                        let left = (claim.expires - instant).as_millis() as u64;
-                        d.state = "pending".into();
-                        d.retry_ms = Some(left.clamp(50, 2000));
-                        c.pending_answers.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => {
-                        let token = format!("claim-{:08}", space.next_token);
-                        space.next_token += 1;
-                        space.claims.insert(
-                            address.clone(),
-                            Claim {
-                                token: token.clone(),
-                                key: name.clone(),
-                                expires: instant + Duration::from_millis(LEASE_MS),
-                            },
-                        );
-                        d.state = "compute".into();
-                        d.claim = Some(token);
-                        d.lease_ms = Some(LEASE_MS);
-                        d.module = Some(to_hex(&module));
-                        d.source_manifest = manifest.as_ref().map(|m| to_hex(m));
-                        d.origin_utc_ms = Some(address_origin);
-                        d.span_index = Some(span);
-                        d.span_seconds = Some(l.span_seconds);
-                        c.compute_answers.fetch_add(1, Ordering::SeqCst);
-                    }
+                _ => {
+                    d.state = if l.shared { "missing" } else { "local" }.into();
+                    d.module = Some(to_hex(&module));
+                    d.source_manifest = manifest.as_ref().map(|m| to_hex(m));
+                    d.origin_utc_ms = Some(address_origin);
+                    d.span_index = Some(span);
+                    d.span_seconds = Some(l.span_seconds);
+                    let counter = if l.shared {
+                        &c.missing_answers
+                    } else {
+                        &c.local_answers
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
                 }
             }
             layers.push(d);
@@ -739,91 +772,76 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
     )
 }
 
-/// Applies an upload (`client-compute.md` section 2.5).
+/// Applies an upload (`client-compute.md` section 2.5), in the hub's order
+/// of checks.
 fn upload(
     state: &State,
     address: &str,
-    claim: Option<&str>,
+    head: &Head,
     body: &[u8],
-) -> (&'static str, String) {
+) -> (&'static str, serde_json::Value) {
     let c = &state.counters;
-    let mut space = state.space.lock().expect("space");
-    if space.sections.contains_key(address) {
-        c.uploads_repeated.fetch_add(1, Ordering::SeqCst);
-        return ("200 OK", String::new());
-    }
-    let live = space
-        .claims
-        .get(address)
-        .filter(|cl| Some(cl.token.as_str()) == claim && cl.expires > Instant::now())
-        .cloned();
-    let Some(held) = live else {
+    let refuse = |status: &'static str, reason: &str| {
         c.uploads_refused.fetch_add(1, Ordering::SeqCst);
-        return (
-            "409 Conflict",
-            "No live claim on this address matches X-Claim.".into(),
-        );
+        (status, refusal(reason))
     };
-    if let Err(e) = gx_core::validate(&held.key, body) {
-        space.claims.remove(address);
-        c.uploads_refused.fetch_add(1, Ordering::SeqCst);
-        return ("400 Bad Request", e.to_string());
+    let mut space = state.space.lock().expect("space");
+    if space.revoked {
+        return refuse("403 Forbidden", "the key is revoked");
     }
-    space.sections.insert(address.to_string(), body.to_vec());
-    space.claims.remove(address);
-    c.uploads_stored.fetch_add(1, Ordering::SeqCst);
-    drop(space);
-    state.stored.send_modify(|s| {
-        s.insert(address.to_string());
-    });
-    ("201 Created", String::new())
-}
-
-async fn serve_socket(stream: TcpStream, state: Arc<State>) -> std::io::Result<()> {
-    let socket = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(std::io::Error::other)?;
-    let (mut write, mut read) = socket.split();
-    let mut stored = state.stored.subscribe();
-    let mut subscribed: BTreeSet<String> = BTreeSet::new();
-    loop {
-        tokio::select! {
-            msg = read.next() => match msg {
-                Some(Ok(Message::Text(text))) => {
-                    #[derive(serde::Deserialize)]
-                    struct Subscribe { subscribe: Option<String> }
-                    if let Ok(Subscribe { subscribe: Some(a) }) = serde_json::from_str(text.as_str()) {
-                        subscribed.insert(a);
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                Some(Ok(_)) => {}
-            },
-            changed = stored.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
-        }
-        let due: Vec<String> = {
-            let ready = stored.borrow_and_update();
-            subscribed
-                .iter()
-                .filter(|a| ready.contains(*a))
-                .cloned()
-                .collect()
+    let Some(l) = head
+        .header(LAYER_HEADER)
+        .and_then(|id| state.layers.iter().find(|l| l.id == id))
+    else {
+        return refuse("400 Bad Request", "unknown X-Layer");
+    };
+    let Some(key) = head
+        .header(KEY_HEADER)
+        .and_then(|k| k.parse::<ChunkKey>().ok())
+    else {
+        return refuse("400 Bad Request", "X-Key is not a chunk key");
+    };
+    let Some(span) = head
+        .header(SPAN_INDEX_HEADER)
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return refuse("400 Bad Request", "X-Span-Index is not an integer");
+    };
+    if is_empty_for(l, &key, &exclusive_owners(state)) {
+        return refuse("400 Bad Request", "the layer is empty for this key");
+    }
+    let origin = space.origin.unwrap_or(0);
+    if to_hex(&address_of(l, &key, origin, span).3) != address {
+        return refuse("400 Bad Request", "the address does not match the headers");
+    }
+    if !l.shared {
+        return refuse("403 Forbidden", "the layer is unshared");
+    }
+    let claimed = head.header(CONTENT_SHA256_HEADER).unwrap_or("");
+    if let Some(stored) = space.sections.get_mut(address) {
+        return if to_hex(&stored.sha256) == claimed {
+            stored.matches += 1;
+            c.uploads_matched.fetch_add(1, Ordering::SeqCst);
+            ("200 OK", serde_json::json!({ "result": "match" }))
+        } else {
+            c.uploads_disputed.fetch_add(1, Ordering::SeqCst);
+            ("202 Accepted", serde_json::json!({ "result": "disputed" }))
         };
-        for a in due {
-            subscribed.remove(&a);
-            let frame = format!(r#"{{"sectionReady":"{a}"}}"#);
-            write
-                .send(Message::text(frame))
-                .await
-                .map_err(std::io::Error::other)?;
-            state.counters.notices.fetch_add(1, Ordering::SeqCst);
-        }
     }
-    Ok(())
+    if to_hex(&sha256(body)) != claimed {
+        return refuse(
+            "400 Bad Request",
+            "the body does not hash to X-Content-Sha256",
+        );
+    }
+    if let Err(e) = gx_core::validate(&key.to_string(), body) {
+        return refuse("400 Bad Request", &e.to_string());
+    }
+    space
+        .sections
+        .insert(address.to_string(), Stored::new(body.to_vec()));
+    c.uploads_stored.fetch_add(1, Ordering::SeqCst);
+    ("201 Created", serde_json::json!({}))
 }
 
 /// A module that answers every request with `section` and reads no
@@ -876,6 +894,7 @@ pub fn registry_layer(id: &str, registry: &[u8]) -> MockLayer {
         span_seconds: 0,
         uses_origin: false,
         stored: None,
+        shared: true,
     }
 }
 
@@ -895,6 +914,7 @@ pub fn stored_layer(id: &str, max_depth: u8, make: SectionMaker) -> MockLayer {
         span_seconds: 0,
         uses_origin: false,
         stored: Some(make),
+        shared: true,
     }
 }
 
@@ -946,6 +966,7 @@ pub fn example_matter_layer(
         span_seconds: 0,
         uses_origin: false,
         stored: None,
+        shared: true,
     };
     (layer, tiles)
 }

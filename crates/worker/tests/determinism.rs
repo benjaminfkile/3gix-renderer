@@ -13,8 +13,8 @@ use gx_core::module_io::{self, ModuleRequest};
 use gx_core::sha256::{sha256, to_hex};
 use gx_module_host::HostConfig;
 use gx_worker::{
-    BlobKind, Blobs, ComputeJob, DiskCache, FailureKind, ModuleRunner, UploadTicket, Uploader,
-    WorkerError, WorkerPool, WorkerStats,
+    BlobKind, Blobs, ComputeJob, DiskCache, FailureKind, ModuleRunner, Uploader, WorkerError,
+    WorkerPool, WorkerStats,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,17 +83,16 @@ impl Blobs for Store {
     }
 }
 
-/// Records uploads and finishes their tickets.
+/// Records offers to the upload lane.
 #[derive(Default)]
 struct Uploads(Mutex<Vec<(String, String, Vec<u8>)>>);
 
 impl Uploader for Uploads {
-    fn upload(&self, job: &ComputeJob, section: Arc<[u8]>, ticket: UploadTicket) {
+    fn offer(&self, job: &ComputeJob, section: Arc<[u8]>) {
         self.0
             .lock()
             .unwrap()
-            .push((job.address_hex(), job.claim.clone(), section.to_vec()));
-        ticket.finish(true);
+            .push((job.address_hex(), job.layer.clone(), section.to_vec()));
     }
 }
 
@@ -137,7 +136,8 @@ fn job_for(store: &mut Store, module: [u8; 32], request: &[u8], tiles: &[u8]) ->
             r.span_index,
             &r.key,
         ),
-        claim: format!("claim-{}", r.key),
+        layer: format!("layer-{}", r.key),
+        share: true,
         module,
         manifest,
         request,
@@ -149,10 +149,17 @@ fn pool_runs_jobs_end_to_end_and_caches_everything() {
     let mut store = Store::default();
     let module = store.add(BlobKind::Module, module_bytes());
     let cases = vectors();
+    // Every other job is `local`: computed and cached, never offered.
     let jobs: Vec<(ComputeJob, String)> = cases
         .iter()
-        .map(|(_, req, tiles, sha)| (job_for(&mut store, module, req, tiles), sha.clone()))
+        .enumerate()
+        .map(|(i, (_, req, tiles, sha))| {
+            let mut job = job_for(&mut store, module, req, tiles);
+            job.share = i % 2 == 0;
+            (job, sha.clone())
+        })
         .collect();
+    let shared = jobs.iter().filter(|(j, _)| j.share).count();
     let store = Arc::new(store);
     let cache_dir = std::env::temp_dir().join(format!("gx-worker-pool-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache_dir);
@@ -178,7 +185,7 @@ fn pool_runs_jobs_end_to_end_and_caches_everything() {
             let (r, sha) = rx.recv_timeout(Duration::from_secs(120)).unwrap();
             assert_eq!(to_hex(&sha256(&r.unwrap().bytes)), sha);
         }
-        // Dropping the pool joins its threads, so every upload has started.
+        // Dropping the pool joins its threads, so every offer has been made.
         let stats = pool.stats_handle();
         drop(pool);
         stats.snapshot()
@@ -188,24 +195,24 @@ fn pool_runs_jobs_end_to_end_and_caches_everything() {
     assert_eq!(first.sections_computed, jobs.len() as u64);
     assert_eq!(first.modules_loaded, 1);
     assert_eq!(first.module_runs, 2 * jobs.len() as u64);
-    assert_eq!(first.uploads_done, jobs.len() as u64);
     let fetched = store.fetches.load(Ordering::SeqCst);
     // A second pool with the same cache fetches nothing from the edge.
     run(Some(cache.clone()));
     assert_eq!(store.fetches.load(Ordering::SeqCst), fetched);
-    // Every section is cached under its address, and every upload carried
-    // its claim.
+    // Every section is cached under its address, every `missing` section
+    // was offered with its layer, and no `local` one was.
     for (job, _) in &jobs {
         assert!(cache.contains(BlobKind::Section, &job.address_hex()));
     }
     let up = uploads.0.lock().unwrap();
-    assert_eq!(up.len(), 2 * jobs.len());
-    for (address, claim, bytes) in up.iter() {
+    assert_eq!(up.len(), 2 * shared);
+    for (address, layer, bytes) in up.iter() {
         let (job, sha) = jobs
             .iter()
             .find(|(j, _)| &j.address_hex() == address)
             .unwrap();
-        assert_eq!(claim, &job.claim);
+        assert!(job.share);
+        assert_eq!(layer, &job.layer);
         assert_eq!(&to_hex(&sha256(bytes)), sha);
     }
     let _ = std::fs::remove_dir_all(&cache_dir);

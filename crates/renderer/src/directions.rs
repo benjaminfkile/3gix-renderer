@@ -3,8 +3,8 @@
 //! layer's answer, and when a key has every layer's section.
 //!
 //! The native fetcher ([`crate::stream::Fetcher`]) and the browser fetcher
-//! (`crate::web`) drive one [`Coordinator`] each: they feed it requests,
-//! answers, and readiness notices, and carry out the [`Action`]s it
+//! (`crate::web`) drive one [`Coordinator`] each: they feed it requests and
+//! answers, and carry out the [`Action`]s it
 //! returns. Everything here is deterministic in its inputs, so the whole
 //! protocol is tested without a network.
 //!
@@ -15,16 +15,19 @@
 //!    [`MAX_DIRECTION_KEYS`] keys, at most [`MAX_DIRECTIONS_IN_FLIGHT`]
 //!    batches at a time, in request order. A key already in flight is not
 //!    asked about twice.
-//! 2. Per layer: `empty` contributes nothing; `ready` is streamed by its
-//!    address (from the local cache or the edge, at most
-//!    [`MAX_STREAMS_IN_FLIGHT`] at a time); `compute` goes to the worker;
-//!    `pending` is subscribed to on the readiness socket and asked about
-//!    again after the hub's `retryMs`, or streamed as soon as its notice
-//!    arrives.
-//! 3. A failed directions request, a failed stream, a `404` for a stored
-//!    address, or a worker failure that may go away is asked about again
-//!    after a backoff ([`backoff_seconds`]). A permanent worker failure
-//!    fails the key.
+//! 2. Per layer (`client-compute.md` section 2.4): `empty` contributes
+//!    nothing; `ready` is streamed by its address and the hash of the
+//!    stored bytes, `GET /section/{address}?sha256={hex}` (from the local
+//!    cache or the edge, at most [`MAX_STREAMS_IN_FLIGHT`] at a time), and
+//!    the driver checks the bytes against that hash, discarding a cached
+//!    copy that differs and fetching again; `missing` and `local` go to the
+//!    worker, whose job says whether the section is offered to the hub
+//!    afterwards (only `missing`). Nothing waits on another client: there
+//!    are no readiness subscriptions and no waiting addresses.
+//! 3. A failed directions request, a failed stream (including bytes that
+//!    do not match their hash), a `404` for a stored address, or a worker
+//!    failure that may go away is asked about again after a backoff
+//!    ([`backoff_seconds`]). A permanent worker failure fails the key.
 //! 4. Once every layer has its section (or is empty) the key completes with
 //!    the sections in the build's layer order, for compositing.
 
@@ -133,8 +136,9 @@ pub enum Action {
     /// Ask for directions for these keys, then call
     /// [`Coordinator::directions_done`] with the same keys.
     Directions(Vec<ChunkKey>),
-    /// Get the section at `address` (local cache, else the edge), then call
-    /// [`Coordinator::stream_done`].
+    /// Get the section at `address` (local cache, else the edge), check
+    /// that its bytes hash to `sha256` (a cached copy that does not is
+    /// discarded and fetched again), then call [`Coordinator::stream_done`].
     Stream {
         /// The key.
         key: ChunkKey,
@@ -142,8 +146,12 @@ pub enum Action {
         layer: usize,
         /// The address.
         address: [u8; 32],
+        /// SHA-256 of the stored bytes.
+        sha256: [u8; 32],
     },
     /// Run the job on the worker, then call [`Coordinator::compute_done`].
+    /// A job with `share` set (`missing`) is offered to the hub once the
+    /// renderer has its section; one without (`local`) never is.
     Compute {
         /// The key.
         key: ChunkKey,
@@ -152,8 +160,6 @@ pub enum Action {
         /// The job.
         job: ComputeJob,
     },
-    /// Subscribe to the address on the readiness socket.
-    Subscribe([u8; 32]),
     /// The key is complete.
     Complete(Completion),
     /// The key can never complete.
@@ -170,11 +176,11 @@ enum Slot {
     /// Not answered yet, or to be asked about again.
     Unknown,
     Empty,
-    StreamQueued([u8; 32]),
-    Streaming([u8; 32]),
+    StreamQueued([u8; 32], [u8; 32]),
+    Streaming([u8; 32], [u8; 32]),
     Computing([u8; 32]),
-    Pending {
-        address: [u8; 32],
+    /// A stream or a job failed in a way that may go away: ask again.
+    Retry {
         retry_at: f64,
     },
     Done(Arrived),
@@ -190,7 +196,7 @@ impl Slot {
     fn ask_at(&self) -> Option<f64> {
         match self {
             Slot::Unknown => Some(f64::NEG_INFINITY),
-            Slot::Pending { retry_at, .. } => Some(*retry_at),
+            Slot::Retry { retry_at } => Some(*retry_at),
             _ => None,
         }
     }
@@ -235,8 +241,10 @@ pub struct DirectionStats {
     pub keys_asked: u64,
     /// The most keys one request carried.
     pub largest_batch: u64,
-    /// `pending` answers.
-    pub pending_answers: u64,
+    /// `missing` answers.
+    pub missing_answers: u64,
+    /// `local` answers.
+    pub local_answers: u64,
     /// Failed directions requests.
     pub directions_failures: u64,
     /// Sections streamed from the edge.
@@ -255,9 +263,7 @@ pub struct DirectionStats {
 #[derive(Debug, Default)]
 pub struct Coordinator {
     keys: BTreeMap<ChunkKey, Entry>,
-    /// Addresses waiting on a readiness notice: key and layer.
-    waiting: BTreeMap<[u8; 32], (ChunkKey, usize)>,
-    stream_queue: VecDeque<(ChunkKey, usize, [u8; 32])>,
+    stream_queue: VecDeque<(ChunkKey, usize, [u8; 32], [u8; 32])>,
     streams_in_flight: usize,
     directions_in_flight: usize,
     next_seq: u64,
@@ -337,21 +343,22 @@ impl Coordinator {
             out.push(Action::Directions(keys));
         }
         while self.streams_in_flight < MAX_STREAMS_IN_FLIGHT {
-            let Some((key, layer, address)) = self.stream_queue.pop_front() else {
+            let Some((key, layer, address, sha256)) = self.stream_queue.pop_front() else {
                 break;
             };
             let Some(slot) = self.slot_mut(&key, layer) else {
                 continue;
             };
-            if *slot != Slot::StreamQueued(address) {
+            if *slot != Slot::StreamQueued(address, sha256) {
                 continue;
             }
-            *slot = Slot::Streaming(address);
+            *slot = Slot::Streaming(address, sha256);
             self.streams_in_flight += 1;
             out.push(Action::Stream {
                 key,
                 layer,
                 address,
+                sha256,
             });
         }
         out
@@ -419,7 +426,7 @@ impl Coordinator {
                     continue;
                 }
             };
-            self.apply(key, directions, now, &mut out);
+            self.apply(key, directions, &mut out);
         }
         out
     }
@@ -433,13 +440,7 @@ impl Coordinator {
         }
     }
 
-    fn apply(
-        &mut self,
-        key: &ChunkKey,
-        directions: Vec<Direction>,
-        now: f64,
-        out: &mut Vec<Action>,
-    ) {
+    fn apply(&mut self, key: &ChunkKey, directions: Vec<Direction>, out: &mut Vec<Action>) {
         let Some(entry) = self.keys.get_mut(key) else {
             return;
         };
@@ -449,25 +450,27 @@ impl Coordinator {
         if entry.slots.len() != directions.len() {
             entry.slots = vec![Slot::Unknown; directions.len()];
         }
-        let mut subscribe = Vec::new();
-        let mut unwait = Vec::new();
         let mut streams = Vec::new();
         for (layer, d) in directions.into_iter().enumerate() {
             let slot = &mut entry.slots[layer];
             // An answer already being acted on, or finished, stands.
-            if !matches!(slot, Slot::Unknown | Slot::Pending { .. }) {
+            if !matches!(slot, Slot::Unknown | Slot::Retry { .. }) {
                 continue;
-            }
-            if let Slot::Pending { address, .. } = slot {
-                unwait.push(*address);
             }
             *slot = match d {
                 Direction::Empty => Slot::Empty,
-                Direction::Ready { address } => {
-                    streams.push((*key, layer, address));
-                    Slot::StreamQueued(address)
+                Direction::Ready {
+                    address, sha256, ..
+                } => {
+                    streams.push((*key, layer, address, sha256));
+                    Slot::StreamQueued(address, sha256)
                 }
-                Direction::Compute(job) => {
+                Direction::Missing(job) | Direction::Local(job) => {
+                    if job.share {
+                        self.stats.missing_answers += 1;
+                    } else {
+                        self.stats.local_answers += 1;
+                    }
                     let address = job.address;
                     out.push(Action::Compute {
                         key: *key,
@@ -476,34 +479,20 @@ impl Coordinator {
                     });
                     Slot::Computing(address)
                 }
-                Direction::Pending { address, retry_ms } => {
-                    subscribe.push((address, layer));
-                    Slot::Pending {
-                        address,
-                        retry_at: now + retry_ms as f64 / 1000.0,
-                    }
-                }
             };
         }
         self.stream_queue.extend(streams);
-        self.stats.pending_answers += subscribe.len() as u64;
-        for a in unwait {
-            self.waiting.remove(&a);
-        }
-        for (address, layer) in subscribe {
-            if self.waiting.insert(address, (*key, layer)).is_none() {
-                out.push(Action::Subscribe(address));
-            }
-        }
         self.finish_if_done(key, out);
     }
 
-    /// Applies the outcome of a stream.
+    /// Applies the outcome of a stream of `address` checked against
+    /// `sha256`.
     pub fn stream_done(
         &mut self,
         key: &ChunkKey,
         layer: usize,
         address: [u8; 32],
+        sha256: [u8; 32],
         result: StreamResult,
         now: f64,
     ) -> Vec<Action> {
@@ -515,7 +504,7 @@ impl Coordinator {
         let Some(slot) = entry.slots.get_mut(layer) else {
             return out;
         };
-        if *slot != Slot::Streaming(address) {
+        if *slot != Slot::Streaming(address, sha256) {
             return out;
         }
         match result {
@@ -532,8 +521,7 @@ impl Coordinator {
                     tracing::debug!(key = %key, "section stream failed: {reason}");
                 }
                 entry.failures += 1;
-                *slot = Slot::Pending {
-                    address,
+                *slot = Slot::Retry {
                     retry_at: now + backoff_seconds(entry.failures),
                 };
             }
@@ -569,8 +557,7 @@ impl Coordinator {
             }
             Err(e) if e.kind == FailureKind::Transient => {
                 entry.failures += 1;
-                *slot = Slot::Pending {
-                    address,
+                *slot = Slot::Retry {
                     retry_at: now + backoff_seconds(entry.failures),
                 };
             }
@@ -581,41 +568,10 @@ impl Coordinator {
         out
     }
 
-    /// Applies a readiness notice: a layer waiting on `address` is streamed
-    /// at once.
-    pub fn ready_notice(&mut self, address: &[u8; 32]) -> Vec<Action> {
-        if let Some((key, layer)) = self.waiting.remove(address) {
-            if let Some(slot) = self.slot_mut(&key, layer) {
-                if matches!(slot, Slot::Pending { address: a, .. } if a == address) {
-                    *slot = Slot::StreamQueued(*address);
-                    self.stream_queue.push_back((key, layer, *address));
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    /// The addresses waiting on a readiness notice, for a socket that has
-    /// to subscribe again after reconnecting.
-    pub fn waiting_addresses(&self) -> Vec<[u8; 32]> {
-        self.waiting.keys().copied().collect()
-    }
-
     fn fail(&mut self, key: &ChunkKey, reason: String, out: &mut Vec<Action>) {
-        if let Some(e) = self.keys.remove(key) {
-            self.forget_waits(key, &e);
+        if self.keys.remove(key).is_some() {
             self.stats.keys_failed += 1;
             out.push(Action::Failed { key: *key, reason });
-        }
-    }
-
-    fn forget_waits(&mut self, key: &ChunkKey, e: &Entry) {
-        for s in &e.slots {
-            if let Slot::Pending { address, .. } = s {
-                if self.waiting.get(address).is_some_and(|(k, _)| k == key) {
-                    self.waiting.remove(address);
-                }
-            }
         }
     }
 
@@ -666,32 +622,27 @@ mod tests {
         }
     }
 
+    /// `ready` at address `a`, stored bytes hashing to `[a + 100; 32]`.
     fn ready(layer: &str, a: u8) -> RawDirection {
         RawDirection {
             layer: layer.into(),
             state: "ready".into(),
             address: Some(hex(a)),
-            ..RawDirection::default()
-        }
-    }
-
-    fn pending(layer: &str, a: u8, retry_ms: u64) -> RawDirection {
-        RawDirection {
-            layer: layer.into(),
-            state: "pending".into(),
-            address: Some(hex(a)),
-            retry_ms: Some(retry_ms),
+            sha256: Some(hex(a + 100)),
+            check_rate: Some(0.25),
             ..RawDirection::default()
         }
     }
 
     fn compute(layer: &str, a: u8) -> RawDirection {
+        compute_as("missing", layer, a)
+    }
+
+    fn compute_as(state: &str, layer: &str, a: u8) -> RawDirection {
         RawDirection {
             layer: layer.into(),
-            state: "compute".into(),
+            state: state.into(),
             address: Some(hex(a)),
-            claim: Some("c".into()),
-            lease_ms: Some(120_000),
             module: Some(hex(9)),
             origin_utc_ms: Some(0),
             span_index: Some(0),
@@ -783,20 +734,23 @@ mod tests {
         let Action::Compute { layer: 0, job, .. } = &a[0] else {
             panic!("{a:?}")
         };
-        assert_eq!(job.claim, "c");
+        assert_eq!(job.layer, "a");
+        assert!(job.share);
         let s = c.poll(0.1);
         assert_eq!(
             s,
             vec![Action::Stream {
                 key: k,
                 layer: 2,
-                address: [3; 32]
+                address: [3; 32],
+                sha256: [103; 32]
             }]
         );
         let none = c.stream_done(
             &k,
             2,
             [3; 32],
+            [103; 32],
             StreamResult::Bytes(bytes(3), Origin::Cache),
             0.2,
         );
@@ -822,51 +776,87 @@ mod tests {
     }
 
     #[test]
-    fn pending_subscribes_honors_retry_and_streams_on_notice() {
+    fn missing_and_local_both_compute_and_only_missing_is_shared() {
         let mut c = Coordinator::new();
-        let (k, j) = (cell(1), cell(2));
+        let k = cell(1);
         c.request(k, 0.0);
-        c.request(j, 0.0);
         c.poll(0.0);
         let a = c.directions_done(
-            &[k, j],
-            answer(vec![
-                (k, vec![pending("a", 1, 500)]),
-                (j, vec![pending("a", 2, 250)]),
-            ]),
+            &[k],
+            answer(vec![(
+                k,
+                vec![compute_as("missing", "a", 1), compute_as("local", "b", 2)],
+            )]),
             1.0,
         );
-        assert_eq!(
-            a,
-            vec![Action::Subscribe([1; 32]), Action::Subscribe([2; 32])]
+        let shares: Vec<(usize, bool)> = a
+            .iter()
+            .map(|x| match x {
+                Action::Compute { layer, job, .. } => (*layer, job.share),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(shares, vec![(0, true), (1, false)]);
+        assert_eq!(c.next_wake(), None, "nothing waits on time");
+        c.compute_done(&k, 1, [2; 32], Ok(computed(2)), 1.1);
+        let a = c.compute_done(&k, 0, [1; 32], Ok(computed(1)), 1.2);
+        assert!(matches!(&a[0], Action::Complete(x) if x.sections.len() == 2));
+        let s = c.stats();
+        assert_eq!((s.missing_answers, s.local_answers), (1, 1));
+    }
+
+    #[test]
+    fn a_changed_hash_streams_the_new_version() {
+        let mut c = Coordinator::new();
+        let k = cell(1);
+        c.request(k, 0.0);
+        c.poll(0.0);
+        c.directions_done(&[k], answer(vec![(k, vec![ready("a", 1)])]), 0.0);
+        c.poll(0.0);
+        // The bytes did not match the hash: asked about again.
+        c.stream_done(
+            &k,
+            0,
+            [1; 32],
+            [101; 32],
+            StreamResult::Failed("hash".into()),
+            1.0,
         );
-        assert_eq!(c.waiting_addresses(), vec![[1; 32], [2; 32]]);
-        assert_eq!(c.next_wake(), Some(1.25));
-        // The notice for the first arrives: streamed without asking again.
-        c.ready_notice(&[1; 32]);
+        assert_eq!(c.poll(1.25), vec![Action::Directions(vec![k])]);
+        // The hub replaced the section after a dispute: same address, new
+        // hash, so the stream names the new version.
+        let mut r = ready("a", 1);
+        r.sha256 = Some(hex(7));
+        c.directions_done(&[k], answer(vec![(k, vec![r])]), 1.3);
         assert_eq!(
-            c.poll(1.1),
+            c.poll(1.3),
             vec![Action::Stream {
                 key: k,
                 layer: 0,
-                address: [1; 32]
+                address: [1; 32],
+                sha256: [7; 32]
             }]
         );
-        // The second is asked about again after its retryMs; the claim has
-        // lapsed, so this client computes it.
-        assert_eq!(c.poll(1.25), vec![Action::Directions(vec![j])]);
-        let a = c.directions_done(&[j], answer(vec![(j, vec![compute("a", 2)])]), 1.3);
-        assert!(matches!(a[0], Action::Compute { .. }));
-        assert!(c.waiting_addresses().is_empty());
+        // A late result for the old version is ignored.
+        assert!(c
+            .stream_done(
+                &k,
+                0,
+                [1; 32],
+                [101; 32],
+                StreamResult::Bytes(bytes(1), Origin::Edge),
+                1.4
+            )
+            .is_empty());
         let a = c.stream_done(
             &k,
             0,
             [1; 32],
+            [7; 32],
             StreamResult::Bytes(bytes(1), Origin::Edge),
             1.4,
         );
         assert!(matches!(a[0], Action::Complete(_)));
-        assert_eq!(c.stats().pending_answers, 2);
     }
 
     #[test]
@@ -883,7 +873,7 @@ mod tests {
         c.poll(0.0);
         // A 404 for a stored address: asked about again after a backoff.
         assert!(c
-            .stream_done(&k, 0, [1; 32], StreamResult::NotFound, 1.0)
+            .stream_done(&k, 0, [1; 32], [101; 32], StreamResult::NotFound, 1.0)
             .is_empty());
         assert_eq!(c.next_wake(), Some(1.25));
         // A transient worker failure: the same.
@@ -911,6 +901,7 @@ mod tests {
                 &k,
                 0,
                 [1; 32],
+                [101; 32],
                 StreamResult::Bytes(bytes(1), Origin::Edge),
                 1.8
             )

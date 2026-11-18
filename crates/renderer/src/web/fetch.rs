@@ -4,12 +4,17 @@
 //! Drives one [`crate::directions::Coordinator`], exactly as the native
 //! [`crate::stream::Fetcher`] does, and carries out its actions with
 //! futures on the page: directions through [`WebHub`], sections from the
-//! Cache API ([`WebCache`]) or the edge, `compute` jobs on the Web Worker
+//! Cache API ([`WebCache`]) or the edge (`GET
+//! /section/{address}?sha256={hex}`), checked against the hash the
+//! directions carried (a cached copy that differs is discarded and fetched
+//! again), and `missing` and `local` jobs on the Web Worker
 //! ([`ModuleWorker`], one at a time so a queued call never runs into
-//! another's time limit), and readiness notices from the socket, opened
-//! again every [`SOCKET_RETRY_SECONDS`] when it closes. A computed section
-//! is handed over at once; its upload runs in the background, and a failed
-//! upload is logged and never blocks drawing.
+//! another's time limit). A computed section is handed over at once. A
+//! `missing` one then enters the upload lane ([`UploadLane`],
+//! `client-compute.md` sections 2.5 and 2.8): bounded at 64, oldest
+//! dropped when full, sent one at a time and once each, a failure counted
+//! and never retried. A `local` section is never offered. Nothing waits
+//! on another client, so there is no readiness socket.
 //!
 //! Every section is decoded once on its way in (`rendering.md` 3.5): a
 //! streamed one when it arrives, a computed one by the worker's check.
@@ -19,7 +24,7 @@
 //! (`rendering.md` section 4).
 
 use super::cache::WebCache;
-use super::hub::{now_seconds, sleep, ReadySocket, WebHub};
+use super::hub::{now_seconds, sleep, WebHub};
 use super::worker::{run_job, ModuleWorker};
 use crate::directions::{Action, Arrived, Completion, Coordinator, Origin, StreamResult};
 use crate::protocol::DirectionsResponse;
@@ -29,17 +34,17 @@ use crate::stream::{
 use anyhow::{anyhow, Result};
 use gx_core::frames::FrameSystem;
 use gx_core::key::{CellKey, ChunkKey};
-use gx_core::sha256::to_hex;
+use gx_core::sha256::{sha256, to_hex};
 use gx_core::units::Meters;
-use gx_worker::{BlobKind, ComputeJob, Computed, WorkerError, WorkerStats};
+use gx_worker::{
+    BlobKind, ComputeJob, Computed, UploadLane, UploadOffer, UploadOutcome, WorkerError,
+    WorkerStats,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Seconds between two attempts to open a closed readiness socket.
-pub const SOCKET_RETRY_SECONDS: f64 = 5.0;
 
 /// Seconds the registry may take to arrive.
 pub const REGISTRY_DEADLINE_SECONDS: f64 = 120.0;
@@ -50,6 +55,7 @@ enum Internal {
         key: ChunkKey,
         layer: usize,
         address: [u8; 32],
+        sha256: [u8; 32],
         result: StreamResult,
     },
     Compute {
@@ -67,8 +73,8 @@ pub struct WebFetcher {
     worker: ModuleWorker,
     stats: Arc<WorkerStats>,
     coordinator: Coordinator,
-    socket: Option<ReadySocket>,
-    socket_tried_at: f64,
+    lane: Rc<UploadLane>,
+    uploading: Rc<Cell<bool>>,
     inbox: Rc<RefCell<VecDeque<Internal>>>,
     jobs: VecDeque<(ChunkKey, usize, ComputeJob)>,
     job_running: Rc<Cell<bool>>,
@@ -84,16 +90,16 @@ impl WebFetcher {
     /// A fetcher over `hub`, caching in `cache` when the page has one.
     /// Keeps the hub's clock measured ([`WebHub::keep_clock`]).
     pub fn new(hub: Rc<WebHub>, cache: Option<WebCache>) -> WebFetcher {
-        let socket = ReadySocket::open(&hub.routes().ready(hub.build_id()));
         hub.keep_clock();
+        let stats = WorkerStats::new();
         WebFetcher {
             hub,
             cache: cache.map(Rc::new),
             worker: ModuleWorker::new(),
-            stats: WorkerStats::new(),
+            lane: Rc::new(UploadLane::new(stats.clone())),
+            uploading: Rc::new(Cell::new(false)),
+            stats,
             coordinator: Coordinator::new(),
-            socket,
-            socket_tried_at: now_seconds(),
             inbox: Rc::default(),
             jobs: VecDeque::new(),
             job_running: Rc::new(Cell::new(false)),
@@ -147,21 +153,6 @@ impl WebFetcher {
         self.pump();
     }
 
-    fn keep_socket(&mut self) {
-        let closed = self.socket.as_ref().is_none_or(ReadySocket::is_closed);
-        let now = now_seconds();
-        if !closed || now - self.socket_tried_at < SOCKET_RETRY_SECONDS {
-            return;
-        }
-        self.socket_tried_at = now;
-        self.socket = ReadySocket::open(&self.hub.routes().ready(self.hub.build_id()));
-        if let Some(s) = &self.socket {
-            for a in self.coordinator.waiting_addresses() {
-                s.subscribe(&a);
-            }
-        }
-    }
-
     fn apply(&mut self, msg: Internal) -> Vec<Action> {
         let now = self.now();
         match msg {
@@ -170,10 +161,11 @@ impl WebFetcher {
                 key,
                 layer,
                 address,
+                sha256,
                 result,
             } => self
                 .coordinator
-                .stream_done(&key, layer, address, result, now),
+                .stream_done(&key, layer, address, sha256, result, now),
             Internal::Compute {
                 key,
                 layer,
@@ -186,16 +178,10 @@ impl WebFetcher {
     }
 
     fn pump(&mut self) {
-        self.keep_socket();
         let mut actions = Vec::new();
         let inbox: Vec<Internal> = self.inbox.borrow_mut().drain(..).collect();
         for msg in inbox {
             actions.extend(self.apply(msg));
-        }
-        if let Some(s) = &self.socket {
-            for a in s.take_ready() {
-                actions.extend(self.coordinator.ready_notice(&a));
-            }
         }
         actions.extend(self.coordinator.poll(self.now()));
         while !actions.is_empty() {
@@ -205,6 +191,7 @@ impl WebFetcher {
             actions = self.coordinator.poll(self.now());
         }
         self.start_job();
+        self.start_upload();
         if let Some(c) = &self.cache {
             let c = c.clone();
             wasm_bindgen_futures::spawn_local(async move { c.flush_index().await });
@@ -220,11 +207,12 @@ impl WebFetcher {
             return;
         };
         self.job_running.set(true);
-        let (hub, cache, worker, stats) = (
+        let (hub, cache, worker, stats, lane) = (
             self.hub.clone(),
             self.cache.clone(),
             self.worker.clone(),
             self.stats.clone(),
+            self.lane.clone(),
         );
         let (inbox, running) = (self.inbox.clone(), self.job_running.clone());
         wasm_bindgen_futures::spawn_local(async move {
@@ -249,16 +237,33 @@ impl WebFetcher {
             if let Some(c) = &cache {
                 let _ = c.put(BlobKind::Section, &job.address_hex(), &section).await;
             }
-            let ticket = stats.upload_started();
-            match hub.upload(&job.address, &job.claim, section.to_vec()).await {
-                Ok(_) => ticket.finish(true),
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("gx-renderer: upload for {key} failed: {e:#}").into(),
-                    );
-                    ticket.finish(false);
-                }
+            if job.share {
+                lane.offer(UploadOffer {
+                    job,
+                    bytes: section,
+                });
             }
+        });
+    }
+
+    /// Sends the upload lane's oldest offer if none is being sent. Each
+    /// offer is sent once; a failure is counted and dropped.
+    fn start_upload(&mut self) {
+        if self.uploading.get() {
+            return;
+        }
+        let Some((offer, ticket)) = self.lane.take() else {
+            return;
+        };
+        self.uploading.set(true);
+        let (hub, uploading) = (self.hub.clone(), self.uploading.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let outcome = match hub.upload(&offer.job, offer.bytes.to_vec()).await {
+                Ok(status) => UploadOutcome::from_status(status),
+                Err(_) => UploadOutcome::Failed,
+            };
+            ticket.finish(outcome);
+            uploading.set(false);
         });
     }
 
@@ -280,25 +285,22 @@ impl WebFetcher {
                 key,
                 layer,
                 address,
+                sha256,
             } => {
                 let (hub, cache, inbox) =
                     (self.hub.clone(), self.cache.clone(), self.inbox.clone());
                 wasm_bindgen_futures::spawn_local(async move {
-                    let result = stream_section(&hub, cache.as_deref(), key, address).await;
+                    let result = stream_section(&hub, cache.as_deref(), key, address, sha256).await;
                     inbox.borrow_mut().push_back(Internal::Stream {
                         key,
                         layer,
                         address,
+                        sha256,
                         result,
                     });
                 });
             }
             Action::Compute { key, layer, job } => self.jobs.push_back((key, layer, job)),
-            Action::Subscribe(address) => {
-                if let Some(s) = &self.socket {
-                    s.subscribe(&address);
-                }
-            }
             Action::Complete(done) => match done.key {
                 ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
                     .sections
@@ -422,24 +424,34 @@ fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
     }
 }
 
-/// Streams the section at `address`: the cache first (decoded, dropped if
-/// damaged), then the edge (decoded, then cached).
+/// Streams the version of the section at `address` whose bytes hash to
+/// `expected`: the cache first (dropped if it is another version or
+/// damaged), then the edge (checked, decoded, then cached).
 async fn stream_section(
     hub: &WebHub,
     cache: Option<&WebCache>,
     key: ChunkKey,
     address: [u8; 32],
+    expected: [u8; 32],
 ) -> StreamResult {
     let name = to_hex(&address);
     if let Some(c) = cache {
         if let Some(bytes) = c.get(BlobKind::Section, &name).await {
-            match decode_arrived(key, bytes) {
-                Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
-                Err(_) => c.remove(BlobKind::Section, &name).await,
+            if sha256(&bytes) != expected {
+                c.remove(BlobKind::Section, &name).await;
+            } else {
+                match decode_arrived(key, bytes) {
+                    Ok(a) => return StreamResult::Bytes(a, Origin::Cache),
+                    Err(_) => c.remove(BlobKind::Section, &name).await,
+                }
             }
         }
     }
-    match hub.get_blob(BlobKind::Section, &name).await {
+    match hub.get_section(&address, &expected).await {
+        Ok(Some(bytes)) if sha256(&bytes) != expected => StreamResult::Failed(format!(
+            "section {name} from the edge does not hash to {}",
+            to_hex(&expected)
+        )),
         Ok(Some(bytes)) => {
             let arrived = match decode_arrived(key, bytes) {
                 Ok(a) => a,

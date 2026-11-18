@@ -26,19 +26,20 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 
 | `gx-worker` module | What it does | Spec |
 |---|---|---|
-| `job` | The job (`compute` direction), the address check, blob hash checks, manifest and tile resolution, section validation; shared by both platforms | `client-compute.md` 1, 3, 4, 5.2 |
-| `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then uploading | `client-compute.md` 1, 4 |
+| `job` | The job (`missing` or `local` direction, with its layer and whether it is shared), the address check, blob hash checks, manifest and tile resolution, section validation; shared by both platforms | `client-compute.md` 1, 3, 4, 5.2 |
+| `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then offering `missing` sections to the upload lane | `client-compute.md` 1, 4 |
+| `upload` | The upload lane: bounded at 64, oldest dropped when full, one try per offer, and the outcome of each status (`201` stored, `200` matched, `202` disputed) | `client-compute.md` 2.5, 2.8 |
 | `cache` | The native local cache directory, keyed by kind and hash or address, evicted least recently used by size (default 20 GB) | `client-compute.md` 6 |
-| `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, done, failed | |
+| `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, offered, stored, matched, disputed, dropped, failed | |
 
 `renderer` modules:
 
 | Module | What it does | Spec |
 |---|---|---|
 | `config` | Environment, `.env`, and command line flags, flags winning | |
-| `protocol` | The hub protocol without I/O: clock and its sync, builds and layer configs, directions, statuses, socket frames, URLs, the frame system from the union of the layers' registries | `client-compute.md` 2.2 to 2.5, `matter-format.md` 5 and 6 |
-| `hub` | The native hub client v2: clock, active build, build, directions, edge reads, uploads with `X-Claim`, the readiness socket keyed by address | `client-compute.md` 2.3 to 2.5 |
-| `directions` | The client loop as a state machine without I/O: batches of at most 512 keys, deduplication in flight, `ready`/`compute`/`pending`/`empty` per layer, retries with backoff, readiness notices | `client-compute.md` 1, 2.4 |
+| `protocol` | The hub protocol without I/O: clock and its sync, builds and layer configs, directions, upload headers, statuses, URLs, the frame system from the union of the layers' registries | `client-compute.md` 2.2 to 2.5, `matter-format.md` 5 and 6 |
+| `hub` | The native hub client v2: clock, active build, build, directions, edge reads (sections by address and `sha256`), uploads with the section 2.5 headers | `client-compute.md` 2.3 to 2.5 |
+| `directions` | The client loop as a state machine without I/O: batches of at most 512 keys, deduplication in flight, `ready`/`missing`/`local`/`empty` per layer, retries with backoff | `client-compute.md` 1, 2.4 |
 | `mock_hub` | A small v2 hub for tests and `gx-mock-hub` | `client-compute.md` 2 |
 | `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every simulated day, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
 | `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
@@ -87,7 +88,8 @@ the time runs out; without it the run renders whatever has settled within
 round trips of the first and the latest cell; and the counts of
 `directions` and the worker: directions requests, sections streamed from
 the edge and read from the local cache, sections computed here, module
-runs, modules loaded, and uploads pending, done, and failed. `--no-overlay`
+runs, modules loaded, and uploads pending, offered, stored, matched,
+disputed, dropped, and failed. `--no-overlay`
 leaves out the text, the frame markers, and the lines, so only matter is
 in the image.
 
@@ -128,7 +130,7 @@ visibly from the last one drawn (`redraw`, `rendering.md` section 4).
    retarded states, with the camera at the same place in space among them.
    Everything below reads it.
 5. Matter streams: selection (on arrivals, camera moves, and every 100 ms; natively on its own thread, `selector`), requests, directions at the
-   simulation time, streamed and computed sections, readiness notices,
+   simulation time, streamed and computed sections,
    finished meshes, eviction. See "From selection to pixels" below.
 6. The scene is built camera-relative with the drawn cells and their lights
    and drawn with the overlay. Each surface draw carries its own light
@@ -201,14 +203,15 @@ Every key, the registry included, goes through `directions::Coordinator`:
    keys, at most two batches in flight; a key already in flight is not
    asked about again. The time asked for is the drawn moment, clamped to
    the hub's now and the space's origin.
-2. Per layer: `empty` contributes nothing. `ready` is streamed from `GET
-   /section/{address}` (through the edge when `GX_EDGE_URL` is set), or
-   read from the local cache; the bytes are validated, then cached.
-   `compute` goes to the worker. `pending` is subscribed to on the
-   readiness socket (`WS .../sections/ready`, `{"subscribe": address}`
-   out, `{"sectionReady": address}` in) and asked about again after the
-   hub's `retryMs`, or streamed as soon as its notice arrives.
-3. A failed directions request, a failed stream, a `404` for a stored
+2. Per layer: `empty` contributes nothing. `ready` carries the stored
+   bytes' `sha256`: it is streamed from `GET
+   /section/{address}?sha256={hex}` (through the edge when `GX_EDGE_URL`
+   is set), or read from the local cache; the bytes are checked against
+   the hash (a cached copy of another version is discarded and fetched
+   again), validated, then cached. `missing` and `local` go to the worker.
+   There is no readiness socket: nothing waits on another client.
+3. A failed directions request, a failed stream (bytes of another hash
+   included), a `404` for a stored
    address, or a transient worker failure is retried after a backoff of
    0.25 s doubling to at most 8 s. A permanent worker failure (the module
    failed, or its output fails validation) fails the key, which becomes
@@ -220,14 +223,18 @@ The registry is just another key. The renderer waits for the union of all
 layers' registries before starting the integrator; the registry load gives
 up after 300 s natively and 120 s in the browser with a clear error.
 
-The worker (`gx-worker`), for each `compute` direction: checks that the
+The worker (`gx-worker`), for each `missing` or `local` direction: checks that the
 address is the address of the job's inputs (`client-compute.md` 3), fetches
 the module by hash (local cache first, every byte checked against its
 hash), runs `gx_sources`, resolves the ids through the layer's manifest
 (fetched by hash), fetches and checks each tile, runs `gx_compile`,
 validates the section with the library validator, hands it to the renderer
-at once, caches it, and uploads it with `PUT .../section/{address}` and
-`X-Claim`. Upload failures are logged and counted and never block drawing.
+at once, and caches it. A `missing` section then enters the upload lane
+(`client-compute.md` 2.5 and 2.8): at most 64 offers, the oldest dropped
+when full, each sent once with `PUT .../section/{address}` and `X-Layer`,
+`X-Key`, `X-Span-Index`, `X-Content-Sha256` (and natively `Expect:
+100-continue`). A failure is counted and never retried, and uploads never
+delay a result reaching the renderer. A `local` section is never offered.
 Natively the modules run on a pool of threads with `gx-module-host`
 (1 GiB and 60 s per call); in the browser in a dedicated Web Worker with
 the browser's `WebAssembly` (`docs/web.md`).
@@ -257,8 +264,8 @@ a light, a dense sample is a surface.
    | `Empty` | Every layer is `empty`, or the composite holds no matter |
    | `Gone` | Sections that fail validation, or a module that failed |
 
-   A request stays `Requested` however long the hub keeps it `pending`;
-   the client loop retries on its own. Cells not
+   A request stays `Requested` until every layer has its section; the
+   client loop retries on its own. Cells not
    selected (or drawn as a stand-in) for 60 s are evicted, and beyond 4096
    cached cells the least recently used go first. Selected cells and
    requests in flight are never evicted.
