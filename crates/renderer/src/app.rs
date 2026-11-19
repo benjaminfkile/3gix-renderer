@@ -84,7 +84,12 @@ pub fn matter_step(
     for e in fetcher.drain() {
         match e {
             FetchEvent::Completed { key, outcome, .. } => cells.push((key, outcome)),
-            FetchEvent::Surface { key, outcome, .. } => world.complete_surface(key, outcome),
+            FetchEvent::Surface {
+                key,
+                outcome,
+                partial,
+                ..
+            } => world.complete_surface(key, outcome, partial),
             // Loaded once at startup, before the integrator.
             FetchEvent::Registry(_) => {}
         }
@@ -497,6 +502,9 @@ pub fn render_headless_view(
     };
     let mut controls = Controls::new(None);
     let mut world = World::new(default_threads());
+    if let Some(f) = &fetcher {
+        world.set_hidden_layers(f.client().build().initially_hidden_layers());
+    }
     let start = Instant::now();
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
     let done = |world: &World| match run.wait_ready_seconds {
@@ -662,7 +670,11 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
             active: None,
             pending: launch.pending_spawn,
         },
-        world: World::new(default_threads()),
+        world: {
+            let mut w = World::new(default_threads());
+            w.set_hidden_layers(fetcher.client().build().initially_hidden_layers());
+            w
+        },
         fetcher,
         started: Instant::now(),
         controls: {

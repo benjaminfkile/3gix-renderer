@@ -107,6 +107,8 @@ impl WebFetcher {
     pub fn new(hub: Rc<WebHub>, cache: Option<WebCache>) -> WebFetcher {
         hub.keep_clock();
         let stats = WorkerStats::new();
+        let overlay_layers = hub.build().overlay_layers();
+        let hidden_layers = hub.build().initially_hidden_layers();
         WebFetcher {
             hub,
             cache: cache.map(Rc::new),
@@ -123,6 +125,8 @@ impl WebFetcher {
                 // Seeded once per page load, never from an address: it
                 // only chooses which downloads to check.
                 let mut c = Coordinator::new();
+                c.set_overlay_layers(overlay_layers);
+                c.set_hidden_layers(hidden_layers);
                 c.set_check_seed((js_sys::Math::random() * (u64::MAX as f64)) as u64);
                 c
             },
@@ -573,9 +577,16 @@ impl WebFetcher {
                     let bytes = done.sections.iter().map(|s| s.bytes.len() as u64).sum();
                     let sections: Vec<Arc<[u8]>> =
                         done.sections.iter().map(|a| a.bytes.clone()).collect();
+                    let overlays = self.hub.build().overlay_layers();
                     self.out.push(FetchEvent::Surface {
                         key,
-                        outcome: crate::tiles::decode_tile(&key, &sections),
+                        outcome: crate::tiles::decode_tile(
+                            &key,
+                            &sections,
+                            &done.layers,
+                            &overlays,
+                        ),
+                        partial: done.partial,
                         bytes,
                     });
                 }
@@ -588,6 +599,7 @@ impl WebFetcher {
                 ChunkKey::Surface(key) => self.out.push(FetchEvent::Surface {
                     key,
                     outcome: Err(reason),
+                    partial: false,
                     bytes: 0,
                 }),
                 ChunkKey::Cell(key) => {

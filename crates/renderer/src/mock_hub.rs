@@ -49,7 +49,9 @@
 //! [`SectionMaker`] the first time a directions request names them (their
 //! hash is part of the answer). This is how tests serve synthetic worlds
 //! of any shape with every section already on the hub, as the budget
-//! measures them (`rendering.md` section 5).
+//! measures them (`rendering.md` section 5). Such a layer may store its
+//! surface tiles the same way ([`MockLayer::stored_surfaces`],
+//! [`SurfaceMaker`]).
 
 use crate::protocol::{
     Attachment, BuildDescription, InputSlot, LayerConfig, RawDirection, API_KEY_HEADER,
@@ -109,6 +111,15 @@ pub struct MockLayer {
     /// addresses are version 2, and its uploads and checks must carry
     /// `X-Inputs-Sha256`.
     pub inputs: Vec<InputSlot>,
+    /// A surface overlay layer (`client-compute.md` section 2.2): never
+    /// made empty by an exclusive layer.
+    pub overlay: bool,
+    /// Whether clients start with the layer drawn.
+    pub shown: bool,
+    /// Every surface tile of this layer is stored already: made by this on
+    /// its first read. `None` for a layer whose surface tiles are computed
+    /// by clients, or, for a [`MockLayer::stored`] layer, empty.
+    pub stored_surfaces: Option<SurfaceMaker>,
 }
 
 /// A function from a cell key to that cell's section bytes.
@@ -125,6 +136,21 @@ impl std::fmt::Debug for SectionMaker {
     }
 }
 
+/// A function from a surface key to that tile's section bytes.
+pub type MakeSurface = dyn Fn(&gx_core::key::SurfaceKey) -> Vec<u8> + Send + Sync;
+
+/// Makes the section bytes of one surface tile for a
+/// [`MockLayer::stored_surfaces`] layer. Must give the same bytes for the
+/// same key every time.
+#[derive(Clone)]
+pub struct SurfaceMaker(pub Arc<MakeSurface>);
+
+impl std::fmt::Debug for SurfaceMaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SurfaceMaker")
+    }
+}
+
 impl MockLayer {
     fn config(&self) -> LayerConfig {
         LayerConfig {
@@ -133,6 +159,8 @@ impl MockLayer {
             source_manifest: self.manifest.as_ref().map(|m| to_hex(&sha256(m))),
             attachment: self.attachment.clone(),
             exclusive: self.exclusive,
+            overlay: self.overlay,
+            shown: self.shown,
             max_depth: self.max_depth.clone(),
             span_seconds: self.span_seconds,
             uses_origin: self.uses_origin,
@@ -732,7 +760,7 @@ fn exclusive_owners(state: &State) -> BTreeMap<u64, &str> {
 /// `true` when layer `l` is `empty` for `key`: attachments, exclusivity,
 /// and maximum depths apply to cells and to surface tiles (their level as
 /// the depth), as the hub applies them. A layer of stored matter has no
-/// surface tiles. The registry key is never empty.
+/// surface tiles unless it stores those too. The registry key is never empty.
 fn is_empty_for(l: &MockLayer, key: &ChunkKey, exclusive: &BTreeMap<u64, &str>) -> bool {
     let placed = match key {
         ChunkKey::Cell(cell) => Some((cell.frame_id, cell.depth)),
@@ -742,11 +770,14 @@ fn is_empty_for(l: &MockLayer, key: &ChunkKey, exclusive: &BTreeMap<u64, &str>) 
     let Some((frame_id, depth)) = placed else {
         return false;
     };
-    let owned_elsewhere = exclusive.get(&frame_id).is_some_and(|owner| *owner != l.id);
+    let owned_elsewhere =
+        !l.overlay && exclusive.get(&frame_id).is_some_and(|owner| *owner != l.id);
     !l.attachment.contains(frame_id)
         || owned_elsewhere
         || depth > l.max_depth_for(frame_id)
-        || (l.stored.is_some() && matches!(key, ChunkKey::Surface(_)))
+        || (l.stored.is_some()
+            && l.stored_surfaces.is_none()
+            && matches!(key, ChunkKey::Surface(_)))
 }
 
 /// The inputs of layer `l`'s section for `key` at span `span`: module,
@@ -880,10 +911,13 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
                 let span = span_index(t, address_origin, l.span_seconds).unwrap_or(0);
                 let inputs = address_of(&build, l, key, origin, span);
                 let hex = to_hex(&inputs.3);
-                if let (Some(_), ChunkKey::Cell(cell)) = (&l.stored, key) {
-                    if !space.sections.contains_key(&hex) {
-                        unmade.push((hex.clone(), index, *cell));
-                    }
+                let stored = match key {
+                    ChunkKey::Cell(_) => l.stored.is_some(),
+                    ChunkKey::Surface(_) => l.stored_surfaces.is_some(),
+                    _ => false,
+                };
+                if stored && !space.sections.contains_key(&hex) {
+                    unmade.push((hex.clone(), index, *key));
                 }
                 row.push(Some((index, span, inputs, hex)));
             }
@@ -894,9 +928,14 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
     // in parallel; their hash is part of the answer.
     let made: Vec<(String, Stored)> = unmade
         .into_iter()
-        .filter_map(|(hex, index, cell)| {
-            let maker = state.layers[index].stored.as_ref()?;
-            Some((hex, Stored::new((maker.0)(&cell))))
+        .filter_map(|(hex, index, key)| {
+            let l = &state.layers[index];
+            let bytes = match key {
+                ChunkKey::Cell(cell) => (l.stored.as_ref()?.0)(&cell),
+                ChunkKey::Surface(tile) => (l.stored_surfaces.as_ref()?.0)(&tile),
+                _ => return None,
+            };
+            Some((hex, Stored::new(bytes)))
         })
         .collect();
     let mut space = state.space.lock().expect("space");
@@ -1146,6 +1185,9 @@ pub fn registry_layer(id: &str, registry: &[u8]) -> MockLayer {
         manifest: None,
         attachment: Attachment::Frames(Vec::new()),
         exclusive: false,
+        overlay: false,
+        shown: true,
+        stored_surfaces: None,
         max_depth: BTreeMap::new(),
         span_seconds: 0,
         uses_origin: false,
@@ -1167,6 +1209,9 @@ pub fn stored_layer(id: &str, max_depth: u8, make: SectionMaker) -> MockLayer {
         manifest: None,
         attachment: Attachment::All,
         exclusive: false,
+        overlay: false,
+        shown: true,
+        stored_surfaces: None,
         max_depth: [("*".to_string(), max_depth)].into(),
         span_seconds: 0,
         uses_origin: false,
@@ -1220,6 +1265,9 @@ pub fn example_matter_layer(
         manifest: Some(manifest),
         attachment: Attachment::All,
         exclusive: false,
+        overlay: false,
+        shown: true,
+        stored_surfaces: None,
         max_depth: [("*".to_string(), max_depth)].into(),
         span_seconds: 0,
         uses_origin: false,

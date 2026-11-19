@@ -1,0 +1,32 @@
+{
+  "cases": {
+    "01-registry": {
+      "key": "registry",
+      "sha256": "7e57bc1e3d9c540188dcebfc67d5ebc01ccde9cc629d18bfba8f8dc2aa4c3be8"
+    },
+    "02-frame": {
+      "key": "frame-7",
+      "sha256": "da78a281ad55e7be75963a093304d324aa81dfcf0dcb01bcf80b986b6d008755"
+    },
+    "03-cell": {
+      "key": "7-1-0-1-0",
+      "sha256": "477d4dc43837c9052bb00570edd1b2139ad5b539a67499c8e00cb4e20a948c1a"
+    },
+    "04-equator": {
+      "key": "s-7-0-0-0-0",
+      "sha256": "59eed624cfbdc3aa0aac27196e9ae9e9ad89f2ca7daf77a06a820e355d1bc639"
+    },
+    "05-band-edge": {
+      "key": "s-7-0-2-1-2",
+      "sha256": "89fa423ffd3f2f5f74a70b1ea380f47e5c6abc30f54e1327fc797b0f134c2cb2"
+    },
+    "06-pole": {
+      "key": "s-7-4-1-0-1",
+      "sha256": "7f764d85d994421eed7913a3a86fc3184e9c18120d685fcd5953b022ba664cb1"
+    },
+    "07-other-frame": {
+      "key": "s-8-0-0-0-0",
+      "sha256": "6fd097cf8df3478157d481cf6a575be411530e66cd9abe54f33373a35dd90559"
+    }
+  }
+}

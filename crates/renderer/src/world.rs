@@ -482,9 +482,23 @@ impl World {
     pub fn complete_surface(
         &mut self,
         key: gx_core::key::SurfaceKey,
-        outcome: Result<Option<Arc<crate::tiles::TileGeometry>>, String>,
+        outcome: Result<crate::tiles::DecodedTile, String>,
+        partial: bool,
     ) {
-        self.surfaces.complete(key, outcome);
+        self.surfaces.complete_layers(key, outcome, partial);
+    }
+
+    /// Hides the layers in `hidden` (indices in the build) and shows every
+    /// other one (`rendering.md` section 7 item 7): a hidden overlay is not
+    /// composited. A client starts with the build's
+    /// [`crate::protocol::BuildDescription::initially_hidden_layers`].
+    pub fn set_hidden_layers(&mut self, hidden: std::collections::BTreeSet<usize>) {
+        self.surfaces.set_hidden_layers(hidden);
+    }
+
+    /// The hidden layers, by index in the build.
+    pub fn hidden_layers(&self) -> &std::collections::BTreeSet<usize> {
+        self.surfaces.hidden_layers()
     }
 
     /// The surface tiles to request now.

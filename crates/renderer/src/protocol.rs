@@ -34,7 +34,7 @@ use gx_core::sha256::{sha256, to_hex};
 use gx_worker::job::parse_hash;
 use gx_worker::{BlobKind, ComputeJob};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// The header that carries the API key.
@@ -256,6 +256,14 @@ pub struct LayerConfig {
     /// (`client-compute.md` sections 2.2 and 10), in slot order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputSlot>,
+    /// The layer is a surface overlay (`client-compute.md` section 2.2,
+    /// `matter-format.md` section 12): it gives the ground's material only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overlay: bool,
+    /// Whether clients start with the layer drawn (`client-compute.md`
+    /// section 2.2).
+    #[serde(default = "shared_by_default")]
+    pub shown: bool,
 }
 
 /// One input slot of a layer config (`client-compute.md` section 2.2).
@@ -306,6 +314,31 @@ pub struct BuildDescription {
 }
 
 impl BuildDescription {
+    /// The indices of the overlay layers, in layer order.
+    pub fn overlay_layers(&self) -> BTreeSet<usize> {
+        (self.layers.iter().enumerate())
+            .filter(|(_, l)| l.overlay)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The indices of the layers whose `shown` is false.
+    pub fn initially_hidden_layers(&self) -> BTreeSet<usize> {
+        (self.layers.iter().enumerate())
+            .filter(|(_, l)| !l.shown)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The ids of the layers whose `shown` is false: the hidden set a
+    /// client starts with (`rendering.md` section 7 item 7).
+    pub fn initially_hidden(&self) -> BTreeSet<String> {
+        (self.layers.iter())
+            .filter(|l| !l.shown)
+            .map(|l| l.layer.clone())
+            .collect()
+    }
+
     /// Every frame record the build lists, as `(frame id, hash)` in layer
     /// id, then frame id order, each hash once. Fails for a frame id that
     /// is not a decimal `u64` or a hash that is not 64 lowercase hex.

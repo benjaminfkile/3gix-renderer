@@ -23,11 +23,12 @@ use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::farfield::focal_px;
 use gx_core::frames::FrameSystem;
 use gx_core::key::{SurfaceKey, SURFACE_FACES};
+use gx_core::overlay::{self, Overlay, OverlayTile};
 use gx_core::surface::{
     vertex_position, SurfaceTile, Tile, TILE_QUADS, TILE_VERTICES, VERTEX_COUNT,
 };
 use gx_core::units::Vec3;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Largest projected quad edge, pixels, at the distance a tile is split
@@ -253,20 +254,108 @@ impl TileGeometry {
     }
 }
 
-/// Decodes a surface key's sections (one per layer, in layer order) into
-/// the first layer's surface, `None` when every layer's tile is empty.
+/// A surface key's sections decoded (`rendering.md` section 7 item 6):
+/// the base surface and the overlays that have arrived.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecodedTile {
+    /// The first non-empty surface tile among the non-overlay layers, in
+    /// layer order; `None` when every one is empty.
+    pub base: Option<Arc<TileGeometry>>,
+    /// The overlay layers' non-empty overlay tiles, each with its layer
+    /// index, in layer order.
+    pub overlays: Vec<(usize, Arc<OverlayTile>)>,
+}
+
+/// Decodes a surface key's sections, `layers[n]` the layer index of
+/// `sections[n]`, in layer order: the base from the non-overlay layers,
+/// the overlays from the layers in `overlay_layers`.
 pub fn decode_tile(
     key: &SurfaceKey,
     sections: &[impl AsRef<[u8]>],
-) -> Result<Option<Arc<TileGeometry>>, String> {
-    for bytes in sections {
-        match gx_core::surface::decode(key, bytes.as_ref()) {
-            Ok(Tile::Surface(t)) => return Ok(Some(Arc::new(TileGeometry::new(&t)))),
+    layers: &[usize],
+    overlay_layers: &BTreeSet<usize>,
+) -> Result<DecodedTile, String> {
+    let mut out = DecodedTile::default();
+    for (n, bytes) in sections.iter().enumerate() {
+        let layer = layers.get(n).copied().unwrap_or(n);
+        let bytes = bytes.as_ref();
+        if overlay_layers.contains(&layer) {
+            match overlay::decode(key, bytes) {
+                Ok(Overlay::Tile(t)) => out.overlays.push((layer, Arc::new(t))),
+                Ok(Overlay::Empty(_)) => {}
+                Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
+            }
+            continue;
+        }
+        if out.base.is_some() {
+            continue;
+        }
+        match gx_core::surface::decode(key, bytes) {
+            Ok(Tile::Surface(t)) => out.base = Some(Arc::new(TileGeometry::new(&t))),
             Ok(Tile::Empty(_)) => {}
             Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
         }
     }
-    Ok(None)
+    Ok(out)
+}
+
+/// The base tile's geometry with its material composited with
+/// `overlays`, in order, per vertex by [`overlay::composite`]
+/// (`rendering.md` section 7 item 6). The parent values of each overlay
+/// are composited the same way over the base at the tile's even vertices
+/// ([`composite_parent`]). Positions and normals are the base's.
+pub fn composite_tile(base: &TileGeometry, overlays: &[&OverlayTile]) -> TileGeometry {
+    let mut out = base.clone();
+    if overlays.is_empty() {
+        return out;
+    }
+    let mut samples = Vec::with_capacity(overlays.len());
+    for v in 0..out.albedo.len() {
+        samples.clear();
+        samples.extend(overlays.iter().map(|o| sample(o, v)));
+        let (a, r) = overlay::composite(base.albedo[v], base.roughness[v], &samples);
+        out.albedo[v] = a;
+        out.roughness[v] = r;
+    }
+    out
+}
+
+fn sample(o: &OverlayTile, v: usize) -> overlay::OverlaySample {
+    (
+        overlay::unit(o.coverage[v]),
+        o.albedo[v].map(overlay::unit),
+        overlay::unit(o.roughness[v]),
+    )
+}
+
+/// The material at the parent's values (`rendering.md` section 7 item 6):
+/// per even vertex `(2k, 2m)`, row major with `m` outer, the base's
+/// albedo and roughness there composited with each overlay's parent
+/// values, in order.
+pub fn composite_parent(base: &TileGeometry, overlays: &[&OverlayTile]) -> Vec<([f32; 3], f32)> {
+    let mut out = Vec::with_capacity(overlay::PARENT_COUNT);
+    for m in 0..overlay::PARENT_VERTICES {
+        for k in 0..overlay::PARENT_VERTICES {
+            let v = 2 * k + TILE_VERTICES * 2 * m;
+            let p = k + overlay::PARENT_VERTICES * m;
+            let samples: Vec<overlay::OverlaySample> = overlays
+                .iter()
+                .map(|o| {
+                    (
+                        overlay::unit(o.parent_coverage[p]),
+                        o.parent_albedo[p].map(overlay::unit),
+                        overlay::unit(o.parent_roughness[p]),
+                    )
+                })
+                .collect();
+            out.push(overlay::composite(
+                base.albedo[v],
+                base.roughness[v],
+                &samples,
+            ));
+        }
+    }
+    out
 }
 
 /// The distance within which a tile is split: where its quads
@@ -331,6 +420,14 @@ pub struct Surfaces {
     /// Every tile the latest selection looked at: the tiles it walked and
     /// the children it checked or asked for. Eviction keeps them.
     used: std::collections::HashSet<SurfaceKey>,
+    /// Every ready tile's base and overlays (`rendering.md` section 7
+    /// item 6).
+    layers: HashMap<SurfaceKey, TileLayers>,
+    /// Ready tiles whose overlay layers are still to come: kept in the
+    /// wanted set so they arrive.
+    pending: std::collections::HashSet<SurfaceKey>,
+    /// The hidden layers, by index (`rendering.md` section 7 item 7).
+    hidden: BTreeSet<usize>,
 }
 
 impl Surfaces {
@@ -359,7 +456,7 @@ impl Surfaces {
                 self.requests.push(key);
             }
             std::collections::hash_map::Entry::Occupied(e) => {
-                if !matches!(e.get(), State::Requested) {
+                if !matches!(e.get(), State::Requested) && !self.pending.contains(&key) {
                     return;
                 }
             }
@@ -367,6 +464,32 @@ impl Surfaces {
         self.wanted
             .get_or_insert_with(Vec::new)
             .push((key, priority));
+    }
+
+    /// The hidden layers, by index (`rendering.md` section 7 item 7).
+    pub fn hidden_layers(&self) -> &BTreeSet<usize> {
+        &self.hidden
+    }
+
+    /// Hides the layers in `hidden` (indices) and shows every other one:
+    /// every ready tile's material is composited again from its shown
+    /// overlays, so no stale material is drawn.
+    pub fn set_hidden_layers(&mut self, hidden: BTreeSet<usize>) {
+        if hidden == self.hidden {
+            return;
+        }
+        self.hidden = hidden;
+        for (key, layers) in &self.layers {
+            if !layers.overlays.is_empty() {
+                self.tiles
+                    .insert(*key, State::Ready(layers.drawn(&self.hidden)));
+            }
+        }
+    }
+
+    /// The geometry drawn for `key`, if it is ready.
+    pub fn drawn_geometry(&self, key: &SurfaceKey) -> Option<&Arc<TileGeometry>> {
+        self.ready(key)
     }
 
     /// The keys to request now.
@@ -388,17 +511,53 @@ impl Surfaces {
         Some(wanted)
     }
 
-    /// Applies a finished request.
+    /// Applies a finished request without overlays.
     pub fn complete(
         &mut self,
         key: SurfaceKey,
         outcome: Result<Option<Arc<TileGeometry>>, String>,
     ) {
+        self.complete_layers(
+            key,
+            outcome.map(|base| DecodedTile {
+                base,
+                overlays: Vec::new(),
+            }),
+            false,
+        );
+    }
+
+    /// Applies a finished or partly finished request
+    /// (`rendering.md` section 7 item 6): the tile is drawn with the
+    /// overlays it has, and a later completion with more overlays replaces
+    /// its material (a new geometry, so its GPU copy is rebuilt).
+    /// `partial` is `true` while overlays are still to come.
+    pub fn complete_layers(
+        &mut self,
+        key: SurfaceKey,
+        outcome: Result<DecodedTile, String>,
+        partial: bool,
+    ) {
+        if partial {
+            self.pending.insert(key);
+        } else {
+            self.pending.remove(&key);
+        }
+        self.layers.remove(&key);
         let state = match outcome {
-            Ok(Some(g)) => State::Ready(g),
-            Ok(None) => State::Empty,
+            Ok(DecodedTile {
+                base: Some(base),
+                overlays,
+            }) => {
+                let layers = TileLayers { base, overlays };
+                let drawn = layers.drawn(&self.hidden);
+                self.layers.insert(key, layers);
+                State::Ready(drawn)
+            }
+            Ok(DecodedTile { base: None, .. }) => State::Empty,
             Err(reason) => {
                 tracing::warn!(key = %key, "surface tile is invalid: {reason}");
+                self.pending.remove(&key);
                 State::Gone
             }
         };
@@ -610,6 +769,32 @@ impl Surfaces {
         let used = &self.used;
         self.tiles
             .retain(|k, s| k.level == 0 || matches!(s, State::Requested) || used.contains(k));
+        let tiles = &self.tiles;
+        self.layers.retain(|k, _| tiles.contains_key(k));
+        self.pending.retain(|k| tiles.contains_key(k));
+    }
+}
+
+/// A tile's base surface and the overlays that have arrived for it.
+#[derive(Clone, Debug)]
+struct TileLayers {
+    base: Arc<TileGeometry>,
+    overlays: Vec<(usize, Arc<OverlayTile>)>,
+}
+
+impl TileLayers {
+    /// The geometry to draw: the base with the shown overlays composited,
+    /// or the base itself when none is shown.
+    fn drawn(&self, hidden: &BTreeSet<usize>) -> Arc<TileGeometry> {
+        let shown: Vec<&OverlayTile> = (self.overlays.iter())
+            .filter(|(l, _)| !hidden.contains(l))
+            .map(|(_, o)| o.as_ref())
+            .collect();
+        if shown.is_empty() {
+            Arc::clone(&self.base)
+        } else {
+            Arc::new(composite_tile(&self.base, &shown))
+        }
     }
 }
 
@@ -662,6 +847,78 @@ fn in_cone(cam: [f64; 3], forward: [f64; 3], (lo, hi): ([f64; 3], [f64; 3]), con
 mod tests {
     use super::*;
     use gx_core::surface::{HEIGHT_SIDE, PARENT_SIDE};
+
+    fn overlay_tile(key: SurfaceKey, coverage: u8, albedo: u8, roughness: u8) -> OverlayTile {
+        let mut c = vec![coverage; VERTEX_COUNT];
+        // Partial coverage: the first row is not covered.
+        for v in c.iter_mut().take(TILE_VERTICES) {
+            *v = 0;
+        }
+        OverlayTile {
+            key,
+            coverage: c,
+            albedo: vec![[albedo; 3]; VERTEX_COUNT],
+            roughness: vec![roughness; VERTEX_COUNT],
+            parent_coverage: vec![coverage; overlay::PARENT_COUNT],
+            parent_albedo: vec![[albedo; 3]; overlay::PARENT_COUNT],
+            parent_roughness: vec![roughness; overlay::PARENT_COUNT],
+        }
+    }
+
+    fn overlay_bytes(o: &OverlayTile) -> Vec<u8> {
+        overlay::encode(o, gx_core::matter::Compression::None)
+    }
+
+    #[test]
+    fn overlays_composite_in_layer_order_and_hide() {
+        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let base = gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
+        let first = overlay_tile(key, 255, 255, 255);
+        let second = overlay_tile(key, 128, 0, 0);
+        let overlays: BTreeSet<usize> = [1, 2].into();
+        let decode = |sections: &[Vec<u8>], layers: &[usize]| {
+            decode_tile(&key, sections, layers, &overlays).unwrap()
+        };
+        let mut s = Surfaces::new();
+        // No overlay: the base material.
+        let d = decode(std::slice::from_ref(&base), &[0]);
+        let plain = d.base.clone().unwrap();
+        s.complete_layers(key, Ok(d), true);
+        let drawn = Arc::clone(s.drawn_geometry(&key).unwrap());
+        assert!(Arc::ptr_eq(&drawn, &plain));
+        // The second overlay arrives first: drawn with it alone.
+        let d = decode(&[base.clone(), overlay_bytes(&second)], &[0, 2]);
+        s.complete_layers(key, Ok(d), true);
+        let one = Arc::clone(s.drawn_geometry(&key).unwrap());
+        assert!(!Arc::ptr_eq(&one, &drawn), "a new material is a new copy");
+        assert_eq!(one.positions, plain.positions);
+        let v = TILE_VERTICES + 1;
+        let c = overlay::unit(128);
+        let want = (1.0 - c) * plain.albedo[v][0];
+        assert_eq!(one.albedo[v][0], want);
+        // Partial coverage: the uncovered row keeps the base.
+        assert_eq!(one.albedo[1], plain.albedo[1]);
+        assert_eq!(one.roughness[1], plain.roughness[1]);
+        // Both, in layer order: the first replaces, the second blends.
+        let d = decode(
+            &[base.clone(), overlay_bytes(&first), overlay_bytes(&second)],
+            &[0, 1, 2],
+        );
+        s.complete_layers(key, Ok(d), false);
+        let two = Arc::clone(s.drawn_geometry(&key).unwrap());
+        assert_eq!(two.albedo[v], [1.0 - c; 3]);
+        assert_eq!(two.roughness[v], 1.0 - c);
+        let parent = composite_parent(&plain, &[&first, &second]);
+        assert_eq!(parent[1], ([1.0 - c; 3], 1.0 - c));
+        // Hiding the second leaves the first; hiding both restores the base.
+        s.set_hidden_layers([2].into());
+        let hidden = Arc::clone(s.drawn_geometry(&key).unwrap());
+        assert_eq!(hidden.albedo[v], [1.0; 3]);
+        s.set_hidden_layers([1, 2].into());
+        let restored = s.drawn_geometry(&key).unwrap();
+        assert_eq!(restored.albedo, plain.albedo);
+        assert_eq!(restored.roughness, plain.roughness);
+    }
 
     /// A tile whose heights are a smooth function of the vertex direction,
     /// with parent heights the same function at the parent's level (the
