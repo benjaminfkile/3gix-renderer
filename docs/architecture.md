@@ -27,6 +27,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `gx-worker` module | What it does | Spec |
 |---|---|---|
 | `job` | The job (`missing` or `local` direction, with its layer and whether it is shared), the address check, blob hash checks, manifest and tile resolution, section validation; shared by both platforms | `client-compute.md` 1, 3, 4, 5.2 |
+| `resolve` | Input resolution, written once as async code over a small platform trait: `gx_inputs`, then memory, cache, directions, stream or compute per input, one flight per address, `X-Inputs-Sha256`, computed `missing` inputs offered; a blocking executor for the native pool | `client-compute.md` 2.8, 10.3, 10.4 |
 | `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then offering `missing` sections to the upload lane | `client-compute.md` 1, 4 |
 | `queue` | The work order: the three lanes (computes, uploads, checks) and the compute queue, highest priority first, reprioritized and pruned by the wanted set | `client-compute.md` 2.8 |
 | `upload` | The upload lane: bounded at 64, oldest dropped when full, one try per offer, and the outcome of each status (`201` stored, `200` matched, `202` disputed) | `client-compute.md` 2.5, 2.8 |

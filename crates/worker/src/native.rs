@@ -36,21 +36,20 @@
 //!
 //! # Inputs (`client-compute.md` sections 2.8 and 10.3)
 //!
-//! An input section is got as any section, through the pool's
-//! [`InputSource`]: this session's memory of resolved sections, else the
-//! local cache, else directions for its key, then a stream (`ready`,
-//! checked against the hash the directions carried) or a compute
-//! (`missing`, `local`), which resolves its own inputs the same way. A
-//! computed `missing` input is offered to the upload lane like any section.
-//! Input work runs on the thread of the compute that needs it, so it has
-//! that compute's priority and never waits in the queue behind other work,
-//! and a compute dropped before it starts never resolves its inputs. Work
-//! on one address is shared: whoever gets an address first fetches or
+//! Input resolution is the shared resolver ([`crate::resolve`]), the same
+//! code the browser runs; this module holds its native platform layer: the
+//! pool's [`InputSource`] (directions and streams), the module host, the
+//! cache directory, the [`Uploader`] for computed `missing` inputs, and the
+//! pool's queue, whose waiting compute for an input's key a waiter raises
+//! to its own priority. The resolver runs on the pool thread of the compute
+//! that needs it under a small blocking executor
+//! ([`crate::resolve::block_on`]), since every native platform call
+//! blocks. Input work therefore has that compute's priority, and a compute
+//! dropped before it starts never resolves its inputs. Work on one address
+//! runs once across threads: whoever gets an address first fetches or
 //! computes it while every other thread that needs it (another compute's
 //! input, or the wanted set's own job for it) waits and takes the same
-//! bytes. Locks are taken along the layers' input order, which has no
-//! cycle, so the waits cannot deadlock. No input work ever runs on the
-//! frame thread.
+//! bytes. No input work ever runs on the frame thread.
 //!
 //! The worker sees modules, requests, tile bytes, and section bytes, and
 //! nothing else.
@@ -61,8 +60,8 @@ use crate::job::{
     Computed, WorkerError,
 };
 use crate::queue::{ComputeQueue, Lane};
+use crate::resolve::{block_on, InputDirection, InputResolver, Platform};
 use crate::stats::{WorkerSnapshot, WorkerStats};
-use gx_core::address::SlotKind;
 use gx_core::key::ChunkKey;
 use gx_core::sha256::to_hex;
 use gx_module_host::{HostConfig, HostError, LoadedModule, ModuleHost};
@@ -87,26 +86,6 @@ pub trait Uploader: Send + Sync {
     fn offer(&self, job: &ComputeJob, section: Arc<[u8]>);
 }
 
-/// What directions say about one input section (`client-compute.md`
-/// section 2.4), as [`InputSource::direct`] reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InputDirection {
-    /// The layer contributes nothing for this key: the input is passed as
-    /// an empty section (section 4.1).
-    Empty,
-    /// Stored: stream it and check the bytes against `sha256`.
-    Ready {
-        /// SHA-256 of the stored bytes.
-        sha256: [u8; 32],
-    },
-    /// Not stored: compute it, and offer it to the hub when `share` is
-    /// `true` (`missing`); keep it here when `false` (`local`).
-    Compute {
-        /// `true` for `missing`, `false` for `local`.
-        share: bool,
-    },
-}
-
 /// Where a compute's input sections come from (`client-compute.md` section
 /// 10.3), in the client. Called from the pool's threads; may block.
 pub trait InputSource: Send + Sync {
@@ -129,36 +108,6 @@ pub trait InputSource: Send + Sync {
     /// The stored section at `address` (`GET /section/{address}?sha256=`).
     /// The worker checks the hash.
     fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError>;
-}
-
-/// Sections resolved as inputs, or computed, kept in memory
-/// ([`ResolvedMemory`]).
-pub const RESOLVED_MEMORY_SECTIONS: usize = 256;
-
-/// Sections this session resolved or computed, by address, at most
-/// [`RESOLVED_MEMORY_SECTIONS`]; the oldest go first. They hand one
-/// address's bytes to every waiter without a cache directory.
-#[derive(Default)]
-struct ResolvedMemory {
-    sections: BTreeMap<[u8; 32], Arc<[u8]>>,
-    order: std::collections::VecDeque<[u8; 32]>,
-}
-
-impl ResolvedMemory {
-    fn get(&self, address: &[u8; 32]) -> Option<Arc<[u8]>> {
-        self.sections.get(address).cloned()
-    }
-
-    fn put(&mut self, address: [u8; 32], bytes: Arc<[u8]>) {
-        if self.sections.insert(address, bytes).is_none() {
-            self.order.push_back(address);
-        }
-        while self.order.len() > RESOLVED_MEMORY_SECTIONS {
-            if let Some(old) = self.order.pop_front() {
-                self.sections.remove(&old);
-            }
-        }
-    }
 }
 
 /// The default pool size: the number of cores minus two, at least one.
@@ -288,7 +237,7 @@ pub struct ModuleRunner {
     sources: Mutex<SourceMemory>,
     stats: Arc<WorkerStats>,
     flights: SingleFlight,
-    resolved: Mutex<ResolvedMemory>,
+    resolver: Arc<InputResolver>,
 }
 
 /// What [`ModuleRunner::run`] uses to resolve a job's input sections:
@@ -313,7 +262,7 @@ impl ModuleRunner {
             sources: Mutex::new(SourceMemory::default()),
             stats,
             flights: SingleFlight::default(),
-            resolved: Mutex::new(ResolvedMemory::default()),
+            resolver: Arc::new(InputResolver::new()),
         })
     }
 
@@ -380,10 +329,11 @@ impl ModuleRunner {
     }
 
     /// Runs one job to a validated section (steps 1 to 4 of the module
-    /// docs), resolving its input sections through `inputs`. Does not
-    /// upload the job's own section; computed `missing` inputs are offered
-    /// to the resolver's uploader. A job whose module names input sections
-    /// fails when `inputs` is `None`.
+    /// docs), resolving its input sections through `inputs` with the
+    /// shared resolver ([`crate::resolve`]). Does not upload the job's own
+    /// section; computed `missing` inputs are offered to the resolver's
+    /// uploader. A job whose module names input sections fails when
+    /// `inputs` is `None`.
     pub fn run(
         &self,
         job: &ComputeJob,
@@ -391,23 +341,53 @@ impl ModuleRunner {
         cache: Option<&DiskCache>,
         inputs: Option<Resolver<'_>>,
     ) -> Result<Computed, WorkerError> {
-        job.check_address()?;
+        let p = NativePlatform {
+            runner: self,
+            blobs,
+            cache,
+            inputs,
+            queue: None,
+        };
+        block_on(self.resolver.compute(&p, job, 0.0))
+    }
+
+    /// Gets `job`'s module and runs `gx_inputs` (version 1: nothing).
+    fn input_list(
+        &self,
+        job: &ComputeJob,
+        blobs: &dyn Blobs,
+        cache: Option<&DiskCache>,
+    ) -> Result<Vec<(u32, ChunkKey)>, WorkerError> {
         let module = self.module(&job.module, || {
             get_blob(BlobKind::Module, &job.module, blobs, cache, &self.flights)
         })?;
         self.stats.module_run();
         let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
-        let v2 = module.abi_version() >= 2;
-        let list = if v2 {
-            module.inputs(&job.request, &frames).map_err(host_error)?
-        } else {
-            Vec::new()
-        };
-        if !v2 && !frames.is_empty() {
-            return Err(WorkerError::permanent(
+        if module.abi_version() >= 2 {
+            module.inputs(&job.request, &frames).map_err(host_error)
+        } else if !frames.is_empty() {
+            Err(WorkerError::permanent(
                 "frame records given to a version 1 module, which reads none",
-            ));
+            ))
+        } else {
+            Ok(Vec::new())
         }
+    }
+
+    /// `gx_sources`, the manifest and tiles, `gx_compile` with `passed`,
+    /// and the validator.
+    fn compile(
+        &self,
+        job: &ComputeJob,
+        passed: &[Arc<[u8]>],
+        blobs: &dyn Blobs,
+        cache: Option<&DiskCache>,
+    ) -> Result<Computed, WorkerError> {
+        let module = self.module(&job.module, || {
+            get_blob(BlobKind::Module, &job.module, blobs, cache, &self.flights)
+        })?;
+        let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
+        let v2 = module.abi_version() >= 2;
         let ids = if v2 {
             module.sources_v2(&job.request, &frames)
         } else {
@@ -437,11 +417,6 @@ impl ModuleRunner {
             };
             tiles.push((r.id, bytes.as_ref().clone()));
         }
-        let passed = if v2 {
-            self.gather_inputs(job, &list, blobs, cache, inputs)?
-        } else {
-            Vec::new()
-        };
         let passed_refs: Vec<&[u8]> = passed.iter().map(|b| b.as_ref()).collect();
         self.stats.module_run();
         let bytes = if v2 {
@@ -454,165 +429,95 @@ impl ModuleRunner {
         Ok(Computed {
             bytes: Arc::from(bytes),
             section: section.map(Arc::new),
-            inputs_sha256: (!job.slots.is_empty())
-                .then(|| gx_core::module_io::inputs_sha256(&passed_refs)),
+            inputs_sha256: None,
         })
     }
+}
 
-    /// The inputs `gx_compile` receives (`client-compute.md` section 4.1),
-    /// in slot order: a frames slot's records from the job, a layer slot's
-    /// sections in the order `list` names them, each resolved through
-    /// `inputs` (section 10.3).
-    fn gather_inputs(
-        &self,
-        job: &ComputeJob,
-        list: &[(u32, ChunkKey)],
-        blobs: &dyn Blobs,
-        cache: Option<&DiskCache>,
-        inputs: Option<Resolver<'_>>,
-    ) -> Result<Vec<Arc<[u8]>>, WorkerError> {
-        let slots = job.slots.len();
-        let per_slot = if job.frames_per_slot.len() == slots {
-            job.frames_per_slot.clone()
-        } else if slots == 0 {
-            Vec::new()
-        } else {
-            return Err(WorkerError::permanent(format!(
-                "the job has {slots} slots and {} frame counts",
-                job.frames_per_slot.len()
-            )));
-        };
-        let mut out = Vec::with_capacity(job.frames.len() + list.len());
-        let mut records = job.frames.iter();
-        for (slot, (value, &count)) in job.slots.iter().zip(&per_slot).enumerate() {
-            match value.kind {
-                SlotKind::Frames => {
-                    for _ in 0..count {
-                        let r = records.next().ok_or_else(|| {
-                            WorkerError::permanent("the job has fewer frame records than slots")
-                        })?;
-                        out.push(Arc::clone(r));
-                    }
-                }
-                SlotKind::Layer => {
-                    for (_, key) in list.iter().filter(|(s, _)| *s as usize == slot) {
-                        let Some(resolver) = inputs else {
-                            return Err(WorkerError::permanent(format!(
-                                "the module reads input {key} of slot {slot}, and nothing resolves inputs here"
-                            )));
-                        };
-                        out.push(self.input(job, slot as u32, *key, blobs, cache, resolver)?);
-                    }
-                }
-            }
-        }
-        if let Some((slot, key)) = list.iter().find(|(s, _)| {
-            job.slots
-                .get(*s as usize)
-                .is_none_or(|v| v.kind != SlotKind::Layer)
-        }) {
-            return Err(WorkerError::permanent(format!(
-                "the module names input {key} of slot {slot}, which is not a layer slot of the layer"
-            )));
-        }
-        if slots == 0 && !job.frames.is_empty() {
-            // A job without slots passes its frame records as given.
-            out.extend(job.frames.iter().cloned());
-        }
-        Ok(out)
-    }
+/// The native platform of the shared resolver ([`crate::resolve`]): the
+/// module host, the fetcher, the cache directory, the input source, and
+/// the pool's queue. Every call blocks the pool thread it runs on.
+struct NativePlatform<'a> {
+    runner: &'a ModuleRunner,
+    blobs: &'a dyn Blobs,
+    cache: Option<&'a DiskCache>,
+    inputs: Option<Resolver<'a>>,
+    queue: Option<&'a Queue>,
+}
 
-    /// One input section of `reader` (`client-compute.md` section 10.3):
-    /// this session's memory, else the cache, else directions and a stream
-    /// or a compute. One thread per address does the work; the others wait
-    /// for it and take its bytes.
-    fn input(
+impl Platform for NativePlatform<'_> {
+    fn input_job(
         &self,
         reader: &ComputeJob,
         slot: u32,
         key: ChunkKey,
-        blobs: &dyn Blobs,
-        cache: Option<&DiskCache>,
-        resolver: Resolver<'_>,
-    ) -> Result<Arc<[u8]>, WorkerError> {
-        let mut job = resolver.source.input_job(reader, slot, key)?;
-        let address = job.address;
-        if let Some(b) = self.known_section(&key, &address, cache) {
-            return Ok(b);
+    ) -> Result<ComputeJob, WorkerError> {
+        match self.inputs {
+            Some(r) => r.source.input_job(reader, slot, key),
+            None => Err(WorkerError::permanent(format!(
+                "the module reads input {key} of slot {slot}, and nothing resolves inputs here"
+            ))),
         }
-        self.flights.run(Some(BlobKind::Section), &address, || {
-            if let Some(b) = self.known_section(&key, &address, cache) {
-                return Ok(b);
-            }
-            let bytes: Arc<[u8]> = match resolver.source.direct(&job)? {
-                InputDirection::Empty => Arc::from(Vec::new()),
-                InputDirection::Ready { sha256 } => {
-                    let bytes = resolver.source.stream(&address, &sha256)?;
-                    if gx_core::sha256::sha256(&bytes) != sha256 {
-                        return Err(WorkerError::transient(format!(
-                            "input section {} does not hash to {}",
-                            to_hex(&address),
-                            to_hex(&sha256)
-                        )));
-                    }
-                    check_section(&key, &bytes)?;
-                    let bytes: Arc<[u8]> = Arc::from(bytes);
-                    self.remember(&address, &bytes, cache);
-                    bytes
-                }
-                InputDirection::Compute { share } => {
-                    job.share = share;
-                    let computed = self.run(&job, blobs, cache, Some(resolver))?;
-                    self.stats.job_finished(true);
-                    self.remember(&address, &computed.bytes, cache);
-                    job.inputs_sha256 = computed.inputs_sha256;
-                    if share {
-                        if let Some(u) = resolver.uploader {
-                            u.offer(&job, Arc::clone(&computed.bytes));
-                        }
-                    }
-                    computed.bytes
-                }
-            };
-            Ok(bytes)
-        })
     }
 
-    /// The section at `address` if this session resolved it or the cache
-    /// holds a valid copy.
-    fn known_section(
+    async fn direct(&self, job: &ComputeJob) -> Result<InputDirection, WorkerError> {
+        match self.inputs {
+            Some(r) => r.source.direct(job),
+            None => Err(WorkerError::permanent("nothing resolves inputs here")),
+        }
+    }
+
+    async fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+        match self.inputs {
+            Some(r) => r.source.stream(address, sha256),
+            None => Err(WorkerError::permanent("nothing resolves inputs here")),
+        }
+    }
+
+    async fn input_list(&self, job: &ComputeJob) -> Result<Vec<(u32, ChunkKey)>, WorkerError> {
+        self.runner.input_list(job, self.blobs, self.cache)
+    }
+
+    async fn compile(
         &self,
-        key: &ChunkKey,
-        address: &[u8; 32],
-        cache: Option<&DiskCache>,
-    ) -> Option<Arc<[u8]>> {
-        if let Some(b) = self.resolved.lock().expect("resolved").get(address) {
-            return Some(b);
-        }
-        let name = to_hex(address);
-        let bytes = cache?.get(BlobKind::Section, &name)?;
-        if check_section(key, &bytes).is_err() {
-            return None;
-        }
-        let bytes: Arc<[u8]> = Arc::from(bytes);
-        self.resolved
-            .lock()
-            .expect("resolved")
-            .put(*address, Arc::clone(&bytes));
-        Some(bytes)
+        job: &ComputeJob,
+        inputs: &[Arc<[u8]>],
+    ) -> Result<Computed, WorkerError> {
+        self.runner.compile(job, inputs, self.blobs, self.cache)
     }
 
-    /// Keeps a resolved or computed section in memory and in the cache.
-    fn remember(&self, address: &[u8; 32], bytes: &Arc<[u8]>, cache: Option<&DiskCache>) {
-        self.resolved
-            .lock()
-            .expect("resolved")
-            .put(*address, Arc::clone(bytes));
-        if let Some(c) = cache {
+    async fn cache_get(&self, address: &[u8; 32]) -> Option<Vec<u8>> {
+        self.cache?.get(BlobKind::Section, &to_hex(address))
+    }
+
+    async fn cache_put(&self, address: &[u8; 32], bytes: &Arc<[u8]>) {
+        if let Some(c) = self.cache {
             let name = to_hex(address);
             if let Err(e) = c.put(BlobKind::Section, &name, bytes) {
                 tracing::warn!(address = name, "could not cache the section: {e}");
             }
+        }
+    }
+
+    fn offer(&self, job: &ComputeJob, bytes: Arc<[u8]>) {
+        if let Some(u) = self.inputs.and_then(|r| r.uploader) {
+            u.offer(job, bytes);
+        }
+    }
+
+    fn input_computed(&self) {
+        self.runner.stats.job_finished(true);
+    }
+
+    /// A waiting compute for `key` in the pool's queue takes the waiter's
+    /// priority if it is higher.
+    fn raise(&self, key: &ChunkKey, _: &[u8; 32], priority: f64) {
+        if let Some(q) = self.queue {
+            q.state
+                .lock()
+                .expect("job queue")
+                .computes
+                .raise(key, priority);
         }
     }
 }
@@ -622,6 +527,7 @@ pub type JobResult = Result<Computed, WorkerError>;
 
 struct Task {
     job: ComputeJob,
+    priority: f64,
     done: Box<dyn FnOnce(JobResult) + Send>,
 }
 
@@ -738,6 +644,7 @@ struct Shared {
     cache: Option<Arc<DiskCache>>,
     uploader: Arc<dyn Uploader>,
     inputs: Mutex<Option<Arc<dyn InputSource>>>,
+    queue: Arc<Queue>,
 }
 
 impl WorkerPool {
@@ -764,13 +671,6 @@ impl WorkerPool {
         uploader: Arc<dyn Uploader>,
         stats: Arc<WorkerStats>,
     ) -> Result<WorkerPool, WorkerError> {
-        let shared = Arc::new(Shared {
-            runner: ModuleRunner::new(config, Arc::clone(&stats))?,
-            blobs,
-            cache,
-            uploader,
-            inputs: Mutex::new(None),
-        });
         let queue = Arc::new(Queue {
             state: Mutex::new(State {
                 computes: ComputeQueue::new(),
@@ -778,6 +678,14 @@ impl WorkerPool {
                 stopping: false,
             }),
             ready: Condvar::new(),
+        });
+        let shared = Arc::new(Shared {
+            runner: ModuleRunner::new(config, Arc::clone(&stats))?,
+            blobs,
+            cache,
+            uploader,
+            inputs: Mutex::new(None),
+            queue: Arc::clone(&queue),
         });
         let size = threads.max(1);
         let threads = (0..size)
@@ -862,6 +770,7 @@ impl WorkerPool {
     ) {
         let task = Task {
             job,
+            priority,
             done: Box::new(done),
         };
         let mut state = self.queue.state.lock().expect("job queue");
@@ -901,6 +810,13 @@ impl WorkerPool {
         }
     }
 
+    /// The pool's input resolver ([`crate::resolve`]), so the client's own
+    /// streams of `ready` sections share its flight and memory per address
+    /// (`client-compute.md` section 10.3).
+    pub fn input_resolver(&self) -> Arc<InputResolver> {
+        Arc::clone(&self.shared.runner.resolver)
+    }
+
     /// Compute jobs waiting to start.
     pub fn waiting(&self) -> usize {
         self.queue.state.lock().expect("job queue").computes.len()
@@ -930,42 +846,28 @@ impl Drop for WorkerPool {
 }
 
 fn run_task(shared: &Shared, task: Task) {
-    let Task { mut job, done } = task;
+    let Task {
+        mut job,
+        priority,
+        done,
+    } = task;
     let runner = &shared.runner;
     let stats = runner.stats();
     let source = shared.inputs.lock().expect("input source").clone();
-    let resolver = source.as_deref().map(|s| Resolver {
-        source: s,
-        uploader: Some(shared.uploader.as_ref()),
-    });
-    let key = job.key();
-    let address = job.address;
-    let cache = shared.cache.as_deref();
+    let p = NativePlatform {
+        runner,
+        blobs: shared.blobs.as_ref(),
+        cache: shared.cache.as_deref(),
+        inputs: source.as_deref().map(|s| Resolver {
+            source: s,
+            uploader: Some(shared.uploader.as_ref()),
+        }),
+        queue: Some(&shared.queue),
+    };
     // One address is worked on once: a section already resolved as
     // another compute's input is handed over, and one being resolved now
     // is waited for (section 10.3).
-    let result = runner.flights.run(Some(BlobKind::Section), &address, || {
-        let remembered = runner.resolved.lock().expect("resolved").get(&address);
-        if let Some(bytes) = remembered {
-            return check_section(&key, &bytes).map(|section| {
-                (
-                    Computed {
-                        bytes,
-                        section: section.map(Arc::new),
-                        inputs_sha256: None,
-                    },
-                    false,
-                )
-            });
-        }
-        let r = runner.run(&job, shared.blobs.as_ref(), cache, resolver)?;
-        runner
-            .resolved
-            .lock()
-            .expect("resolved")
-            .put(address, Arc::clone(&r.bytes));
-        Ok((r, true))
-    });
+    let result = block_on(runner.resolver.run_wanted(&p, &job, priority));
     let result = match result {
         // Already computed here: handed over, neither cached nor offered
         // again.

@@ -982,6 +982,59 @@ pub fn frame_system_from_registries(
     Ok(FrameSystem::from_tree(tree))
 }
 
+/// When to ask directions for an input `job` (`client-compute.md` section
+/// 10.3): a moment inside the input's span, not before the origin and not
+/// after now. The reader's span lies inside it (rule 2).
+pub fn input_directions_time(job: &ComputeJob, origin: i64, now_utc_ms: i64) -> i64 {
+    let r = &job.request;
+    let span_ms = r.span_seconds as i64 * 1000;
+    let start = if span_ms == 0 {
+        now_utc_ms
+    } else {
+        r.origin_utc_ms + r.span_index as i64 * span_ms
+    };
+    start.max(origin).min(now_utc_ms)
+}
+
+/// What `response` directs for the input `job` (section 10.3), as the
+/// shared resolver takes it ([`gx_worker::resolve`]). Fails when the
+/// answer lacks the key or layer, or names another address.
+pub fn input_direction(
+    response: &DirectionsResponse,
+    job: &ComputeJob,
+) -> Result<gx_worker::InputDirection, gx_worker::WorkerError> {
+    use gx_worker::{InputDirection, WorkerError};
+    let key = job.key();
+    let raw = response
+        .results
+        .iter()
+        .find(|k| k.key == key.to_string())
+        .and_then(|k| k.layers.iter().find(|l| l.layer == job.layer))
+        .ok_or_else(|| {
+            WorkerError::transient(format!("no directions for input {key} of {}", job.layer))
+        })?;
+    let direction = raw
+        .parse(&key)
+        .map_err(|e| WorkerError::transient(format!("directions for input {key}: {e:#}")))?;
+    let (address, out) = match direction {
+        Direction::Empty => return Ok(InputDirection::Empty),
+        Direction::Ready {
+            address, sha256, ..
+        } => (address, InputDirection::Ready { sha256 }),
+        Direction::Missing(j) => (j.address, InputDirection::Compute { share: true }),
+        Direction::Local(j) => (j.address, InputDirection::Compute { share: false }),
+    };
+    if address != job.address {
+        return Err(WorkerError::transient(format!(
+            "directions name input {key} of {} at {}, the build at {}",
+            job.layer,
+            to_hex(&address),
+            job.address_hex()
+        )));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

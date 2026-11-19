@@ -28,7 +28,7 @@
 
 use super::cache::WebCache;
 use super::hub::{now_seconds, sleep, WebHub};
-use super::worker::{run_job, ModuleWorker};
+use super::worker::{ModuleWorker, WebPlatform};
 use crate::directions::{Action, Arrived, Completion, Coordinator, Origin, StreamResult};
 use crate::protocol::DirectionsResponse;
 use crate::stream::{
@@ -40,8 +40,8 @@ use gx_core::key::{CellKey, ChunkKey};
 use gx_core::sha256::{sha256, to_hex};
 use gx_core::units::Meters;
 use gx_worker::{
-    BlobKind, CheckJob, CheckLane, CheckOutcome, ComputeJob, ComputeQueue, Computed, UploadLane,
-    UploadOffer, UploadOutcome, WorkerError, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
+    BlobKind, CheckJob, CheckLane, CheckOutcome, ComputeJob, ComputeQueue, Computed, InputResolver,
+    UploadLane, UploadOffer, UploadOutcome, WorkerError, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -82,6 +82,8 @@ pub struct WebFetcher {
     cache: Option<Rc<WebCache>>,
     worker: ModuleWorker,
     stats: Arc<WorkerStats>,
+    resolver: Rc<InputResolver>,
+    records: Rc<crate::protocol::FrameRecords>,
     coordinator: Coordinator,
     lane: Rc<UploadLane>,
     uploading: Rc<Cell<usize>>,
@@ -109,6 +111,8 @@ impl WebFetcher {
             hub,
             cache: cache.map(Rc::new),
             worker: ModuleWorker::new(),
+            resolver: Rc::new(InputResolver::new()),
+            records: Rc::default(),
             lane: Rc::new(UploadLane::new(stats.clone())),
             uploading: Rc::new(Cell::new(0)),
             checks: CheckLane::new(stats.clone()),
@@ -282,7 +286,7 @@ impl WebFetcher {
         if self.job_running.get() {
             return;
         }
-        let Some((key, (layer, job))) = self.jobs.pop() else {
+        let Some((key, priority, (layer, job))) = self.jobs.pop_with_priority() else {
             return;
         };
         self.job_running.set(true);
@@ -293,11 +297,33 @@ impl WebFetcher {
             self.stats.clone(),
             self.lane.clone(),
         );
+        let (resolver, records, origin) = (
+            self.resolver.clone(),
+            self.records.clone(),
+            self.coordinator.origin_utc_ms(),
+        );
         let (inbox, running) = (self.inbox.clone(), self.job_running.clone());
         wasm_bindgen_futures::spawn_local(async move {
+            let mut job = job;
             let address = job.address;
-            let result = run_job(&job, &hub, cache.as_deref(), &worker, &stats).await;
-            stats.job_finished(result.is_ok());
+            let platform = WebPlatform {
+                hub: &hub,
+                cache: cache.as_deref(),
+                worker: &worker,
+                stats: &stats,
+                records: &records,
+                origin,
+                lane: &lane,
+            };
+            // One flight per address (section 10.3): a section already
+            // resolved as another job's input is handed over, neither
+            // cached nor offered again.
+            let result = resolver.run_wanted(&platform, &job, priority).await;
+            let fresh = matches!(result, Ok((_, true)));
+            let result = result.map(|(c, _)| c);
+            if fresh || result.is_err() {
+                stats.job_finished(result.is_ok());
+            }
             if let Err(e) = &result {
                 web_sys::console::warn_1(
                     &format!("gx-renderer: module job for {key} failed: {e}").into(),
@@ -310,13 +336,22 @@ impl WebFetcher {
                 result: result.clone(),
             });
             running.set(false);
-            let Ok(Computed { bytes: section, .. }) = result else {
+            let Ok(Computed {
+                bytes: section,
+                inputs_sha256,
+                ..
+            }) = result
+            else {
                 return;
             };
+            if !fresh {
+                return;
+            }
             if let Some(c) = &cache {
                 let _ = c.put(BlobKind::Section, &job.address_hex(), &section).await;
             }
             if job.share {
+                job.inputs_sha256 = inputs_sha256;
                 lane.offer(UploadOffer {
                     job,
                     bytes: section,
@@ -362,21 +397,40 @@ impl WebFetcher {
             return;
         };
         self.job_running.set(true);
-        let (hub, cache, worker, stats) = (
+        let (hub, cache, worker, stats, lane) = (
             self.hub.clone(),
             self.cache.clone(),
             self.worker.clone(),
             self.stats.clone(),
+            self.lane.clone(),
+        );
+        let (resolver, records, origin) = (
+            self.resolver.clone(),
+            self.records.clone(),
+            self.coordinator.origin_utc_ms(),
         );
         let (inbox, running) = (self.inbox.clone(), self.job_running.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let result = run_job(&check.job, &hub, cache.as_deref(), &worker, &stats).await;
+            let mut check = check;
+            let platform = WebPlatform {
+                hub: &hub,
+                cache: cache.as_deref(),
+                worker: &worker,
+                stats: &stats,
+                records: &records,
+                origin,
+                lane: &lane,
+            };
+            // A layer with inputs resolves them like a compute (section
+            // 10.3); its report carries `X-Inputs-Sha256` (10.4).
+            let result = resolver.compute(&platform, &check.job, 0.0).await;
             running.set(false);
             let Ok(computed) = result else {
                 stats.check_skipped();
                 return;
             };
             stats.check_run();
+            check.job.inputs_sha256 = computed.inputs_sha256;
             let hash = sha256(&computed.bytes);
             if hash != check.drawn {
                 inbox.borrow_mut().push_back(Internal::Replace {
@@ -421,10 +475,16 @@ impl WebFetcher {
                 address,
                 sha256,
             } => {
-                let (hub, cache, inbox) =
-                    (self.hub.clone(), self.cache.clone(), self.inbox.clone());
+                let (hub, cache, inbox, resolver) = (
+                    self.hub.clone(),
+                    self.cache.clone(),
+                    self.inbox.clone(),
+                    self.resolver.clone(),
+                );
                 wasm_bindgen_futures::spawn_local(async move {
-                    let result = stream_section(&hub, cache.as_deref(), key, address, sha256).await;
+                    let result =
+                        shared_stream(&resolver, &hub, cache.as_deref(), key, address, sha256)
+                            .await;
                     inbox.borrow_mut().push_back(Internal::Stream {
                         key,
                         layer,
@@ -454,7 +514,7 @@ impl WebFetcher {
                         address,
                         t,
                         origin,
-                        None,
+                        Some(&self.records),
                     ),
                     _ => None,
                 };
@@ -613,6 +673,14 @@ impl WebFetcher {
                         tracing::error!("refusing the build: {e}");
                         return Err(anyhow!("refusing the build: {e}"));
                     }
+                    // Input jobs take their frame records from these
+                    // (section 10.2).
+                    self.records = Rc::new(
+                        records
+                            .iter()
+                            .map(|(_, b)| (sha256(b), Arc::clone(b)))
+                            .collect(),
+                    );
                     return crate::protocol::frame_system_from_registries(
                         &sections,
                         self.hub.build(),
@@ -642,6 +710,33 @@ fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
             .map_err(|e| e.to_string()),
         ChunkKey::Registry | ChunkKey::Surface(_) | ChunkKey::Frame(_) => Ok(Arrived::raw(bytes)),
     }
+}
+
+/// [`stream_section`] under the address's flight in the shared resolver
+/// (section 10.3): a `ready` section being streamed as an input is waited
+/// for and taken from memory, not downloaded a second time, and one
+/// streamed here is remembered for input work.
+async fn shared_stream(
+    resolver: &InputResolver,
+    hub: &WebHub,
+    cache: Option<&WebCache>,
+    key: ChunkKey,
+    address: [u8; 32],
+    expected: [u8; 32],
+) -> StreamResult {
+    let _flight = resolver.flights().acquire(&address, 0.0, &|_| {}).await;
+    if let Some(bytes) = resolver.remembered(&address) {
+        if sha256(&bytes) == expected {
+            if let Ok(a) = decode_arrived(key, bytes.to_vec()) {
+                return StreamResult::Bytes(a, Origin::Cache);
+            }
+        }
+    }
+    let result = stream_section(hub, cache, key, address, expected).await;
+    if let StreamResult::Bytes(a, _) = &result {
+        resolver.remember(&address, a.bytes.clone());
+    }
+    result
 }
 
 /// Streams the version of the section at `address` whose bytes hash to
