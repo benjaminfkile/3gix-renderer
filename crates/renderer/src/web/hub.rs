@@ -23,6 +23,7 @@ use gx_core::sha256::to_hex;
 use gx_worker::{BlobKind, ComputeJob};
 use serde::de::DeserializeOwned;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// Seconds since the page loaded, from `performance.now()`.
@@ -65,6 +66,7 @@ impl WebHub {
             build: BuildDescription {
                 build_id: String::new(),
                 layers: Vec::new(),
+                frame_records: BTreeMap::new(),
             },
             clock: Cell::new(ClockSync::measure(
                 Clock {

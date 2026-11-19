@@ -10,7 +10,10 @@
 //
 // Two passes: web/module-runner.js called directly, then web/module-worker.js
 // itself in a worker thread, driven through its message protocol exactly as
-// the page drives the Web Worker.
+// the page drives the Web Worker. Both passes also run the core's version 2
+// example module (testdata/example-module-v2, client-compute.md section
+// 4.1) through gx_inputs, gx_sources, and gx_compile with its vectors'
+// frame and input bytes.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -89,6 +92,65 @@ for (const v of vectors) {
     }
 }
 
+// The version 2 example module and its vectors.
+const v2Dir = join(root, "testdata/example-module-v2");
+const wasmV2 = new Uint8Array(readFileSync(join(v2Dir, "module.wasm")));
+const hashV2 = sha(wasmV2);
+const vectorsV2 = readdirSync(join(v2Dir, "vectors"))
+    .filter((f) => f.endsWith(".request.bin"))
+    .map((f) => f.slice(0, -".request.bin".length))
+    .sort()
+    .map((name) => {
+        const read = (ext) => new Uint8Array(readFileSync(join(v2Dir, "vectors", `${name}.${ext}`)));
+        return {
+            name: `v2 ${name}`,
+            request: read("request.bin"),
+            frames: read("frames.bin"),
+            tiles: read("tiles.bin"),
+            inputList: read("input-list.bin"),
+            inputs: read("inputs.bin"),
+            expected: readFileSync(join(v2Dir, "vectors", `${name}.sha256`), "utf8").trim(),
+        };
+    });
+if (vectorsV2.length === 0) {
+    console.error(`${v2Dir}: no vectors`);
+    process.exit(1);
+}
+const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+async function checkV2(pass, run) {
+    for (const v of vectorsV2) {
+        try {
+            const list = await run("inputs", v);
+            if (!same(list, v.inputList)) {
+                console.log(`${pass} FAIL ${v.name}: the input list differs`);
+                failed++;
+                continue;
+            }
+            const sources = sourceIds(await run("sources", v));
+            check(pass, v.name, sources, v.tiles, await run("compile", v), v.expected);
+        } catch (e) {
+            console.log(`${pass} FAIL ${v.name}: ${e.message}`);
+            failed++;
+        }
+    }
+}
+
+const moduleV2 = await runner.compileModule(wasmV2);
+await checkV2("runner", (op, v) =>
+    op === "inputs" ? runner.runInputs(moduleV2, v.request, v.frames)
+        : op === "sources" ? runner.runSources(moduleV2, v.request, v.frames)
+            : runner.runCompile(moduleV2, v.request, v.tiles, v.inputs));
+
+// A version 1 module given frame records fails.
+try {
+    await runner.runSources(module, vectors[0].request, vectorsV2[0].frames);
+    console.log("runner FAIL a version 1 module took frame records");
+    failed++;
+} catch (e) {
+    console.log(`runner ok   frame records refused for version 1 (${e.message})`);
+}
+
 // A module with an import is refused.
 const importing = new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version
@@ -139,6 +201,8 @@ try {
         const section = await call({ op: "compile", hash, request: v.request, tiles: v.tiles });
         check("worker", v.name, sources, v.tiles, section, v.expected);
     }
+    await call({ op: "load", hash: hashV2, wasm: wasmV2 });
+    await checkV2("worker", (op, v) => call({ op, hash: hashV2, ...v }));
     try {
         await call({ op: "sources", hash: "0".repeat(64), request: vectors[0].request });
         console.log("worker FAIL a module never loaded ran");
@@ -156,4 +220,4 @@ if (failed > 0) {
     console.error(`worker-node-check: ${failed} failed`);
     process.exit(1);
 }
-console.log(`worker-node-check: ${vectors.length} vectors ok in both passes`);
+console.log(`worker-node-check: ${vectors.length} version 1 and ${vectorsV2.length} version 2 vectors ok in both passes`);

@@ -131,6 +131,8 @@ mod tests {
                     span_index: 0,
                     key: "1-0-0-0-0".parse().unwrap(),
                 },
+                slots: Vec::new(),
+                frames: Vec::new(),
             },
             layer_index: 0,
             drawn: [i; 32],

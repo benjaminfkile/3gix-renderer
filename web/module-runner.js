@@ -1,5 +1,5 @@
 // Runs compiler modules with the browser's own WebAssembly, under the module
-// ABI v1 (client-compute.md section 4). Used by the client's Web Worker
+// ABI v1 and v2 (client-compute.md sections 4 and 4.1). Used by the client's Web Worker
 // (module-worker.js) and, unchanged, by scripts/worker-node-check.mjs, which
 // runs it under Node (V8, standing in for the browser) against the core
 // example module's conformance vectors.
@@ -12,7 +12,10 @@
 // Rules enforced here:
 // - a module is compiled once and instantiated with an empty import object
 //   for every call, so a module that imports anything fails;
-// - gx_abi_version must return 1;
+// - gx_abi_version must return 1 or 2; a version 2 module also exports
+//   gx_inputs, and its gx_sources and gx_compile take the frame and input
+//   buffers. A version 1 module runs exactly as before and may be given no
+//   frame records or inputs;
 // - a call that leaves the module's memory above the limit (1 GiB) fails.
 // The time limit is enforced by the page, which terminates the worker.
 
@@ -43,7 +46,11 @@ class Call {
             if (!(name in this.e)) throw new Error(`module export ${name} is missing`);
         }
         const version = this.e.gx_abi_version();
-        if (version !== 1) throw new Error(`gx_abi_version returned ${version}, expected 1`);
+        if (version !== 1 && version !== 2) {
+            throw new Error(`gx_abi_version returned ${version}, expected 1 or 2`);
+        }
+        if (version === 2 && !("gx_inputs" in this.e)) throw new Error("module export gx_inputs is missing");
+        this.version = version;
     }
 
     checkMemory() {
@@ -87,20 +94,60 @@ async function fresh(module) {
     return new Call(instance);
 }
 
-/**
- * Runs gx_sources: the raw source id list bytes (u64 LE values) for the
- * request bytes.
- */
-export async function runSources(module, request) {
-    const call = await fresh(module);
-    const [rp, rl] = call.write(request);
-    return call.take(call.e.gx_sources(rp, rl));
+/** The count of a frame or input buffer (u32 LE count first); 0 for none. */
+function count(bytes) {
+    if (!bytes || bytes.length === 0) return 0;
+    if (bytes.length < 4) throw new Error(`a list of ${bytes.length} bytes has no count`);
+    return new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
 }
 
-/** Runs gx_compile: the section bytes for the request and tile bytes. */
-export async function runCompile(module, request, tiles) {
+function noneForV1(bytes, what) {
+    const n = count(bytes);
+    if (n !== 0) throw new Error(`${n} ${what} given to a version 1 module, which reads none`);
+}
+
+/**
+ * Runs gx_inputs (version 2): the raw input list bytes for the request and
+ * frame bytes. A version 1 module reads no inputs: the empty list.
+ */
+export async function runInputs(module, request, frames) {
+    const call = await fresh(module);
+    if (call.version === 1) {
+        noneForV1(frames, "frame records");
+        return new Uint8Array(4);
+    }
+    const [rp, rl] = call.write(request);
+    const [fp, fl] = call.write(frames ?? new Uint8Array(4));
+    return call.take(call.e.gx_inputs(rp, rl, fp, fl));
+}
+
+/**
+ * Runs gx_sources: the raw source id list bytes (u64 LE values) for the
+ * request bytes, and for a version 2 module the frame bytes.
+ */
+export async function runSources(module, request, frames) {
+    const call = await fresh(module);
+    const [rp, rl] = call.write(request);
+    if (call.version === 1) {
+        noneForV1(frames, "frame records");
+        return call.take(call.e.gx_sources(rp, rl));
+    }
+    const [fp, fl] = call.write(frames ?? new Uint8Array(4));
+    return call.take(call.e.gx_sources(rp, rl, fp, fl));
+}
+
+/**
+ * Runs gx_compile: the section bytes for the request and tile bytes, and
+ * for a version 2 module the input bytes.
+ */
+export async function runCompile(module, request, tiles, inputs) {
     const call = await fresh(module);
     const [rp, rl] = call.write(request);
     const [tp, tl] = call.write(tiles);
-    return call.take(call.e.gx_compile(rp, rl, tp, tl));
+    if (call.version === 1) {
+        noneForV1(inputs, "inputs");
+        return call.take(call.e.gx_compile(rp, rl, tp, tl));
+    }
+    const [ip, il] = call.write(inputs ?? new Uint8Array(4));
+    return call.take(call.e.gx_compile(rp, rl, tp, tl, ip, il));
 }

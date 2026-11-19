@@ -8,7 +8,7 @@
 //! module) both run their jobs through these functions, so the two
 //! platforms check exactly the same things.
 
-use gx_core::address::section_address;
+use gx_core::address::{section_address, section_address_v2, SlotValue};
 use gx_core::key::ChunkKey;
 use gx_core::manifest::{self, Manifest};
 use gx_core::matter::Section;
@@ -29,15 +29,19 @@ pub enum BlobKind {
     Source,
     /// A section, named by its address (not the hash of its bytes).
     Section,
+    /// A frame record (`client-compute.md` section 10.2), named by its
+    /// SHA-256.
+    FrameRecord,
 }
 
 impl BlobKind {
     /// Every kind, in a fixed order.
-    pub const ALL: [BlobKind; 4] = [
+    pub const ALL: [BlobKind; 5] = [
         BlobKind::Module,
         BlobKind::Manifest,
         BlobKind::Source,
         BlobKind::Section,
+        BlobKind::FrameRecord,
     ];
 
     /// The route segment the hub serves this kind under: `GET
@@ -48,6 +52,7 @@ impl BlobKind {
             BlobKind::Manifest => "source-manifest",
             BlobKind::Source => "source",
             BlobKind::Section => "section",
+            BlobKind::FrameRecord => "frame-record",
         }
     }
 
@@ -153,6 +158,14 @@ pub struct ComputeJob {
     pub manifest: Option<[u8; 32]>,
     /// The request the module receives: key, origin, and span.
     pub request: ModuleRequest,
+    /// The layer's input slots in slot order (`client-compute.md` section
+    /// 10.5), which make the address version 2. Empty for a layer without
+    /// inputs, whose address is version 1.
+    pub slots: Vec<SlotValue>,
+    /// The records of the layer's frames slots, in slot order and, within a
+    /// slot, in the order the config lists the frames (section 4.1). They
+    /// come from the build. Empty for a layer without frames slots.
+    pub frames: Vec<Arc<[u8]>>,
 }
 
 impl ComputeJob {
@@ -172,14 +185,27 @@ impl ComputeJob {
     /// the section would be stored under the wrong name.
     pub fn check_address(&self) -> Result<(), WorkerError> {
         let r = &self.request;
-        let expected = section_address(
-            &self.module,
-            self.manifest.as_ref(),
-            r.origin_utc_ms,
-            r.span_seconds,
-            r.span_index,
-            &r.key,
-        );
+        let expected = if self.slots.is_empty() {
+            section_address(
+                &self.module,
+                self.manifest.as_ref(),
+                r.origin_utc_ms,
+                r.span_seconds,
+                r.span_index,
+                &r.key,
+            )
+        } else {
+            section_address_v2(
+                &self.module,
+                self.manifest.as_ref(),
+                r.origin_utc_ms,
+                r.span_seconds,
+                r.span_index,
+                &self.slots,
+                &r.key,
+            )
+            .map_err(|e| WorkerError::permanent(format!("the job's slots: {e}")))?
+        };
         if expected == self.address {
             Ok(())
         } else {
@@ -295,9 +321,11 @@ pub fn check_section(key: &ChunkKey, bytes: &[u8]) -> Result<Option<Section>, Wo
     };
     match key {
         ChunkKey::Cell(cell) => gx_core::matter::decode(cell, bytes).map(Some).map_err(fail),
-        ChunkKey::Registry | ChunkKey::Surface(_) => gx_core::validate(&key.to_string(), bytes)
-            .map(|()| None)
-            .map_err(fail),
+        ChunkKey::Registry | ChunkKey::Surface(_) | ChunkKey::Frame(_) => {
+            gx_core::validate(&key.to_string(), bytes)
+                .map(|()| None)
+                .map_err(fail)
+        }
     }
 }
 
@@ -321,6 +349,8 @@ mod tests {
             module,
             manifest: None,
             request,
+            slots: Vec::new(),
+            frames: Vec::new(),
         }
     }
 

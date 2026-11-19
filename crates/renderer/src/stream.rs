@@ -1913,7 +1913,7 @@ pub fn directions_time(wanted: Option<i64>, origin: Option<i64>, now: i64) -> i6
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{Fetcher, FetcherOptions};
+pub use native::{frame_records, Fetcher, FetcherOptions};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -1930,6 +1930,7 @@ mod native {
     use gx_core::sha256::to_hex;
     use gx_core::units::Meters;
     use gx_module_host::HostConfig;
+    use gx_worker::job::check_blob;
     use gx_worker::{
         BlobKind, Blobs, CheckJob, CheckLane, CheckOutcome, CheckRunner, ComputeJob, Computed,
         DiskCache, Lane, LaneSource, UploadLane, UploadOffer, UploadOutcome, Uploader, WorkerError,
@@ -2541,6 +2542,8 @@ mod native {
                             }));
                         });
                     }
+
+                    ChunkKey::Frame(_) => {}
                 },
                 Action::Failed { key, reason } => match key {
                     ChunkKey::Registry => self.out.push(FetchEvent::Registry(Err(reason))),
@@ -2558,6 +2561,9 @@ mod native {
                         outcome: Err(reason),
                         bytes: 0,
                     }),
+                    // The renderer never asks for a frame key: frame
+                    // records come from the build (section 10.2).
+                    ChunkKey::Frame(_) => {}
                 },
             }
         }
@@ -2673,6 +2679,13 @@ mod native {
                 for e in self.wait(left.min(Duration::from_millis(200))) {
                     if let FetchEvent::Registry(r) = e {
                         let sections = r.map_err(|e| anyhow!("registry: {e}"))?;
+                        let records = self
+                            .handle
+                            .block_on(frame_records(&self.client, self.cache.as_deref()))?;
+                        crate::protocol::check_frame_records(&sections, &records).map_err(|e| {
+                            tracing::error!("refusing the build: {e}");
+                            anyhow!("refusing the build: {e}")
+                        })?;
                         let system = crate::protocol::frame_system_from_registries(
                             &sections,
                             self.client.build(),
@@ -2683,6 +2696,44 @@ mod native {
                 }
             }
         }
+    }
+
+    /// Every frame record the build lists (`client-compute.md` section
+    /// 10.2), as `(frame id, bytes)`: the local cache if it holds bytes
+    /// with the right hash, else `GET /frame-record/{hash}` from the edge,
+    /// checked against the hash and cached like any content-addressed
+    /// bytes. Fails for a record that is missing or does not hash to its
+    /// name.
+    pub async fn frame_records(
+        client: &HubClient,
+        cache: Option<&DiskCache>,
+    ) -> Result<Vec<(u64, Arc<[u8]>)>> {
+        let mut out = Vec::new();
+        for (frame_id, hash) in client.build().frame_record_hashes()? {
+            let name = to_hex(&hash);
+            let kind = BlobKind::FrameRecord;
+            let cached = cache
+                .and_then(|c| c.get(kind, &name))
+                .filter(|b| check_blob(kind, &hash, b).is_ok());
+            let bytes = match cached {
+                Some(b) => b,
+                None => {
+                    let b = client
+                        .get_blob(kind, &name)
+                        .await?
+                        .ok_or_else(|| anyhow!("frame record {name} is not stored"))?;
+                    check_blob(kind, &hash, &b).map_err(|e| anyhow!("frame record {name}: {e}"))?;
+                    if let Some(c) = cache {
+                        if let Err(e) = c.put(kind, &name, &b) {
+                            tracing::warn!(name, "could not cache the frame record: {e}");
+                        }
+                    }
+                    b
+                }
+            };
+            out.push((frame_id, Arc::from(bytes)));
+        }
+        Ok(out)
     }
 
     /// Decodes a cell's section on a blocking task: the one validation it
@@ -2915,6 +2966,22 @@ mod tests {
             decode_cell(&k, &none, Meters::new(8.0)),
             FetchOutcome::Decoded(None)
         );
+    }
+
+    #[test]
+    fn a_section_with_a_wrong_cell_edge_is_refused() {
+        use gx_core::matter::{encode, Compression};
+        let k = key(1, 1, 0, 0);
+        let g = k.geometry(Meters::new(8.0));
+        let wrong = Meters::new(g.edge.value() * (1.0 + f64::EPSILON));
+        let section = Section::empty(k, g.origin, wrong).unwrap();
+        let bytes = encode(&section, Compression::None);
+        match decode_cell(&k, &[&bytes], Meters::new(8.0)) {
+            FetchOutcome::Invalid(reason) => {
+                assert!(reason.contains("geometry"), "{reason}")
+            }
+            other => panic!("drawn: {other:?}"),
+        }
     }
 
     #[test]

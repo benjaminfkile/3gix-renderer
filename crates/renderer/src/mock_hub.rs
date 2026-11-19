@@ -161,6 +161,9 @@ pub struct MockHubOptions {
     pub sources: Vec<Vec<u8>>,
     /// The origin, if it was set before the mock started.
     pub origin_utc_ms: Option<i64>,
+    /// Frame records the build lists (`client-compute.md` section 10.2):
+    /// `(layer id, frame id, bytes)`, served by their SHA-256.
+    pub frame_records: Vec<(String, u64, Vec<u8>)>,
 }
 
 impl MockHubOptions {
@@ -173,6 +176,7 @@ impl MockHubOptions {
             layers,
             sources,
             origin_utc_ms: None,
+            frame_records: Vec::new(),
         }
     }
 }
@@ -210,6 +214,8 @@ pub struct MockCounts {
     pub source_reads: u64,
     /// `GET /source-manifest/...` answered `200`.
     pub manifest_reads: u64,
+    /// `GET /frame-record/...` answered `200`.
+    pub frame_record_reads: u64,
     /// Checks answered `match` (`200`).
     pub checks_matched: u64,
     /// Checks answered `disputed` (`202`).
@@ -235,6 +241,7 @@ struct Counters {
     module_reads: AtomicU64,
     source_reads: AtomicU64,
     manifest_reads: AtomicU64,
+    frame_record_reads: AtomicU64,
     checks_matched: AtomicU64,
     checks_disputed: AtomicU64,
     checks_refused: AtomicU64,
@@ -278,6 +285,7 @@ struct State {
     modules: BTreeMap<String, Vec<u8>>,
     manifests: BTreeMap<String, Vec<u8>>,
     sources: BTreeMap<String, Vec<u8>>,
+    frame_records: BTreeMap<String, Vec<u8>>,
     space: Mutex<Space>,
     counters: Counters,
 }
@@ -331,6 +339,11 @@ impl MockHub {
                 .sources
                 .iter()
                 .map(|s| (hex(s), s.clone()))
+                .collect(),
+            frame_records: options
+                .frame_records
+                .iter()
+                .map(|(_, _, r)| (hex(r), r.clone()))
                 .collect(),
             space: Mutex::new(Space {
                 origin: options.origin_utc_ms,
@@ -445,6 +458,7 @@ impl MockHub {
             module_reads: l(&c.module_reads),
             source_reads: l(&c.source_reads),
             manifest_reads: l(&c.manifest_reads),
+            frame_record_reads: l(&c.frame_record_reads),
         }
     }
 }
@@ -459,9 +473,17 @@ impl Drop for Held<'_> {
 }
 
 fn build_description(state: &State) -> BuildDescription {
+    let mut frame_records: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (layer, frame, bytes) in &state.options.frame_records {
+        frame_records
+            .entry(layer.clone())
+            .or_default()
+            .insert(frame.to_string(), to_hex(&sha256(bytes)));
+    }
     BuildDescription {
         build_id: state.options.build_id.clone(),
         layers: state.layers.iter().map(MockLayer::config).collect(),
+        frame_records,
     }
 }
 
@@ -650,6 +672,8 @@ fn blob(state: &State, path: &str) -> Option<Vec<u8>> {
         )
     } else if let Some(h) = path.strip_prefix("/module/") {
         (&c.module_reads, state.modules.get(h).cloned())
+    } else if let Some(h) = path.strip_prefix("/frame-record/") {
+        (&c.frame_record_reads, state.frame_records.get(h).cloned())
     } else if let Some(h) = path.strip_prefix("/source-manifest/") {
         (&c.manifest_reads, state.manifests.get(h).cloned())
     } else {
@@ -687,7 +711,7 @@ fn is_empty_for(l: &MockLayer, key: &ChunkKey, exclusive: &BTreeMap<u64, &str>) 
     let placed = match key {
         ChunkKey::Cell(cell) => Some((cell.frame_id, cell.depth)),
         ChunkKey::Surface(t) => Some((t.frame_id, t.level)),
-        ChunkKey::Registry => None,
+        ChunkKey::Registry | ChunkKey::Frame(_) => None,
     };
     let Some((frame_id, depth)) = placed else {
         return false;

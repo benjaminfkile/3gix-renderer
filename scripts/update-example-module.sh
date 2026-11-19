@@ -1,7 +1,9 @@
 #!/bin/sh
-# Rebuilds the core library's example module (gx-module-test) at the core
-# revision pinned in Cargo.lock and copies it, with its conformance vectors
-# (conformance/module/), into testdata/example-module/.
+# Rebuilds the core library's example modules at the core revision pinned in
+# Cargo.lock and copies each, with its conformance vectors, into testdata:
+# gx-module-test (ABI v1, conformance/module/) into testdata/example-module/
+# and gx-module-reader (ABI v2, conformance/module-v2/) into
+# testdata/example-module-v2/.
 #
 # The worker tests, the mock hub, and scripts/worker-node-check.mjs run this
 # module. Rerun this script after moving the gx-core pin; the worker's
@@ -21,7 +23,7 @@ echo "core checkout: $core"
 
 target="$(pwd)/target/example-module"
 # The core checkout is read-only; build into our own target directory.
-(cd "$core" && cargo build -q -p gx-module-test --release \
+(cd "$core" && cargo build -q -p gx-module-test -p gx-module-reader --release \
     --target wasm32-unknown-unknown --target-dir "$target")
 
 out=testdata/example-module
@@ -29,4 +31,11 @@ rm -rf "$out"
 mkdir -p "$out/vectors"
 cp "$target/wasm32-unknown-unknown/release/gx_module_test.wasm" "$out/module.wasm"
 cp "$core"/conformance/module/* "$out/vectors/"
+ls -l "$out/module.wasm"
+
+out=testdata/example-module-v2
+rm -rf "$out"
+mkdir -p "$out/vectors"
+cp "$target/wasm32-unknown-unknown/release/gx_module_reader.wasm" "$out/module.wasm"
+cp "$core"/conformance/module-v2/* "$out/vectors/"
 ls -l "$out/module.wasm"

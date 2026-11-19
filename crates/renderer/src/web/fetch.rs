@@ -492,6 +492,9 @@ impl WebFetcher {
                         bytes,
                     });
                 }
+                // The renderer never asks for a frame key: frame records
+                // come from the build (section 10.2).
+                ChunkKey::Frame(_) => {}
             },
             Action::Failed { key, reason } => match key {
                 ChunkKey::Registry => self.out.push(FetchEvent::Registry(Err(reason))),
@@ -509,6 +512,7 @@ impl WebFetcher {
                         round_trip: Duration::ZERO,
                     });
                 }
+                ChunkKey::Frame(_) => {}
             },
         }
     }
@@ -551,6 +555,44 @@ impl WebFetcher {
         }
     }
 
+    /// Every frame record the build lists (`client-compute.md` section
+    /// 10.2), as `(frame id, bytes)`: the page's cache if it holds bytes
+    /// with the right hash, else `GET /frame-record/{hash}` from the edge,
+    /// checked against the hash and cached like sections. Fails for a
+    /// record that is missing or does not hash to its name.
+    pub async fn frame_records(&self) -> Result<Vec<(u64, Arc<[u8]>)>> {
+        let kind = BlobKind::FrameRecord;
+        let mut out = Vec::new();
+        for (frame_id, hash) in self.hub.build().frame_record_hashes()? {
+            let name = to_hex(&hash);
+            let cached = match &self.cache {
+                Some(c) => c.get(kind, &name).await.filter(|b| sha256(b) == hash),
+                None => None,
+            };
+            let bytes = match cached {
+                Some(b) => b,
+                None => {
+                    let b = self
+                        .hub
+                        .get_blob(kind, &name)
+                        .await?
+                        .ok_or_else(|| anyhow!("frame record {name} is not stored"))?;
+                    if sha256(&b) != hash {
+                        return Err(anyhow!("frame record {name}: the bytes do not hash to it"));
+                    }
+                    if let Some(c) = &self.cache {
+                        if let Err(e) = c.put(kind, &name, &b).await {
+                            tracing::warn!(name, "could not cache the frame record: {e}");
+                        }
+                    }
+                    b
+                }
+            };
+            out.push((frame_id, Arc::from(bytes)));
+        }
+        Ok(out)
+    }
+
     /// Asks for the registry key and waits for every layer's registry,
     /// then builds the frame system from their union.
     pub async fn load_registry(&mut self) -> Result<FrameSystem> {
@@ -560,6 +602,11 @@ impl WebFetcher {
             for e in self.drain() {
                 if let FetchEvent::Registry(r) = e {
                     let sections = r.map_err(|e| anyhow!("registry: {e}"))?;
+                    let records = self.frame_records().await?;
+                    if let Err(e) = crate::protocol::check_frame_records(&sections, &records) {
+                        tracing::error!("refusing the build: {e}");
+                        return Err(anyhow!("refusing the build: {e}"));
+                    }
                     return crate::protocol::frame_system_from_registries(
                         &sections,
                         self.hub.build(),
@@ -587,7 +634,7 @@ fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
                 decoded: Some(Arc::new(s)),
             })
             .map_err(|e| e.to_string()),
-        ChunkKey::Registry | ChunkKey::Surface(_) => Ok(Arrived::raw(bytes)),
+        ChunkKey::Registry | ChunkKey::Surface(_) | ChunkKey::Frame(_) => Ok(Arrived::raw(bytes)),
     }
 }
 
