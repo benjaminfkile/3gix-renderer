@@ -439,7 +439,7 @@ impl WebFetcher {
                 layer,
                 job,
                 priority,
-            } => self.jobs.push(key, priority, (layer, job)),
+            } => self.jobs.push(key, priority, (layer, *job)),
             Action::Check {
                 key,
                 layer,
@@ -447,9 +447,15 @@ impl WebFetcher {
                 sha256,
             } => {
                 let job = match (self.asked_at.get(&key), self.coordinator.origin_utc_ms()) {
-                    (Some(&t), Some(origin)) => {
-                        crate::protocol::check_job(self.hub.build(), layer, key, address, t, origin)
-                    }
+                    (Some(&t), Some(origin)) => crate::protocol::check_job(
+                        self.hub.build(),
+                        layer,
+                        key,
+                        address,
+                        t,
+                        origin,
+                        None,
+                    ),
                     _ => None,
                 };
                 if let ChunkKey::Cell(cell) = key {

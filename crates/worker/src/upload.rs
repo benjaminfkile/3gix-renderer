@@ -44,6 +44,10 @@ pub enum UploadOutcome {
     Matched,
     /// `202`: a copy was already stored and this one differs from it.
     Disputed,
+    /// `409`: the hub does not hold the inputs this section was
+    /// computed from as true (`client-compute.md` section 10.4). Logged
+    /// and counted, never retried; nobody is blamed.
+    Conflict,
     /// Anything else, or no answer at all.
     Failed,
 }
@@ -55,6 +59,7 @@ impl UploadOutcome {
             201 => UploadOutcome::Stored,
             200 => UploadOutcome::Matched,
             202 => UploadOutcome::Disputed,
+            409 => UploadOutcome::Conflict,
             _ => UploadOutcome::Failed,
         }
     }
@@ -138,6 +143,8 @@ mod tests {
                 },
                 slots: Vec::new(),
                 frames: Vec::new(),
+                frames_per_slot: Vec::new(),
+                inputs_sha256: None,
             },
             bytes: Arc::from(vec![i]),
         }

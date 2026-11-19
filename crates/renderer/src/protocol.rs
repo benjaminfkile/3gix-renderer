@@ -6,7 +6,11 @@
 //! config), 2.3 (client routes), 2.4 (directions: `ready`, `missing`,
 //! `local`, `empty`), 2.5 (the upload headers), and 2.6 (the check body
 //! and headers, and the job that recomputes a `ready` section from the
-//! layer config, [`check_job`]). There is no readiness
+//! layer config, [`check_job`]), and section 10 for layers with inputs:
+//! the config's input slots ([`InputSlot`]), slot values and identities
+//! (10.5, [`BuildDescription::slots`]), the job of an input at the input
+//! span (10.3, [`BuildDescription::input_job`]), and `X-Inputs-Sha256` on
+//! uploads and checks (10.4). There is no readiness
 //! socket: nothing waits on another client. Shared by the native client ([`crate::hub`])
 //! and the browser client (`crate::web`), which differ only in how they
 //! send requests.
@@ -20,6 +24,7 @@
 //! 11.4).
 
 use anyhow::{anyhow, bail, Result};
+use gx_core::address::{frames_slot_value, input_span_index, layer_identity, SlotKind, SlotValue};
 use gx_core::frame_record;
 use gx_core::frames::FrameSystem;
 use gx_core::key::{ChunkKey, REGISTRY_KEY};
@@ -47,17 +52,27 @@ pub const SPAN_INDEX_HEADER: &str = "X-Span-Index";
 /// Upload header: SHA-256 of the body, lowercase hex.
 pub const CONTENT_SHA256_HEADER: &str = "X-Content-Sha256";
 
+/// Upload and check header of a layer with inputs: SHA-256 over the
+/// SHA-256 of every input passed to `gx_compile` (`client-compute.md`
+/// section 10.4).
+pub const INPUTS_SHA256_HEADER: &str = "X-Inputs-Sha256";
+
 /// The section 2.5 headers of an upload of `bytes` for `job`, in a fixed
-/// order: `X-Layer`, `X-Key`, `X-Span-Index`, `X-Content-Sha256`. The
+/// order: `X-Layer`, `X-Key`, `X-Span-Index`, `X-Content-Sha256`, and for
+/// a layer with inputs `X-Inputs-Sha256` (section 10.4). The
 /// `Expect: 100-continue` header is added by the native client; the
 /// browser's fetch does not let a page set it.
-pub fn upload_headers(job: &ComputeJob, bytes: &[u8]) -> [(&'static str, String); 4] {
-    [
+pub fn upload_headers(job: &ComputeJob, bytes: &[u8]) -> Vec<(&'static str, String)> {
+    let mut h = vec![
         (LAYER_HEADER, job.layer.clone()),
         (KEY_HEADER, job.key().to_string()),
         (SPAN_INDEX_HEADER, job.request.span_index.to_string()),
         (CONTENT_SHA256_HEADER, to_hex(&sha256(bytes))),
-    ]
+    ];
+    if let Some(i) = &job.inputs_sha256 {
+        h.push((INPUTS_SHA256_HEADER, to_hex(i)));
+    }
+    h
 }
 
 /// Most keys one directions request may carry (`client-compute.md`
@@ -237,6 +252,25 @@ pub struct LayerConfig {
     /// sections are never uploaded (`client-compute.md` section 2.2).
     #[serde(default = "shared_by_default")]
     pub shared: bool,
+    /// What the layer's module reads besides its source tiles
+    /// (`client-compute.md` sections 2.2 and 10), in slot order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputSlot>,
+}
+
+/// One input slot of a layer config (`client-compute.md` section 2.2).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum InputSlot {
+    /// A layer slot: the sections of the layer with this id.
+    Layer(String),
+    /// A frames slot: the records of these frames, declared by `layer`.
+    Frames {
+        /// The layer whose module declares the frames.
+        layer: String,
+        /// The frame ids, in the order their records are passed.
+        frames: Vec<u64>,
+    },
 }
 
 fn shared_by_default() -> bool {
@@ -298,6 +332,218 @@ impl BuildDescription {
         Ok(out)
     }
 
+    /// The layer with id `id`.
+    pub fn layer_by_id(&self, id: &str) -> Result<&LayerConfig> {
+        self.layers
+            .iter()
+            .find(|l| l.layer == id)
+            .ok_or_else(|| anyhow!("the build has no layer {id:?}"))
+    }
+
+    /// The span index of `layer` at `t_utc_ms` (`client-compute.md`
+    /// section 2.4).
+    pub fn span_index_at(&self, layer: &LayerConfig, t_utc_ms: i64, origin: i64) -> Result<u64> {
+        if layer.span_seconds == 0 {
+            return Ok(0);
+        }
+        let start = if layer.uses_origin { origin } else { 0 };
+        let span_ms = i64::try_from(layer.span_seconds)?.saturating_mul(1000);
+        Ok(u64::try_from((t_utc_ms - start).div_euclid(span_ms))?)
+    }
+
+    /// The hashes of the records of `layer`'s frames slot `frames` declared
+    /// by `declarer`, in the order the slot lists the frames.
+    fn record_hashes(&self, declarer: &str, frames: &[u64]) -> Result<Vec<[u8; 32]>> {
+        frames
+            .iter()
+            .map(|f| {
+                let hex = self
+                    .frame_records
+                    .get(declarer)
+                    .and_then(|m| m.get(&f.to_string()))
+                    .ok_or_else(|| {
+                        anyhow!("the build lists no record of frame {f} by {declarer:?}")
+                    })?;
+                parse_hash(hex).ok_or_else(|| anyhow!("frame record hash {hex:?}"))
+            })
+            .collect()
+    }
+
+    /// The slot values of `layer` at span `span_index` (`client-compute.md`
+    /// section 10.5): each layer slot's identity at the input span (section
+    /// 10.3), each frames slot's hash of its records' hashes. Empty for a
+    /// layer without inputs. Fails for a missing layer or record, a layer
+    /// with source epochs among the read ones, or a cycle.
+    pub fn slots(
+        &self,
+        layer: &LayerConfig,
+        span_index: u64,
+        origin: i64,
+    ) -> Result<Vec<SlotValue>> {
+        self.slots_at_depth(layer, span_index, origin, 0)
+    }
+
+    fn slots_at_depth(
+        &self,
+        layer: &LayerConfig,
+        span_index: u64,
+        origin: i64,
+        depth: usize,
+    ) -> Result<Vec<SlotValue>> {
+        if depth > self.layers.len() {
+            bail!("the inputs of layer {:?} form a cycle", layer.layer);
+        }
+        layer
+            .inputs
+            .iter()
+            .map(|slot| match slot {
+                InputSlot::Frames { layer: d, frames } => Ok(SlotValue {
+                    kind: SlotKind::Frames,
+                    value: frames_slot_value(&self.record_hashes(d, frames)?),
+                }),
+                InputSlot::Layer(id) => {
+                    let input = self.layer_by_id(id)?;
+                    let s = input_span_index(span_index, layer.span_seconds, input.span_seconds)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let (module, manifest) = module_and_manifest(input)?;
+                    let slots = self.slots_at_depth(input, s, origin, depth + 1)?;
+                    let value = layer_identity(
+                        &module,
+                        manifest.as_ref(),
+                        if input.uses_origin { origin } else { 0 },
+                        input.span_seconds,
+                        s,
+                        &slots,
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                    Ok(SlotValue {
+                        kind: SlotKind::Layer,
+                        value,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// The job that computes `layer`'s section of `key` at span
+    /// `span_index` in a space of origin `origin`: module, manifest,
+    /// request, slots, the frames slots' records from `records`, and the
+    /// address (version 1 without inputs, version 2 with,
+    /// `client-compute.md` section 3). Its `share` is the layer's.
+    pub fn layer_job(
+        &self,
+        layer: &LayerConfig,
+        key: ChunkKey,
+        span_index: u64,
+        origin: i64,
+        records: &FrameRecords,
+    ) -> Result<ComputeJob> {
+        let (module, manifest) = module_and_manifest(layer)?;
+        let request = ModuleRequest {
+            origin_utc_ms: if layer.uses_origin { origin } else { 0 },
+            span_seconds: layer.span_seconds,
+            span_index,
+            key,
+        };
+        let mut job = ComputeJob {
+            address: [0; 32],
+            layer: layer.layer.clone(),
+            share: layer.shared,
+            module,
+            manifest,
+            request,
+            slots: Vec::new(),
+            frames: Vec::new(),
+            frames_per_slot: Vec::new(),
+            inputs_sha256: None,
+        };
+        self.complete_job(&mut job, origin, records)?;
+        let r = &job.request;
+        job.address = if job.slots.is_empty() {
+            gx_core::address::section_address(
+                &module,
+                manifest.as_ref(),
+                r.origin_utc_ms,
+                r.span_seconds,
+                r.span_index,
+                &r.key,
+            )
+        } else {
+            gx_core::address::section_address_v2(
+                &module,
+                manifest.as_ref(),
+                r.origin_utc_ms,
+                r.span_seconds,
+                r.span_index,
+                &job.slots,
+                &r.key,
+            )
+            .map_err(|e| anyhow!("{e}"))?
+        };
+        Ok(job)
+    }
+
+    /// Fills in the slots and the frames slots' records of a job made from
+    /// directions (`client-compute.md` section 10): nothing for a layer
+    /// without inputs. The worker checks the address against them.
+    pub fn complete_job(
+        &self,
+        job: &mut ComputeJob,
+        origin: i64,
+        records: &FrameRecords,
+    ) -> Result<()> {
+        let layer = self.layer_by_id(&job.layer)?;
+        if layer.inputs.is_empty() {
+            return Ok(());
+        }
+        job.slots = self.slots(layer, job.request.span_index, origin)?;
+        job.frames.clear();
+        job.frames_per_slot.clear();
+        for slot in &layer.inputs {
+            match slot {
+                InputSlot::Layer(_) => job.frames_per_slot.push(0),
+                InputSlot::Frames { layer: d, frames } => {
+                    for h in self.record_hashes(d, frames)? {
+                        let bytes = records
+                            .get(&h)
+                            .ok_or_else(|| anyhow!("frame record {} is not loaded", to_hex(&h)))?;
+                        job.frames.push(Arc::clone(bytes));
+                    }
+                    job.frames_per_slot.push(frames.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The job for input `key` of `reader`'s layer slot `slot`
+    /// (`client-compute.md` section 10.3): the slot's layer at the span
+    /// containing the reader's span start.
+    pub fn input_job(
+        &self,
+        reader: &ComputeJob,
+        slot: u32,
+        key: ChunkKey,
+        origin: i64,
+        records: &FrameRecords,
+    ) -> Result<ComputeJob> {
+        let config = self.layer_by_id(&reader.layer)?;
+        let Some(InputSlot::Layer(id)) = config.inputs.get(slot as usize) else {
+            bail!(
+                "slot {slot} of layer {:?} is not a layer slot",
+                reader.layer
+            );
+        };
+        let input = self.layer_by_id(id)?;
+        let s = input_span_index(
+            reader.request.span_index,
+            reader.request.span_seconds,
+            input.span_seconds,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        self.layer_job(input, key, s, origin, records)
+    }
+
     /// `true` when `layer` is directed for matter cells of `frame_id`:
     /// attached, and no exclusive layer of another id owns the frame
     /// (`space-model.md` section 8).
@@ -319,6 +565,29 @@ impl BuildDescription {
     }
 }
 
+/// Frame records by the SHA-256 of their bytes (`client-compute.md`
+/// section 10.2).
+pub type FrameRecords = BTreeMap<[u8; 32], Arc<[u8]>>;
+
+/// The module hash and the source manifest hash of a layer. Fails for a
+/// layer with source epochs, whose manifest depends on the span (section
+/// 5.4) and is not resolved here.
+fn module_and_manifest(layer: &LayerConfig) -> Result<([u8; 32], Option<[u8; 32]>)> {
+    if layer.source_epochs.is_some() {
+        bail!(
+            "layer {:?} has source epochs, not resolved as an input",
+            layer.layer
+        );
+    }
+    let module =
+        parse_hash(&layer.module).ok_or_else(|| anyhow!("module hash {:?}", layer.module))?;
+    let manifest = match &layer.source_manifest {
+        Some(h) => Some(parse_hash(h).ok_or_else(|| anyhow!("manifest hash {h:?}"))?),
+        None => None,
+    };
+    Ok((module, manifest))
+}
+
 /// The job that recomputes the `ready` section at `address` of `key` in
 /// the build's layer `layer`, asked about at `t_utc_ms` in a space of
 /// origin `origin_utc_ms` (`client-compute.md` section 2.6, "On the
@@ -326,7 +595,9 @@ impl BuildDescription {
 /// index by the rule of section 2.4, so no extra request is needed. `None`
 /// for an unknown layer, a malformed hash, or a layer with source epochs,
 /// whose manifest per span needs the epoch index (section 5.4) and is not
-/// checked here.
+/// checked here. A layer with inputs (section 10) takes its slots and
+/// frame records from the build and `records` ([`BuildDescription::layer_job`]),
+/// and is `None` without `records` or when its address is not `address`.
 pub fn check_job(
     build: &BuildDescription,
     layer: usize,
@@ -334,10 +605,24 @@ pub fn check_job(
     address: [u8; 32],
     t_utc_ms: i64,
     origin_utc_ms: i64,
+    records: Option<&FrameRecords>,
 ) -> Option<ComputeJob> {
     let config = build.layers.get(layer)?;
     if config.source_epochs.is_some() || !config.shared {
         return None;
+    }
+    if !config.inputs.is_empty() {
+        let records = records?;
+        let job = build
+            .layer_job(
+                config,
+                key,
+                build.span_index_at(config, t_utc_ms, origin_utc_ms).ok()?,
+                origin_utc_ms,
+                records,
+            )
+            .ok()?;
+        return (job.address == address).then_some(job);
     }
     let manifest = match &config.source_manifest {
         Some(h) => Some(parse_hash(h)?),
@@ -364,17 +649,24 @@ pub fn check_job(
         },
         slots: Vec::new(),
         frames: Vec::new(),
+        frames_per_slot: Vec::new(),
+        inputs_sha256: None,
     })
 }
 
 /// The section 2.6 headers of a check for `job`, in a fixed order:
-/// `X-Layer`, `X-Key`, `X-Span-Index`.
-pub fn check_headers(job: &ComputeJob) -> [(&'static str, String); 3] {
-    [
+/// `X-Layer`, `X-Key`, `X-Span-Index`, and for a layer with inputs
+/// `X-Inputs-Sha256` (section 10.4).
+pub fn check_headers(job: &ComputeJob) -> Vec<(&'static str, String)> {
+    let mut h = vec![
         (LAYER_HEADER, job.layer.clone()),
         (KEY_HEADER, job.key().to_string()),
         (SPAN_INDEX_HEADER, job.request.span_index.to_string()),
-    ]
+    ];
+    if let Some(i) = &job.inputs_sha256 {
+        h.push((INPUTS_SHA256_HEADER, to_hex(i)));
+    }
+    h
 }
 
 /// `POST /space/{spaceId}/build/{buildId}/section/{address}/check` body.
@@ -502,6 +794,8 @@ impl RawDirection {
                 },
                 slots: Vec::new(),
                 frames: Vec::new(),
+                frames_per_slot: Vec::new(),
+                inputs_sha256: None,
             })
         };
         Ok(match self.state.as_str() {

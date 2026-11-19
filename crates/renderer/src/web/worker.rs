@@ -397,5 +397,9 @@ pub async fn run_job(
     Ok(Computed {
         bytes: std::sync::Arc::from(bytes),
         section: section.map(std::sync::Arc::new),
+        // The browser does not resolve layer inputs (section 10.3) yet: a
+        // module that names input sections fails, so nothing here is
+        // computed from inputs.
+        inputs_sha256: None,
     })
 }

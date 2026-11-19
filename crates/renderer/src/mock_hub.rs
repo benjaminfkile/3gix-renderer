@@ -52,8 +52,9 @@
 //! measures them (`rendering.md` section 5).
 
 use crate::protocol::{
-    Attachment, BuildDescription, LayerConfig, RawDirection, API_KEY_HEADER, CONTENT_SHA256_HEADER,
-    DEEPEST_DEPTH, KEY_HEADER, LAYER_HEADER, SPAN_INDEX_HEADER,
+    Attachment, BuildDescription, InputSlot, LayerConfig, RawDirection, API_KEY_HEADER,
+    CONTENT_SHA256_HEADER, DEEPEST_DEPTH, INPUTS_SHA256_HEADER, KEY_HEADER, LAYER_HEADER,
+    SPAN_INDEX_HEADER,
 };
 use gx_core::address::{section_address, span_index};
 use gx_core::key::ChunkKey;
@@ -104,6 +105,10 @@ pub struct MockLayer {
     /// `false` for an unshared layer: directions answer `local` and
     /// uploads are refused with `403`.
     pub shared: bool,
+    /// The layer's input slots (`client-compute.md` section 2.2): its
+    /// addresses are version 2, and its uploads and checks must carry
+    /// `X-Inputs-Sha256`.
+    pub inputs: Vec<InputSlot>,
 }
 
 /// A function from a cell key to that cell's section bytes.
@@ -133,6 +138,7 @@ impl MockLayer {
             uses_origin: self.uses_origin,
             shared: self.shared,
             source_epochs: None,
+            inputs: self.inputs.clone(),
         }
     }
 
@@ -222,6 +228,11 @@ pub struct MockCounts {
     pub checks_disputed: u64,
     /// Checks refused (`400`, `403`, `404`, or `429`).
     pub checks_refused: u64,
+    /// Uploads and checks of layers with inputs that carried
+    /// `X-Inputs-Sha256` (`client-compute.md` section 10.4).
+    pub inputs_headers: u64,
+    /// Uploads and checks answered `409` ([`MockHub::refuse_inputs`]).
+    pub inputs_refused: u64,
 }
 
 #[derive(Default)]
@@ -245,6 +256,8 @@ struct Counters {
     checks_matched: AtomicU64,
     checks_disputed: AtomicU64,
     checks_refused: AtomicU64,
+    inputs_headers: AtomicU64,
+    inputs_refused: AtomicU64,
 }
 
 /// One stored section.
@@ -276,6 +289,9 @@ struct Space {
     report_limit: u64,
     /// Every `ready` answer's `checkRate`, in place of the hub's rule.
     check_rate: Option<f64>,
+    /// Uploads and checks of layers with inputs are answered `409`, as
+    /// the hub does when it holds other inputs as true (section 10.4).
+    refusing_inputs: bool,
 }
 
 struct State {
@@ -353,6 +369,7 @@ impl MockHub {
                 reports: 0,
                 report_limit: u64::MAX,
                 check_rate: None,
+                refusing_inputs: false,
             }),
             layers,
             options,
@@ -430,6 +447,13 @@ impl MockHub {
         self.state.space.lock().expect("space").report_limit = reports;
     }
 
+    /// Answers every later upload and check of a layer with inputs `409`:
+    /// the hub holds other inputs as true (`client-compute.md` section
+    /// 10.4).
+    pub fn refuse_inputs(&self) {
+        self.state.space.lock().expect("space").refusing_inputs = true;
+    }
+
     /// The build's description as served.
     pub fn build(&self) -> BuildDescription {
         build_description(&self.state)
@@ -459,6 +483,8 @@ impl MockHub {
             source_reads: l(&c.source_reads),
             manifest_reads: l(&c.manifest_reads),
             frame_record_reads: l(&c.frame_record_reads),
+            inputs_headers: l(&c.inputs_headers),
+            inputs_refused: l(&c.inputs_refused),
         }
     }
 }
@@ -724,8 +750,11 @@ fn is_empty_for(l: &MockLayer, key: &ChunkKey, exclusive: &BTreeMap<u64, &str>) 
 }
 
 /// The inputs of layer `l`'s section for `key` at span `span`: module,
-/// manifest, the origin it receives, and the address.
+/// manifest, the origin it receives, and the address: version 1, or
+/// version 2 over the slots of `build` for a layer with inputs
+/// (`client-compute.md` sections 3 and 10.5).
 fn address_of(
+    build: &BuildDescription,
     l: &MockLayer,
     key: &ChunkKey,
     origin: i64,
@@ -734,15 +763,59 @@ fn address_of(
     let address_origin = if l.uses_origin { origin } else { 0 };
     let module = sha256(&l.module);
     let manifest = l.manifest.as_ref().map(|m| sha256(m));
-    let address = section_address(
-        &module,
-        manifest.as_ref(),
-        address_origin,
-        l.span_seconds,
-        span,
-        key,
-    );
+    let address = if l.inputs.is_empty() {
+        section_address(
+            &module,
+            manifest.as_ref(),
+            address_origin,
+            l.span_seconds,
+            span,
+            key,
+        )
+    } else {
+        let config = build.layer_by_id(&l.id).expect("the layer is in the build");
+        let slots = build
+            .slots(config, span, origin)
+            .expect("the mock's layer inputs are valid");
+        gx_core::address::section_address_v2(
+            &module,
+            manifest.as_ref(),
+            address_origin,
+            l.span_seconds,
+            span,
+            &slots,
+            key,
+        )
+        .expect("a layer with inputs has slots")
+    };
     (module, manifest, address_origin, address)
+}
+
+/// Checks `X-Inputs-Sha256` of an upload or check of `l`
+/// (`client-compute.md` section 10.4): required for a layer with inputs
+/// (`400` without), `409` while [`MockHub::refuse_inputs`] holds. `None`
+/// to go on.
+fn inputs_refusal(
+    state: &State,
+    space: &Space,
+    l: &MockLayer,
+    head: &Head,
+) -> Option<(&'static str, &'static str)> {
+    if l.inputs.is_empty() {
+        return None;
+    }
+    let c = &state.counters;
+    match head.header(INPUTS_SHA256_HEADER) {
+        Some(h) if gx_worker::job::is_hex_name(h) => {
+            c.inputs_headers.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => return Some(("400 Bad Request", "X-Inputs-Sha256 is missing")),
+    }
+    if space.refusing_inputs {
+        c.inputs_refused.fetch_add(1, Ordering::SeqCst);
+        return Some(("409 Conflict", "the inputs are not the ones held as true"));
+    }
+    None
 }
 
 /// Answers a directions request (`client-compute.md` section 2.4).
@@ -789,6 +862,7 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
     c.largest_batch
         .fetch_max(keys.len() as u64, Ordering::SeqCst);
     let exclusive = exclusive_owners(state);
+    let build = build_description(state);
     // Every answer per key and layer: `None` for empty, else the address
     // and its inputs.
     let mut placed = Vec::with_capacity(keys.len());
@@ -804,7 +878,7 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
                 }
                 let address_origin = if l.uses_origin { origin } else { 0 };
                 let span = span_index(t, address_origin, l.span_seconds).unwrap_or(0);
-                let inputs = address_of(l, key, origin, span);
+                let inputs = address_of(&build, l, key, origin, span);
                 let hex = to_hex(&inputs.3);
                 if let (Some(_), ChunkKey::Cell(cell)) = (&l.stored, key) {
                     if !space.sections.contains_key(&hex) {
@@ -918,11 +992,15 @@ fn upload(
         return refuse("400 Bad Request", "the layer is empty for this key");
     }
     let origin = space.origin.unwrap_or(0);
-    if to_hex(&address_of(l, &key, origin, span).3) != address {
+    let build = build_description(state);
+    if to_hex(&address_of(&build, l, &key, origin, span).3) != address {
         return refuse("400 Bad Request", "the address does not match the headers");
     }
     if !l.shared {
         return refuse("403 Forbidden", "the layer is unshared");
+    }
+    if let Some((status, reason)) = inputs_refusal(state, &space, l, head) {
+        return refuse(status, reason);
     }
     let claimed = head.header(CONTENT_SHA256_HEADER).unwrap_or("");
     if let Some(stored) = space.sections.get_mut(address) {
@@ -989,11 +1067,15 @@ fn check(
         return refuse("400 Bad Request", "the layer is empty for this key");
     }
     let origin = space.origin.unwrap_or(0);
-    if to_hex(&address_of(l, &key, origin, span).3) != address {
+    let build = build_description(state);
+    if to_hex(&address_of(&build, l, &key, origin, span).3) != address {
         return refuse("400 Bad Request", "the address does not match the headers");
     }
     if !l.shared {
         return refuse("403 Forbidden", "the layer is unshared");
+    }
+    if let Some((status, reason)) = inputs_refusal(state, &space, l, head) {
+        return refuse(status, reason);
     }
     let Some(reported) = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -1069,6 +1151,7 @@ pub fn registry_layer(id: &str, registry: &[u8]) -> MockLayer {
         uses_origin: false,
         stored: None,
         shared: true,
+        inputs: Vec::new(),
     }
 }
 
@@ -1089,6 +1172,7 @@ pub fn stored_layer(id: &str, max_depth: u8, make: SectionMaker) -> MockLayer {
         uses_origin: false,
         stored: Some(make),
         shared: true,
+        inputs: Vec::new(),
     }
 }
 
@@ -1141,6 +1225,7 @@ pub fn example_matter_layer(
         uses_origin: false,
         stored: None,
         shared: true,
+        inputs: Vec::new(),
     };
     (layer, tiles)
 }
