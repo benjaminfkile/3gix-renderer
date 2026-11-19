@@ -30,8 +30,9 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `native` | The pool of worker threads running modules with `gx-module-host` (default: cores minus two, at least one), fetching by hash with single flight per name, caching, handing sections over, then offering `missing` sections to the upload lane | `client-compute.md` 1, 4 |
 | `queue` | The work order: the three lanes (computes, uploads, checks) and the compute queue, highest priority first, reprioritized and pruned by the wanted set | `client-compute.md` 2.8 |
 | `upload` | The upload lane: bounded at 64, oldest dropped when full, one try per offer, and the outcome of each status (`201` stored, `200` matched, `202` disputed) | `client-compute.md` 2.5, 2.8 |
+| `check` | The check lane: bounded at 32, a new check skipped when full, and the outcome of each status (`200` match, `202` disputed) | `client-compute.md` 2.6, 2.8 |
 | `cache` | The native local cache directory, keyed by kind and hash or address, evicted least recently used by size (default 20 GB) | `client-compute.md` 6 |
-| `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, offered, stored, matched, disputed, dropped, failed | |
+| `stats` | Counters for the overlay: modules loaded, module runs, sections computed, uploads pending, offered, stored, matched, disputed, dropped, failed; checks queued, run, skipped, matched, disputed, failed | |
 
 `renderer` modules:
 
@@ -90,7 +91,8 @@ round trips of the first and the latest cell; and the counts of
 `directions` and the worker: directions requests, sections streamed from
 the edge and read from the local cache, sections computed here, module
 runs, modules loaded, and uploads pending, offered, stored, matched,
-disputed, dropped, and failed. `--no-overlay`
+disputed, dropped, and failed, and checks queued, run, skipped, matched,
+and disputed. `--no-overlay`
 leaves out the text, the frame markers, and the lines, so only matter is
 in the image.
 
@@ -257,6 +259,26 @@ and while four are in flight the lane keeps the rest (still bounded at
 upload starts only while no compute waits, one at a time, as an async
 `fetch` on the page's event loop; the module work runs in a Web Worker,
 which the upload never occupies.
+
+Checks (`client-compute.md` 2.6 and 2.8, `gx_worker::check`): when a
+`ready` section of a cell or a surface tile arrives from the edge or the
+local cache, the coordinator chooses it for a check with probability
+`checkRate`, from its own random source seeded once per run (never from
+the address; it never affects bytes). The job is built without another
+request: the module and manifest from the build's layer config, the span
+index by the rule of 2.4 from the time the key was asked about
+(`protocol::check_job`). The check lane holds at most 32; a new check
+into a full lane is skipped. Checks run only when no compute and no
+upload waits: natively the recompute runs on a pool thread and the
+`POST .../section/{address}/check` (body `{"sha256"}`, headers `X-Layer`,
+`X-Key`, `X-Span-Index`) on the tokio runtime; in the browser the
+recompute runs in the Web Worker when it is idle and nothing else waits.
+When the recomputed hash differs from the drawn bytes, the computed
+section takes their place for that address and hash
+(`directions::Coordinator::replace`): the key completes again with it,
+whatever the hub answers. Layers with source epochs are not checked: the
+renderer has no epoch index reader, so each such check is counted as
+skipped.
 
 The local cache (`client-compute.md` 6) holds modules, manifests, tiles,
 and sections keyed by kind and hash or address. Natively it is a

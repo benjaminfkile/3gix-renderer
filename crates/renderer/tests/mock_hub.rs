@@ -18,6 +18,11 @@
 //! - two clients at once both compute what they need; the hub stores the
 //!   first copy and matches the second; directions go out in batches of
 //!   at most 512 keys;
+//! - checks (section 2.6): at rate 0 nothing is checked, at rate 1 every
+//!   downloaded section is recomputed once the view's computes are done
+//!   and reported `match`; a section the hub stores wrongly is replaced
+//!   by the computed one and reported `disputed`; while wanted computes
+//!   wait no check runs;
 //! - a headless render against the mock hub, entered at now and at the
 //!   origin, produces a non-empty image each time, saved as
 //!   `target/tmp/mock-hub-home-now.png` and `target/tmp/mock-hub-home-origin.png`.
@@ -223,7 +228,9 @@ fn first_run_computes_and_uploads_second_run_streams_with_zero_module_runs() {
     assert_eq!(stored.len() as u64, after_a.uploads_stored);
     drop(a);
 
-    // Second client, fresh cache: everything streams, the module never runs.
+    // Second client, fresh cache: everything streams, the module never runs
+    // (no download is chosen for a check at rate 0).
+    hub.set_check_rate(Some(0.0));
     let dir_b = cache_dir("b");
     let mut b = connect(&rt, &hub, Some(&dir_b));
     let world_b = stream_home(&mut b);
@@ -552,4 +559,110 @@ fn headless_render_at_now_and_at_the_origin() {
     }
     assert!(c.fetcher.stats().worker.sections_computed > 0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Waits until every queued check has run and been reported.
+fn wait_for_checks(c: &mut Client) {
+    let start = Instant::now();
+    loop {
+        let w = c.fetcher.stats().worker;
+        if w.checks_matched + w.checks_disputed + w.checks_failed >= w.checks_queued {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "checks hang: {w:?}"
+        );
+        c.fetcher.wait_for_events(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn rate_zero_never_checks_and_rate_one_checks_every_download() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    drop(stream_home(&mut connect(&rt, &hub, None)));
+    let stored = hub.sections().len() as u64;
+
+    hub.set_check_rate(Some(0.0));
+    let mut a = connect(&rt, &hub, None);
+    stream_home(&mut a);
+    let s = a.fetcher.stats();
+    assert!(s.directions.sections_streamed > 1, "{s:?}");
+    assert_eq!(s.worker.checks_queued + s.worker.checks_skipped, 0, "{s:?}");
+    assert_eq!(s.worker.module_runs, 0);
+    drop(a);
+
+    hub.set_check_rate(Some(1.0));
+    let mut b = connect(&rt, &hub, None);
+    let world = stream_home(&mut b);
+    wait_for_checks(&mut b);
+    let s = b.fetcher.stats();
+    // Every downloaded cell section is checked (the registry key is not).
+    let cells = s.directions.sections_streamed - 2;
+    assert!(cells >= 1 && stored >= cells, "{s:?}");
+    assert_eq!(s.worker.checks_queued, cells, "{s:?}");
+    assert_eq!(s.worker.checks_run, cells, "{s:?}");
+    assert_eq!(s.worker.checks_matched, cells, "{s:?}");
+    assert_eq!(s.worker.checks_disputed + s.worker.checks_failed, 0);
+    assert_eq!(hub.counts().checks_matched, cells);
+    assert!(!matter(&world).is_empty());
+}
+
+#[test]
+fn a_lying_section_is_replaced_by_the_computed_one_and_disputed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt.block_on(MockHub::start(space())).unwrap();
+    let truth = matter(&stream_home(&mut connect(&rt, &hub, None)));
+    // Replace one stored cell section with valid bytes that differ: the
+    // same section with every density doubled.
+    let (address, lie) = hub
+        .sections()
+        .into_iter()
+        .find_map(|(a, bytes)| {
+            let (k, s) = truth
+                .keys()
+                .find_map(|k| gx_core::matter::decode(k, &bytes).ok().map(|s| (*k, s)))?;
+            let mut doubled = s.samples()?.clone();
+            for i in 0..doubled.len() {
+                let mut x = doubled.get(i)?;
+                x.density = gx_core::units::Density::new(x.density.value() * 2.0);
+                doubled.set(i, x);
+            }
+            let lie =
+                gx_core::matter::Section::new(k, s.origin(), s.edge(), s.resolution(), doubled)
+                    .ok()?;
+            let lie = gx_core::matter::encode(&lie, gx_core::matter::Compression::None);
+            (lie != bytes).then_some((a, lie))
+        })
+        .expect("a stored cell section");
+    hub.replace_section(&address, lie);
+
+    hub.set_check_rate(Some(1.0));
+    let mut b = connect(&rt, &hub, None);
+    stream_home(&mut b);
+    wait_for_checks(&mut b);
+    let s = b.fetcher.stats();
+    assert_eq!(s.worker.checks_disputed, 1, "{s:?}");
+    assert_eq!(hub.counts().checks_disputed, 1);
+    // The replaced key completes again with the computed section.
+    let mut world = settle_home(&mut b);
+    let start = Instant::now();
+    while matter(&world) != truth {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the lie stayed drawn"
+        );
+        let mut camera = Camera::home(&b.system);
+        camera.update_parent(&b.system);
+        let seen = Seen::instant(&b.system, &camera);
+        matter_step(
+            &mut world,
+            &mut b.fetcher,
+            &seen,
+            (WIDTH, HEIGHT),
+            start.elapsed().as_secs_f64(),
+        );
+        b.fetcher.wait_for_events(Duration::from_millis(20));
+    }
 }

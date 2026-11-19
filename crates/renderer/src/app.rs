@@ -423,7 +423,14 @@ impl HeadlessStats {
             "selection_rounds": self.selection_rounds,
             "cells_requested_ahead": self.cells_requested_ahead,
         });
-        for more in [time, budget] {
+        let checks = serde_json::json!({
+            "checks_queued": m.checks_queued,
+            "checks_run": m.checks_run,
+            "checks_skipped": m.checks_skipped,
+            "checks_matched": m.checks_matched,
+            "checks_disputed": m.checks_disputed,
+        });
+        for more in [time, budget, checks] {
             if let (Some(all), serde_json::Value::Object(more)) = (out.as_object_mut(), more) {
                 all.extend(more);
             }

@@ -18,6 +18,8 @@
 //!   both platforms.
 //! - [`upload`]: the bounded upload lane and the outcome of each offer,
 //!   shared by both platforms.
+//! - [`check`]: the bounded check lane and the outcome of each check,
+//!   shared by both platforms.
 //! - [`cache`]: the native local cache directory (native only).
 //! - [`native`]: the thread pool running modules with `gx-module-host`
 //!   (native only).
@@ -28,6 +30,7 @@
 
 #![warn(missing_docs)]
 
+pub mod check;
 pub mod job;
 pub mod queue;
 pub mod stats;
@@ -38,6 +41,7 @@ pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 
+pub use check::{CheckJob, CheckLane, CheckOutcome, CHECK_LANE_CAPACITY};
 pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
 pub use queue::{ComputeQueue, Lane};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
@@ -49,5 +53,5 @@ pub use upload::{
 pub use cache::DiskCache;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    default_threads, Blobs, LaneSource, ModuleRunner, PoolWaker, Uploader, WorkerPool,
+    default_threads, Blobs, CheckRunner, LaneSource, ModuleRunner, PoolWaker, Uploader, WorkerPool,
 };

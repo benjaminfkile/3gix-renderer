@@ -40,8 +40,8 @@ use gx_core::key::{CellKey, ChunkKey};
 use gx_core::sha256::{sha256, to_hex};
 use gx_core::units::Meters;
 use gx_worker::{
-    BlobKind, ComputeJob, ComputeQueue, Computed, UploadLane, UploadOffer, UploadOutcome,
-    WorkerError, WorkerStats,
+    BlobKind, CheckJob, CheckLane, CheckOutcome, ComputeJob, ComputeQueue, Computed, UploadLane,
+    UploadOffer, UploadOutcome, WorkerError, WorkerStats,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -53,6 +53,13 @@ use std::time::Duration;
 pub const REGISTRY_DEADLINE_SECONDS: f64 = 120.0;
 
 enum Internal {
+    Replace {
+        key: ChunkKey,
+        layer: usize,
+        address: [u8; 32],
+        sha256: [u8; 32],
+        computed: Computed,
+    },
     Directions(Vec<ChunkKey>, Result<DirectionsResponse, String>),
     Stream {
         key: ChunkKey,
@@ -78,6 +85,9 @@ pub struct WebFetcher {
     coordinator: Coordinator,
     lane: Rc<UploadLane>,
     uploading: Rc<Cell<bool>>,
+    checks: CheckLane,
+    asked_at: BTreeMap<ChunkKey, i64>,
+    checked_extents: BTreeMap<CellKey, Meters>,
     inbox: Rc<RefCell<VecDeque<Internal>>>,
     jobs: ComputeQueue<(usize, ComputeJob)>,
     job_running: Rc<Cell<bool>>,
@@ -101,8 +111,17 @@ impl WebFetcher {
             worker: ModuleWorker::new(),
             lane: Rc::new(UploadLane::new(stats.clone())),
             uploading: Rc::new(Cell::new(false)),
+            checks: CheckLane::new(stats.clone()),
+            asked_at: BTreeMap::new(),
+            checked_extents: BTreeMap::new(),
             stats,
-            coordinator: Coordinator::new(),
+            coordinator: {
+                // Seeded once per page load, never from an address: it
+                // only chooses which downloads to check.
+                let mut c = Coordinator::new();
+                c.set_check_seed((js_sys::Math::random() * (u64::MAX as f64)) as u64);
+                c
+            },
             inbox: Rc::default(),
             jobs: ComputeQueue::new(),
             job_running: Rc::new(Cell::new(false)),
@@ -200,6 +219,21 @@ impl WebFetcher {
     fn apply(&mut self, msg: Internal) -> Vec<Action> {
         let now = self.now();
         match msg {
+            Internal::Replace {
+                key,
+                layer,
+                address,
+                sha256,
+                computed,
+            } => {
+                if let ChunkKey::Cell(cell) = key {
+                    if let Some(e) = self.checked_extents.remove(&cell) {
+                        self.extents.entry(cell).or_insert(e);
+                    }
+                }
+                self.coordinator
+                    .replace(key, layer, address, sha256, computed.into(), now)
+            }
             Internal::Directions(keys, r) => self.coordinator.directions_done(&keys, r, now),
             Internal::Stream {
                 key,
@@ -236,6 +270,7 @@ impl WebFetcher {
         }
         self.start_job();
         self.start_upload();
+        self.start_check();
         if let Some(c) = &self.cache {
             let c = c.clone();
             wasm_bindgen_futures::spawn_local(async move { c.flush_index().await });
@@ -313,7 +348,56 @@ impl WebFetcher {
         });
     }
 
+    /// Runs the check lane's oldest check on the Web Worker if it is idle
+    /// and no wanted compute and no upload waits (`client-compute.md`
+    /// section 2.8: checks are below uploads), then reports its hash. A
+    /// recompute that differs from the drawn bytes takes their place,
+    /// whatever the hub answers.
+    fn start_check(&mut self) {
+        if self.job_running.get() || !self.jobs.is_empty() || !self.lane.is_empty() {
+            return;
+        }
+        let Some(check) = self.checks.take() else {
+            return;
+        };
+        self.job_running.set(true);
+        let (hub, cache, worker, stats) = (
+            self.hub.clone(),
+            self.cache.clone(),
+            self.worker.clone(),
+            self.stats.clone(),
+        );
+        let (inbox, running) = (self.inbox.clone(), self.job_running.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = run_job(&check.job, &hub, cache.as_deref(), &worker, &stats).await;
+            running.set(false);
+            let Ok(computed) = result else {
+                stats.check_skipped();
+                return;
+            };
+            stats.check_run();
+            let hash = sha256(&computed.bytes);
+            if hash != check.drawn {
+                inbox.borrow_mut().push_back(Internal::Replace {
+                    key: check.job.key(),
+                    layer: check.layer_index,
+                    address: check.job.address,
+                    sha256: check.drawn,
+                    computed,
+                });
+            }
+            let outcome = match hub.check(&check.job, &hash).await {
+                Ok(status) => CheckOutcome::from_status(status),
+                Err(_) => CheckOutcome::Failed,
+            };
+            stats.check_finished(outcome);
+        });
+    }
+
     fn execute(&mut self, action: Action) {
+        if let Action::Complete(Completion { key, .. }) | Action::Failed { key, .. } = &action {
+            self.asked_at.remove(key);
+        }
         match action {
             Action::Directions(keys) => {
                 let t = directions_time(
@@ -321,6 +405,9 @@ impl WebFetcher {
                     self.coordinator.origin_utc_ms(),
                     self.hub.now_utc_ms(),
                 );
+                for k in &keys {
+                    self.asked_at.insert(*k, t);
+                }
                 let (hub, inbox) = (self.hub.clone(), self.inbox.clone());
                 wasm_bindgen_futures::spawn_local(async move {
                     let r = hub.directions(t, &keys).await.map_err(|e| format!("{e:#}"));
@@ -352,6 +439,34 @@ impl WebFetcher {
                 job,
                 priority,
             } => self.jobs.push(key, priority, (layer, job)),
+            Action::Check {
+                key,
+                layer,
+                address,
+                sha256,
+            } => {
+                let job = match (self.asked_at.get(&key), self.coordinator.origin_utc_ms()) {
+                    (Some(&t), Some(origin)) => {
+                        crate::protocol::check_job(self.hub.build(), layer, key, address, t, origin)
+                    }
+                    _ => None,
+                };
+                if let ChunkKey::Cell(cell) = key {
+                    if let Some(e) = self.extents.get(&cell) {
+                        self.checked_extents.insert(cell, *e);
+                    }
+                }
+                match job {
+                    Some(job) => {
+                        self.checks.push(CheckJob {
+                            job,
+                            layer_index: layer,
+                            drawn: sha256,
+                        });
+                    }
+                    None => self.stats.check_skipped(),
+                }
+            }
             Action::Complete(done) => match done.key {
                 ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done
                     .sections

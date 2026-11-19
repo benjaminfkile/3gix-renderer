@@ -400,9 +400,28 @@ impl PoolWaker {
 /// The pool of worker threads.
 pub struct WorkerPool {
     queue: Arc<Queue>,
+    shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     stats: Arc<WorkerStats>,
     size: usize,
+}
+
+/// Recomputes sections for the check lane ([`WorkerPool::check_runner`]).
+#[derive(Clone)]
+pub struct CheckRunner {
+    shared: Arc<Shared>,
+}
+
+impl CheckRunner {
+    /// Runs `job` to a validated section on this thread. Counts nothing
+    /// as computed and neither caches nor offers the section.
+    pub fn run(&self, job: &ComputeJob) -> JobResult {
+        self.shared.runner.run(
+            job,
+            self.shared.blobs.as_ref(),
+            self.shared.cache.as_deref(),
+        )
+    }
 }
 
 /// Everything the pool's threads share.
@@ -471,6 +490,7 @@ impl WorkerPool {
             .collect();
         Ok(WorkerPool {
             queue,
+            shared,
             threads,
             stats,
             size,
@@ -554,6 +574,15 @@ impl WorkerPool {
             (task.done)(Err(WorkerError::dropped()));
         }
         n
+    }
+
+    /// A handle that recomputes a section on the calling thread with the
+    /// pool's module host, fetcher, and cache, without caching or offering
+    /// the result: the check lane's work, run on a pool thread.
+    pub fn check_runner(&self) -> CheckRunner {
+        CheckRunner {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Compute jobs waiting to start.
