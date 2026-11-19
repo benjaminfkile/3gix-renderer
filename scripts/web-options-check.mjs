@@ -40,6 +40,12 @@ assert.deepEqual(
     "view", "3",
   ],
 );
+// hideLayers: an array from config.js is joined with commas, and the query
+// string overrides it.
+assert.deepEqual(viewOptionPairs({ hideLayers: ["a", "b"] }, "?hideLayers=c"), [
+  "hideLayers", "a,b",
+  "hideLayers", "c",
+]);
 // An invalid query value is passed on as given, for the parser to reject.
 assert.deepEqual(viewOptionPairs({}, "startOffsetSeconds=soon"), ["startOffsetSeconds", "soon"]);
 

@@ -14,11 +14,13 @@ export const VIEW_OPTION_NAMES = [
   "viewDistanceScale",
   "exposureStops",
   "meshMode",
+  "hideLayers",
 ];
 
 // The options as flattened name and value pairs for start(): first the
 // values in config.js (`config`, an object), then the page's query string
 // (`search`, such as location.search), so a link overrides config.js.
+// An array value (such as hideLayers) is joined with commas.
 // Empty, null, and undefined config values are left out; a query value is
 // taken as given. Names that are not view options are ignored.
 export function viewOptionPairs(config, search) {

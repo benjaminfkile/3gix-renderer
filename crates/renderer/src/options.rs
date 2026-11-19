@@ -15,6 +15,10 @@
 //! origin and now. The time scale is the playback rate of a start in the
 //! past, simulation seconds per wall-clock second (negative plays
 //! backwards); at now the rate is always 1.
+//!
+//! `hide-layers` lists layer ids to hide (`rendering.md` section 7 item
+//! 7), overriding the build's `shown` defaults; [`hidden_layer_indices`]
+//! resolves it against the build and reports unknown ids.
 
 use crate::camera::Camera;
 use crate::config::{ConfigError, Start, StartOn, View};
@@ -24,7 +28,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::units::Seconds;
 
 /// The option names, in the native flags' kebab case, in a fixed order.
-pub const OPTION_NAMES: [&str; 8] = [
+pub const OPTION_NAMES: [&str; 9] = [
     "start",
     "start-offset-seconds",
     "time-scale",
@@ -33,10 +37,11 @@ pub const OPTION_NAMES: [&str; 8] = [
     "view-distance-scale",
     "exposure-stops",
     "mesh-mode",
+    "hide-layers",
 ];
 
 /// The view and time options of one start, each at its default until set.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ViewOptions {
     /// `start`: where the simulation time starts.
     pub start: Start,
@@ -59,6 +64,9 @@ pub struct ViewOptions {
     pub exposure_stops: Option<f64>,
     /// `mesh-mode`: how surface meshes are drawn at start.
     pub mesh_mode: MeshMode,
+    /// `hide-layers`: layer ids to hide at start, overriding the build's
+    /// `shown` defaults; `None` keeps the defaults.
+    pub hide_layers: Option<Vec<String>>,
 }
 
 impl Default for ViewOptions {
@@ -72,6 +80,7 @@ impl Default for ViewOptions {
             view_distance_scale: 1.0,
             exposure_stops: None,
             mesh_mode: MeshMode::Surfaces,
+            hide_layers: None,
         }
     }
 }
@@ -141,6 +150,40 @@ pub fn parse_mesh_mode(name: &str, v: &str) -> Result<MeshMode, ConfigError> {
     }
 }
 
+/// Parses a comma-separated list of layer ids for `hide-layers`: blanks
+/// around ids are dropped, an empty list hides nothing.
+pub fn parse_layer_ids(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The hidden layers, by index in `layer_ids` (the build's layers in
+/// order): the ids in `hide` when given, else `default_hidden`. Ids not in
+/// the build are returned second, to be reported and ignored.
+pub fn hidden_layer_indices(
+    layer_ids: &[&str],
+    hide: Option<&[String]>,
+    default_hidden: std::collections::BTreeSet<usize>,
+) -> (std::collections::BTreeSet<usize>, Vec<String>) {
+    let Some(hide) = hide else {
+        return (default_hidden, Vec::new());
+    };
+    let mut hidden = std::collections::BTreeSet::new();
+    let mut unknown = Vec::new();
+    for id in hide {
+        match layer_ids.iter().position(|l| l == id) {
+            Some(i) => {
+                hidden.insert(i);
+            }
+            None => unknown.push(id.clone()),
+        }
+    }
+    (hidden, unknown)
+}
+
 /// Parses `<frame>:<x>,<y>,<z>[@[+]<m>[^<deg>]]` for `start-on`
 /// ([`StartOn::parse`]).
 pub fn parse_start_on(name: &str, v: &str) -> Result<StartOn, ConfigError> {
@@ -166,6 +209,7 @@ impl ViewOptions {
             "view-distance-scale" => self.view_distance_scale = parse_distance_scale(label, value)?,
             "exposure-stops" => self.exposure_stops = Some(parse_f64(label, value)?),
             "mesh-mode" => self.mesh_mode = parse_mesh_mode(label, value)?,
+            "hide-layers" => self.hide_layers = Some(parse_layer_ids(value)),
             _ => return Ok(false),
         }
         Ok(true)
@@ -269,9 +313,27 @@ mod tests {
                 "view",
                 "viewDistanceScale",
                 "exposureStops",
-                "meshMode"
+                "meshMode",
+                "hideLayers"
             ]
         );
+    }
+
+    #[test]
+    fn hide_layers_overrides_the_shown_defaults() {
+        let o = ViewOptions::from_camel_pairs([("hideLayers", " ground , ,stain,nope")]).unwrap();
+        let hide = o.hide_layers.clone().unwrap();
+        assert_eq!(hide, ["ground", "stain", "nope"]);
+        let ids = ["ground", "stain", "haze"];
+        let (hidden, unknown) = hidden_layer_indices(&ids, Some(&hide), [2].into());
+        assert_eq!(hidden, [0, 1].into());
+        assert_eq!(unknown, ["nope"]);
+        // Without the option the build's defaults stand; an empty list
+        // shows every layer.
+        assert_eq!(hidden_layer_indices(&ids, None, [2].into()).0, [2].into());
+        let none = ViewOptions::from_camel_pairs([("hideLayers", "")]).unwrap();
+        let (hidden, _) = hidden_layer_indices(&ids, none.hide_layers.as_deref(), [2].into());
+        assert!(hidden.is_empty());
     }
 
     #[test]

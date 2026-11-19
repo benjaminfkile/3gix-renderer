@@ -202,7 +202,7 @@ impl WebApp {
             },
             world: {
                 let mut w = World::new(default_threads());
-                w.set_hidden_layers(fetcher.hub().build().initially_hidden_layers());
+                w.start_layers(fetcher.hub().build(), options.hide_layers.as_deref());
                 w
             },
             fetcher,
@@ -278,6 +278,8 @@ impl WebApp {
         self.sim.prepare_light(&self.camera);
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
+        self.world
+            .toggle_layers(&self.controls.take_layer_toggles());
         let draw = matter_step(
             &mut self.world,
             &mut self.fetcher,
@@ -377,6 +379,14 @@ impl WebApp {
                 self.world.cache(),
                 self.sim.system().tree(),
             )));
+        }
+        if self.controls.choosing_layers {
+            text.push('\n');
+            text.push_str(&self.world.layer_view().chooser_line());
+        }
+        if let Some(line) = self.world.layer_view().hidden_line() {
+            text.push('\n');
+            text.push_str(&line);
         }
         for line in self.controls.status_lines() {
             text.push('\n');

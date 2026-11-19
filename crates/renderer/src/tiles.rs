@@ -258,9 +258,10 @@ impl TileGeometry {
 /// the base surface and the overlays that have arrived.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DecodedTile {
-    /// The first non-empty surface tile among the non-overlay layers, in
-    /// layer order; `None` when every one is empty.
-    pub base: Option<Arc<TileGeometry>>,
+    /// The non-overlay layers' non-empty surface tiles, each with its
+    /// layer index, in layer order: the first shown one is the base
+    /// (`rendering.md` section 7 item 7).
+    pub bases: Vec<(usize, Arc<TileGeometry>)>,
     /// The overlay layers' non-empty overlay tiles, each with its layer
     /// index, in layer order.
     pub overlays: Vec<(usize, Arc<OverlayTile>)>,
@@ -287,16 +288,21 @@ pub fn decode_tile(
             }
             continue;
         }
-        if out.base.is_some() {
-            continue;
-        }
         match gx_core::surface::decode(key, bytes) {
-            Ok(Tile::Surface(t)) => out.base = Some(Arc::new(TileGeometry::new(&t))),
+            Ok(Tile::Surface(t)) => out.bases.push((layer, Arc::new(TileGeometry::new(&t)))),
             Ok(Tile::Empty(_)) => {}
             Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
         }
     }
     Ok(out)
+}
+
+impl DecodedTile {
+    /// The first non-empty surface tile among the non-overlay layers, with
+    /// every layer shown.
+    pub fn base(&self) -> Option<&Arc<TileGeometry>> {
+        self.bases.first().map(|(_, b)| b)
+    }
 }
 
 /// The base tile's geometry with its material composited with
@@ -471,19 +477,28 @@ impl Surfaces {
         &self.hidden
     }
 
-    /// Hides the layers in `hidden` (indices) and shows every other one:
-    /// every ready tile's material is composited again from its shown
-    /// overlays, so no stale material is drawn.
+    /// Hides the layers in `hidden` (indices) and shows every other one
+    /// (`rendering.md` section 7 item 7): every arrived tile is drawn again
+    /// from its first shown base, or not at all when every base is hidden,
+    /// and its material composited again from its shown overlays, so no
+    /// stale material is drawn. A frame whose level-0 tiles all lose their
+    /// base has no surface while they are hidden, and its cells are drawn.
     pub fn set_hidden_layers(&mut self, hidden: BTreeSet<usize>) {
         if hidden == self.hidden {
             return;
         }
         self.hidden = hidden;
+        let mut frames = BTreeSet::new();
         for (key, layers) in &self.layers {
-            if !layers.overlays.is_empty() {
-                self.tiles
-                    .insert(*key, State::Ready(layers.drawn(&self.hidden)));
-            }
+            let state = match layers.drawn(&self.hidden) {
+                Some(g) => State::Ready(g),
+                None => State::Empty,
+            };
+            self.tiles.insert(*key, state);
+            frames.insert(key.frame_id);
+        }
+        for frame in frames {
+            self.update_has_surface(frame);
         }
     }
 
@@ -520,7 +535,7 @@ impl Surfaces {
         self.complete_layers(
             key,
             outcome.map(|base| DecodedTile {
-                base,
+                bases: base.into_iter().map(|b| (0, b)).collect(),
                 overlays: Vec::new(),
             }),
             false,
@@ -545,16 +560,16 @@ impl Surfaces {
         }
         self.layers.remove(&key);
         let state = match outcome {
-            Ok(DecodedTile {
-                base: Some(base),
-                overlays,
-            }) => {
-                let layers = TileLayers { base, overlays };
+            Ok(DecodedTile { bases, overlays }) if !bases.is_empty() => {
+                let layers = TileLayers { bases, overlays };
                 let drawn = layers.drawn(&self.hidden);
                 self.layers.insert(key, layers);
-                State::Ready(drawn)
+                match drawn {
+                    Some(g) => State::Ready(g),
+                    None => State::Empty,
+                }
             }
-            Ok(DecodedTile { base: None, .. }) => State::Empty,
+            Ok(_) => State::Empty,
             Err(reason) => {
                 tracing::warn!(key = %key, "surface tile is invalid: {reason}");
                 self.pending.remove(&key);
@@ -563,10 +578,18 @@ impl Surfaces {
         };
         self.tiles.insert(key, state);
         if key.level == 0 {
+            self.update_has_surface(key.frame_id);
+        }
+    }
+
+    /// Records whether `frame_id` has a surface once all six of its
+    /// level-0 tiles have an answer: whether any of them is drawn.
+    fn update_has_surface(&mut self, frame_id: u64) {
+        {
             let roots: Vec<Option<&State>> = (0..SURFACE_FACES)
                 .map(|f| {
                     self.tiles.get(&SurfaceKey {
-                        frame_id: key.frame_id,
+                        frame_id,
                         face: f,
                         level: 0,
                         x: 0,
@@ -579,7 +602,7 @@ impl Surfaces {
                 .all(|s| !matches!(s, None | Some(State::Requested)))
             {
                 let any = roots.iter().any(|s| matches!(s, Some(State::Ready(_))));
-                self.has_surface.insert(key.frame_id, any);
+                self.has_surface.insert(frame_id, any);
             }
         }
     }
@@ -775,26 +798,29 @@ impl Surfaces {
     }
 }
 
-/// A tile's base surface and the overlays that have arrived for it.
+/// A tile's base surfaces and the overlays that have arrived for it.
 #[derive(Clone, Debug)]
 struct TileLayers {
-    base: Arc<TileGeometry>,
+    /// Every non-empty base, with its layer index, in layer order.
+    bases: Vec<(usize, Arc<TileGeometry>)>,
     overlays: Vec<(usize, Arc<OverlayTile>)>,
 }
 
 impl TileLayers {
-    /// The geometry to draw: the base with the shown overlays composited,
-    /// or the base itself when none is shown.
-    fn drawn(&self, hidden: &BTreeSet<usize>) -> Arc<TileGeometry> {
+    /// The geometry to draw: the first shown base with the shown overlays
+    /// composited, or that base itself when no overlay is shown; `None`
+    /// when every base is hidden.
+    fn drawn(&self, hidden: &BTreeSet<usize>) -> Option<Arc<TileGeometry>> {
+        let (_, base) = self.bases.iter().find(|(l, _)| !hidden.contains(l))?;
         let shown: Vec<&OverlayTile> = (self.overlays.iter())
             .filter(|(l, _)| !hidden.contains(l))
             .map(|(_, o)| o.as_ref())
             .collect();
-        if shown.is_empty() {
-            Arc::clone(&self.base)
+        Some(if shown.is_empty() {
+            Arc::clone(base)
         } else {
-            Arc::new(composite_tile(&self.base, &shown))
-        }
+            Arc::new(composite_tile(base, &shown))
+        })
     }
 }
 
@@ -882,7 +908,7 @@ mod tests {
         let mut s = Surfaces::new();
         // No overlay: the base material.
         let d = decode(std::slice::from_ref(&base), &[0]);
-        let plain = d.base.clone().unwrap();
+        let plain = d.base().cloned().unwrap();
         s.complete_layers(key, Ok(d), true);
         let drawn = Arc::clone(s.drawn_geometry(&key).unwrap());
         assert!(Arc::ptr_eq(&drawn, &plain));
