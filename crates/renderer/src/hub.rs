@@ -320,7 +320,8 @@ impl HubClient {
 
     /// Offers a computed section for `job` once (`client-compute.md`
     /// section 2.5). Returns the status: `201` stored, `200` matched a
-    /// stored copy, `202` differed from it. Anything else is an error with
+    /// stored copy, `202` differed from it, `409` the hub holds other
+    /// inputs as true (section 10.4). Anything else is an error with
     /// the hub's reason.
     pub async fn upload(&self, job: &ComputeJob, bytes: Vec<u8>) -> Result<u16> {
         let address = job.address_hex();
@@ -339,7 +340,9 @@ impl HubClient {
             .await
             .map_err(|e| anyhow!("upload {address}: {}", e.without_url()))?;
         let status = resp.status().as_u16();
-        if matches!(status, 200..=202) {
+        // `409`: the hub holds other inputs as true (section 10.4); the
+        // caller counts it, and nothing is retried.
+        if matches!(status, 200..=202 | 409) {
             return Ok(status);
         }
         let body = resp.bytes().await.unwrap_or_default();

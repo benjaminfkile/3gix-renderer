@@ -106,8 +106,20 @@
 //! it dropped before they start. A `local` section is never offered. Uploads never delay a
 //! result reaching the renderer. The frame loop hands the fetcher the
 //! wanted cells and surface tiles on every selection
-//! ([`Fetcher::set_wanted_cells`], [`Fetcher::set_wanted_surfaces`]). The
-//! browser has its own fetcher with the same coordinator (`crate::web`).
+//! ([`Fetcher::set_wanted_cells`], [`Fetcher::set_wanted_surfaces`]).
+//!
+//! A layer with inputs (`client-compute.md` section 10) takes its slots and
+//! frame records from the build: the records are fetched by hash before
+//! the registry is asked for, and every compute job is completed from the
+//! build before it is queued. The pool resolves its input sections through
+//! the fetcher's input source (section 10.3, [`gx_worker::InputSource`]):
+//! input jobs from the build, directions for one key, and streams, as
+//! blocking calls on the runtime from pool threads, never from the frame
+//! thread. Checks of such a layer resolve their inputs the same way.
+//! Uploads and check reports carry `X-Inputs-Sha256` (section 10.4); a
+//! `409` is counted, never retried. The
+//! browser has its own fetcher with the same coordinator (`crate::web`);
+//! it does not resolve layer inputs yet.
 
 use crate::camera::{Camera, FIELD_OF_VIEW_Y};
 use crate::directions::Arrived;
@@ -1980,6 +1992,112 @@ mod native {
         }
     }
 
+    /// The worker's view of the hub for input sections (`client-compute.md`
+    /// section 10.3): input jobs from the build and the frame records,
+    /// directions for one key, and streams, as blocking calls on the
+    /// runtime from the pool's threads, never from the frame thread.
+    struct HubInputs {
+        handle: tokio::runtime::Handle,
+        client: Arc<HubClient>,
+        /// The frame records the build lists, by hash, once the registry
+        /// has loaded.
+        records: Mutex<Arc<crate::protocol::FrameRecords>>,
+        /// The space's origin, once directions have told it.
+        origin: Mutex<Option<i64>>,
+    }
+
+    impl HubInputs {
+        fn origin(&self) -> Result<i64, WorkerError> {
+            self.origin
+                .lock()
+                .expect("origin")
+                .ok_or_else(|| WorkerError::transient("the origin is not known yet"))
+        }
+    }
+
+    impl gx_worker::InputSource for HubInputs {
+        fn input_job(
+            &self,
+            reader: &ComputeJob,
+            slot: u32,
+            key: ChunkKey,
+        ) -> Result<ComputeJob, WorkerError> {
+            let records = Arc::clone(&self.records.lock().expect("records"));
+            self.client
+                .build()
+                .input_job(reader, slot, key, self.origin()?, &records)
+                .map_err(|e| WorkerError::permanent(format!("input {key} of slot {slot}: {e:#}")))
+        }
+
+        fn direct(&self, job: &ComputeJob) -> Result<gx_worker::InputDirection, WorkerError> {
+            use crate::protocol::Direction;
+            use gx_worker::InputDirection;
+            let origin = self.origin()?;
+            let r = &job.request;
+            // A moment inside the input's span, not before the origin and
+            // not after now: the reader's span lies inside it (rule 2).
+            let span_ms = r.span_seconds as i64 * 1000;
+            let start = if span_ms == 0 {
+                self.client.now_utc_ms()
+            } else {
+                r.origin_utc_ms + r.span_index as i64 * span_ms
+            };
+            let t = start.max(origin).min(self.client.now_utc_ms());
+            let key = job.key();
+            let response = self
+                .handle
+                .block_on(self.client.directions(t, &[key]))
+                .map_err(|e| {
+                    WorkerError::transient(format!("directions for input {key}: {e:#}"))
+                })?;
+            let raw = response
+                .results
+                .iter()
+                .find(|k| k.key == key.to_string())
+                .and_then(|k| k.layers.iter().find(|l| l.layer == job.layer))
+                .ok_or_else(|| {
+                    WorkerError::transient(format!(
+                        "no directions for input {key} of {}",
+                        job.layer
+                    ))
+                })?;
+            let direction = raw.parse(&key).map_err(|e| {
+                WorkerError::transient(format!("directions for input {key}: {e:#}"))
+            })?;
+            let (address, out) = match direction {
+                Direction::Empty => return Ok(InputDirection::Empty),
+                Direction::Ready {
+                    address, sha256, ..
+                } => (address, InputDirection::Ready { sha256 }),
+                Direction::Missing(j) => (j.address, InputDirection::Compute { share: true }),
+                Direction::Local(j) => (j.address, InputDirection::Compute { share: false }),
+            };
+            if address != job.address {
+                return Err(WorkerError::transient(format!(
+                    "directions name input {key} of {} at {}, the build at {}",
+                    job.layer,
+                    to_hex(&address),
+                    job.address_hex()
+                )));
+            }
+            Ok(out)
+        }
+
+        fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+            match self
+                .handle
+                .block_on(self.client.get_section(address, sha256))
+            {
+                Ok(Some(b)) => Ok(b),
+                Ok(None) => Err(WorkerError::transient(format!(
+                    "input section {}: not found",
+                    to_hex(address)
+                ))),
+                Err(e) => Err(WorkerError::transient(format!("{e:#}"))),
+            }
+        }
+    }
+
     /// Puts computed `missing` sections into the upload lane and starts
     /// sending ([`UploadSender::pump`]). Never blocks the worker.
     struct HubUploader {
@@ -2101,6 +2219,8 @@ mod native {
                 };
                 stats.check_run();
                 let hash = sha256(&computed.bytes);
+                let mut check = check;
+                check.job.inputs_sha256 = computed.inputs_sha256;
                 if hash != check.drawn {
                     tracing::info!(key = %key, "a checked section differs; drawing the computed one");
                     let _ = tx.send(Internal::Replace {
@@ -2161,6 +2281,7 @@ mod native {
         pool: WorkerPool,
         coordinator: Coordinator,
         checks: Arc<CheckLane>,
+        inputs: Arc<HubInputs>,
         /// The directions time each key in flight was last asked about at.
         asked_at: BTreeMap<ChunkKey, i64>,
         /// The frame edge of each checked cell, to ask for it again when
@@ -2219,6 +2340,13 @@ mod native {
                     tx: Mutex::new(tx.clone()),
                 }),
             );
+            let inputs = Arc::new(HubInputs {
+                handle: handle.clone(),
+                client: client.clone(),
+                records: Mutex::new(Arc::default()),
+                origin: Mutex::new(None),
+            });
+            pool.set_inputs(Arc::clone(&inputs) as Arc<dyn gx_worker::InputSource>);
             tracing::info!(threads = pool.size(), "worker started");
             let mut coordinator = Coordinator::new();
             // Seeded once per run, never from an address: it only chooses
@@ -2237,6 +2365,7 @@ mod native {
                 pool,
                 coordinator,
                 checks,
+                inputs,
                 asked_at: BTreeMap::new(),
                 checked_extents: BTreeMap::new(),
                 tx,
@@ -2405,6 +2534,10 @@ mod native {
         }
 
         fn execute(&mut self, action: Action) {
+            // Input work on the pool needs the origin (section 10.3).
+            if let Some(origin) = self.coordinator.origin_utc_ms() {
+                *self.inputs.origin.lock().expect("origin") = Some(origin);
+            }
             if let Action::Complete(crate::directions::Completion { key, .. })
             | Action::Failed { key, .. } = &action
             {
@@ -2456,8 +2589,22 @@ mod native {
                     job,
                     priority,
                 } => {
+                    let mut job = *job;
                     let tx = self.tx.clone();
                     let address = job.address;
+                    // A layer with inputs takes its slots and frame records
+                    // from the build (section 10).
+                    let records = Arc::clone(&self.inputs.records.lock().expect("records"));
+                    let origin = self.coordinator.origin_utc_ms().unwrap_or(0);
+                    if let Err(e) = self.client.build().complete_job(&mut job, origin, &records) {
+                        let _ = tx.send(Internal::Compute {
+                            key,
+                            layer,
+                            address,
+                            result: Err(WorkerError::permanent(format!("{e:#}"))),
+                        });
+                        return;
+                    }
                     self.pool.submit(job, priority, move |result| {
                         let _ = tx.send(Internal::Compute {
                             key,
@@ -2473,6 +2620,7 @@ mod native {
                     address,
                     sha256,
                 } => {
+                    let records = Arc::clone(&self.inputs.records.lock().expect("records"));
                     let job = match (self.asked_at.get(&key), self.coordinator.origin_utc_ms()) {
                         (Some(&t), Some(origin)) => crate::protocol::check_job(
                             self.client.build(),
@@ -2481,6 +2629,7 @@ mod native {
                             address,
                             t,
                             origin,
+                            Some(&records),
                         ),
                         _ => None,
                     };
@@ -2666,6 +2815,18 @@ mod native {
         /// frame system from their union with the build's layer depths. The
         /// integrator starts only after this.
         pub fn load_registry(&mut self, deadline: Duration) -> Result<FrameSystem> {
+            // Frame records come from the build by hash, before anything
+            // runs: a layer with a frames slot passes them to its module,
+            // for the registry key too (section 10.2).
+            let records = self
+                .handle
+                .block_on(frame_records(&self.client, self.cache.as_deref()))?;
+            *self.inputs.records.lock().expect("records") = Arc::new(
+                records
+                    .iter()
+                    .map(|(_, b)| (sha256(b), Arc::clone(b)))
+                    .collect(),
+            );
             self.request_registry();
             let start = Instant::now();
             loop {
@@ -2679,9 +2840,6 @@ mod native {
                 for e in self.wait(left.min(Duration::from_millis(200))) {
                     if let FetchEvent::Registry(r) = e {
                         let sections = r.map_err(|e| anyhow!("registry: {e}"))?;
-                        let records = self
-                            .handle
-                            .block_on(frame_records(&self.client, self.cache.as_deref()))?;
                         crate::protocol::check_frame_records(&sections, &records).map_err(|e| {
                             tracing::error!("refusing the build: {e}");
                             anyhow!("refusing the build: {e}")

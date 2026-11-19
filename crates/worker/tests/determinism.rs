@@ -7,14 +7,14 @@
 //! The module and its vectors are vendored in `testdata/example-module/`
 //! by `scripts/update-example-module.sh` from the pinned core revision.
 
-use gx_core::address::section_address;
+use gx_core::address::{section_address, section_address_v2, SlotKind, SlotValue};
 use gx_core::manifest::{self, Entry, Manifest};
 use gx_core::module_io::{self, ModuleRequest};
 use gx_core::sha256::{sha256, to_hex};
 use gx_module_host::HostConfig;
 use gx_worker::{
-    BlobKind, Blobs, ComputeJob, DiskCache, FailureKind, ModuleRunner, Uploader, WorkerError,
-    WorkerPool, WorkerStats,
+    BlobKind, Blobs, ComputeJob, DiskCache, FailureKind, InputDirection, InputSource, ModuleRunner,
+    Resolver, Uploader, WorkerError, WorkerPool, WorkerStats,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -143,6 +143,8 @@ fn job_for(store: &mut Store, module: [u8; 32], request: &[u8], tiles: &[u8]) ->
         request,
         slots: Vec::new(),
         frames: Vec::new(),
+        frames_per_slot: Vec::new(),
+        inputs_sha256: None,
     }
 }
 
@@ -232,7 +234,7 @@ fn bad_inputs_fail_the_job() {
     let mut wrong = job.clone();
     wrong.request.span_index += 1;
     assert_eq!(
-        runner.run(&wrong, &store, None).unwrap_err().kind,
+        runner.run(&wrong, &store, None, None).unwrap_err().kind,
         FailureKind::Permanent
     );
 
@@ -247,7 +249,7 @@ fn bad_inputs_fail_the_job() {
         job.request.span_index,
         &job.request.key,
     );
-    let e = runner.run(&no_manifest, &store, None).unwrap_err();
+    let e = runner.run(&no_manifest, &store, None, None).unwrap_err();
     assert_eq!(e.kind, FailureKind::Permanent, "{e}");
 
     // A damaged tile on the edge fails its hash check, and may be retried.
@@ -260,11 +262,11 @@ fn bad_inputs_fail_the_job() {
             bytes[0] ^= 1;
         }
     }
-    let e = runner.run(&job, &damaged, None).unwrap_err();
+    let e = runner.run(&job, &damaged, None, None).unwrap_err();
     assert_eq!(e.kind, FailureKind::Transient, "{e}");
 
     // The good inputs work, and the module was admitted once.
-    assert!(runner.run(&job, &store, None).is_ok());
+    assert!(runner.run(&job, &store, None, None).is_ok());
     assert_eq!(runner.stats().snapshot().modules_loaded, 1);
 }
 
@@ -336,48 +338,143 @@ fn native_worker_reproduces_the_version_2_conformance_hashes() {
     }
 }
 
-/// A version 2 job through the pool's runner: the frame records go to
-/// `gx_inputs`, `gx_sources`, and `gx_compile`. A request whose input list
-/// is empty (the registry and the frame key) is computed to the vector's
-/// hash; one that reads layer sections fails permanently, since this
-/// worker passes frame records only.
+/// Serves one vector's input sections as stored (`ready`) sections, by a
+/// made-up address per key, and counts the streams.
+struct VectorInputs {
+    sections: BTreeMap<String, Vec<u8>>,
+    streams: AtomicU32,
+}
+
+impl VectorInputs {
+    fn address(key: &gx_core::key::ChunkKey) -> [u8; 32] {
+        sha256(key.to_string().as_bytes())
+    }
+}
+
+impl InputSource for VectorInputs {
+    fn input_job(
+        &self,
+        reader: &ComputeJob,
+        slot: u32,
+        key: gx_core::key::ChunkKey,
+    ) -> Result<ComputeJob, WorkerError> {
+        assert_eq!(slot, 1, "the example reader's layer slot");
+        let mut job = reader.clone();
+        job.address = VectorInputs::address(&key);
+        job.request.key = key;
+        Ok(job)
+    }
+
+    fn direct(&self, job: &ComputeJob) -> Result<InputDirection, WorkerError> {
+        let bytes = &self.sections[&job.key().to_string()];
+        Ok(InputDirection::Ready {
+            sha256: sha256(bytes),
+        })
+    }
+
+    fn stream(&self, address: &[u8; 32], _: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .sections
+            .iter()
+            .find(|(k, _)| VectorInputs::address(&k.parse().unwrap()) == *address)
+            .map(|(_, b)| b.clone())
+            .expect("a vector input"))
+    }
+}
+
+/// A version 2 job through the pool's runner (`client-compute.md`
+/// sections 4.1 and 10.3): the frame records go to `gx_inputs`,
+/// `gx_sources`, and `gx_compile`, and the input sections `gx_inputs`
+/// names are resolved through the input source and passed after the
+/// frames slot's record. Every vector is computed to its hash, and the
+/// inputs hash is the one over exactly the inputs passed.
 #[test]
-fn runner_runs_version_2_jobs_with_their_frame_records() {
+fn runner_runs_version_2_jobs_with_their_inputs() {
     let wasm = std::fs::read(data_v2().join("module.wasm")).unwrap();
     let mut store = Store::default();
     let module = store.add(BlobKind::Module, wasm);
-    let store = Arc::new(Mutex::new(store));
     let runner = ModuleRunner::new(HostConfig::default(), WorkerStats::new()).unwrap();
-    let mut computed = 0;
-    let mut refused = 0;
+    let mut with_inputs = 0;
+    let mut seen = std::collections::BTreeSet::new();
     for v in vectors_v2() {
-        let mut job = job_for(&mut store.lock().unwrap(), module, &v.request, &v.tiles);
-        job.frames = module_io::decode_inputs(&v.frames)
+        let mut job = job_for(&mut store, module, &v.request, &v.tiles);
+        let frames: Vec<Arc<[u8]>> = module_io::decode_inputs(&v.frames)
             .unwrap()
             .into_iter()
             .map(Arc::from)
             .collect();
-        let blobs = std::mem::take(&mut *store.lock().unwrap());
-        let result = runner.run(&job, &blobs, None);
-        *store.lock().unwrap() = blobs;
-        if module_io::decode_input_list(&v.input_list)
-            .unwrap()
-            .is_empty()
-        {
-            let out = result.unwrap_or_else(|e| panic!("{}: {e}", v.name));
-            assert_eq!(to_hex(&sha256(&out.bytes)), v.sha256, "{}", v.name);
-            computed += 1;
-        } else {
-            let e = result.expect_err(&v.name);
+        let list = module_io::decode_input_list(&v.input_list).unwrap();
+        let passed = module_io::decode_inputs(&v.inputs).unwrap();
+        let source = VectorInputs {
+            sections: list
+                .iter()
+                .zip(&passed[frames.len()..])
+                .map(|(e, b)| (e.key.to_string(), b.to_vec()))
+                .collect(),
+            streams: AtomicU32::new(0),
+        };
+        if !frames.is_empty() {
+            let r = &job.request;
+            job.slots = vec![
+                SlotValue {
+                    kind: SlotKind::Frames,
+                    value: [1; 32],
+                },
+                SlotValue {
+                    kind: SlotKind::Layer,
+                    value: [2; 32],
+                },
+            ];
+            job.frames_per_slot = vec![frames.len(), 0];
+            job.address = section_address_v2(
+                &module,
+                job.manifest.as_ref(),
+                r.origin_utc_ms,
+                r.span_seconds,
+                r.span_index,
+                &job.slots,
+                &r.key,
+            )
+            .unwrap();
+        }
+        job.frames = frames;
+        let resolver = Resolver {
+            source: &source,
+            uploader: None,
+        };
+        let out = runner
+            .run(&job, &store, None, Some(resolver))
+            .unwrap_or_else(|e| panic!("{}: {e}", v.name));
+        assert_eq!(to_hex(&sha256(&out.bytes)), v.sha256, "{}", v.name);
+        // An input resolved for an earlier vector is remembered by address
+        // and not streamed again.
+        let new = list
+            .iter()
+            .filter(|e| seen.insert(e.key.to_string()))
+            .count();
+        assert_eq!(
+            source.streams.load(Ordering::SeqCst) as usize,
+            new,
+            "{}",
+            v.name
+        );
+        if !job.slots.is_empty() {
+            assert_eq!(
+                out.inputs_sha256,
+                Some(module_io::inputs_sha256(&passed)),
+                "{}",
+                v.name
+            );
+        }
+        if !list.is_empty() {
+            with_inputs += 1;
+            // Without an input source the same job fails, never guesses.
+            let e = runner.run(&job, &store, None, None).expect_err(&v.name);
             assert_eq!(e.kind, FailureKind::Permanent, "{}", v.name);
-            assert!(e.message.contains("layer input"), "{}: {e}", v.name);
-            refused += 1;
         }
     }
-    assert!(
-        computed >= 2 && refused >= 1,
-        "{computed} computed, {refused} refused"
-    );
+    assert!(with_inputs >= 3, "{with_inputs} vectors read inputs");
 }
 
 /// A version 1 module given frame records fails before it runs.
@@ -389,6 +486,6 @@ fn runner_refuses_frame_records_for_a_version_1_module() {
     let mut job = job_for(&mut store, module, &request, &tiles);
     job.frames = vec![Arc::from(&[0u8; 88][..])];
     let runner = ModuleRunner::new(HostConfig::default(), WorkerStats::new()).unwrap();
-    let e = runner.run(&job, &store, None).expect_err(&name);
+    let e = runner.run(&job, &store, None, None).expect_err(&name);
     assert_eq!(e.kind, FailureKind::Permanent);
 }

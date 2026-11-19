@@ -29,6 +29,7 @@ pub struct WorkerStats {
     checks_matched: AtomicU64,
     checks_disputed: AtomicU64,
     checks_failed: AtomicU64,
+    inputs_conflicts: AtomicU64,
 }
 
 /// A copy of the counters at one moment.
@@ -68,6 +69,10 @@ pub struct WorkerSnapshot {
     pub checks_disputed: u64,
     /// Checks whose recompute or report failed.
     pub checks_failed: u64,
+    /// Uploads and check reports the hub answered `409`: it does not hold
+    /// the inputs they were computed from as true (`client-compute.md`
+    /// section 10.4). Logged and counted, never retried.
+    pub inputs_conflicts: u64,
 }
 
 impl WorkerStats {
@@ -137,6 +142,10 @@ impl WorkerStats {
             CheckOutcome::Matched => &self.checks_matched,
             CheckOutcome::Disputed => &self.checks_disputed,
             CheckOutcome::Failed => &self.checks_failed,
+            CheckOutcome::Conflict => {
+                tracing::info!("a check report was refused: the hub holds other inputs");
+                &self.inputs_conflicts
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -162,6 +171,7 @@ impl WorkerStats {
             checks_matched: l(&self.checks_matched),
             checks_disputed: l(&self.checks_disputed),
             checks_failed: l(&self.checks_failed),
+            inputs_conflicts: l(&self.inputs_conflicts),
         }
     }
 
@@ -172,6 +182,10 @@ impl WorkerStats {
             UploadOutcome::Matched => &self.uploads_matched,
             UploadOutcome::Disputed => &self.uploads_disputed,
             UploadOutcome::Failed => &self.uploads_failed,
+            UploadOutcome::Conflict => {
+                tracing::info!("an upload was refused: the hub holds other inputs");
+                &self.inputs_conflicts
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

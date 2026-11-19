@@ -166,6 +166,15 @@ pub struct ComputeJob {
     /// slot, in the order the config lists the frames (section 4.1). They
     /// come from the build. Empty for a layer without frames slots.
     pub frames: Vec<Arc<[u8]>>,
+    /// How many of [`ComputeJob::frames`] each slot takes, one entry per
+    /// slot in slot order: the frame count of a frames slot, 0 for a layer
+    /// slot. Empty for a layer without inputs.
+    pub frames_per_slot: Vec<usize>,
+    /// `X-Inputs-Sha256` (`client-compute.md` section 10.4): SHA-256 over
+    /// the SHA-256 of every input passed to `gx_compile`, in the order
+    /// passed. Set by the worker once it has run the job of a layer with
+    /// inputs; `None` before that and for a layer without inputs.
+    pub inputs_sha256: Option<[u8; 32]>,
 }
 
 impl ComputeJob {
@@ -308,6 +317,10 @@ pub struct Computed {
     /// Decoding is the validation, so the renderer takes this instead of
     /// decoding the bytes a second time (`rendering.md` section 3.5).
     pub section: Option<Arc<Section>>,
+    /// `X-Inputs-Sha256` of the inputs the section was computed from
+    /// (`client-compute.md` section 10.4), `None` for a layer without
+    /// inputs.
+    pub inputs_sha256: Option<[u8; 32]>,
 }
 
 /// Validates a section under its chunk key (`space-model.md` section 4
@@ -351,6 +364,8 @@ mod tests {
             request,
             slots: Vec::new(),
             frames: Vec::new(),
+            frames_per_slot: Vec::new(),
+            inputs_sha256: None,
         }
     }
 

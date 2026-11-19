@@ -53,5 +53,6 @@ pub use upload::{
 pub use cache::DiskCache;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    default_threads, Blobs, CheckRunner, LaneSource, ModuleRunner, PoolWaker, Uploader, WorkerPool,
+    default_threads, Blobs, CheckRunner, InputDirection, InputSource, LaneSource, ModuleRunner,
+    PoolWaker, Resolver, Uploader, WorkerPool,
 };

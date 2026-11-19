@@ -203,8 +203,8 @@ pub enum Action {
         key: ChunkKey,
         /// The layer's index in the build.
         layer: usize,
-        /// The job.
-        job: ComputeJob,
+        /// The job, boxed: it is much larger than the other actions.
+        job: Box<ComputeJob>,
         /// The key's priority now (projected size on screen, pixels); the
         /// worker starts the highest first and follows later changes
         /// through [`Coordinator::compute_priority`].
@@ -764,7 +764,7 @@ impl Coordinator {
                     out.push(Action::Compute {
                         key: *key,
                         layer,
-                        job,
+                        job: Box::new(job),
                         priority,
                     });
                     Slot::Computing(address)
@@ -992,6 +992,7 @@ mod tests {
         Computed {
             bytes: Arc::from(vec![b; 4]),
             section: None,
+            inputs_sha256: None,
         }
     }
 

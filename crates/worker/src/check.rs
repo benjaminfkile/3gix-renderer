@@ -37,6 +37,10 @@ pub enum CheckOutcome {
     Matched,
     /// `202 {"result": "disputed"}`.
     Disputed,
+    /// `409`: the hub does not hold the inputs this section was
+    /// computed from as true (`client-compute.md` section 10.4). Logged
+    /// and counted, never retried; nobody is blamed.
+    Conflict,
     /// Anything else (`403`, `404`, `429`, no answer), or a failed
     /// recompute.
     Failed,
@@ -48,6 +52,7 @@ impl CheckOutcome {
         match status {
             200 => CheckOutcome::Matched,
             202 => CheckOutcome::Disputed,
+            409 => CheckOutcome::Conflict,
             _ => CheckOutcome::Failed,
         }
     }
@@ -133,6 +138,8 @@ mod tests {
                 },
                 slots: Vec::new(),
                 frames: Vec::new(),
+                frames_per_slot: Vec::new(),
+                inputs_sha256: None,
             },
             layer_index: 0,
             drawn: [i; 32],

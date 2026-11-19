@@ -13,8 +13,8 @@ use gx_core::key::ChunkKey;
 use gx_core::module_io::ModuleRequest;
 use gx_module_host::HostConfig;
 use gx_worker::{
-    BlobKind, Blobs, CheckJob, CheckLane, ComputeJob, FailureKind, Lane, LaneSource, Uploader,
-    WorkerError, WorkerPool, WorkerStats, CHECK_LANE_CAPACITY,
+    BlobKind, Blobs, CheckJob, CheckLane, ComputeJob, FailureKind, InputDirection, InputSource,
+    Lane, LaneSource, Uploader, WorkerError, WorkerPool, WorkerStats, CHECK_LANE_CAPACITY,
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,8 @@ fn job(i: u32) -> ComputeJob {
         },
         slots: Vec::new(),
         frames: Vec::new(),
+        frames_per_slot: Vec::new(),
+        inputs_sha256: None,
     }
 }
 
@@ -279,4 +281,62 @@ fn a_busy_worker_runs_no_check_and_a_full_lane_skips_new_ones() {
     want.extend(["upload".to_string(), "upload".to_string()]);
     want.extend((0..CHECK_LANE_CAPACITY as u32).map(|i| format!("check {}", 100 + i)));
     assert_eq!(log, want);
+}
+
+/// Counts every call the worker makes for input sections.
+#[derive(Default)]
+struct CountingInputs {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl InputSource for CountingInputs {
+    fn input_job(
+        &self,
+        reader: &ComputeJob,
+        _: u32,
+        _: ChunkKey,
+    ) -> Result<ComputeJob, WorkerError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(reader.clone())
+    }
+
+    fn direct(&self, _: &ComputeJob) -> Result<InputDirection, WorkerError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(InputDirection::Empty)
+    }
+
+    fn stream(&self, _: &[u8; 32], _: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(WorkerError::transient("none"))
+    }
+}
+
+/// Input work belongs to the compute that needs it (`client-compute.md`
+/// section 2.8): a compute of a layer with inputs whose key leaves the
+/// view before it starts is dropped, and none of its inputs is ever
+/// asked for, fetched, or computed.
+#[test]
+fn a_dropped_compute_never_resolves_its_inputs() {
+    let (pool, release) = held_pool();
+    let inputs = Arc::new(CountingInputs::default());
+    pool.set_inputs(Arc::clone(&inputs) as Arc<dyn InputSource>);
+    let log = Log::default();
+    let mut reader = job(7);
+    reader.slots = vec![gx_core::address::SlotValue {
+        kind: gx_core::address::SlotKind::Layer,
+        value: [3; 32],
+    }];
+    reader.frames_per_slot = vec![0];
+    {
+        let log = Arc::clone(&log);
+        pool.submit(reader, 1.0, move |r| {
+            let kind = r.unwrap_err().kind;
+            log.lock().unwrap().push(format!("{kind:?}"));
+        });
+    }
+    assert_eq!(pool.reprioritize(|_| None), 1);
+    drop(release);
+    drop(pool);
+    assert_eq!(*log.lock().unwrap(), ["Dropped"]);
+    assert_eq!(inputs.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

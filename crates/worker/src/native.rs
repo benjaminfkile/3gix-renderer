@@ -8,12 +8,14 @@
 //! 2. gets the module by hash (the local cache, else [`Blobs`]), checks the
 //!    hash, and admits it once per session ([`ModuleRunner`]),
 //! 3. runs `gx_sources` (for a version 2 module, `gx_inputs` first, and
-//!    both with the job's frame records, section 4.1), resolves the ids through the layer's manifest
-//!    (fetched and checked the same way), and gets every tile, checking
-//!    its length and hash,
-//! 4. runs `gx_compile` (version 2: with the frame records as inputs) and validates the section by decoding it with the
-//!    library decoder (the one validation the section gets on its way in,
-//!    `rendering.md` section 3.5),
+//!    both with the job's frame records, section 4.1), resolves the ids
+//!    through the layer's manifest (fetched and checked the same way), and
+//!    gets every tile, checking its length and hash,
+//! 4. resolves every input section `gx_inputs` named (section 10.3, below),
+//!    runs `gx_compile` (version 2: with the frame records and the input
+//!    sections, in slot order) and validates the section by decoding it
+//!    with the library decoder (the one validation the section gets on its
+//!    way in, `rendering.md` section 3.5),
 //! 5. hands the bytes and the decoded section to the caller at once, stores them in the local cache
 //!    under their address, and, for a `missing` direction only, offers
 //!    it to the upload lane ([`Uploader`]), which never holds up the next
@@ -32,6 +34,24 @@
 //! [`crate::FailureKind::Dropped`]. A running job finishes and its section
 //! is cached.
 //!
+//! # Inputs (`client-compute.md` sections 2.8 and 10.3)
+//!
+//! An input section is got as any section, through the pool's
+//! [`InputSource`]: this session's memory of resolved sections, else the
+//! local cache, else directions for its key, then a stream (`ready`,
+//! checked against the hash the directions carried) or a compute
+//! (`missing`, `local`), which resolves its own inputs the same way. A
+//! computed `missing` input is offered to the upload lane like any section.
+//! Input work runs on the thread of the compute that needs it, so it has
+//! that compute's priority and never waits in the queue behind other work,
+//! and a compute dropped before it starts never resolves its inputs. Work
+//! on one address is shared: whoever gets an address first fetches or
+//! computes it while every other thread that needs it (another compute's
+//! input, or the wanted set's own job for it) waits and takes the same
+//! bytes. Locks are taken along the layers' input order, which has no
+//! cycle, so the waits cannot deadlock. No input work ever runs on the
+//! frame thread.
+//!
 //! The worker sees modules, requests, tile bytes, and section bytes, and
 //! nothing else.
 
@@ -42,6 +62,7 @@ use crate::job::{
 };
 use crate::queue::{ComputeQueue, Lane};
 use crate::stats::{WorkerSnapshot, WorkerStats};
+use gx_core::address::SlotKind;
 use gx_core::key::ChunkKey;
 use gx_core::sha256::to_hex;
 use gx_module_host::{HostConfig, HostError, LoadedModule, ModuleHost};
@@ -64,6 +85,80 @@ pub trait Blobs: Send + Sync {
 pub trait Uploader: Send + Sync {
     /// Offers `section` for `job`, once.
     fn offer(&self, job: &ComputeJob, section: Arc<[u8]>);
+}
+
+/// What directions say about one input section (`client-compute.md`
+/// section 2.4), as [`InputSource::direct`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputDirection {
+    /// The layer contributes nothing for this key: the input is passed as
+    /// an empty section (section 4.1).
+    Empty,
+    /// Stored: stream it and check the bytes against `sha256`.
+    Ready {
+        /// SHA-256 of the stored bytes.
+        sha256: [u8; 32],
+    },
+    /// Not stored: compute it, and offer it to the hub when `share` is
+    /// `true` (`missing`); keep it here when `false` (`local`).
+    Compute {
+        /// `true` for `missing`, `false` for `local`.
+        share: bool,
+    },
+}
+
+/// Where a compute's input sections come from (`client-compute.md` section
+/// 10.3), in the client. Called from the pool's threads; may block.
+pub trait InputSource: Send + Sync {
+    /// The job that makes the section `key` of `reader`'s layer slot
+    /// `slot`, at the input span (section 10.3), with its address, slots,
+    /// and frame records filled in from the build. Its `share` is ignored:
+    /// [`InputSource::direct`] decides it. Fails for a slot that is not a
+    /// layer slot of the reader's layer.
+    fn input_job(
+        &self,
+        reader: &ComputeJob,
+        slot: u32,
+        key: ChunkKey,
+    ) -> Result<ComputeJob, WorkerError>;
+
+    /// Directions for `job`'s layer and key at `job`'s span. Fails when the
+    /// answer's address is not `job`'s.
+    fn direct(&self, job: &ComputeJob) -> Result<InputDirection, WorkerError>;
+
+    /// The stored section at `address` (`GET /section/{address}?sha256=`).
+    /// The worker checks the hash.
+    fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError>;
+}
+
+/// Sections resolved as inputs, or computed, kept in memory
+/// ([`ResolvedMemory`]).
+pub const RESOLVED_MEMORY_SECTIONS: usize = 256;
+
+/// Sections this session resolved or computed, by address, at most
+/// [`RESOLVED_MEMORY_SECTIONS`]; the oldest go first. They hand one
+/// address's bytes to every waiter without a cache directory.
+#[derive(Default)]
+struct ResolvedMemory {
+    sections: BTreeMap<[u8; 32], Arc<[u8]>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl ResolvedMemory {
+    fn get(&self, address: &[u8; 32]) -> Option<Arc<[u8]>> {
+        self.sections.get(address).cloned()
+    }
+
+    fn put(&mut self, address: [u8; 32], bytes: Arc<[u8]>) {
+        if self.sections.insert(address, bytes).is_none() {
+            self.order.push_back(address);
+        }
+        while self.order.len() > RESOLVED_MEMORY_SECTIONS {
+            if let Some(old) = self.order.pop_front() {
+                self.sections.remove(&old);
+            }
+        }
+    }
 }
 
 /// The default pool size: the number of cores minus two, at least one.
@@ -193,6 +288,18 @@ pub struct ModuleRunner {
     sources: Mutex<SourceMemory>,
     stats: Arc<WorkerStats>,
     flights: SingleFlight,
+    resolved: Mutex<ResolvedMemory>,
+}
+
+/// What [`ModuleRunner::run`] uses to resolve a job's input sections:
+/// where they come from, the cache, and where computed `missing` inputs
+/// are offered.
+#[derive(Copy, Clone)]
+pub struct Resolver<'a> {
+    /// Directions, streams, and input jobs.
+    pub source: &'a dyn InputSource,
+    /// Takes computed `missing` inputs; `None` to offer nothing (checks).
+    pub uploader: Option<&'a dyn Uploader>,
 }
 
 impl ModuleRunner {
@@ -206,6 +313,7 @@ impl ModuleRunner {
             sources: Mutex::new(SourceMemory::default()),
             stats,
             flights: SingleFlight::default(),
+            resolved: Mutex::new(ResolvedMemory::default()),
         })
     }
 
@@ -272,12 +380,16 @@ impl ModuleRunner {
     }
 
     /// Runs one job to a validated section (steps 1 to 4 of the module
-    /// docs). Does not upload.
+    /// docs), resolving its input sections through `inputs`. Does not
+    /// upload the job's own section; computed `missing` inputs are offered
+    /// to the resolver's uploader. A job whose module names input sections
+    /// fails when `inputs` is `None`.
     pub fn run(
         &self,
         job: &ComputeJob,
         blobs: &dyn Blobs,
         cache: Option<&DiskCache>,
+        inputs: Option<Resolver<'_>>,
     ) -> Result<Computed, WorkerError> {
         job.check_address()?;
         let module = self.module(&job.module, || {
@@ -286,9 +398,12 @@ impl ModuleRunner {
         self.stats.module_run();
         let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
         let v2 = module.abi_version() >= 2;
-        if v2 {
-            check_input_list(&module.inputs(&job.request, &frames).map_err(host_error)?)?;
-        } else if !frames.is_empty() {
+        let list = if v2 {
+            module.inputs(&job.request, &frames).map_err(host_error)?
+        } else {
+            Vec::new()
+        };
+        if !v2 && !frames.is_empty() {
             return Err(WorkerError::permanent(
                 "frame records given to a version 1 module, which reads none",
             ));
@@ -322,9 +437,15 @@ impl ModuleRunner {
             };
             tiles.push((r.id, bytes.as_ref().clone()));
         }
+        let passed = if v2 {
+            self.gather_inputs(job, &list, blobs, cache, inputs)?
+        } else {
+            Vec::new()
+        };
+        let passed_refs: Vec<&[u8]> = passed.iter().map(|b| b.as_ref()).collect();
         self.stats.module_run();
         let bytes = if v2 {
-            module.compile_v2(&job.request, &tiles, &frames)
+            module.compile_v2(&job.request, &tiles, &passed_refs)
         } else {
             module.compile(&job.request, &tiles)
         }
@@ -333,21 +454,166 @@ impl ModuleRunner {
         Ok(Computed {
             bytes: Arc::from(bytes),
             section: section.map(Arc::new),
+            inputs_sha256: (!job.slots.is_empty())
+                .then(|| gx_core::module_io::inputs_sha256(&passed_refs)),
         })
     }
-}
 
-/// Fails for a non-empty `gx_inputs` list (`client-compute.md` section
-/// 4.1): the sections a version 2 module reads from its layer slots are
-/// not resolved by this worker yet, so it passes only the frames slots'
-/// records, which is right exactly when the list is empty.
-fn check_input_list(list: &[(u32, ChunkKey)]) -> Result<(), WorkerError> {
-    match list.first() {
-        None => Ok(()),
-        Some((slot, key)) => Err(WorkerError::permanent(format!(
-            "the module reads {} layer input sections (first: slot {slot}, key {key}), which this worker does not resolve",
-            list.len()
-        ))),
+    /// The inputs `gx_compile` receives (`client-compute.md` section 4.1),
+    /// in slot order: a frames slot's records from the job, a layer slot's
+    /// sections in the order `list` names them, each resolved through
+    /// `inputs` (section 10.3).
+    fn gather_inputs(
+        &self,
+        job: &ComputeJob,
+        list: &[(u32, ChunkKey)],
+        blobs: &dyn Blobs,
+        cache: Option<&DiskCache>,
+        inputs: Option<Resolver<'_>>,
+    ) -> Result<Vec<Arc<[u8]>>, WorkerError> {
+        let slots = job.slots.len();
+        let per_slot = if job.frames_per_slot.len() == slots {
+            job.frames_per_slot.clone()
+        } else if slots == 0 {
+            Vec::new()
+        } else {
+            return Err(WorkerError::permanent(format!(
+                "the job has {slots} slots and {} frame counts",
+                job.frames_per_slot.len()
+            )));
+        };
+        let mut out = Vec::with_capacity(job.frames.len() + list.len());
+        let mut records = job.frames.iter();
+        for (slot, (value, &count)) in job.slots.iter().zip(&per_slot).enumerate() {
+            match value.kind {
+                SlotKind::Frames => {
+                    for _ in 0..count {
+                        let r = records.next().ok_or_else(|| {
+                            WorkerError::permanent("the job has fewer frame records than slots")
+                        })?;
+                        out.push(Arc::clone(r));
+                    }
+                }
+                SlotKind::Layer => {
+                    for (_, key) in list.iter().filter(|(s, _)| *s as usize == slot) {
+                        let Some(resolver) = inputs else {
+                            return Err(WorkerError::permanent(format!(
+                                "the module reads input {key} of slot {slot}, and nothing resolves inputs here"
+                            )));
+                        };
+                        out.push(self.input(job, slot as u32, *key, blobs, cache, resolver)?);
+                    }
+                }
+            }
+        }
+        if let Some((slot, key)) = list.iter().find(|(s, _)| {
+            job.slots
+                .get(*s as usize)
+                .is_none_or(|v| v.kind != SlotKind::Layer)
+        }) {
+            return Err(WorkerError::permanent(format!(
+                "the module names input {key} of slot {slot}, which is not a layer slot of the layer"
+            )));
+        }
+        if slots == 0 && !job.frames.is_empty() {
+            // A job without slots passes its frame records as given.
+            out.extend(job.frames.iter().cloned());
+        }
+        Ok(out)
+    }
+
+    /// One input section of `reader` (`client-compute.md` section 10.3):
+    /// this session's memory, else the cache, else directions and a stream
+    /// or a compute. One thread per address does the work; the others wait
+    /// for it and take its bytes.
+    fn input(
+        &self,
+        reader: &ComputeJob,
+        slot: u32,
+        key: ChunkKey,
+        blobs: &dyn Blobs,
+        cache: Option<&DiskCache>,
+        resolver: Resolver<'_>,
+    ) -> Result<Arc<[u8]>, WorkerError> {
+        let mut job = resolver.source.input_job(reader, slot, key)?;
+        let address = job.address;
+        if let Some(b) = self.known_section(&key, &address, cache) {
+            return Ok(b);
+        }
+        self.flights.run(Some(BlobKind::Section), &address, || {
+            if let Some(b) = self.known_section(&key, &address, cache) {
+                return Ok(b);
+            }
+            let bytes: Arc<[u8]> = match resolver.source.direct(&job)? {
+                InputDirection::Empty => Arc::from(Vec::new()),
+                InputDirection::Ready { sha256 } => {
+                    let bytes = resolver.source.stream(&address, &sha256)?;
+                    if gx_core::sha256::sha256(&bytes) != sha256 {
+                        return Err(WorkerError::transient(format!(
+                            "input section {} does not hash to {}",
+                            to_hex(&address),
+                            to_hex(&sha256)
+                        )));
+                    }
+                    check_section(&key, &bytes)?;
+                    let bytes: Arc<[u8]> = Arc::from(bytes);
+                    self.remember(&address, &bytes, cache);
+                    bytes
+                }
+                InputDirection::Compute { share } => {
+                    job.share = share;
+                    let computed = self.run(&job, blobs, cache, Some(resolver))?;
+                    self.stats.job_finished(true);
+                    self.remember(&address, &computed.bytes, cache);
+                    job.inputs_sha256 = computed.inputs_sha256;
+                    if share {
+                        if let Some(u) = resolver.uploader {
+                            u.offer(&job, Arc::clone(&computed.bytes));
+                        }
+                    }
+                    computed.bytes
+                }
+            };
+            Ok(bytes)
+        })
+    }
+
+    /// The section at `address` if this session resolved it or the cache
+    /// holds a valid copy.
+    fn known_section(
+        &self,
+        key: &ChunkKey,
+        address: &[u8; 32],
+        cache: Option<&DiskCache>,
+    ) -> Option<Arc<[u8]>> {
+        if let Some(b) = self.resolved.lock().expect("resolved").get(address) {
+            return Some(b);
+        }
+        let name = to_hex(address);
+        let bytes = cache?.get(BlobKind::Section, &name)?;
+        if check_section(key, &bytes).is_err() {
+            return None;
+        }
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        self.resolved
+            .lock()
+            .expect("resolved")
+            .put(*address, Arc::clone(&bytes));
+        Some(bytes)
+    }
+
+    /// Keeps a resolved or computed section in memory and in the cache.
+    fn remember(&self, address: &[u8; 32], bytes: &Arc<[u8]>, cache: Option<&DiskCache>) {
+        self.resolved
+            .lock()
+            .expect("resolved")
+            .put(*address, Arc::clone(bytes));
+        if let Some(c) = cache {
+            let name = to_hex(address);
+            if let Err(e) = c.put(BlobKind::Section, &name, bytes) {
+                tracing::warn!(address = name, "could not cache the section: {e}");
+            }
+        }
     }
 }
 
@@ -448,11 +714,19 @@ pub struct CheckRunner {
 impl CheckRunner {
     /// Runs `job` to a validated section on this thread. Counts nothing
     /// as computed and neither caches nor offers the section.
+    /// A layer with inputs resolves them the same way a compute does
+    /// (`client-compute.md` section 10.3); computed `missing` inputs are
+    /// offered like any.
     pub fn run(&self, job: &ComputeJob) -> JobResult {
+        let source = self.shared.inputs.lock().expect("input source").clone();
         self.shared.runner.run(
             job,
             self.shared.blobs.as_ref(),
             self.shared.cache.as_deref(),
+            source.as_deref().map(|s| Resolver {
+                source: s,
+                uploader: Some(self.shared.uploader.as_ref()),
+            }),
         )
     }
 }
@@ -463,6 +737,7 @@ struct Shared {
     blobs: Arc<dyn Blobs>,
     cache: Option<Arc<DiskCache>>,
     uploader: Arc<dyn Uploader>,
+    inputs: Mutex<Option<Arc<dyn InputSource>>>,
 }
 
 impl WorkerPool {
@@ -494,6 +769,7 @@ impl WorkerPool {
             blobs,
             cache,
             uploader,
+            inputs: Mutex::new(None),
         });
         let queue = Arc::new(Queue {
             state: Mutex::new(State {
@@ -548,6 +824,13 @@ impl WorkerPool {
         state.lanes.sort_by_key(|(l, _)| *l);
         drop(state);
         self.queue.ready.notify_all();
+    }
+
+    /// Resolves the input sections of layers with inputs through `source`
+    /// (`client-compute.md` section 10.3), for computes and checks. Until
+    /// it is set, a module that names input sections fails.
+    pub fn set_inputs(&self, source: Arc<dyn InputSource>) {
+        *self.shared.inputs.lock().expect("input source") = Some(source);
     }
 
     /// Tells idle threads that a lane source has new work. Work offered
@@ -647,15 +930,57 @@ impl Drop for WorkerPool {
 }
 
 fn run_task(shared: &Shared, task: Task) {
-    let Task { job, done } = task;
-    let stats = shared.runner.stats();
-    let result = shared
-        .runner
-        .run(&job, shared.blobs.as_ref(), shared.cache.as_deref());
+    let Task { mut job, done } = task;
+    let runner = &shared.runner;
+    let stats = runner.stats();
+    let source = shared.inputs.lock().expect("input source").clone();
+    let resolver = source.as_deref().map(|s| Resolver {
+        source: s,
+        uploader: Some(shared.uploader.as_ref()),
+    });
+    let key = job.key();
+    let address = job.address;
+    let cache = shared.cache.as_deref();
+    // One address is worked on once: a section already resolved as
+    // another compute's input is handed over, and one being resolved now
+    // is waited for (section 10.3).
+    let result = runner.flights.run(Some(BlobKind::Section), &address, || {
+        let remembered = runner.resolved.lock().expect("resolved").get(&address);
+        if let Some(bytes) = remembered {
+            return check_section(&key, &bytes).map(|section| {
+                (
+                    Computed {
+                        bytes,
+                        section: section.map(Arc::new),
+                        inputs_sha256: None,
+                    },
+                    false,
+                )
+            });
+        }
+        let r = runner.run(&job, shared.blobs.as_ref(), cache, resolver)?;
+        runner
+            .resolved
+            .lock()
+            .expect("resolved")
+            .put(address, Arc::clone(&r.bytes));
+        Ok((r, true))
+    });
+    let result = match result {
+        // Already computed here: handed over, neither cached nor offered
+        // again.
+        Ok((computed, false)) => {
+            done(Ok(computed));
+            return;
+        }
+        Ok((computed, true)) => Ok(computed),
+        Err(e) => Err(e),
+    };
     stats.job_finished(result.is_ok());
     match result {
         Ok(computed) => {
             let section = Arc::clone(&computed.bytes);
+            job.inputs_sha256 = computed.inputs_sha256;
             done(Ok(computed));
             let address = job.address_hex();
             if let Some(c) = &shared.cache {
