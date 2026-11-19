@@ -134,7 +134,12 @@ fn matter_step(
     for e in fetcher.drain_until(started + COMPOSITE_SLICE_SECONDS) {
         match e {
             FetchEvent::Completed { key, outcome, .. } => cells.push((key, outcome)),
-            FetchEvent::Surface { key, outcome, .. } => world.complete_surface(key, outcome),
+            FetchEvent::Surface {
+                key,
+                outcome,
+                partial,
+                ..
+            } => world.complete_surface(key, outcome, partial),
             FetchEvent::Registry(_) => {}
         }
     }
@@ -195,7 +200,11 @@ impl WebApp {
                 active: None,
                 pending: launch.pending_spawn,
             },
-            world: World::new(default_threads()),
+            world: {
+                let mut w = World::new(default_threads());
+                w.set_hidden_layers(fetcher.hub().build().initially_hidden_layers());
+                w
+            },
             fetcher,
             controls: {
                 let mut c = Controls::new(options.exposure_stops);

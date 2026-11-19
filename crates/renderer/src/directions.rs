@@ -62,6 +62,11 @@
 //!    ([`backoff_seconds`]). A permanent worker failure fails the key.
 //! 4. Once every layer has its section (or is empty) the key completes with
 //!    the sections in the build's layer order, for compositing.
+//! 5. A surface key never waits on an overlay layer
+//!    ([`Coordinator::set_overlay_layers`], `rendering.md` section 7 item
+//!    6): it completes as soon as every other layer has its section, with
+//!    the overlays that have arrived, and completes again, with every
+//!    section so far, each time another overlay arrives.
 //!
 //! # Checks (`client-compute.md` sections 2.6, "On the client", and 2.8)
 //!
@@ -170,8 +175,15 @@ pub enum StreamResult {
 pub struct Completion {
     /// The key.
     pub key: ChunkKey,
-    /// The non-empty layers' sections, in the build's layer order.
+    /// The non-empty layers' sections, in the build's layer order. For a
+    /// surface key completed before its overlays (module docs, item 5),
+    /// the overlays that have arrived so far.
     pub sections: Vec<Arrived>,
+    /// Each section's layer index in the build, parallel to `sections`.
+    pub layers: Vec<usize>,
+    /// `true` while overlay layers of a surface key are still to come: the
+    /// key stays in flight and completes again.
+    pub partial: bool,
     /// Session time, seconds, the key was requested.
     pub requested_at: f64,
 }
@@ -274,6 +286,9 @@ struct Entry {
     /// Not before this time, after a failed directions request.
     hold_until: f64,
     failures: u32,
+    /// Finished slots when the key last completed early (module docs,
+    /// item 5); 0 before.
+    emitted: usize,
 }
 
 impl Entry {
@@ -361,12 +376,28 @@ pub struct Coordinator {
     /// Sections computed here in place of drawn ones that differed, by
     /// address and the hash of the drawn bytes.
     replaced: BTreeMap<([u8; 32], [u8; 32]), Arrived>,
+    /// The build's overlay layers, by index.
+    overlay_layers: BTreeSet<usize>,
+    /// The hidden layers, by index.
+    hidden_layers: BTreeSet<usize>,
 }
 
 impl Coordinator {
     /// No keys in flight.
     pub fn new() -> Coordinator {
         Coordinator::default()
+    }
+
+    /// The build's overlay layers, by index (`client-compute.md` section
+    /// 2.2): a surface key does not wait on them (module docs, item 5).
+    pub fn set_overlay_layers(&mut self, layers: BTreeSet<usize>) {
+        self.overlay_layers = layers;
+    }
+
+    /// The hidden layers, by index (`rendering.md` section 7 item 7): a
+    /// hidden overlay is not fetched for surface keys answered from now on.
+    pub fn set_hidden_layers(&mut self, layers: BTreeSet<usize>) {
+        self.hidden_layers = layers;
     }
 
     /// Seeds the random source that chooses which downloads to check.
@@ -541,6 +572,7 @@ impl Coordinator {
                 asking: false,
                 hold_until: f64::NEG_INFINITY,
                 failures: 0,
+                emitted: 0,
             },
         );
     }
@@ -738,7 +770,13 @@ impl Coordinator {
             if !matches!(slot, Slot::Unknown | Slot::Retry { .. }) {
                 continue;
             }
+            // A hidden overlay is not fetched for drawing (`rendering.md`
+            // section 7 item 7); inputs are resolved elsewhere.
+            let hidden = matches!(key, ChunkKey::Surface(_))
+                && self.overlay_layers.contains(&layer)
+                && self.hidden_layers.contains(&layer);
             *slot = match d {
+                _ if hidden => Slot::Empty,
                 Direction::Empty => Slot::Empty,
                 Direction::Ready {
                     address,
@@ -895,30 +933,57 @@ impl Coordinator {
     }
 
     fn finish_if_done(&mut self, key: &ChunkKey, out: &mut Vec<Action>) {
-        let done = self
-            .keys
-            .get(key)
-            .is_some_and(|e| !e.slots.is_empty() && e.slots.iter().all(Slot::finished));
-        if !done {
+        let surface = matches!(key, ChunkKey::Surface(_));
+        let overlays = &self.overlay_layers;
+        let Some(e) = self.keys.get_mut(key) else {
+            return;
+        };
+        if e.slots.is_empty() {
+            return;
+        }
+        let all = e.slots.iter().all(Slot::finished);
+        if !all {
+            // A surface key completes early when only overlays are left,
+            // and again whenever another overlay has arrived.
+            let base_done = surface
+                && (e.slots.iter().enumerate()).all(|(i, s)| s.finished() || overlays.contains(&i));
+            let finished = e.slots.iter().filter(|s| s.finished()).count();
+            if base_done && finished > e.emitted {
+                e.emitted = finished;
+                let (layers, sections) = done_sections(e.slots.iter().cloned());
+                out.push(Action::Complete(Completion {
+                    key: *key,
+                    sections,
+                    layers,
+                    partial: true,
+                    requested_at: e.requested_at,
+                }));
+            }
             return;
         }
         let e = self.keys.remove(key).expect("checked above");
         self.settle(key);
-        let sections = e
-            .slots
-            .into_iter()
-            .filter_map(|s| match s {
-                Slot::Done(b) => Some(b),
-                _ => None,
-            })
-            .collect();
+        let (layers, sections) = done_sections(e.slots.into_iter());
         self.stats.keys_completed += 1;
         out.push(Action::Complete(Completion {
             key: *key,
             sections,
+            layers,
+            partial: false,
             requested_at: e.requested_at,
         }));
     }
+}
+
+/// The finished sections among `slots` with their layer indices.
+fn done_sections(slots: impl Iterator<Item = Slot>) -> (Vec<usize>, Vec<Arrived>) {
+    slots
+        .enumerate()
+        .filter_map(|(i, s)| match s {
+            Slot::Done(b) => Some((i, b)),
+            _ => None,
+        })
+        .unzip()
 }
 
 #[cfg(test)]
@@ -994,6 +1059,55 @@ mod tests {
             section: None,
             inputs_sha256: None,
         }
+    }
+
+    #[test]
+    fn surface_key_never_waits_on_an_overlay() {
+        let mut c = Coordinator::new();
+        c.set_overlay_layers([1, 2].into());
+        let k = ChunkKey::Surface(SurfaceKey::new(1, 0, 0, 0, 0).unwrap());
+        c.request(k, 0.0);
+        c.poll(0.0);
+        c.directions_done(
+            &[k],
+            answer(vec![(
+                k,
+                vec![ready("s", 1), compute("o", 2), compute("p", 3)],
+            )]),
+            0.1,
+        );
+        c.poll(0.1);
+        let a = c.stream_done(
+            &k,
+            0,
+            [1; 32],
+            [101; 32],
+            StreamResult::Bytes(bytes(1), Origin::Cache),
+            0.2,
+        );
+        let a: Vec<Action> = a
+            .into_iter()
+            .filter(|x| matches!(x, Action::Complete(_)))
+            .collect();
+        let [Action::Complete(early)] = &a[..] else {
+            panic!("{a:?}")
+        };
+        assert!(early.partial);
+        assert_eq!(early.layers, vec![0]);
+        assert_eq!(c.in_flight(), 1);
+        let a = c.compute_done(&k, 2, [3; 32], Ok(computed(3)), 0.3);
+        let [Action::Complete(more)] = &a[..] else {
+            panic!("{a:?}")
+        };
+        assert!(more.partial);
+        assert_eq!(more.layers, vec![0, 2]);
+        let a = c.compute_done(&k, 1, [2; 32], Ok(computed(2)), 0.4);
+        let [Action::Complete(all)] = &a[..] else {
+            panic!("{a:?}")
+        };
+        assert!(!all.partial);
+        assert_eq!(all.layers, vec![0, 1, 2]);
+        assert_eq!(c.in_flight(), 0);
     }
 
     #[test]
@@ -1082,6 +1196,8 @@ mod tests {
             vec![Action::Complete(Completion {
                 key: k,
                 sections: vec![bytes(1), bytes(3)],
+                layers: vec![0, 2],
+                partial: false,
                 requested_at: 0.0
             })]
         );

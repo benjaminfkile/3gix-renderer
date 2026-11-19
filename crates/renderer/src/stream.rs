@@ -1844,14 +1844,18 @@ pub enum FetchEvent {
     /// The registry key finished: every non-empty layer's registry section
     /// in layer order, or why it never can.
     Registry(Result<Vec<Arc<[u8]>>, String>),
-    /// A surface tile request finished (`matter-format.md` section 10):
-    /// the first layer's surface ready to draw, `None` when every layer's
-    /// tile is empty, or why it is invalid.
+    /// A surface tile request finished (`matter-format.md` sections 10
+    /// and 12): the base surface ready to draw (`None` when every
+    /// non-overlay layer's tile is empty) with the overlays so far, or why
+    /// it is invalid.
     Surface {
         /// The tile.
         key: gx_core::key::SurfaceKey,
-        /// What came back, decoded into geometry.
-        outcome: Result<Option<Arc<crate::tiles::TileGeometry>>, String>,
+        /// What came back, decoded into geometry and overlays.
+        outcome: Result<crate::tiles::DecodedTile, String>,
+        /// `true` while overlay layers are still to come: the tile draws
+        /// now and the request finishes again when one arrives.
+        partial: bool,
         /// Section bytes received.
         bytes: u64,
     },
@@ -2311,6 +2315,8 @@ mod native {
             pool.set_inputs(Arc::clone(&inputs) as Arc<dyn gx_worker::InputSource>);
             tracing::info!(threads = pool.size(), "worker started");
             let mut coordinator = Coordinator::new();
+            coordinator.set_overlay_layers(client.build().overlay_layers());
+            coordinator.set_hidden_layers(client.build().initially_hidden_layers());
             // Seeded once per run, never from an address: it only chooses
             // which downloads to check and never touches bytes.
             coordinator.set_check_seed(
@@ -2643,14 +2649,17 @@ mod native {
                     ChunkKey::Surface(key) => {
                         let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
                         let tx = self.tx.clone();
+                        let overlays = self.client.build().overlay_layers();
                         self.decoding += 1;
                         self.handle.spawn_blocking(move || {
                             let sections: Vec<Arc<[u8]>> =
                                 done.sections.iter().map(|a| a.bytes.clone()).collect();
-                            let outcome = crate::tiles::decode_tile(&key, &sections);
+                            let outcome =
+                                crate::tiles::decode_tile(&key, &sections, &done.layers, &overlays);
                             let _ = tx.send(Internal::Event(FetchEvent::Surface {
                                 key,
                                 outcome,
+                                partial: done.partial,
                                 bytes,
                             }));
                         });
@@ -2672,6 +2681,7 @@ mod native {
                     ChunkKey::Surface(key) => self.out.push(FetchEvent::Surface {
                         key,
                         outcome: Err(reason),
+                        partial: false,
                         bytes: 0,
                     }),
                     // The renderer never asks for a frame key: frame
