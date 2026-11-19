@@ -499,7 +499,28 @@ impl WebFetcher {
                 layer,
                 job,
                 priority,
-            } => self.jobs.push(key, priority, (layer, *job)),
+            } => {
+                // A layer with inputs takes its slots and frame records from
+                // the build (`client-compute.md` section 10), as the native
+                // client does before it submits the job.
+                let mut job = *job;
+                let origin = self.coordinator.origin_utc_ms().unwrap_or(0);
+                if let Err(e) = self
+                    .hub
+                    .build()
+                    .complete_job(&mut job, origin, &self.records)
+                {
+                    let address = job.address;
+                    self.inbox.borrow_mut().push_back(Internal::Compute {
+                        key,
+                        layer,
+                        address,
+                        result: Err(WorkerError::permanent(format!("{e:#}"))),
+                    });
+                    return;
+                }
+                self.jobs.push(key, priority, (layer, job));
+            }
             Action::Check {
                 key,
                 layer,
