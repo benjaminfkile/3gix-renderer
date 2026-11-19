@@ -110,6 +110,7 @@ http://localhost:8000/?startOn=3:0,0,1@%2B10&timeScale=60
 | `viewDistanceScale` | `--view-distance-scale` | factor on the headless view's distance from its frame origin (default 1) |
 | `exposureStops` | `--exposure-stops` | fixed exposure, stops; leave out for automatic |
 | `meshMode` | `--mesh-mode` | `surfaces` (default), `vertices`, or `edges` |
+| `hideLayers` | `--hide-layers` | layer ids to hide, comma separated (an array in `config.js` is joined), overriding the build's `shown` defaults; unknown ids are reported in the console and ignored |
 
 Without any the client enters at the hub's now at the `Home` view. The
 values go through the same parser as the native flags
@@ -122,7 +123,8 @@ values; `scripts/web-options-check.mjs` checks it under Node in CI.
 
 The keys are those of `docs/controls.md`. The number keys, on the top row
 or the keypad (`Numpad0` to `Numpad9`), jump to a frame's view, or pick a
-frame while the spawn chooser (`G`) is open. While the speed field (`V`) is
+frame while the spawn chooser (`G`) is open, or show or hide a layer
+while the layer chooser (`L`) is open. While the speed field (`V`) is
 open both type digits instead.
 
 ## What the hub must allow

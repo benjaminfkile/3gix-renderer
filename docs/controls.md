@@ -17,6 +17,7 @@ In the browser, click the canvas first so it has the keyboard focus.
 | `Shift` (held) | Boost: fly at ten times the set speed while held |
 | `1` to `9`, `0` | Jump to a view of the frame with that index (see below); with the spawn chooser open, spawn instead (see Spawning) |
 | `G` | Open or close the spawn chooser (see Spawning) |
+| `L` | Open or close the layer chooser (see Layers) |
 | `Home` | Jump to a view of the whole system from above the root frame |
 | `M` | Hide or show the frame markers and the frame-to-parent lines (drawing aids, not matter) |
 | `V` | Type a speed in meters per second (see Typing a speed) |
@@ -60,6 +61,35 @@ meters per second (digits, the number row or the numpad, and one decimal
 point), `Backspace` to correct, `Enter` to set it, `Escape` to cancel.
 It sets the flight speed (clamped to 1e-3 to 1e15 m/s). While the entry
 is open every other key waits.
+
+## Layers
+
+| Input | Action |
+|---|---|
+| `L` | Open or close the layer chooser |
+| `1` to `9`, `0` (chooser open) | Show or hide the layer with that number in the chooser |
+
+`L` lists the build's layers in layer order with their number keys and
+whether each is shown or hidden, on the overlay's last line:
+`layers: 1:frames shown  2:ground hidden`. The chooser stays open while
+layers are toggled, and `L` closes it (`G` opens the spawn chooser
+instead). While any layer is hidden, an overlay line names them:
+`hidden layers: ground`.
+
+A toggle takes effect on the next frame (`rendering.md` section 7 item 7).
+A hidden overlay layer's material is not composited. A hidden plain
+layer's surface tiles are not drawn: where it gave a frame's base surface,
+the next non-empty surface tile in layer order is drawn, and where there is
+none the frame has no surface while it is hidden. Nothing computed changes,
+and input resolution is unaffected. An overlay hidden at start (by the
+build's `shown` or by `--hide-layers`) is not fetched for tiles requested
+while it is hidden, so tiles that arrived then show it only once they are
+fetched again.
+
+The layers hidden at start are the build's `shown: false` layers, or the
+ones listed by `--hide-layers <id,id,...>` instead (`hideLayers` in the
+browser). An id the build does not have is reported and ignored; an empty
+list shows every layer.
 
 ## Spawning
 

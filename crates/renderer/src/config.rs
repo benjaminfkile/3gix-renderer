@@ -116,6 +116,8 @@ FLAGS:
                                    adaptation off, + and - change it (default: automatic)
     --mesh-mode <mode>             surfaces (default), vertices, or edges: how surface meshes
                                    are drawn; X cycles them in the window
+    --hide-layers <id,id,...>      layers to hide, overriding the build's shown defaults; L
+                                   toggles layers in the window; unknown ids are reported
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID
@@ -582,7 +584,7 @@ impl Config {
             api_key,
             space_id: space_id.trim().to_string(),
             build_id: build_id.map(|b| b.trim().to_string()),
-            options: flags.options,
+            options: flags.options.clone(),
             headless: flags.headless || flags.screenshot.is_some(),
             screenshot: flags.screenshot.clone(),
             width: flags.width.unwrap_or(DEFAULT_WIDTH),
@@ -743,6 +745,20 @@ mod tests {
         let c = Config::resolve(&base_env(), &flags).unwrap();
         assert_eq!(c.adapter, None, "a blank adapter name means no preference");
         assert!(parse_flags(["--max-fps", "fast"]).is_err());
+    }
+
+    #[test]
+    fn hide_layers_flag() {
+        let flags = parse_flags(["--hide-layers", "ground,stain"]).unwrap();
+        let c = Config::resolve(&base_env(), &flags).unwrap();
+        assert_eq!(
+            c.options.hide_layers.as_deref(),
+            Some(&["ground".to_string(), "stain".to_string()][..])
+        );
+        let c = Config::resolve(&base_env(), &parse_flags(["--hide-layers="]).unwrap()).unwrap();
+        assert_eq!(c.options.hide_layers, Some(Vec::new()));
+        let c = Config::resolve(&base_env(), &parse_flags(Vec::<String>::new()).unwrap()).unwrap();
+        assert_eq!(c.options.hide_layers, None);
     }
 
     #[test]

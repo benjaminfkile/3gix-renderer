@@ -66,6 +66,7 @@ pub mod controls;
 pub mod directions;
 pub mod extract;
 pub mod farfield;
+pub mod layers;
 pub mod light;
 pub mod options;
 pub mod protocol;

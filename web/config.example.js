@@ -19,4 +19,5 @@ export default {
   // viewDistanceScale: 1,          // factor on the start view's distance from its frame origin
   // exposureStops: 0,              // fixed exposure in stops; leave out for automatic
   // meshMode: "surfaces",          // surfaces, vertices, or edges
+  // hideLayers: "a,b",             // layer ids to hide, overriding the build's shown defaults
 };

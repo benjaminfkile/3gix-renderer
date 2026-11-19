@@ -194,6 +194,9 @@ pub struct World {
     shown: Option<Shown>,
     /// Times the shown set was replaced by a different selection.
     shown_switches: u64,
+    /// The build's layers and the hidden ones (`rendering.md` section 7
+    /// item 7).
+    layer_view: crate::layers::LayerView,
     /// When the current selection was applied, while its cells are not
     /// all extracted for it yet; `None` once it is shown.
     building_since: Option<f64>,
@@ -232,6 +235,7 @@ impl World {
             surfaces: crate::tiles::Surfaces::new(),
             shown: None,
             shown_switches: 0,
+            layer_view: crate::layers::LayerView::default(),
             building_since: None,
             cache: CellCache::new(),
             pool: ExtractPool::new(threads),
@@ -493,7 +497,39 @@ impl World {
     /// composited. A client starts with the build's
     /// [`crate::protocol::BuildDescription::initially_hidden_layers`].
     pub fn set_hidden_layers(&mut self, hidden: std::collections::BTreeSet<usize>) {
+        self.layer_view.hidden = hidden.clone();
         self.surfaces.set_hidden_layers(hidden);
+    }
+
+    /// Starts the layer view for `build` (`rendering.md` section 7 item
+    /// 7): the `hide-layers` ids `hide` when given, else the build's
+    /// `shown` defaults. Returns the ids of `hide` the build does not have,
+    /// which are reported and ignored.
+    pub fn start_layers(
+        &mut self,
+        build: &crate::protocol::BuildDescription,
+        hide: Option<&[String]>,
+    ) -> Vec<String> {
+        let (view, unknown) = crate::layers::LayerView::for_build(build, hide);
+        self.set_hidden_layers(view.hidden.clone());
+        self.layer_view = view;
+        unknown
+    }
+
+    /// Applies the layer chooser's toggles
+    /// ([`crate::controls::Controls::take_layer_toggles`]); they take
+    /// effect on the next frame drawn.
+    pub fn toggle_layers(&mut self, toggles: &[usize]) {
+        let mut view = self.layer_view.clone();
+        if view.apply(toggles) {
+            self.set_hidden_layers(view.hidden.clone());
+            self.layer_view = view;
+        }
+    }
+
+    /// The build's layers and which are hidden.
+    pub fn layer_view(&self) -> &crate::layers::LayerView {
+        &self.layer_view
     }
 
     /// The hidden layers, by index in the build.

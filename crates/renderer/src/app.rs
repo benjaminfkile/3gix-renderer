@@ -237,6 +237,9 @@ pub struct HeadlessRun {
     pub mesh_mode: crate::render::scene::MeshMode,
     /// A part of the graphics adapter's name ([`crate::render::gpu::pick_adapter`]).
     pub adapter: Option<String>,
+    /// Layer ids to hide (`--hide-layers`), overriding the build's `shown`
+    /// defaults; `None` keeps them.
+    pub hide_layers: Option<Vec<String>>,
 }
 
 impl HeadlessRun {
@@ -253,6 +256,7 @@ impl HeadlessRun {
             exposure_stops: None,
             mesh_mode: crate::render::scene::MeshMode::Surfaces,
             adapter: None,
+            hide_layers: None,
         }
     }
 
@@ -268,6 +272,7 @@ impl HeadlessRun {
             exposure_stops: config.options.exposure_stops,
             mesh_mode: config.options.mesh_mode,
             adapter: config.adapter.clone(),
+            hide_layers: config.options.hide_layers.clone(),
         }
     }
 }
@@ -503,7 +508,7 @@ pub fn render_headless_view(
     let mut controls = Controls::new(None);
     let mut world = World::new(default_threads());
     if let Some(f) = &fetcher {
-        world.set_hidden_layers(f.client().build().initially_hidden_layers());
+        world.start_layers(f.client().build(), run.hide_layers.as_deref());
     }
     let start = Instant::now();
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
@@ -672,7 +677,10 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
         },
         world: {
             let mut w = World::new(default_threads());
-            w.set_hidden_layers(fetcher.client().build().initially_hidden_layers());
+            w.start_layers(
+                fetcher.client().build(),
+                config.options.hide_layers.as_deref(),
+            );
             w
         },
         fetcher,
@@ -904,6 +912,8 @@ impl App {
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
         set_fetch_time(&mut self.fetcher, &self.sim);
+        self.world
+            .toggle_layers(&self.controls.take_layer_toggles());
         let draw = matter_step(&mut self.world, &mut self.fetcher, &seen, size, t);
         let mut scene = scene_with(&draw, &seen, size);
         scene.mesh_mode = self.controls.mesh_mode;
@@ -933,6 +943,14 @@ impl App {
                 self.world.cache(),
                 self.sim.system().tree(),
             )));
+        }
+        if self.controls.choosing_layers {
+            overlay.push('\n');
+            overlay.push_str(&self.world.layer_view().chooser_line());
+        }
+        if let Some(line) = self.world.layer_view().hidden_line() {
+            overlay.push('\n');
+            overlay.push_str(&line);
         }
         for line in self.controls.status_lines() {
             overlay.push('\n');

@@ -2,7 +2,8 @@
 //! browser canvas.
 //!
 //! Turns `winit` window events into flight input for the [`Camera`], the
-//! spawn chooser (`G`, [`crate::spawn`]), actions on the simulation clock
+//! spawn chooser (`G`, [`crate::spawn`]), the layer chooser (`L`,
+//! [`crate::layers`]), actions on the simulation clock
 //! ([`crate::sim::ClockAction`]), view jumps, and the
 //! exposure: the bias of the automatic exposure, or the fixed exposure when
 //! one was given (`--exposure-stops`). The bindings are listed in `docs/controls.md`. Keys are
@@ -45,6 +46,11 @@ pub struct Controls {
     pub spawning: bool,
     /// The chooser index picked since the last frame.
     spawn: Option<usize>,
+    /// `true` while the layer chooser is open (`L`): the number keys toggle
+    /// a layer ([`crate::layers`], `rendering.md` section 7 item 7).
+    pub choosing_layers: bool,
+    /// The layer indices toggled since the last frame, in key order.
+    layer_toggles: Vec<usize>,
     /// The camera is attached to the frame it spawned onto
     /// ([`crate::camera::advance`]); `Home` and the view keys detach it.
     pub attached: bool,
@@ -92,6 +98,13 @@ impl Controls {
     /// [`crate::spawn::spawn_frames`].
     pub fn take_spawn(&mut self) -> Option<usize> {
         self.spawn.take()
+    }
+
+    /// The layer indices (`0` for key `1`, up to `9` for key `0`) toggled
+    /// in the layer chooser since the last frame; clears them. The frame
+    /// loop applies them ([`crate::layers::LayerView::toggle`]).
+    pub fn take_layer_toggles(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.layer_toggles)
     }
 
     /// Applies one window event. Returns `true` when the user asked to
@@ -173,7 +186,14 @@ impl Controls {
                 self.attached = false;
                 *camera = Camera::home(sim.system());
             }
-            KeyCode::KeyG => self.spawning = !self.spawning,
+            KeyCode::KeyG => {
+                self.spawning = !self.spawning;
+                self.choosing_layers = false;
+            }
+            KeyCode::KeyL => {
+                self.choosing_layers = !self.choosing_layers;
+                self.spawning = false;
+            }
             KeyCode::KeyM => self.hide_guides = !self.hide_guides,
             KeyCode::KeyV => self.speed_entry = Some(String::new()),
             KeyCode::KeyX => self.mesh_mode = self.mesh_mode.next(),
@@ -182,7 +202,9 @@ impl Controls {
             KeyCode::Escape => return true,
             other => {
                 if let Some(index) = digit_index(other) {
-                    if self.spawning {
+                    if self.choosing_layers {
+                        self.layer_toggles.push(index);
+                    } else if self.spawning {
                         self.spawning = false;
                         self.spawn = Some(index);
                     } else if let Some(cam) = Camera::view_of_index(sim.system(), index) {
@@ -326,6 +348,30 @@ mod tests {
         let top = Camera::view_of_index(sim.system(), 0).unwrap();
         assert_eq!(camera.frame_id, top.frame_id);
         assert_eq!(camera.position, top.position);
+    }
+
+    #[test]
+    fn the_layer_chooser_toggles_layers() {
+        let system = crate::camera::tests::system();
+        let mut sim = crate::sim::Simulation::at_now(system, gx_core::units::Seconds::new(0.0));
+        let mut camera = Camera::home(sim.system());
+        let before = camera.position;
+        let mut c = Controls::new(None);
+        c.key(KeyCode::KeyG, true, false, &mut sim, &mut camera);
+        c.key(KeyCode::KeyL, true, false, &mut sim, &mut camera);
+        assert!(c.choosing_layers && !c.spawning);
+        // The top row and the keypad toggle alike, and the chooser stays
+        // open.
+        c.key(KeyCode::Digit2, true, false, &mut sim, &mut camera);
+        c.key(KeyCode::Numpad1, true, false, &mut sim, &mut camera);
+        assert_eq!(c.take_layer_toggles(), vec![1, 0]);
+        assert!(c.choosing_layers);
+        assert_eq!(c.take_spawn(), None);
+        assert_eq!(camera.position, before);
+        c.key(KeyCode::KeyL, true, false, &mut sim, &mut camera);
+        assert!(!c.choosing_layers);
+        c.key(KeyCode::Digit1, true, false, &mut sim, &mut camera);
+        assert!(c.take_layer_toggles().is_empty());
     }
 
     #[test]

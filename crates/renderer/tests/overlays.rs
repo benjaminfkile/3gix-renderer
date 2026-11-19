@@ -70,6 +70,12 @@ fn stain_tile(key: &SurfaceKey) -> OverlayTile {
 }
 
 fn space(stain_shown: bool) -> MockHubOptions {
+    MockHubOptions::new(space_layers(stain_shown), Vec::new())
+}
+
+/// The layers of [`space`]: the registry, the `ground` base, and the
+/// `paint` and `stain` overlays.
+fn space_layers(stain_shown: bool) -> Vec<MockLayer> {
     let mut base = stored_layer("ground", 4, SectionMaker(Arc::new(|_| Vec::new())));
     base.stored_surfaces = Some(SurfaceMaker(Arc::new(ground)));
     let paint = MockLayer {
@@ -105,7 +111,7 @@ fn space(stain_shown: bool) -> MockHubOptions {
         paint,
         stain,
     ];
-    MockHubOptions::new(layers, Vec::new())
+    layers
 }
 
 fn connect(rt: &tokio::runtime::Runtime, hub: &MockHub) -> Fetcher {
@@ -153,7 +159,7 @@ fn fetch(fetcher: &mut Fetcher, surfaces: &mut Surfaces, key: SurfaceKey) -> Vec
             };
             assert_eq!(k, key);
             let tile = outcome.expect("a valid tile");
-            assert!(tile.base.is_some(), "the base came first");
+            assert!(tile.base().is_some(), "the base came first");
             steps.push(tile.overlays.iter().map(|(l, _)| *l).collect());
             surfaces.complete_layers(key, Ok(tile), partial);
             let drawn = surfaces.drawn_geometry(&key).expect("drawn at once");
@@ -170,7 +176,7 @@ fn fetch(fetcher: &mut Fetcher, surfaces: &mut Surfaces, key: SurfaceKey) -> Vec
 fn expected(key: &SurfaceKey) -> (renderer::tiles::TileGeometry, OverlayTile, OverlayTile) {
     let decoded: DecodedTile =
         renderer::tiles::decode_tile(key, &[ground(key)], &[1], &Default::default()).unwrap();
-    let base = Arc::unwrap_or_clone(decoded.base.unwrap());
+    let base = Arc::unwrap_or_clone(decoded.base().cloned().unwrap());
     let paint = gx_module_overlay_tile(key);
     (base, paint, stain_tile(key))
 }
@@ -240,6 +246,71 @@ fn overlays_draw_in_layer_order_as_they_arrive() {
         surfaces.drawn_geometry(&key).unwrap().albedo,
         paint_only.albedo
     );
+}
+
+#[test]
+fn a_hidden_base_layer_gives_way_to_the_next() {
+    // A second plain layer with a surface: `rock`, layer 3 (the build
+    // orders layers by id).
+    let mut layers = space_layers(true);
+    let mut rock = stored_layer("rock", 4, SectionMaker(Arc::new(|_| Vec::new())));
+    rock.module
+        .extend_from_slice(&[0, 5, 4, b'r', b'o', b'c', b'k']);
+    rock.stored_surfaces = Some(SurfaceMaker(Arc::new(ground)));
+    layers.push(rock);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let hub = rt
+        .block_on(MockHub::start(MockHubOptions::new(layers, Vec::new())))
+        .unwrap();
+    let mut fetcher = connect(&rt, &hub);
+    let mut surfaces = Surfaces::new();
+    let mut left = std::collections::BTreeSet::new();
+    for face in 0..6 {
+        let key = SurfaceKey::new(PAINTED, face, 0, 0, 0).unwrap();
+        fetcher.request_surface(key);
+        left.insert(key);
+    }
+    let start = Instant::now();
+    while !left.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(120), "the tiles hang");
+        for e in fetcher.wait(Duration::from_millis(50)) {
+            if let FetchEvent::Surface {
+                key,
+                outcome,
+                partial,
+                ..
+            } = e
+            {
+                surfaces.complete_layers(key, outcome, partial);
+                if !partial {
+                    left.remove(&key);
+                }
+            }
+        }
+    }
+    let key = SurfaceKey::new(PAINTED, 2, 0, 0, 0).unwrap();
+    assert!(surfaces.has_surface(PAINTED));
+    let shown = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
+
+    // Hiding `ground` draws `rock`'s tile, with the overlays over it.
+    surfaces.set_hidden_layers([1].into());
+    let rock = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
+    assert!(!Arc::ptr_eq(&rock, &shown));
+    assert_eq!(rock.positions, shown.positions);
+    assert!(surfaces.has_surface(PAINTED));
+
+    // Hiding both bases draws no tile: the frame has no surface, and its
+    // cells are drawn instead.
+    surfaces.set_hidden_layers([1, 3].into());
+    assert!(surfaces.drawn_geometry(&key).is_none());
+    assert!(!surfaces.has_surface(PAINTED));
+
+    // Showing them again draws `ground` with its overlays as before.
+    surfaces.set_hidden_layers(Default::default());
+    let again = surfaces.drawn_geometry(&key).unwrap();
+    assert_eq!(again.albedo, shown.albedo);
+    assert_eq!(again.positions, shown.positions);
+    assert!(surfaces.has_surface(PAINTED));
 }
 
 #[test]
