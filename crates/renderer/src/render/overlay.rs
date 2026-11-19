@@ -77,6 +77,16 @@ pub struct MatterStats {
     pub uploads_dropped: u64,
     /// Offers that failed (counted, never retried; drawing never waits).
     pub uploads_failed: u64,
+    /// Downloads chosen and queued for a check.
+    pub checks_queued: u64,
+    /// Checks whose recompute ran.
+    pub checks_run: u64,
+    /// Checks skipped (a full check lane, or not runnable here).
+    pub checks_skipped: u64,
+    /// Checks the hub answered `match`.
+    pub checks_matched: u64,
+    /// Checks the hub answered `disputed`.
+    pub checks_disputed: u64,
     /// Directions requests sent.
     pub directions_requests: u64,
     /// 95th percentile of the frame thread's matter work per step over the
@@ -108,6 +118,11 @@ impl MatterStats {
             uploads_disputed: s.worker.uploads_disputed,
             uploads_dropped: s.worker.uploads_dropped,
             uploads_failed: s.worker.uploads_failed,
+            checks_queued: s.worker.checks_queued,
+            checks_run: s.worker.checks_run,
+            checks_skipped: s.worker.checks_skipped,
+            checks_matched: s.worker.checks_matched,
+            checks_disputed: s.worker.checks_disputed,
             directions_requests: s.directions.directions_requests,
             ..MatterStats::default()
         }
@@ -350,6 +365,11 @@ mod tests {
                 uploads_stored: 3,
                 uploads_matched: 0,
                 uploads_disputed: 0,
+                checks_queued: 2,
+                checks_run: 2,
+                checks_skipped: 0,
+                checks_matched: 2,
+                checks_disputed: 0,
                 uploads_dropped: 0,
                 uploads_failed: 0,
                 directions_requests: 5,

@@ -4,7 +4,9 @@
 //!
 //! Implements the wire side of `client-compute.md` sections 2.2 (layer
 //! config), 2.3 (client routes), 2.4 (directions: `ready`, `missing`,
-//! `local`, `empty`), and 2.5 (the upload headers). There is no readiness
+//! `local`, `empty`), 2.5 (the upload headers), and 2.6 (the check body
+//! and headers, and the job that recomputes a `ready` section from the
+//! layer config, [`check_job`]). There is no readiness
 //! socket: nothing waits on another client. Shared by the native client ([`crate::hub`])
 //! and the browser client (`crate::web`), which differ only in how they
 //! send requests.
@@ -208,6 +210,10 @@ pub struct LayerConfig {
     /// SHA-256 of the layer's source manifest, or `None`.
     #[serde(default)]
     pub source_manifest: Option<String>,
+    /// SHA-256 of the layer's source epoch index, or `None`
+    /// (`client-compute.md` section 5.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epochs: Option<String>,
     /// The frames the layer is directed for.
     pub attachment: Attachment,
     /// The layer owns its frames exclusively.
@@ -276,6 +282,69 @@ impl BuildDescription {
             .filter_map(|l| l.declared_depth(frame_id))
             .max()
     }
+}
+
+/// The job that recomputes the `ready` section at `address` of `key` in
+/// the build's layer `layer`, asked about at `t_utc_ms` in a space of
+/// origin `origin_utc_ms` (`client-compute.md` section 2.6, "On the
+/// client"): the module and manifest from the layer's config and the span
+/// index by the rule of section 2.4, so no extra request is needed. `None`
+/// for an unknown layer, a malformed hash, or a layer with source epochs,
+/// whose manifest per span needs the epoch index (section 5.4) and is not
+/// checked here.
+pub fn check_job(
+    build: &BuildDescription,
+    layer: usize,
+    key: ChunkKey,
+    address: [u8; 32],
+    t_utc_ms: i64,
+    origin_utc_ms: i64,
+) -> Option<ComputeJob> {
+    let config = build.layers.get(layer)?;
+    if config.source_epochs.is_some() || !config.shared {
+        return None;
+    }
+    let manifest = match &config.source_manifest {
+        Some(h) => Some(parse_hash(h)?),
+        None => None,
+    };
+    let span_index = if config.span_seconds > 0 {
+        let start = if config.uses_origin { origin_utc_ms } else { 0 };
+        let span_ms = config.span_seconds as i64 * 1000;
+        u64::try_from((t_utc_ms - start).div_euclid(span_ms)).ok()?
+    } else {
+        0
+    };
+    Some(ComputeJob {
+        address,
+        layer: config.layer.clone(),
+        share: true,
+        module: parse_hash(&config.module)?,
+        manifest,
+        request: ModuleRequest {
+            origin_utc_ms: if config.uses_origin { origin_utc_ms } else { 0 },
+            span_seconds: config.span_seconds,
+            span_index,
+            key,
+        },
+    })
+}
+
+/// The section 2.6 headers of a check for `job`, in a fixed order:
+/// `X-Layer`, `X-Key`, `X-Span-Index`.
+pub fn check_headers(job: &ComputeJob) -> [(&'static str, String); 3] {
+    [
+        (LAYER_HEADER, job.layer.clone()),
+        (KEY_HEADER, job.key().to_string()),
+        (SPAN_INDEX_HEADER, job.request.span_index.to_string()),
+    ]
+}
+
+/// `POST /space/{spaceId}/build/{buildId}/section/{address}/check` body.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckRequest {
+    /// SHA-256 of the recomputed section, lowercase hex.
+    pub sha256: String,
 }
 
 /// `POST /space/{spaceId}/build/{buildId}/directions` body.

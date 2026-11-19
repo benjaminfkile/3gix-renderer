@@ -271,4 +271,28 @@ impl WebHub {
         let detail = String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned();
         bail!("upload {address}: hub answered {status}: {detail}")
     }
+
+    /// Reports the hash of a recomputed section for `job` once
+    /// (`client-compute.md` section 2.6). Returns the status: `200` match,
+    /// `202` disputed, or a refusal (`403`, `404`, `429`).
+    pub async fn check(&self, job: &ComputeJob, recomputed: &[u8; 32]) -> Result<u16> {
+        let address = job.address_hex();
+        let mut req = self
+            .http
+            .post(self.routes.check(self.build_id(), &address))
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .header("Content-Type", "application/json");
+        for (name, value) in crate::protocol::check_headers(job) {
+            req = req.header(name, value);
+        }
+        let body = serde_json::to_vec(&crate::protocol::CheckRequest {
+            sha256: to_hex(recomputed),
+        })?;
+        let resp = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("check {address}: {}", e.without_url()))?;
+        Ok(resp.status().as_u16())
+    }
 }

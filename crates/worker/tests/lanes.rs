@@ -1,7 +1,8 @@
 //! The pool's work order (`client-compute.md` section 2.8): the highest
 //! priority waiting compute starts next, a waiting compute whose key left
 //! the wanted set never starts, and lower lanes run only when no compute
-//! waits.
+//! waits; checks run only after every compute and every upload, and a
+//! check chosen while the check lane is full is skipped.
 //!
 //! The jobs here carry an address that does not match their inputs, so
 //! each one fails its first check at once; the order in which their
@@ -12,7 +13,8 @@ use gx_core::key::ChunkKey;
 use gx_core::module_io::ModuleRequest;
 use gx_module_host::HostConfig;
 use gx_worker::{
-    BlobKind, Blobs, ComputeJob, FailureKind, Lane, LaneSource, Uploader, WorkerError, WorkerPool,
+    BlobKind, Blobs, CheckJob, CheckLane, ComputeJob, FailureKind, Lane, LaneSource, Uploader,
+    WorkerError, WorkerPool, WorkerStats, CHECK_LANE_CAPACITY,
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -214,4 +216,65 @@ fn a_long_run_of_wanted_work_starves_uploads_and_nothing_else() {
         assert_eq!(*entry, format!("ran {i}"));
     }
     assert!(log[50..].iter().all(|e| e == "upload"));
+}
+
+/// The check lane as the pool sees it: each check logged when it runs.
+struct Checks {
+    log: Log,
+    lane: Arc<CheckLane>,
+}
+
+impl LaneSource for Checks {
+    fn next(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        let check = self.lane.take()?;
+        let log = Arc::clone(&self.log);
+        Some(Box::new(move || {
+            log.lock()
+                .unwrap()
+                .push(format!("check {}", check.job.request.span_index))
+        }))
+    }
+}
+
+#[test]
+fn a_busy_worker_runs_no_check_and_a_full_lane_skips_new_ones() {
+    let (pool, release) = held_pool();
+    let log = Log::default();
+    let stats = WorkerStats::new();
+    let lane = Arc::new(CheckLane::new(Arc::clone(&stats)));
+    pool.set_lane(
+        Lane::Check,
+        Arc::new(Checks {
+            log: Arc::clone(&log),
+            lane: Arc::clone(&lane),
+        }),
+    );
+    pool.set_lane(
+        Lane::Upload,
+        Arc::new(Uploads {
+            log: Arc::clone(&log),
+            left: Mutex::new(2),
+        }),
+    );
+    for i in 0..5 {
+        submit(&pool, &log, i, 1.0);
+    }
+    let chosen = CHECK_LANE_CAPACITY as u32 + 8;
+    for i in 0..chosen {
+        lane.push(CheckJob {
+            job: job(100 + i),
+            layer_index: 0,
+            drawn: [0; 32],
+        });
+    }
+    let n = stats.snapshot();
+    assert_eq!(n.checks_queued, CHECK_LANE_CAPACITY as u64);
+    assert_eq!(n.checks_skipped, 8);
+    drop(release);
+    drop(pool);
+    let log = log.lock().unwrap().clone();
+    let mut want: Vec<String> = (0..5).map(|i| format!("ran {i}")).collect();
+    want.extend(["upload".to_string(), "upload".to_string()]);
+    want.extend((0..CHECK_LANE_CAPACITY as u32).map(|i| format!("check {}", 100 + i)));
+    assert_eq!(log, want);
 }

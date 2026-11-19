@@ -1,9 +1,9 @@
 //! The native hub client, version 2: the clock, the build and its layers,
-//! directions, content-addressed reads through the edge, and uploads with
-//! the section 2.5 headers. There is no readiness socket: nothing waits on
-//! another client.
+//! directions, content-addressed reads through the edge, uploads with the
+//! section 2.5 headers, and check reports ([`HubClient::check`], section
+//! 2.6). There is no readiness socket: nothing waits on another client.
 //!
-//! Implements the client side of `client-compute.md` sections 2.3 to 2.5
+//! Implements the client side of `client-compute.md` sections 2.3 to 2.6
 //! over [`crate::protocol`]:
 //!
 //! - [`HubClient::connect`] reads `GET /space/{s}/clock`, `GET
@@ -287,6 +287,30 @@ impl HubClient {
             .await
             .map_err(|e| anyhow!("{what}: {}", e.without_url()))?;
         Ok(Some(body.to_vec()))
+    }
+
+    /// Reports the hash of a recomputed section for `job` once
+    /// (`client-compute.md` section 2.6). Returns the status: `200` match,
+    /// `202` disputed, or a refusal (`403`, `404`, `429`).
+    pub async fn check(&self, job: &ComputeJob, recomputed: &[u8; 32]) -> Result<u16> {
+        let address = job.address_hex();
+        let mut req = self
+            .http
+            .post(self.routes.check(self.build_id(), &address))
+            .header(API_KEY_HEADER, self.api_key.expose())
+            .header("Content-Type", "application/json");
+        for (name, value) in crate::protocol::check_headers(job) {
+            req = req.header(name, value);
+        }
+        let body = serde_json::to_vec(&crate::protocol::CheckRequest {
+            sha256: to_hex(recomputed),
+        })?;
+        let resp = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("check {address}: {}", e.without_url()))?;
+        Ok(resp.status().as_u16())
     }
 
     /// Offers a computed section for `job` once (`client-compute.md`

@@ -1,7 +1,8 @@
 //! Running counts of what the worker did, for the overlay
 //! (`client-compute.md` section 1: sections computed here, modules
 //! loaded; section 2.8: uploads offered, stored, matched, disputed,
-//! dropped, and failed).
+//! dropped, and failed; section 2.6: checks queued, run, skipped, matched,
+//! disputed, and failed).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +23,12 @@ pub struct WorkerStats {
     uploads_disputed: AtomicU64,
     uploads_dropped: AtomicU64,
     uploads_failed: AtomicU64,
+    checks_queued: AtomicU64,
+    checks_run: AtomicU64,
+    checks_skipped: AtomicU64,
+    checks_matched: AtomicU64,
+    checks_disputed: AtomicU64,
+    checks_failed: AtomicU64,
 }
 
 /// A copy of the counters at one moment.
@@ -49,6 +56,18 @@ pub struct WorkerSnapshot {
     pub uploads_dropped: u64,
     /// Offers sent that failed. Counted, never retried.
     pub uploads_failed: u64,
+    /// Checks put into the check lane.
+    pub checks_queued: u64,
+    /// Checks whose recompute ran.
+    pub checks_run: u64,
+    /// Checks not queued because the check lane was full, or not runnable here.
+    pub checks_skipped: u64,
+    /// Checks the hub answered `match`.
+    pub checks_matched: u64,
+    /// Checks the hub answered `disputed`.
+    pub checks_disputed: u64,
+    /// Checks whose recompute or report failed.
+    pub checks_failed: u64,
 }
 
 impl WorkerStats {
@@ -96,6 +115,32 @@ impl WorkerStats {
         }
     }
 
+    /// Records a check put into the check lane.
+    pub fn check_queued(&self) {
+        self.checks_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a check that was not queued or could not run.
+    pub fn check_skipped(&self) {
+        self.checks_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a check whose recompute ran.
+    pub fn check_run(&self) {
+        self.checks_run.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the hub's answer to a check.
+    pub fn check_finished(&self, outcome: crate::check::CheckOutcome) {
+        use crate::check::CheckOutcome;
+        let counter = match outcome {
+            CheckOutcome::Matched => &self.checks_matched,
+            CheckOutcome::Disputed => &self.checks_disputed,
+            CheckOutcome::Failed => &self.checks_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The counters now.
     pub fn snapshot(&self) -> WorkerSnapshot {
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -111,6 +156,12 @@ impl WorkerStats {
             uploads_disputed: l(&self.uploads_disputed),
             uploads_dropped: l(&self.uploads_dropped),
             uploads_failed: l(&self.uploads_failed),
+            checks_queued: l(&self.checks_queued),
+            checks_run: l(&self.checks_run),
+            checks_skipped: l(&self.checks_skipped),
+            checks_matched: l(&self.checks_matched),
+            checks_disputed: l(&self.checks_disputed),
+            checks_failed: l(&self.checks_failed),
         }
     }
 

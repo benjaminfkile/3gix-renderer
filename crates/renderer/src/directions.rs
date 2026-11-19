@@ -62,6 +62,20 @@
 //!    ([`backoff_seconds`]). A permanent worker failure fails the key.
 //! 4. Once every layer has its section (or is empty) the key completes with
 //!    the sections in the build's layer order, for compositing.
+//!
+//! # Checks (`client-compute.md` sections 2.6, "On the client", and 2.8)
+//!
+//! When a `ready` section of a cell or a surface tile arrives (from the
+//! edge or the local cache), the coordinator draws a number from its own
+//! random source, seeded once per client run ([`Coordinator::set_check_seed`])
+//! and never from the address, and with probability `checkRate` returns an
+//! [`Action::Check`]. The driver builds the job from the build config and
+//! queues it in its check lane. When the recomputed hash differs from the
+//! drawn one, the driver calls [`Coordinator::replace`]: the computed
+//! section takes the place of the drawn one for that address and hash
+//! (the key completes again with it, as a computed section would),
+//! whatever the hub answers. The random source only chooses what to check;
+//! it never touches bytes.
 
 use crate::protocol::{Direction, DirectionsResponse, MAX_DIRECTION_KEYS};
 use gx_core::key::{CellKey, ChunkKey, SurfaceKey};
@@ -196,6 +210,19 @@ pub enum Action {
         /// through [`Coordinator::compute_priority`].
         priority: f64,
     },
+    /// Recompute the `ready` section at `address`, whose drawn bytes hash
+    /// to `sha256`, in the check lane, report the hash to the hub, and if
+    /// it differs call [`Coordinator::replace`].
+    Check {
+        /// The key.
+        key: ChunkKey,
+        /// The layer's index in the build.
+        layer: usize,
+        /// The address.
+        address: [u8; 32],
+        /// SHA-256 of the bytes drawn.
+        sha256: [u8; 32],
+    },
     /// The key is complete.
     Complete(Completion),
     /// The key can never complete.
@@ -327,12 +354,63 @@ pub struct Coordinator {
     answers: BTreeMap<ChunkKey, Vec<Direction>>,
     origin_utc_ms: Option<i64>,
     stats: DirectionStats,
+    /// `checkRate` of each `ready` slot, by key and layer.
+    check_rates: BTreeMap<(ChunkKey, usize), f64>,
+    /// The check source's state (SplitMix64).
+    check_state: u64,
+    /// Sections computed here in place of drawn ones that differed, by
+    /// address and the hash of the drawn bytes.
+    replaced: BTreeMap<([u8; 32], [u8; 32]), Arrived>,
 }
 
 impl Coordinator {
     /// No keys in flight.
     pub fn new() -> Coordinator {
         Coordinator::default()
+    }
+
+    /// Seeds the random source that chooses which downloads to check.
+    /// Called once per client run; the seed never affects any bytes.
+    pub fn set_check_seed(&mut self, seed: u64) {
+        self.check_state = seed;
+    }
+
+    /// A number in `[0, 1)` from the check source (SplitMix64).
+    fn check_draw(&mut self) -> f64 {
+        self.check_state = self.check_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.check_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Puts `computed`, recomputed by a check, in place of the drawn
+    /// section of `key`'s `layer` at `address` whose bytes hash to
+    /// `sha256`. The key completes again with it: at once if it is still
+    /// in flight, else through a new request whose `ready` answer for
+    /// that address and hash takes the computed section instead of
+    /// streaming.
+    pub fn replace(
+        &mut self,
+        key: ChunkKey,
+        layer: usize,
+        address: [u8; 32],
+        sha256: [u8; 32],
+        computed: Arrived,
+        now: f64,
+    ) -> Vec<Action> {
+        self.replaced.insert((address, sha256), computed.clone());
+        let mut out = Vec::new();
+        if let Some(slot) = self.slot_mut(&key, layer) {
+            if let Slot::Done(_) = slot {
+                *slot = Slot::Done(computed);
+            }
+            return out;
+        }
+        self.request(key, now);
+        self.finish_if_done(&key, &mut out);
+        out
     }
 
     /// The universe's origin, once a directions response has carried it.
@@ -663,10 +741,18 @@ impl Coordinator {
             *slot = match d {
                 Direction::Empty => Slot::Empty,
                 Direction::Ready {
-                    address, sha256, ..
+                    address,
+                    sha256,
+                    check_rate,
                 } => {
-                    streams.push((*key, layer, address, sha256));
-                    Slot::StreamQueued(address, sha256)
+                    if let Some(computed) = self.replaced.get(&(address, sha256)) {
+                        self.stats.sections_computed += 1;
+                        Slot::Done(computed.clone())
+                    } else {
+                        self.check_rates.insert((*key, layer), check_rate);
+                        streams.push((*key, layer, address, sha256));
+                        Slot::StreamQueued(address, sha256)
+                    }
                 }
                 Direction::Missing(job) | Direction::Local(job) => {
                     if job.share {
@@ -719,6 +805,16 @@ impl Coordinator {
                     Origin::Edge => self.stats.sections_streamed += 1,
                     Origin::Cache => self.stats.sections_cached += 1,
                     Origin::Computed => self.stats.sections_computed += 1,
+                }
+                let rate = self.check_rates.remove(&(*key, layer)).unwrap_or(0.0);
+                let checkable = !matches!(key, ChunkKey::Registry) && origin != Origin::Computed;
+                if checkable && rate > 0.0 && self.check_draw() < rate {
+                    out.push(Action::Check {
+                        key: *key,
+                        layer,
+                        address,
+                        sha256,
+                    });
                 }
             }
             StreamResult::NotFound | StreamResult::Failed(_) => {
@@ -1201,6 +1297,9 @@ mod tests {
                         streams.push((*key, *layer, *address, *sha256));
                     }
                     Action::Complete(done) => completed.push(done.key),
+                    // Chosen at the answer's `checkRate`; runs below
+                    // everything wanted and starts nothing here.
+                    Action::Check { .. } => {}
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -1440,5 +1539,90 @@ mod tests {
                 ChunkKey::Surface(tile_key(1))
             ])]
         );
+    }
+
+    /// Streams `n` cells whose one layer is `ready` at `rate` and returns
+    /// how many were chosen for a check.
+    fn checks_chosen(rate: f64, n: u32, seed: u64) -> usize {
+        let mut c = Coordinator::new();
+        c.set_check_seed(seed);
+        let mut chosen = 0;
+        for i in 0..n {
+            let k = cell(i);
+            c.request(k, 0.0);
+            c.poll(0.0);
+            let mut r = ready("a", 1);
+            r.check_rate = Some(rate);
+            c.directions_done(&[k], answer(vec![(k, vec![r])]), 0.0);
+            c.poll(0.0);
+            let a = c.stream_done(
+                &k,
+                0,
+                [1; 32],
+                [101; 32],
+                StreamResult::Bytes(bytes(1), Origin::Edge),
+                0.0,
+            );
+            chosen += a
+                .iter()
+                .filter(|a| matches!(a, Action::Check { .. }))
+                .count();
+            assert!(a.iter().any(|a| matches!(a, Action::Complete(_))));
+        }
+        chosen
+    }
+
+    #[test]
+    fn rate_zero_never_checks_and_rate_one_always_does() {
+        assert_eq!(checks_chosen(0.0, 200, 1), 0);
+        assert_eq!(checks_chosen(1.0, 200, 1), 200);
+        let half = checks_chosen(0.5, 400, 7);
+        assert!((150..250).contains(&half), "{half}");
+        // The choice is the client's own, not the address's.
+        assert_ne!(checks_chosen(0.5, 64, 1), checks_chosen(0.5, 64, 2));
+    }
+
+    #[test]
+    fn a_differing_check_replaces_the_drawn_section() {
+        let mut c = Coordinator::new();
+        let k = cell(1);
+        c.request(k, 0.0);
+        c.poll(0.0);
+        let mut r = ready("a", 1);
+        r.check_rate = Some(1.0);
+        c.directions_done(&[k], answer(vec![(k, vec![r])]), 0.0);
+        c.poll(0.0);
+        let a = c.stream_done(
+            &k,
+            0,
+            [1; 32],
+            [101; 32],
+            StreamResult::Bytes(bytes(1), Origin::Edge),
+            0.0,
+        );
+        assert_eq!(
+            a[0],
+            Action::Check {
+                key: k,
+                layer: 0,
+                address: [1; 32],
+                sha256: [101; 32]
+            }
+        );
+        let Action::Complete(done) = &a[1] else {
+            panic!()
+        };
+        assert_eq!(done.sections, vec![bytes(1)]);
+        // The recompute differs: the key completes again with it, from
+        // the kept answer, without streaming.
+        assert!(c
+            .replace(k, 0, [1; 32], [101; 32], bytes(2), 1.0)
+            .is_empty());
+        let a = c.poll(1.0);
+        let Some(Action::Complete(done)) = a.last() else {
+            panic!("{a:?}")
+        };
+        assert_eq!(done.sections, vec![bytes(2)]);
+        assert!(!a.iter().any(|a| matches!(a, Action::Stream { .. })));
     }
 }

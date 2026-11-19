@@ -1932,14 +1932,14 @@ mod native {
     use gx_core::units::Meters;
     use gx_module_host::HostConfig;
     use gx_worker::{
-        BlobKind, Blobs, ComputeJob, Computed, DiskCache, Lane, LaneSource, PoolWaker, UploadLane,
-        UploadOffer, UploadOutcome, Uploader, WorkerError, WorkerPool, WorkerStats,
-        MAX_UPLOADS_IN_FLIGHT,
+        BlobKind, Blobs, CheckJob, CheckLane, CheckOutcome, CheckRunner, ComputeJob, Computed,
+        DiskCache, Lane, LaneSource, PoolWaker, UploadLane, UploadOffer, UploadOutcome, Uploader,
+        WorkerError, WorkerPool, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// How the fetcher's worker and cache are set up.
@@ -2058,8 +2058,74 @@ mod native {
         }
     }
 
+    /// The pool's check lane (`client-compute.md` sections 2.6 and 2.8):
+    /// taken only when no compute and no upload waits. The recompute runs
+    /// on the pool thread, the report on the runtime. A recompute whose
+    /// hash differs from the drawn bytes is handed back to the fetcher to
+    /// take the drawn section's place, whatever the hub answers.
+    struct CheckSender {
+        handle: tokio::runtime::Handle,
+        client: Arc<HubClient>,
+        lane: Arc<CheckLane>,
+        runner: CheckRunner,
+        tx: Mutex<mpsc::Sender<Internal>>,
+    }
+
+    impl LaneSource for CheckSender {
+        fn next(&self) -> Option<Box<dyn FnOnce() + Send>> {
+            let check = self.lane.take()?;
+            let (handle, client, runner) = (
+                self.handle.clone(),
+                self.client.clone(),
+                self.runner.clone(),
+            );
+            let stats = Arc::clone(self.lane.stats());
+            let tx = self.tx.lock().expect("check sender").clone();
+            Some(Box::new(move || {
+                let key = check.job.key();
+                let computed = match runner.run(&check.job) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(key = %key, "check recompute failed: {e}");
+                        stats.check_skipped();
+                        return;
+                    }
+                };
+                stats.check_run();
+                let hash = sha256(&computed.bytes);
+                if hash != check.drawn {
+                    tracing::info!(key = %key, "a checked section differs; drawing the computed one");
+                    let _ = tx.send(Internal::Replace {
+                        key,
+                        layer: check.layer_index,
+                        address: check.job.address,
+                        sha256: check.drawn,
+                        computed,
+                    });
+                }
+                handle.spawn(async move {
+                    let outcome = match client.check(&check.job, &hash).await {
+                        Ok(status) => CheckOutcome::from_status(status),
+                        Err(e) => {
+                            tracing::debug!(key = %key, "check report failed: {e:#}");
+                            CheckOutcome::Failed
+                        }
+                    };
+                    stats.check_finished(outcome);
+                });
+            }))
+        }
+    }
+
     /// What the fetcher's tasks report back.
     enum Internal {
+        Replace {
+            key: ChunkKey,
+            layer: usize,
+            address: [u8; 32],
+            sha256: [u8; 32],
+            computed: Computed,
+        },
         Directions(Vec<ChunkKey>, Result<DirectionsResponse, String>),
         Stream {
             key: ChunkKey,
@@ -2086,6 +2152,12 @@ mod native {
         cache: Option<Arc<DiskCache>>,
         pool: WorkerPool,
         coordinator: Coordinator,
+        checks: Arc<CheckLane>,
+        /// The directions time each key in flight was last asked about at.
+        asked_at: BTreeMap<ChunkKey, i64>,
+        /// The frame edge of each checked cell, to ask for it again when
+        /// its check replaces a section.
+        checked_extents: BTreeMap<CellKey, Meters>,
         tx: mpsc::Sender<Internal>,
         rx: mpsc::Receiver<Internal>,
         extents: BTreeMap<CellKey, Meters>,
@@ -2107,6 +2179,7 @@ mod native {
         ) -> Result<Fetcher> {
             let stats = WorkerStats::new();
             let lane = Arc::new(UploadLane::new(Arc::clone(&stats)));
+            let checks = Arc::new(CheckLane::new(Arc::clone(&stats)));
             let pool = WorkerPool::with_stats(
                 options.worker_threads,
                 options.host,
@@ -2131,15 +2204,37 @@ mod native {
                     waker: pool.waker(),
                 }),
             );
-            tracing::info!(threads = pool.size(), "worker started");
             let (tx, rx) = mpsc::channel();
+            pool.set_lane(
+                Lane::Check,
+                Arc::new(CheckSender {
+                    handle: handle.clone(),
+                    client: client.clone(),
+                    lane: Arc::clone(&checks),
+                    runner: pool.check_runner(),
+                    tx: Mutex::new(tx.clone()),
+                }),
+            );
+            tracing::info!(threads = pool.size(), "worker started");
+            let mut coordinator = Coordinator::new();
+            // Seeded once per run, never from an address: it only chooses
+            // which downloads to check and never touches bytes.
+            coordinator.set_check_seed(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64)
+                    ^ u64::from(std::process::id()),
+            );
             client.keep_clock(&handle);
             Ok(Fetcher {
                 handle,
                 client,
                 cache: options.cache,
                 pool,
-                coordinator: Coordinator::new(),
+                coordinator,
+                checks,
+                asked_at: BTreeMap::new(),
+                checked_extents: BTreeMap::new(),
                 tx,
                 rx,
                 extents: BTreeMap::new(),
@@ -2248,6 +2343,21 @@ mod native {
         fn apply(&mut self, msg: Internal) -> Vec<Action> {
             let now = self.now();
             match msg {
+                Internal::Replace {
+                    key,
+                    layer,
+                    address,
+                    sha256,
+                    computed,
+                } => {
+                    if let ChunkKey::Cell(cell) = key {
+                        if let Some(e) = self.checked_extents.remove(&cell) {
+                            self.extents.entry(cell).or_insert(e);
+                        }
+                    }
+                    self.coordinator
+                        .replace(key, layer, address, sha256, computed.into(), now)
+                }
                 Internal::Directions(keys, r) => self.coordinator.directions_done(&keys, r, now),
                 Internal::Stream {
                     key,
@@ -2291,6 +2401,11 @@ mod native {
         }
 
         fn execute(&mut self, action: Action) {
+            if let Action::Complete(crate::directions::Completion { key, .. })
+            | Action::Failed { key, .. } = &action
+            {
+                self.asked_at.remove(key);
+            }
             match action {
                 Action::Directions(keys) => {
                     let t = directions_time(
@@ -2298,6 +2413,9 @@ mod native {
                         self.coordinator.origin_utc_ms(),
                         self.client.now_utc_ms(),
                     );
+                    for k in &keys {
+                        self.asked_at.insert(*k, t);
+                    }
                     let client = self.client.clone();
                     let tx = self.tx.clone();
                     self.handle.spawn(async move {
@@ -2344,6 +2462,41 @@ mod native {
                             result,
                         });
                     });
+                }
+                Action::Check {
+                    key,
+                    layer,
+                    address,
+                    sha256,
+                } => {
+                    let job = match (self.asked_at.get(&key), self.coordinator.origin_utc_ms()) {
+                        (Some(&t), Some(origin)) => crate::protocol::check_job(
+                            self.client.build(),
+                            layer,
+                            key,
+                            address,
+                            t,
+                            origin,
+                        ),
+                        _ => None,
+                    };
+                    if let ChunkKey::Cell(cell) = key {
+                        if let Some(e) = self.extents.get(&cell) {
+                            self.checked_extents.insert(cell, *e);
+                        }
+                    }
+                    match job {
+                        Some(job) => {
+                            if self.checks.push(CheckJob {
+                                job,
+                                layer_index: layer,
+                                drawn: sha256,
+                            }) {
+                                self.pool.wake();
+                            }
+                        }
+                        None => self.pool.stats_handle().check_skipped(),
+                    }
                 }
                 Action::Complete(done) => match done.key {
                     ChunkKey::Registry => self.out.push(FetchEvent::Registry(Ok(done

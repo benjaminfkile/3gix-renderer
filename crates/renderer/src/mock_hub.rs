@@ -10,7 +10,8 @@
 //!   `empty` (attachment, exclusivity, max depth), `local` for an unshared
 //!   layer ([`MockLayer::shared`]), `ready` with the stored bytes'
 //!   `sha256` and a `checkRate` of `max(1 / (1 + c), 0.01)` for `c`
-//!   matches, or `missing`.
+//!   matches (or the rate set by [`MockHub::set_check_rate`]), or
+//!   `missing`.
 //! - `PUT /space/{s}/build/{b}/section/{address}` (section 2.5) with
 //!   `X-Layer`, `X-Key`, `X-Span-Index`, and `X-Content-Sha256`: never
 //!   answered once [`MockHub::hold_uploads`] was called; `403` for a
@@ -22,6 +23,12 @@
 //!   does not hash to the header or the library validator rejects it, and
 //!   `201` once stored. `Expect: 100-continue` is answered with `100
 //!   Continue` before the body is read.
+//! - `POST /space/{s}/build/{b}/section/{address}/check` (section 2.6)
+//!   with body `{"sha256"}` and the headers of 2.5 but `X-Content-Sha256`:
+//!   `403` for a revoked key or an unshared layer, `400` as for uploads,
+//!   `429` past [`MockHub::limit_checks`] reports, `404` when nothing is
+//!   stored, else `200 {"result":"match"}` (a confirmation, raising no
+//!   more than the stored copy's count) or `202 {"result":"disputed"}`.
 //! - `GET /section/{address}` (any `?sha256=` query is ignored, as the
 //!   origin ignores it), `/module/{hash}`, `/source/{hash}`,
 //!   `/source-manifest/{hash}`: `200` immutable, or `404`.
@@ -125,6 +132,7 @@ impl MockLayer {
             span_seconds: self.span_seconds,
             uses_origin: self.uses_origin,
             shared: self.shared,
+            source_epochs: None,
         }
     }
 
@@ -202,6 +210,12 @@ pub struct MockCounts {
     pub source_reads: u64,
     /// `GET /source-manifest/...` answered `200`.
     pub manifest_reads: u64,
+    /// Checks answered `match` (`200`).
+    pub checks_matched: u64,
+    /// Checks answered `disputed` (`202`).
+    pub checks_disputed: u64,
+    /// Checks refused (`400`, `403`, `404`, or `429`).
+    pub checks_refused: u64,
 }
 
 #[derive(Default)]
@@ -221,6 +235,9 @@ struct Counters {
     module_reads: AtomicU64,
     source_reads: AtomicU64,
     manifest_reads: AtomicU64,
+    checks_matched: AtomicU64,
+    checks_disputed: AtomicU64,
+    checks_refused: AtomicU64,
 }
 
 /// One stored section.
@@ -247,6 +264,11 @@ struct Space {
     revoked: bool,
     /// Uploads are read and then never answered.
     holding: bool,
+    /// Check reports answered so far, and the most allowed.
+    reports: u64,
+    report_limit: u64,
+    /// Every `ready` answer's `checkRate`, in place of the hub's rule.
+    check_rate: Option<f64>,
 }
 
 struct State {
@@ -315,6 +337,9 @@ impl MockHub {
                 sections: BTreeMap::new(),
                 revoked: false,
                 holding: false,
+                reports: 0,
+                report_limit: u64::MAX,
+                check_rate: None,
             }),
             layers,
             options,
@@ -380,6 +405,18 @@ impl MockHub {
         self.state.space.lock().expect("space").holding = true;
     }
 
+    /// Answers every later `ready` with `checkRate` `rate` instead of the
+    /// hub's rule (`None` goes back to the rule).
+    pub fn set_check_rate(&self, rate: Option<f64>) {
+        self.state.space.lock().expect("space").check_rate = rate;
+    }
+
+    /// Answers every check after the first `reports` with `429`, as the
+    /// hub does for a key over its report limit.
+    pub fn limit_checks(&self, reports: u64) {
+        self.state.space.lock().expect("space").report_limit = reports;
+    }
+
     /// The build's description as served.
     pub fn build(&self) -> BuildDescription {
         build_description(&self.state)
@@ -398,6 +435,9 @@ impl MockHub {
             uploads_stored: l(&c.uploads_stored),
             uploads_matched: l(&c.uploads_matched),
             uploads_disputed: l(&c.uploads_disputed),
+            checks_matched: l(&c.checks_matched),
+            checks_disputed: l(&c.checks_disputed),
+            checks_refused: l(&c.checks_refused),
             uploads_refused: l(&c.uploads_refused),
             uploads_held: l(&c.uploads_held),
             most_uploads_held: l(&c.most_uploads_held),
@@ -562,6 +602,11 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()>
         }
         "POST" if path == format!("{build}/directions") => {
             let (status, answer) = directions(&state, &body);
+            json(&mut stream, status, &answer).await
+        }
+        "POST" if path.starts_with(&format!("{build}/section/")) && path.ends_with("/check") => {
+            let address = &path[build.len() + "/section/".len()..path.len() - "/check".len()];
+            let (status, answer) = check(&state, address, &head, &body);
             json(&mut stream, status, &answer).await
         }
         "PUT" if path.starts_with(&format!("{build}/section/")) => {
@@ -778,7 +823,11 @@ fn directions(state: &State, body: &[u8]) -> (&'static str, serde_json::Value) {
                 Some(stored) if l.shared => {
                     d.state = "ready".into();
                     d.sha256 = Some(to_hex(&stored.sha256));
-                    d.check_rate = Some((1.0 / (1.0 + stored.matches as f64)).max(0.01));
+                    d.check_rate = Some(
+                        space
+                            .check_rate
+                            .unwrap_or((1.0 / (1.0 + stored.matches as f64)).max(0.01)),
+                    );
                     c.ready_answers.fetch_add(1, Ordering::SeqCst);
                 }
                 _ => {
@@ -876,6 +925,73 @@ fn upload(
         .insert(address.to_string(), Stored::new(body.to_vec()));
     c.uploads_stored.fetch_add(1, Ordering::SeqCst);
     ("201 Created", serde_json::json!({}))
+}
+
+/// Applies a check (`client-compute.md` section 2.6).
+fn check(
+    state: &State,
+    address: &str,
+    head: &Head,
+    body: &[u8],
+) -> (&'static str, serde_json::Value) {
+    let c = &state.counters;
+    let refuse = |status: &'static str, reason: &str| {
+        c.checks_refused.fetch_add(1, Ordering::SeqCst);
+        (status, refusal(reason))
+    };
+    let mut space = state.space.lock().expect("space");
+    if space.revoked {
+        return refuse("403 Forbidden", "the key is revoked");
+    }
+    let Some(l) = head
+        .header(LAYER_HEADER)
+        .and_then(|id| state.layers.iter().find(|l| l.id == id))
+    else {
+        return refuse("400 Bad Request", "unknown X-Layer");
+    };
+    let Some(key) = head
+        .header(KEY_HEADER)
+        .and_then(|k| k.parse::<ChunkKey>().ok())
+    else {
+        return refuse("400 Bad Request", "X-Key is not a chunk key");
+    };
+    let Some(span) = head
+        .header(SPAN_INDEX_HEADER)
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return refuse("400 Bad Request", "X-Span-Index is not an integer");
+    };
+    if is_empty_for(l, &key, &exclusive_owners(state)) {
+        return refuse("400 Bad Request", "the layer is empty for this key");
+    }
+    let origin = space.origin.unwrap_or(0);
+    if to_hex(&address_of(l, &key, origin, span).3) != address {
+        return refuse("400 Bad Request", "the address does not match the headers");
+    }
+    if !l.shared {
+        return refuse("403 Forbidden", "the layer is unshared");
+    }
+    let Some(reported) = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("sha256")?.as_str().map(str::to_string))
+    else {
+        return refuse("400 Bad Request", "the body is not {\"sha256\"}");
+    };
+    if space.reports >= space.report_limit {
+        return refuse("429 Too Many Requests", "over the report limit");
+    }
+    space.reports += 1;
+    let Some(stored) = space.sections.get_mut(address) else {
+        return refuse("404 Not Found", "nothing is stored at the address");
+    };
+    if to_hex(&stored.sha256) == reported {
+        stored.matches += 1;
+        c.checks_matched.fetch_add(1, Ordering::SeqCst);
+        ("200 OK", serde_json::json!({ "result": "match" }))
+    } else {
+        c.checks_disputed.fetch_add(1, Ordering::SeqCst);
+        ("202 Accepted", serde_json::json!({ "result": "disputed" }))
+    }
 }
 
 /// A module that answers every request with `section` and reads no
