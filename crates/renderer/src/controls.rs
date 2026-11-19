@@ -207,9 +207,7 @@ impl Controls {
         let Some(text) = self.speed_entry.as_mut() else {
             return;
         };
-        let digit = digit_index(code)
-            .map(|i| char::from(b'0' + ((i + 1) % 10) as u8))
-            .or_else(|| numpad_digit(code));
+        let digit = digit_index(code).map(|i| char::from(b'0' + ((i + 1) % 10) as u8));
         match code {
             KeyCode::Enter | KeyCode::NumpadEnter => {
                 if let Ok(v) = text.parse::<f64>() {
@@ -272,8 +270,21 @@ impl Controls {
     }
 }
 
-/// Number keys: `1` to `9` select indices 0 to 8, `0` selects index 9.
+/// Number keys, on the top row or the keypad: `1` to `9` select indices 0
+/// to 8, `0` selects index 9.
 pub fn digit_index(code: KeyCode) -> Option<usize> {
+    const PAD: [KeyCode; 10] = [
+        KeyCode::Numpad1,
+        KeyCode::Numpad2,
+        KeyCode::Numpad3,
+        KeyCode::Numpad4,
+        KeyCode::Numpad5,
+        KeyCode::Numpad6,
+        KeyCode::Numpad7,
+        KeyCode::Numpad8,
+        KeyCode::Numpad9,
+        KeyCode::Numpad0,
+    ];
     const DIGITS: [KeyCode; 10] = [
         KeyCode::Digit1,
         KeyCode::Digit2,
@@ -286,31 +297,36 @@ pub fn digit_index(code: KeyCode) -> Option<usize> {
         KeyCode::Digit9,
         KeyCode::Digit0,
     ];
-    DIGITS.iter().position(|&d| d == code)
-}
-
-/// Numpad digits as characters.
-fn numpad_digit(code: KeyCode) -> Option<char> {
-    const PAD: [KeyCode; 10] = [
-        KeyCode::Numpad0,
-        KeyCode::Numpad1,
-        KeyCode::Numpad2,
-        KeyCode::Numpad3,
-        KeyCode::Numpad4,
-        KeyCode::Numpad5,
-        KeyCode::Numpad6,
-        KeyCode::Numpad7,
-        KeyCode::Numpad8,
-        KeyCode::Numpad9,
-    ];
-    PAD.iter()
+    DIGITS
+        .iter()
         .position(|&d| d == code)
-        .map(|i| char::from(b'0' + i as u8))
+        .or_else(|| PAD.iter().position(|&d| d == code))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keypad_digits_are_number_keys() {
+        assert_eq!(digit_index(KeyCode::Numpad1), Some(0));
+        assert_eq!(digit_index(KeyCode::Numpad0), Some(9));
+        assert_eq!(digit_index(KeyCode::Digit5), digit_index(KeyCode::Numpad5));
+        assert_eq!(digit_index(KeyCode::KeyA), None);
+        let system = crate::camera::tests::system();
+        let mut sim = crate::sim::Simulation::at_now(system, gx_core::units::Seconds::new(0.0));
+        let mut camera = Camera::home(sim.system());
+        // In the spawn chooser a keypad digit picks like the top row.
+        let mut c = Controls::new(None);
+        c.spawning = true;
+        c.key(KeyCode::Numpad2, true, false, &mut sim, &mut camera);
+        assert_eq!((c.spawning, c.take_spawn()), (false, Some(1)));
+        // Outside it, a keypad digit jumps to that frame's view.
+        c.key(KeyCode::Numpad1, true, false, &mut sim, &mut camera);
+        let top = Camera::view_of_index(sim.system(), 0).unwrap();
+        assert_eq!(camera.frame_id, top.frame_id);
+        assert_eq!(camera.position, top.position);
+    }
 
     #[test]
     fn a_typed_speed_sets_the_flight_speed() {

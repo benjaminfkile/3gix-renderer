@@ -179,17 +179,29 @@ pub struct WebApp {
 }
 
 impl WebApp {
-    /// An application drawing `sim` on `canvas`, fetching through
-    /// `fetcher`.
-    pub fn new(sim: Simulation, fetcher: WebFetcher, canvas: web_sys::HtmlCanvasElement) -> WebApp {
-        let camera = Camera::home(sim.system());
+    /// An application drawing the simulation of `launch` from its camera
+    /// on `canvas`, fetching through `fetcher`, with the exposure and mesh
+    /// mode of `options` ([`crate::options::launch`], as natively).
+    pub fn new(
+        launch: crate::options::Launch,
+        options: &crate::options::ViewOptions,
+        fetcher: WebFetcher,
+        canvas: web_sys::HtmlCanvasElement,
+    ) -> WebApp {
         WebApp {
-            sim,
-            camera,
-            spawner: crate::spawn::Spawner::default(),
+            sim: launch.sim,
+            camera: launch.camera,
+            spawner: crate::spawn::Spawner {
+                active: None,
+                pending: launch.pending_spawn,
+            },
             world: World::new(default_threads()),
             fetcher,
-            controls: Controls::default(),
+            controls: {
+                let mut c = Controls::new(options.exposure_stops);
+                c.mesh_mode = options.mesh_mode;
+                c
+            },
             canvas: Some(canvas),
             window: None,
             gfx: Rc::default(),

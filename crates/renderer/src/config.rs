@@ -36,6 +36,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
+pub use crate::options::ViewOptions;
+use crate::options::{parse_f64, OPTION_NAMES};
+
 /// Name of the variable holding the hub base URL.
 pub const ENV_HUB_URL: &str = "GX_HUB_URL";
 /// Name of the variable holding the API key.
@@ -258,13 +261,8 @@ pub struct Config {
     pub cache_max_bytes: u64,
     /// Threads that run modules; `None` for the default.
     pub workers: Option<usize>,
-    /// Playback rate of a start in the past, simulation seconds per
-    /// wall-clock second; negative plays backwards.
-    pub time_scale: f64,
-    /// Where the simulation time starts.
-    pub start: Start,
-    /// Simulation time offset from [`Config::start`] at launch, seconds.
-    pub start_offset_seconds: f64,
+    /// The view and time options (`crate::options`).
+    pub options: ViewOptions,
     /// Render offscreen with no window.
     pub headless: bool,
     /// Write one headless frame to this PNG and exit. Implies `headless`.
@@ -273,10 +271,6 @@ pub struct Config {
     pub width: u32,
     /// Render height in pixels.
     pub height: u32,
-    /// The view a headless run renders.
-    pub view: View,
-    /// Factor on the view's distance from its frame origin.
-    pub view_distance_scale: f64,
     /// Headless: wait at most this long, seconds, for every selected cell
     /// to be ready, and fail if they are not. `None` renders whatever
     /// arrived within [`crate::app::HEADLESS_STREAM_SECONDS`].
@@ -286,15 +280,6 @@ pub struct Config {
     /// Draw the overlay text, the frame markers, and the lines between them
     /// (headless; the window always draws them).
     pub overlay: bool,
-    /// A fixed exposure, stops relative to the automatic exposure of the
-    /// reference scene ([`crate::render::gpu::fixed_exposure`]); `None`
-    /// adapts to the scene.
-    pub exposure_stops: Option<f64>,
-    /// How surface meshes are drawn at start (`--mesh-mode`, `X` in the
-    /// window).
-    pub mesh_mode: crate::render::scene::MeshMode,
-    /// `--start-on`: where the camera starts instead of the `Home` view.
-    pub start_on: Option<StartOn>,
 }
 
 /// A frame, a direction from its origin in its axes, and optionally a
@@ -381,12 +366,10 @@ impl StartOn {
 /// The command line flags, each `None` when not given.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Flags {
-    /// `--time-scale`.
-    pub time_scale: Option<f64>,
-    /// `--start`.
-    pub start: Option<Start>,
-    /// `--start-offset-seconds`.
-    pub start_offset_seconds: Option<f64>,
+    /// The view and time options (`--start`, `--start-offset-seconds`,
+    /// `--time-scale`, `--start-on`, `--view`, `--view-distance-scale`,
+    /// `--exposure-stops`, `--mesh-mode`).
+    pub options: ViewOptions,
     /// `--headless`.
     pub headless: bool,
     /// `--screenshot`.
@@ -395,22 +378,12 @@ pub struct Flags {
     pub width: Option<u32>,
     /// `--height`.
     pub height: Option<u32>,
-    /// `--view`.
-    pub view: Option<View>,
-    /// `--view-distance-scale`.
-    pub view_distance_scale: Option<f64>,
     /// `--wait-ready-seconds`.
     pub wait_ready_seconds: Option<f64>,
     /// `--stats-json`.
     pub stats_json: Option<PathBuf>,
     /// `--no-overlay`.
     pub no_overlay: bool,
-    /// `--exposure-stops`.
-    pub exposure_stops: Option<f64>,
-    /// `--mesh-mode`.
-    pub mesh_mode: Option<crate::render::scene::MeshMode>,
-    /// `--start-on`.
-    pub start_on: Option<StartOn>,
     /// `--hub-url`.
     pub hub_url: Option<String>,
     /// `--space-id`.
@@ -473,36 +446,18 @@ where
                     .ok_or_else(|| err(format!("{name} needs a value"))),
             }
         };
-        match name.as_str() {
-            "--time-scale" => flags.time_scale = Some(parse_f64(&name, &value(&name)?)?),
-            "--start" => {
+        if let Some(option) = name.strip_prefix("--") {
+            if OPTION_NAMES.contains(&option) {
                 let v = value(&name)?;
-                flags.start = Some(
-                    Start::parse(&v)
-                        .ok_or_else(|| err(format!("{name}: {v:?} is not now or origin")))?,
-                )
+                flags.options.set(option, &name, &v)?;
+                continue;
             }
-            "--start-offset-seconds" => {
-                flags.start_offset_seconds = Some(parse_f64(&name, &value(&name)?)?)
-            }
+        }
+        match name.as_str() {
             "--headless" => flags.headless = true,
             "--screenshot" => flags.screenshot = Some(PathBuf::from(value(&name)?)),
             "--width" => flags.width = Some(parse_u32(&name, &value(&name)?)?),
             "--height" => flags.height = Some(parse_u32(&name, &value(&name)?)?),
-            "--view" => {
-                let v = value(&name)?;
-                flags.view = Some(
-                    View::parse(&v)
-                        .ok_or_else(|| err(format!("{name}: {v:?} is not home or 0 to 9")))?,
-                )
-            }
-            "--view-distance-scale" => {
-                let x = parse_f64(&name, &value(&name)?)?;
-                if x <= 0.0 {
-                    return Err(err(format!("{name}: must be above zero")));
-                }
-                flags.view_distance_scale = Some(x)
-            }
             "--wait-ready-seconds" => {
                 let x = parse_f64(&name, &value(&name)?)?;
                 if x < 0.0 {
@@ -512,28 +467,6 @@ where
             }
             "--stats-json" => flags.stats_json = Some(PathBuf::from(value(&name)?)),
             "--no-overlay" => flags.no_overlay = true,
-            "--exposure-stops" => flags.exposure_stops = Some(parse_f64(&name, &value(&name)?)?),
-            "--mesh-mode" => {
-                let v = value(&name)?;
-                flags.mesh_mode = Some(match v.as_str() {
-                    "surfaces" => crate::render::scene::MeshMode::Surfaces,
-                    "vertices" => crate::render::scene::MeshMode::Vertices,
-                    "edges" => crate::render::scene::MeshMode::Edges,
-                    _ => {
-                        return Err(err(format!(
-                            "{name}: {v:?} is not surfaces, vertices, or edges"
-                        )))
-                    }
-                })
-            }
-            "--start-on" => {
-                let v = value(&name)?;
-                flags.start_on = Some(StartOn::parse(&v).ok_or_else(|| {
-                    err(format!(
-                        "{name}: {v:?} is not <frame>:<x>,<y>,<z> with a direction other than zero"
-                    ))
-                })?)
-            }
             "--hub-url" => flags.hub_url = Some(value(&name)?),
             "--space-id" => flags.space_id = Some(value(&name)?),
             "--build-id" => flags.build_id = Some(value(&name)?),
@@ -556,17 +489,6 @@ where
         }
     }
     Ok(flags)
-}
-
-fn parse_f64(name: &str, v: &str) -> Result<f64, ConfigError> {
-    let x: f64 = v
-        .trim()
-        .parse()
-        .map_err(|_| err(format!("{name}: {v:?} is not a number")))?;
-    if !x.is_finite() {
-        return Err(err(format!("{name}: {v:?} is not finite")));
-    }
-    Ok(x)
 }
 
 fn parse_u32(name: &str, v: &str) -> Result<u32, ConfigError> {
@@ -660,24 +582,14 @@ impl Config {
             api_key,
             space_id: space_id.trim().to_string(),
             build_id: build_id.map(|b| b.trim().to_string()),
-            time_scale: flags.time_scale.unwrap_or(1.0),
-            start: flags.start.unwrap_or_default(),
-            start_offset_seconds: flags.start_offset_seconds.unwrap_or(0.0),
+            options: flags.options,
             headless: flags.headless || flags.screenshot.is_some(),
             screenshot: flags.screenshot.clone(),
             width: flags.width.unwrap_or(DEFAULT_WIDTH),
             height: flags.height.unwrap_or(DEFAULT_HEIGHT),
-            view: flags
-                .start_on
-                .map(View::Over)
-                .unwrap_or(flags.view.unwrap_or_default()),
-            view_distance_scale: flags.view_distance_scale.unwrap_or(1.0),
             wait_ready_seconds: flags.wait_ready_seconds,
             stats_json: flags.stats_json.clone(),
             overlay: !flags.no_overlay,
-            exposure_stops: flags.exposure_stops,
-            mesh_mode: flags.mesh_mode.unwrap_or_default(),
-            start_on: flags.start_on,
             adapter: pick(&flags.adapter, ENV_ADAPTER).filter(|a| !a.trim().is_empty()),
             max_fps: flags.max_fps.unwrap_or(0),
             edge_url,
@@ -766,17 +678,17 @@ mod tests {
         let c = Config::resolve(&base_env(), &Flags::default()).unwrap();
         assert_eq!(c.hub_url, "http://hub.invalid");
         assert_eq!(c.build_id, None);
-        assert_eq!(c.time_scale, 1.0);
-        assert_eq!(c.start_offset_seconds, 0.0);
-        assert_eq!(c.start, Start::Now);
+        assert_eq!(c.options.time_scale, 1.0);
+        assert_eq!(c.options.start_offset_seconds, 0.0);
+        assert_eq!(c.options.start, Start::Now);
         assert!(!c.headless);
         assert_eq!((c.width, c.height), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
-        assert_eq!(c.view, View::Home);
-        assert_eq!(c.view_distance_scale, 1.0);
+        assert_eq!(c.options.effective_view(), View::Home);
+        assert_eq!(c.options.view_distance_scale, 1.0);
         assert_eq!(c.wait_ready_seconds, None);
         assert_eq!(c.stats_json, None);
         assert!(c.overlay);
-        assert_eq!(c.exposure_stops, None);
+        assert_eq!(c.options.exposure_stops, None);
         assert_eq!(c.adapter, None);
         assert_eq!(c.max_fps, 0);
         assert_eq!(c.edge_url, None);
@@ -848,16 +760,17 @@ mod tests {
         ])
         .unwrap();
         let c = Config::resolve(&base_env(), &flags).unwrap();
-        assert_eq!(c.exposure_stops, Some(12.75));
+        assert_eq!(c.options.exposure_stops, Some(12.75));
         assert!(parse_flags(["--exposure-stops", "bright"]).is_err());
         assert_eq!(
             parse_flags(["--exposure-stops", "-3"])
                 .unwrap()
+                .options
                 .exposure_stops,
             Some(-3.0)
         );
-        assert_eq!(c.view, View::Key(2));
-        assert_eq!(c.view_distance_scale, 0.25);
+        assert_eq!(c.options.effective_view(), View::Key(2));
+        assert_eq!(c.options.view_distance_scale, 0.25);
         assert_eq!(c.wait_ready_seconds, Some(120.0));
         assert_eq!(c.stats_json, Some(PathBuf::from("s.json")));
         assert!(!c.overlay);
@@ -878,23 +791,26 @@ mod tests {
     #[test]
     fn start_on_is_a_frame_and_a_unit_direction() {
         let flags = parse_flags(["--start-on", "4:0,3,4"]).unwrap();
-        let s = flags.start_on.unwrap();
+        let s = flags.options.start_on.unwrap();
         assert_eq!(s.frame_id, 4);
         assert!((s.direction.y - 0.6).abs() < 1e-12 && (s.direction.z - 0.8).abs() < 1e-12);
         assert_eq!(s.distance, None);
         let s = parse_flags(["--start-on", "4:1,0,0@5e6"])
             .unwrap()
+            .options
             .start_on
             .unwrap();
         assert_eq!(s.distance, Some(5e6));
         let s = parse_flags(["--start-on", "4:1,0,0@5e6^-20"])
             .unwrap()
+            .options
             .start_on
             .unwrap();
         assert_eq!(s.pitch_deg, Some(-20.0));
         assert!(parse_flags(["--start-on", "4:1,0,0@5e6^-100"]).is_err());
         let s = parse_flags(["--start-on", "4:1,0,0@+1e4^20"])
             .unwrap()
+            .options
             .start_on
             .unwrap();
         assert_eq!(
@@ -922,9 +838,9 @@ mod tests {
         ])
         .unwrap();
         let c = Config::resolve(&base_env(), &flags).unwrap();
-        assert_eq!(c.time_scale, 86400.0);
-        assert_eq!(c.start_offset_seconds, -3.5e6);
-        assert_eq!(c.start, Start::Origin);
+        assert_eq!(c.options.time_scale, 86400.0);
+        assert_eq!(c.options.start_offset_seconds, -3.5e6);
+        assert_eq!(c.options.start, Start::Origin);
         assert_eq!(Start::Origin.to_string(), "origin");
         assert!(parse_flags(["--start", "later"]).is_err());
         assert_eq!((c.width, c.height), (640, 360));

@@ -28,7 +28,7 @@
 
 use crate::camera::Camera;
 use crate::clock::now_seconds;
-use crate::config::{Config, Start, View};
+use crate::config::{Config, View};
 use crate::controls::Controls;
 pub use crate::controls::{EXPOSURE_BIAS_LIMITS, PIXELS_PER_NOTCH};
 use crate::extract::default_threads;
@@ -42,7 +42,7 @@ pub use crate::render::scene::matter_scene;
 use crate::render::scene::scene_with;
 use crate::render::scene::Scene;
 use crate::seen::Seen;
-use crate::sim::{SimClock, Simulation};
+use crate::sim::Simulation;
 use crate::stream::{FetchEvent, Fetcher};
 use crate::world::{DrawList, World};
 use anyhow::{anyhow, Context, Result};
@@ -171,19 +171,10 @@ pub fn check_origin(system: &FrameSystem, origin_utc_ms: Option<i64>) -> bool {
 
 /// The configured start (`--start`, `--start-offset-seconds`,
 /// `--time-scale`) of a simulation of `system` (at its epoch, the origin)
-/// whose now is `now`, seconds of TDB since J2000: at now by default.
+/// whose now is `now`, seconds of TDB since J2000: at now by default
+/// ([`crate::options::launch_clock`]).
 pub fn launch_simulation(system: FrameSystem, config: &Config, now: Seconds) -> Simulation {
-    let origin = system.tree().epoch();
-    let from = match config.start {
-        Start::Now => now,
-        Start::Origin => origin,
-    };
-    let clock = SimClock::starting_at(
-        origin,
-        now,
-        from + Seconds::new(config.start_offset_seconds),
-        config.time_scale,
-    );
+    let clock = crate::options::launch_clock(&system, &config.options, now);
     Simulation::new(system, clock)
 }
 
@@ -265,12 +256,12 @@ impl HeadlessRun {
         HeadlessRun {
             width: config.width,
             height: config.height,
-            view: config.view,
-            view_distance_scale: config.view_distance_scale,
+            view: config.options.effective_view(),
+            view_distance_scale: config.options.view_distance_scale,
             wait_ready_seconds: config.wait_ready_seconds,
             overlay: config.overlay,
-            exposure_stops: config.exposure_stops,
-            mesh_mode: config.mesh_mode,
+            exposure_stops: config.options.exposure_stops,
+            mesh_mode: config.options.mesh_mode,
             adapter: config.adapter.clone(),
         }
     }
@@ -663,32 +654,20 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
     event_loop.set_control_flow(ControlFlow::Wait);
     check_origin(&system, fetcher.origin_utc_ms());
     let now = tdb_of_utc_ms(fetcher.now_utc_ms());
-    let sim = launch_simulation(system, config, now);
-    let camera = config
-        .start_on
-        .and_then(|s| {
-            Camera::over_pitched(
-                sim.system(),
-                s.frame_id,
-                s.direction,
-                s.distance,
-                s.distance.and(s.pitch_deg),
-            )
-        })
-        .unwrap_or_else(|| Camera::home(sim.system()));
+    let launch = crate::options::launch(system, &config.options, now);
     let mut app = App {
-        sim,
-        camera,
+        sim: launch.sim,
+        camera: launch.camera,
         spawner: crate::spawn::Spawner {
             active: None,
-            pending: config.start_on.filter(|s| s.distance.is_none()),
+            pending: launch.pending_spawn,
         },
         world: World::new(default_threads()),
         fetcher,
         started: Instant::now(),
         controls: {
-            let mut c = Controls::new(config.exposure_stops);
-            c.mesh_mode = config.mesh_mode;
+            let mut c = Controls::new(config.options.exposure_stops);
+            c.mesh_mode = config.options.mesh_mode;
             c
         },
         adapter: config.adapter.clone(),

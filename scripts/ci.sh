@@ -3,7 +3,8 @@
 # headless renders and the volume comparison on whatever wgpu adapter is
 # present, a software Vulkan driver is enough), the vocabulary lint, the
 # browser worker's module runner under Node (V8, standing in for the
-# browser) against the example module's conformance hashes, the
+# browser) against the example module's conformance hashes, the browser's
+# view options from config.js and the query string, the
 # wasm32 builds with the web feature off and on, and the browser package
 # built by web/build.sh (wasm-pack and wasm-opt). There is no browser here:
 # running the browser build is verified by hand, see docs/web.md.
@@ -45,6 +46,7 @@ fi
 step "6. browser worker under Node"
 node --version
 node scripts/worker-node-check.mjs
+node scripts/web-options-check.mjs
 
 step "7. cargo build wasm32 (library, web feature off)"
 cargo build -p renderer --lib --target wasm32-unknown-unknown

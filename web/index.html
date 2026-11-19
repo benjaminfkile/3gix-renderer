@@ -70,12 +70,15 @@
   <div id="status">Needs a browser with WebGPU.</div>
 </form>
 <script type="module">
-  import init, { start } from "./pkg/renderer.js";
+  import init, { start, check_options } from "./pkg/renderer.js";
+  import { viewOptionPairs } from "./view-options.js";
 
   // Settings come from three places, in order of priority: web/config.js
   // (optional, gitignored; copy config.example.js), then what this browser
   // saved last time, then the empty fields. The API key never leaves this
-  // machine either way.
+  // machine either way. The view and time options (startOn, timeScale, and
+  // the rest, see view-options.js and docs/web.md) come from config.js and
+  // then the page's query string, which overrides it, so a link opens a view.
   const fields = {
     "hub-url": ["gx.hubUrl", "hubUrl"],
     "api-key": ["gx.apiKey", "apiKey"],
@@ -116,6 +119,14 @@
     status.textContent = "Loading...";
     try {
       await init();
+      const options = viewOptionPairs(config, location.search);
+      try {
+        check_options(options);
+      } catch (e) {
+        status.textContent = "Invalid option: " + e;
+        button.disabled = false;
+        return;
+      }
       status.textContent = "Loading the registry...";
       await start(
         "gx-canvas",
@@ -123,6 +134,7 @@
         value("api-key"),
         value("space-id"),
         value("build-id"),
+        options,
       );
       form.classList.add("running");
       document.getElementById("gx-canvas").focus();
