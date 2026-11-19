@@ -2030,19 +2030,11 @@ mod native {
         }
 
         fn direct(&self, job: &ComputeJob) -> Result<gx_worker::InputDirection, WorkerError> {
-            use crate::protocol::Direction;
-            use gx_worker::InputDirection;
-            let origin = self.origin()?;
-            let r = &job.request;
-            // A moment inside the input's span, not before the origin and
-            // not after now: the reader's span lies inside it (rule 2).
-            let span_ms = r.span_seconds as i64 * 1000;
-            let start = if span_ms == 0 {
-                self.client.now_utc_ms()
-            } else {
-                r.origin_utc_ms + r.span_index as i64 * span_ms
-            };
-            let t = start.max(origin).min(self.client.now_utc_ms());
+            let t = crate::protocol::input_directions_time(
+                job,
+                self.origin()?,
+                self.client.now_utc_ms(),
+            );
             let key = job.key();
             let response = self
                 .handle
@@ -2050,37 +2042,7 @@ mod native {
                 .map_err(|e| {
                     WorkerError::transient(format!("directions for input {key}: {e:#}"))
                 })?;
-            let raw = response
-                .results
-                .iter()
-                .find(|k| k.key == key.to_string())
-                .and_then(|k| k.layers.iter().find(|l| l.layer == job.layer))
-                .ok_or_else(|| {
-                    WorkerError::transient(format!(
-                        "no directions for input {key} of {}",
-                        job.layer
-                    ))
-                })?;
-            let direction = raw.parse(&key).map_err(|e| {
-                WorkerError::transient(format!("directions for input {key}: {e:#}"))
-            })?;
-            let (address, out) = match direction {
-                Direction::Empty => return Ok(InputDirection::Empty),
-                Direction::Ready {
-                    address, sha256, ..
-                } => (address, InputDirection::Ready { sha256 }),
-                Direction::Missing(j) => (j.address, InputDirection::Compute { share: true }),
-                Direction::Local(j) => (j.address, InputDirection::Compute { share: false }),
-            };
-            if address != job.address {
-                return Err(WorkerError::transient(format!(
-                    "directions name input {key} of {} at {}, the build at {}",
-                    job.layer,
-                    to_hex(&address),
-                    job.address_hex()
-                )));
-            }
-            Ok(out)
+            crate::protocol::input_direction(&response, job)
         }
 
         fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
@@ -2572,8 +2534,10 @@ mod native {
                     let client = self.client.clone();
                     let cache = self.cache.clone();
                     let tx = self.tx.clone();
+                    let resolver = self.pool.input_resolver();
                     self.handle.spawn(async move {
-                        let result = stream_section(&client, cache, key, address, sha256).await;
+                        let result =
+                            shared_stream(&resolver, &client, cache, key, address, sha256).await;
                         let _ = tx.send(Internal::Stream {
                             key,
                             layer,
@@ -2913,6 +2877,34 @@ mod native {
         })
         .await
         .map_err(|e| format!("decoding task: {e}"))?
+    }
+
+    /// [`stream_section`] under the address's flight in the worker's
+    /// shared input resolver (`client-compute.md` section 10.3): a `ready`
+    /// section being streamed as an input is waited for and taken from
+    /// memory, not downloaded a second time, and one streamed here is
+    /// remembered for input work.
+    async fn shared_stream(
+        resolver: &gx_worker::InputResolver,
+        client: &HubClient,
+        cache: Option<Arc<DiskCache>>,
+        key: ChunkKey,
+        address: [u8; 32],
+        expected: [u8; 32],
+    ) -> StreamResult {
+        let _flight = resolver.flights().acquire(&address, 0.0, |_| {}).await;
+        if let Some(bytes) = resolver.remembered(&address) {
+            if sha256(&bytes) == expected {
+                if let Ok(a) = decode_arrived(key, bytes.to_vec()).await {
+                    return StreamResult::Bytes(a, Origin::Cache);
+                }
+            }
+        }
+        let result = stream_section(client, cache, key, address, expected).await;
+        if let StreamResult::Bytes(a, _) = &result {
+            resolver.remember(&address, a.bytes.clone());
+        }
+        result
     }
 
     /// Gets a stored section: the local cache if it holds a valid copy,

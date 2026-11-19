@@ -24,7 +24,13 @@ from one codebase). The browser-only code is the `web` module
   manifest, and tiles by hash, request and tile bytes from `gx-core` built
   for WebAssembly, and the library validator on the output. A call over the
   60 s time limit terminates the Web Worker, which starts again for the
-  next call. Jobs run one at a time.
+  next call. Jobs run one at a time. Input sections of layers with inputs
+  (`client-compute.md` 10.3) are resolved by the shared resolver
+  (`gx-worker::resolve`, the same code the desktop runs) through
+  `web::worker::WebPlatform`: `fetch` for directions and streams, the
+  Cache API, and the Web Worker. Uploads and check reports carry
+  `X-Inputs-Sha256`. The fetcher's own streams of `ready` sections share
+  the resolver's flight per address, so a section is downloaded once.
 - The local cache (`web::cache`) is the Cache API (cache `gx-renderer`,
   keys `/gx-cache/{kind}/{hash or address}`), with the same keys as the
   desktop's cache directory, evicted least recently used by size (20 GB,
@@ -115,7 +121,11 @@ through its message protocol, against the core example modules'
 conformance vectors (`testdata/example-module/` for ABI version 1,
 `testdata/example-module-v2/` for version 2, whose `gx_inputs`,
 `gx_sources`, and `gx_compile` take the frame and input buffers), and
-fails unless every input list and section's SHA-256 matches. The native worker checks the same vectors
+fails unless every input list and section's SHA-256 matches. A third pass
+resolves the version 2 module's layer inputs through the module worker the
+way `WebPlatform` does (each input computed with the version 1 module once
+per key) and checks the resolved input bytes and sections against the
+vectors. The native worker checks the same vectors
 (`crates/worker/tests/determinism.rs`), so the two runtimes give
 byte-identical sections. `scripts/ci.sh` runs it. Running it is verified
 by hand on a desktop browser, against a hub:

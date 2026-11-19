@@ -81,6 +81,11 @@ impl<T> ComputeQueue<T> {
     /// Takes the waiting job of the highest priority, the first queued
     /// among equals.
     pub fn pop(&mut self) -> Option<(ChunkKey, T)> {
+        self.pop_with_priority().map(|(k, _, t)| (k, t))
+    }
+
+    /// [`ComputeQueue::pop`], with the job's priority.
+    pub fn pop_with_priority(&mut self) -> Option<(ChunkKey, f64, T)> {
         let best = self
             .waiting
             .iter()
@@ -88,7 +93,7 @@ impl<T> ComputeQueue<T> {
             .min_by(|(_, a), (_, b)| b.priority.total_cmp(&a.priority).then(a.seq.cmp(&b.seq)))
             .map(|(i, _)| i)?;
         let w = self.waiting.swap_remove(best);
-        Some((w.key, w.item))
+        Some((w.key, w.priority, w.item))
     }
 
     /// Gives every waiting job its key's priority from `priority`; a job
@@ -110,6 +115,21 @@ impl<T> ComputeQueue<T> {
         }
         self.waiting = kept;
         dropped
+    }
+
+    /// Raises the waiting jobs for `key` to `priority` where it is
+    /// higher (`client-compute.md` section 2.8: work another job waits on
+    /// takes the highest priority of its waiters). Returns `true` if one
+    /// was raised.
+    pub fn raise(&mut self, key: &ChunkKey, priority: f64) -> bool {
+        let mut raised = false;
+        for w in self.waiting.iter_mut().filter(|w| w.key == *key) {
+            if priority > w.priority {
+                w.priority = priority;
+                raised = true;
+            }
+        }
+        raised
     }
 
     /// Jobs waiting.

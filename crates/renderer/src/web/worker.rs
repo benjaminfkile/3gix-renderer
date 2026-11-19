@@ -10,8 +10,11 @@
 //! [`super::cache::WebCache`]), encodes the request and the tiles with
 //! `gx-core` built for WebAssembly, validates the section, and hands it
 //! over before the upload starts. A version 2 module (section 4.1) gets
-//! the job's frame records in `gx_inputs`, `gx_sources`, and `gx_compile`;
-//! a version 1 module gets empty buffers and runs as before.
+//! the job's frame records in `gx_inputs`, `gx_sources`, and `gx_compile`,
+//! and the input sections `gx_inputs` names are resolved by the shared
+//! resolver ([`gx_worker::resolve`], section 10.3) through
+//! [`WebPlatform`]; a version 1 module gets empty buffers and runs as
+//! before.
 //!
 //! The memory limit is enforced inside the Web Worker. The time limit
 //! ([`TIME_LIMIT_MS`], as natively) is enforced here: a call that runs over
@@ -19,13 +22,18 @@
 
 use super::cache::WebCache;
 use super::hub::WebHub;
+use gx_core::key::ChunkKey;
 use gx_core::module_io::{self, Tile};
 use gx_core::sha256::to_hex;
 use gx_worker::job::{check_blob, check_section, check_tile, decode_manifest, resolve_tiles};
-use gx_worker::{BlobKind, ComputeJob, Computed, WorkerError, WorkerStats};
+use gx_worker::{
+    BlobKind, ComputeJob, Computed, InputDirection, Platform, UploadLane, UploadOffer, WorkerError,
+    WorkerStats,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -333,73 +341,158 @@ async fn manifest(
     Ok(m)
 }
 
-/// Runs one job to a validated section: the address check, the module by
-/// hash, `gx_sources`, the manifest and tiles by hash, `gx_compile`, and
-/// the validator, which for a cell decodes the section once and hands it
-/// over decoded. Does not upload.
-pub async fn run_job(
-    job: &ComputeJob,
-    hub: &WebHub,
-    cache: Option<&WebCache>,
-    worker: &ModuleWorker,
-    stats: &WorkerStats,
-) -> Result<Computed, WorkerError> {
-    job.check_address()?;
-    if !worker.has(&job.module) {
-        let wasm = get_blob(hub, cache, BlobKind::Module, &job.module).await?;
-        worker.load(&job.module, &wasm).await?;
-        stats.module_loaded();
+/// The browser platform of the shared input resolver
+/// ([`gx_worker::resolve`], `client-compute.md` section 10.3): the hub over
+/// `fetch` for directions and streams, the Cache API, the Web Worker
+/// module host, the build and frame records for input jobs, and the upload
+/// lane for computed `missing` inputs. Everything runs on the page's event
+/// loop; there is one module call at a time, so there is no queue whose
+/// priority a waiter could raise.
+pub struct WebPlatform<'a> {
+    /// The hub.
+    pub hub: &'a WebHub,
+    /// The page's cache, if it has one.
+    pub cache: Option<&'a WebCache>,
+    /// The Web Worker module host.
+    pub worker: &'a ModuleWorker,
+    /// The counters.
+    pub stats: &'a WorkerStats,
+    /// The frame records the build lists, by hash.
+    pub records: &'a crate::protocol::FrameRecords,
+    /// The space's origin, once directions have told it.
+    pub origin: Option<i64>,
+    /// Takes computed `missing` inputs.
+    pub lane: &'a UploadLane,
+}
+
+impl Platform for WebPlatform<'_> {
+    fn input_job(
+        &self,
+        reader: &ComputeJob,
+        slot: u32,
+        key: ChunkKey,
+    ) -> Result<ComputeJob, WorkerError> {
+        let origin = self
+            .origin
+            .ok_or_else(|| WorkerError::transient("the origin is not known yet"))?;
+        self.hub
+            .build()
+            .input_job(reader, slot, key, origin, self.records)
+            .map_err(|e| WorkerError::permanent(format!("input {key} of slot {slot}: {e:#}")))
     }
-    let request = module_io::encode_request(&job.request);
-    // The frames slots' records (section 4.1); with no layer sections
-    // resolved here they are also the whole input buffer, which is right
-    // exactly when `gx_inputs` asks for nothing.
+
+    async fn direct(&self, job: &ComputeJob) -> Result<InputDirection, WorkerError> {
+        let origin = self
+            .origin
+            .ok_or_else(|| WorkerError::transient("the origin is not known yet"))?;
+        let t = crate::protocol::input_directions_time(job, origin, self.hub.now_utc_ms());
+        let key = job.key();
+        let response =
+            self.hub.directions(t, &[key]).await.map_err(|e| {
+                WorkerError::transient(format!("directions for input {key}: {e:#}"))
+            })?;
+        crate::protocol::input_direction(&response, job)
+    }
+
+    async fn stream(&self, address: &[u8; 32], sha256: &[u8; 32]) -> Result<Vec<u8>, WorkerError> {
+        match self.hub.get_section(address, sha256).await {
+            Ok(Some(b)) => Ok(b),
+            Ok(None) => Err(WorkerError::transient(format!(
+                "input section {}: not found",
+                to_hex(address)
+            ))),
+            Err(e) => Err(WorkerError::transient(format!("{e:#}"))),
+        }
+    }
+
+    async fn input_list(&self, job: &ComputeJob) -> Result<Vec<(u32, ChunkKey)>, WorkerError> {
+        if !self.worker.has(&job.module) {
+            let wasm = get_blob(self.hub, self.cache, BlobKind::Module, &job.module).await?;
+            self.worker.load(&job.module, &wasm).await?;
+            self.stats.module_loaded();
+        }
+        let request = module_io::encode_request(&job.request);
+        self.stats.module_run();
+        let list = self
+            .worker
+            .inputs(&job.module, &request, &frames(job)?)
+            .await?;
+        let list = module_io::decode_input_list(&list)
+            .map_err(|e| WorkerError::permanent(format!("gx_inputs output is invalid: {e}")))?;
+        Ok(list.into_iter().map(|e| (e.slot, e.key)).collect())
+    }
+
+    async fn compile(
+        &self,
+        job: &ComputeJob,
+        inputs: &[Arc<[u8]>],
+    ) -> Result<Computed, WorkerError> {
+        let request = module_io::encode_request(&job.request);
+        let ids = self
+            .worker
+            .sources(&job.module, &request, &frames(job)?)
+            .await?;
+        let ids = module_io::decode_source_ids(&ids)
+            .map_err(|e| WorkerError::permanent(format!("gx_sources output is invalid: {e}")))?;
+        let manifest = match &job.manifest {
+            Some(h) if !ids.is_empty() => Some(manifest(self.hub, self.cache, h).await?),
+            _ => None,
+        };
+        let refs = resolve_tiles(manifest.as_deref(), &ids)?;
+        let mut tiles = Vec::with_capacity(refs.len());
+        for r in &refs {
+            let bytes = get_blob(self.hub, self.cache, BlobKind::Source, &r.sha256).await?;
+            check_tile(r, &bytes)?;
+            tiles.push((r.id, bytes));
+        }
+        let tile_list: Vec<Tile<'_>> = tiles
+            .iter()
+            .map(|(id, bytes)| Tile { id: *id, bytes })
+            .collect();
+        let tiles = module_io::encode_tiles(&tile_list)
+            .map_err(|e| WorkerError::permanent(format!("encoding the tiles: {e}")))?;
+        let passed: Vec<&[u8]> = inputs.iter().map(|b| b.as_ref()).collect();
+        let passed = module_io::encode_inputs(&passed)
+            .map_err(|e| WorkerError::permanent(format!("encoding the inputs: {e}")))?;
+        self.stats.module_run();
+        let bytes = self
+            .worker
+            .compile(&job.module, &request, &tiles, &passed)
+            .await?;
+        let section = check_section(&job.request.key, &bytes)?;
+        Ok(Computed {
+            bytes: Arc::from(bytes),
+            section: section.map(Arc::new),
+            inputs_sha256: None,
+        })
+    }
+
+    async fn cache_get(&self, address: &[u8; 32]) -> Option<Vec<u8>> {
+        self.cache?.get(BlobKind::Section, &to_hex(address)).await
+    }
+
+    async fn cache_put(&self, address: &[u8; 32], bytes: &Arc<[u8]>) {
+        if let Some(c) = self.cache {
+            let _ = c.put(BlobKind::Section, &to_hex(address), bytes).await;
+        }
+    }
+
+    fn offer(&self, job: &ComputeJob, bytes: Arc<[u8]>) {
+        self.lane.offer(UploadOffer {
+            job: job.clone(),
+            bytes,
+        });
+    }
+
+    fn input_computed(&self) {
+        self.stats.job_finished(true);
+    }
+}
+
+/// The job's frame records as one input buffer (section 4.1), what
+/// `gx_inputs` and `gx_sources` read.
+fn frames(job: &ComputeJob) -> Result<Vec<u8>, WorkerError> {
     let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
-    let frames = module_io::encode_inputs(&frames)
-        .map_err(|e| WorkerError::permanent(format!("encoding the frame records: {e}")))?;
-    stats.module_run();
-    let list = worker.inputs(&job.module, &request, &frames).await?;
-    let list = module_io::decode_input_list(&list)
-        .map_err(|e| WorkerError::permanent(format!("gx_inputs output is invalid: {e}")))?;
-    if let Some(first) = list.first() {
-        return Err(WorkerError::permanent(format!(
-            "the module reads {} layer input sections (first: slot {}, key {}), which this worker does not resolve",
-            list.len(),
-            first.slot,
-            first.key
-        )));
-    }
-    let ids = worker.sources(&job.module, &request, &frames).await?;
-    let ids = module_io::decode_source_ids(&ids)
-        .map_err(|e| WorkerError::permanent(format!("gx_sources output is invalid: {e}")))?;
-    let manifest = match &job.manifest {
-        Some(h) if !ids.is_empty() => Some(manifest(hub, cache, h).await?),
-        _ => None,
-    };
-    let refs = resolve_tiles(manifest.as_deref(), &ids)?;
-    let mut tiles = Vec::with_capacity(refs.len());
-    for r in &refs {
-        let bytes = get_blob(hub, cache, BlobKind::Source, &r.sha256).await?;
-        check_tile(r, &bytes)?;
-        tiles.push((r.id, bytes));
-    }
-    let tile_list: Vec<Tile<'_>> = tiles
-        .iter()
-        .map(|(id, bytes)| Tile { id: *id, bytes })
-        .collect();
-    let tiles = module_io::encode_tiles(&tile_list)
-        .map_err(|e| WorkerError::permanent(format!("encoding the tiles: {e}")))?;
-    stats.module_run();
-    let bytes = worker
-        .compile(&job.module, &request, &tiles, &frames)
-        .await?;
-    let section = check_section(&job.request.key, &bytes)?;
-    Ok(Computed {
-        bytes: std::sync::Arc::from(bytes),
-        section: section.map(std::sync::Arc::new),
-        // The browser does not resolve layer inputs (section 10.3) yet: a
-        // module that names input sections fails, so nothing here is
-        // computed from inputs.
-        inputs_sha256: None,
-    })
+    module_io::encode_inputs(&frames)
+        .map_err(|e| WorkerError::permanent(format!("encoding the frame records: {e}")))
 }

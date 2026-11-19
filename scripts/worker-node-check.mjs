@@ -8,12 +8,14 @@
 // Usage: node scripts/worker-node-check.mjs [MODULE.wasm VECTORS_DIR]
 // (default: testdata/example-module/module.wasm and its vectors/).
 //
-// Two passes: web/module-runner.js called directly, then web/module-worker.js
+// Three passes: web/module-runner.js called directly, then web/module-worker.js
 // itself in a worker thread, driven through its message protocol exactly as
 // the page drives the Web Worker. Both passes also run the core's version 2
 // example module (testdata/example-module-v2, client-compute.md section
 // 4.1) through gx_inputs, gx_sources, and gx_compile with its vectors'
-// frame and input bytes.
+// frame and input bytes. The third resolves the version 2 module's layer
+// inputs through the module worker, computing each with the version 1
+// module, as the browser's platform layer does.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -214,10 +216,116 @@ try {
     console.log(`worker FAIL ${e.message}`);
     failed++;
 }
+
+// Pass 3: input resolution through the module worker, the calls the
+// browser's platform layer (crates/renderer/src/web/worker.rs,
+// WebPlatform) makes for the shared resolver (client-compute.md section
+// 10.3): gx_inputs of the version 2 module with the frame records, every
+// listed layer slot input computed with the version 1 module (the layer
+// the example reader's slot 1 reads) once per key, then gx_compile with
+// the frame records and the inputs in gx_inputs order. Every input buffer
+// and section must match the vectors.
+function decodeList(bytes) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const out = [];
+    let at = 4;
+    for (let i = 0; i < v.getUint32(0, true); i++) {
+        const slot = v.getUint32(at, true);
+        const len = v.getUint32(at + 4, true);
+        out.push({ slot, key: new TextDecoder().decode(bytes.subarray(at + 8, at + 8 + len)) });
+        at += 8 + len;
+    }
+    return out;
+}
+function decodeInputs(bytes) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const out = [];
+    let at = 4;
+    for (let i = 0; i < v.getUint32(0, true); i++) {
+        const len = v.getUint32(at, true);
+        out.push(bytes.subarray(at + 4, at + 4 + len));
+        at += 4 + len;
+    }
+    return out;
+}
+function encodeInputs(list) {
+    const out = new Uint8Array(4 + list.reduce((n, b) => n + 4 + b.length, 0));
+    const v = new DataView(out.buffer);
+    v.setUint32(0, list.length, true);
+    let at = 4;
+    for (const b of list) {
+        v.setUint32(at, b.length, true);
+        out.set(b, at + 4);
+        at += 4 + b.length;
+    }
+    return out;
+}
+// The input layer's source tiles as the core's generator gives them: every
+// id the same parameters (root extent 2e7 m, 2.5 kg/m^3, 300 K).
+function layerTiles(ids) {
+    const out = new Uint8Array(4 + ids.length * 36);
+    const v = new DataView(out.buffer);
+    v.setUint32(0, ids.length, true);
+    let at = 4;
+    for (const id of ids) {
+        v.setBigUint64(at, id, true);
+        v.setUint32(at + 8, 24, true);
+        v.setFloat64(at + 12, 2.0e7, true);
+        v.setFloat64(at + 20, 2.5, true);
+        v.setFloat64(at + 28, 300.0, true);
+        at += 36;
+    }
+    return out;
+}
+// A request (encode_request) for another key with the reader's origin and
+// span, which is the input span for these vectors' layers.
+function withKey(request, key) {
+    const k = new TextEncoder().encode(key);
+    const out = new Uint8Array(36 + k.length);
+    out.set(request.subarray(0, 32));
+    new DataView(out.buffer).setUint32(32, k.length, true);
+    out.set(k, 36);
+    return out;
+}
+try {
+    await call({ op: "load", hash, wasm });
+    let resolved = 0;
+    for (const v of vectorsV2) {
+        const list = decodeList(await call({ op: "inputs", hash: hashV2, request: v.request, frames: v.frames }));
+        const memory = new Map();
+        const inputs = [...decodeInputs(v.frames)];
+        for (const e of list) {
+            if (e.slot !== 1) throw new Error(`${v.name}: input of slot ${e.slot}`);
+            if (!memory.has(e.key)) {
+                const request = withKey(v.request, e.key);
+                const ids = sourceIds(await call({ op: "sources", hash, request }));
+                const tiles = layerTiles(ids === "" ? [] : ids.split(",").map(BigInt));
+                memory.set(e.key, await call({ op: "compile", hash, request, tiles }));
+            }
+            inputs.push(memory.get(e.key));
+        }
+        const passed = encodeInputs(inputs);
+        if (!same(passed, v.inputs)) {
+            console.log(`resolve FAIL ${v.name}: the resolved inputs differ from the vector's`);
+            failed++;
+            continue;
+        }
+        resolved += list.length;
+        const section = await call({ op: "compile", hash: hashV2, request: v.request, tiles: v.tiles, inputs: passed });
+        check("resolve", v.name, sourceIds(await call({ op: "sources", hash: hashV2, request: v.request, frames: v.frames })), v.tiles, section, v.expected);
+    }
+    if (resolved === 0) {
+        console.log("resolve FAIL no vector read a layer input");
+        failed++;
+    }
+} catch (e) {
+    console.log(`resolve FAIL ${e.message}`);
+    failed++;
+}
 await worker.terminate();
 
 if (failed > 0) {
     console.error(`worker-node-check: ${failed} failed`);
     process.exit(1);
 }
-console.log(`worker-node-check: ${vectors.length} version 1 and ${vectorsV2.length} version 2 vectors ok in both passes`);
+console.log(`worker-node-check: ${vectors.length} version 1 and ${vectorsV2.length} version 2 vectors ok in every pass`);

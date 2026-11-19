@@ -16,6 +16,8 @@
 //! - [`queue`]: the work list's order: three lanes (computes, uploads,
 //!   checks) and the compute queue, highest priority first, shared by
 //!   both platforms.
+//! - [`resolve`]: input resolution (section 10.3), async over a small
+//!   platform trait, shared by both platforms.
 //! - [`upload`]: the bounded upload lane and the outcome of each offer,
 //!   shared by both platforms.
 //! - [`check`]: the bounded check lane and the outcome of each check,
@@ -33,6 +35,7 @@
 pub mod check;
 pub mod job;
 pub mod queue;
+pub mod resolve;
 pub mod stats;
 pub mod upload;
 
@@ -44,6 +47,7 @@ pub mod native;
 pub use check::{CheckJob, CheckLane, CheckOutcome, CHECK_LANE_CAPACITY};
 pub use job::{BlobKind, ComputeJob, Computed, FailureKind, TileRef, WorkerError};
 pub use queue::{ComputeQueue, Lane};
+pub use resolve::{InputDirection, InputResolver, Platform};
 pub use stats::{UploadTicket, WorkerSnapshot, WorkerStats};
 pub use upload::{
     UploadLane, UploadOffer, UploadOutcome, MAX_UPLOADS_IN_FLIGHT, UPLOAD_LANE_CAPACITY,
@@ -53,6 +57,6 @@ pub use upload::{
 pub use cache::DiskCache;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    default_threads, Blobs, CheckRunner, InputDirection, InputSource, LaneSource, ModuleRunner,
-    PoolWaker, Resolver, Uploader, WorkerPool,
+    default_threads, Blobs, CheckRunner, InputSource, LaneSource, ModuleRunner, PoolWaker,
+    Resolver, Uploader, WorkerPool,
 };
