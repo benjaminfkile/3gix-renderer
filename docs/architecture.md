@@ -250,15 +250,16 @@ never waits while a compute does. Computes start highest priority first
 ones take their key's new priority, and those whose key left the set are
 removed before they start and reported as dropped, so the coordinator
 takes them up again from the kept answer if the key comes back. A
-running job finishes and its section is cached. Uploads never hold a
-compute thread. Natively a free pool thread only takes an upload off the
-lane and spawns its request on the fetcher's tokio runtime, where it
-runs; at most four are in flight (`gx_worker::MAX_UPLOADS_IN_FLIGHT`),
-and while four are in flight the lane keeps the rest (still bounded at
-64, oldest dropped) until one ends and wakes the pool. In the browser an
-upload starts only while no compute waits, one at a time, as an async
-`fetch` on the page's event loop; the module work runs in a Web Worker,
-which the upload never occupies.
+running job finishes and its section is cached. Uploads are network I/O
+and never take a compute thread or wait for computes: natively the
+fetcher sends each offer on its tokio runtime as soon as it enters the
+lane, in the browser as an async `fetch` on the page's event loop (the
+module work runs in a Web Worker, which an upload never occupies). At
+most four are in flight (`gx_worker::MAX_UPLOADS_IN_FLIGHT`); while four
+are in flight the lane keeps the rest (bounded at 64, oldest dropped)
+and a finished request sends the next. Uploads used to wait until no
+compute waited; a burst of computes then overflowed the lane and most
+offers were dropped, so the hub never filled.
 
 Checks (`client-compute.md` 2.6 and 2.8, `gx_worker::check`): when a
 `ready` section of a cell or a surface tile arrives from the edge or the

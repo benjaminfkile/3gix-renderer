@@ -20,13 +20,12 @@
 //!
 //! Jobs wait in one queue per pool (`client-compute.md` section 2.8,
 //! [`crate::queue`]): a free thread takes the waiting compute of the
-//! highest priority; only when no compute waits does it take work from the
-//! upload lane, and only when no upload waits from the check lane
-//! ([`WorkerPool::set_lane`]). Lower-lane work never holds a thread on the
-//! network: the client's upload source only hands each request to its
-//! async runtime and returns, with at most four in flight; while four are
-//! in flight it gives the pool nothing and the offers stay in the bounded
-//! lane, and a finished request wakes the pool ([`PoolWaker`]). [`WorkerPool::reprioritize`] follows the
+//! highest priority; only when no compute waits does it take work from a
+//! lower lane ([`WorkerPool::set_lane`]). The native client registers only
+//! the check lane: uploads are network I/O, sent by the client on its async
+//! runtime as soon as they are offered (at most four in flight), and never
+//! take a pool thread. A lower lane that has work it cannot start yet wakes
+//! the pool when it can ([`PoolWaker`]). [`WorkerPool::reprioritize`] follows the
 //! wanted set: waiting jobs take their key's new priority, and a job whose
 //! key left it is removed before it starts and told
 //! [`crate::FailureKind::Dropped`]. A running job finishes and its section

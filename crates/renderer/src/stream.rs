@@ -97,10 +97,9 @@
 //! worker pool ([`gx_worker::WorkerPool`]), which hands each section over
 //! decoded at once. A computed `missing` section then enters the upload
 //! lane ([`gx_worker::UploadLane`], `client-compute.md` sections 2.5 and
-//! 2.8): bounded at 64, oldest dropped when full, taken by a pool thread
-//! only when no compute waits (the pool's upload lane,
-//! [`gx_worker::Lane`]) and offered once with the section 2.5 headers on
-//! the runtime, never on the pool thread, with at most four in flight
+//! 2.8): bounded at 64, oldest dropped when full, and offered once with
+//! the section 2.5 headers on the runtime as soon as it arrives, never on
+//! a pool thread and never waiting for computes, with at most four in flight
 //! ([`gx_worker::MAX_UPLOADS_IN_FLIGHT`]), a failure counted and never
 //! retried. Compute jobs start highest priority first, and on every new
 //! wanted set the waiting ones are reprioritized and those whose key left
@@ -1933,8 +1932,8 @@ mod native {
     use gx_module_host::HostConfig;
     use gx_worker::{
         BlobKind, Blobs, CheckJob, CheckLane, CheckOutcome, CheckRunner, ComputeJob, Computed,
-        DiskCache, Lane, LaneSource, PoolWaker, UploadLane, UploadOffer, UploadOutcome, Uploader,
-        WorkerError, WorkerPool, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
+        DiskCache, Lane, LaneSource, UploadLane, UploadOffer, UploadOutcome, Uploader, WorkerError,
+        WorkerPool, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1980,11 +1979,11 @@ mod native {
         }
     }
 
-    /// Puts computed `missing` sections into the upload lane. Never blocks
-    /// the worker: the offer is sent later, when no compute waits
-    /// ([`UploadSender`]).
+    /// Puts computed `missing` sections into the upload lane and starts
+    /// sending ([`UploadSender::pump`]). Never blocks the worker.
     struct HubUploader {
         lane: Arc<UploadLane>,
+        sender: Arc<UploadSender>,
     }
 
     impl Uploader for HubUploader {
@@ -1993,53 +1992,61 @@ mod native {
                 job: job.clone(),
                 bytes: section,
             });
+            self.sender.pump();
         }
     }
 
-    /// The pool's upload lane (`client-compute.md` section 2.8): each offer
-    /// sent once, only when no wanted compute waits. A pool thread only
-    /// takes the offer and spawns its request on the runtime; the request
-    /// runs there, so a slow hub never holds a compute thread. At most
-    /// [`MAX_UPLOADS_IN_FLIGHT`] are in flight; until one ends the lane
-    /// keeps the rest, and the one that ends wakes the pool.
+    /// Sends the upload lane (`client-compute.md` section 2.8): each offer
+    /// sent once, at most [`MAX_UPLOADS_IN_FLIGHT`] at a time, on the async
+    /// runtime. An upload is network I/O and never takes a pool thread, so
+    /// it does not wait for computes: waiting let a burst of computes
+    /// overflow the bounded lane and drop most offers, and the hub never
+    /// filled. [`UploadSender::pump`] runs when an offer arrives and when a
+    /// request ends.
     struct UploadSender {
         handle: tokio::runtime::Handle,
         client: Arc<HubClient>,
         lane: Arc<UploadLane>,
-        in_flight: Arc<AtomicUsize>,
-        waker: PoolWaker,
+        in_flight: AtomicUsize,
     }
 
-    /// Frees an upload slot and wakes the pool when the request ends,
-    /// however it ends (answered, failed, or cancelled with the runtime).
+    /// Frees an upload slot when the request ends, however it ends
+    /// (answered, failed, or cancelled with the runtime), and sends the
+    /// next offer.
     struct UploadSlot {
-        in_flight: Arc<AtomicUsize>,
-        waker: PoolWaker,
+        sender: Arc<UploadSender>,
     }
 
     impl Drop for UploadSlot {
         fn drop(&mut self) {
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            self.waker.wake();
+            self.sender.in_flight.fetch_sub(1, Ordering::SeqCst);
+            UploadSender::pump(&self.sender);
         }
     }
 
-    impl LaneSource for UploadSender {
-        fn next(&self) -> Option<Box<dyn FnOnce() + Send>> {
-            // Called with the pool's queue locked, so no other thread
-            // takes a slot between this check and the increment.
-            if self.in_flight.load(Ordering::SeqCst) >= MAX_UPLOADS_IN_FLIGHT {
-                return None;
-            }
-            let (offer, ticket) = self.lane.take()?;
-            self.in_flight.fetch_add(1, Ordering::SeqCst);
-            let slot = UploadSlot {
-                in_flight: Arc::clone(&self.in_flight),
-                waker: self.waker.clone(),
-            };
-            let (handle, client) = (self.handle.clone(), self.client.clone());
-            Some(Box::new(move || {
-                handle.spawn(async move {
+    impl UploadSender {
+        /// Starts offers until [`MAX_UPLOADS_IN_FLIGHT`] are in flight or
+        /// the lane is empty.
+        fn pump(self: &Arc<Self>) {
+            loop {
+                let reserved = self
+                    .in_flight
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        (n < MAX_UPLOADS_IN_FLIGHT).then_some(n + 1)
+                    })
+                    .is_ok();
+                if !reserved {
+                    return;
+                }
+                let Some((offer, ticket)) = self.lane.take() else {
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                };
+                let slot = UploadSlot {
+                    sender: Arc::clone(self),
+                };
+                let client = self.client.clone();
+                self.handle.spawn(async move {
                     let _slot = slot;
                     let key = offer.job.key();
                     let outcome = match client.upload(&offer.job, offer.bytes.to_vec()).await {
@@ -2054,7 +2061,7 @@ mod native {
                     };
                     ticket.finish(outcome);
                 });
-            }))
+            }
         }
     }
 
@@ -2190,20 +2197,16 @@ mod native {
                 options.cache.clone(),
                 Arc::new(HubUploader {
                     lane: Arc::clone(&lane),
+                    sender: Arc::new(UploadSender {
+                        handle: handle.clone(),
+                        client: client.clone(),
+                        lane: Arc::clone(&lane),
+                        in_flight: AtomicUsize::new(0),
+                    }),
                 }),
                 stats,
             )
             .map_err(|e| anyhow!("starting the worker: {e}"))?;
-            pool.set_lane(
-                Lane::Upload,
-                Arc::new(UploadSender {
-                    handle: handle.clone(),
-                    client: client.clone(),
-                    lane,
-                    in_flight: Arc::new(AtomicUsize::new(0)),
-                    waker: pool.waker(),
-                }),
-            );
             let (tx, rx) = mpsc::channel();
             pool.set_lane(
                 Lane::Check,

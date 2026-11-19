@@ -41,7 +41,7 @@ use gx_core::sha256::{sha256, to_hex};
 use gx_core::units::Meters;
 use gx_worker::{
     BlobKind, CheckJob, CheckLane, CheckOutcome, ComputeJob, ComputeQueue, Computed, UploadLane,
-    UploadOffer, UploadOutcome, WorkerError, WorkerStats,
+    UploadOffer, UploadOutcome, WorkerError, WorkerStats, MAX_UPLOADS_IN_FLIGHT,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -84,7 +84,7 @@ pub struct WebFetcher {
     stats: Arc<WorkerStats>,
     coordinator: Coordinator,
     lane: Rc<UploadLane>,
-    uploading: Rc<Cell<bool>>,
+    uploading: Rc<Cell<usize>>,
     checks: CheckLane,
     asked_at: BTreeMap<ChunkKey, i64>,
     checked_extents: BTreeMap<CellKey, Meters>,
@@ -110,7 +110,7 @@ impl WebFetcher {
             cache: cache.map(Rc::new),
             worker: ModuleWorker::new(),
             lane: Rc::new(UploadLane::new(stats.clone())),
-            uploading: Rc::new(Cell::new(false)),
+            uploading: Rc::new(Cell::new(0)),
             checks: CheckLane::new(stats.clone()),
             asked_at: BTreeMap::new(),
             checked_extents: BTreeMap::new(),
@@ -325,27 +325,28 @@ impl WebFetcher {
         });
     }
 
-    /// Sends the upload lane's oldest offer if none is being sent and no
-    /// wanted compute waits (`client-compute.md` section 2.8: uploads are
-    /// below computes). Each offer is sent once; a failure is counted and
-    /// dropped.
+    /// Sends the upload lane's oldest offers, at most
+    /// [`MAX_UPLOADS_IN_FLIGHT`] at once (`client-compute.md` section 2.8).
+    /// An upload is an async `fetch` on the page's event loop and never
+    /// occupies the Web Worker, so it does not wait for computes: waiting
+    /// let a burst of computes overflow the bounded lane and drop most
+    /// offers. Each offer is sent once; a failure is counted and dropped.
     fn start_upload(&mut self) {
-        if self.uploading.get() || !self.jobs.is_empty() {
-            return;
-        }
-        let Some((offer, ticket)) = self.lane.take() else {
-            return;
-        };
-        self.uploading.set(true);
-        let (hub, uploading) = (self.hub.clone(), self.uploading.clone());
-        wasm_bindgen_futures::spawn_local(async move {
-            let outcome = match hub.upload(&offer.job, offer.bytes.to_vec()).await {
-                Ok(status) => UploadOutcome::from_status(status),
-                Err(_) => UploadOutcome::Failed,
+        while self.uploading.get() < MAX_UPLOADS_IN_FLIGHT {
+            let Some((offer, ticket)) = self.lane.take() else {
+                return;
             };
-            ticket.finish(outcome);
-            uploading.set(false);
-        });
+            self.uploading.set(self.uploading.get() + 1);
+            let (hub, uploading) = (self.hub.clone(), self.uploading.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let outcome = match hub.upload(&offer.job, offer.bytes.to_vec()).await {
+                    Ok(status) => UploadOutcome::from_status(status),
+                    Err(_) => UploadOutcome::Failed,
+                };
+                ticket.finish(outcome);
+                uploading.set(uploading.get() - 1);
+            });
+        }
     }
 
     /// Runs the check lane's oldest check on the Web Worker if it is idle
