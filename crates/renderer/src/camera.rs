@@ -447,7 +447,7 @@ pub fn apply_clock(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use gx_core::registry::{Frame, Registry, ROOT_PARENT};
     use gx_core::units::{Kilograms, Meters, Seconds};
@@ -488,7 +488,7 @@ mod tests {
 
     /// Small offsets, so root coordinates themselves are exact enough to
     /// compare at a micrometer.
-    fn system() -> FrameSystem {
+    pub(crate) fn system() -> FrameSystem {
         let h = std::f64::consts::FRAC_1_SQRT_2;
         let frames = vec![
             {

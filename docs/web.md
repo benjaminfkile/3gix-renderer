@@ -79,13 +79,51 @@ HTTPS.
 
 The page is one canvas filling the window and a small settings panel: hub
 URL, API key, space id, build id
-(empty for the active build of the space). The client enters at the hub's
-now, like the desktop one. The values are stored in the browser's
+(empty for the active build of the space). The values are stored in the browser's
 `localStorage`, the API key included, so use a key meant for this purpose.
-`Start` loads the module, connects to the hub, loads the registry, and
-starts the frame loop; an error shows in the panel. Controls are those of
-the desktop (`docs/controls.md`); click the canvas first so it has the
-keyboard focus. `Escape` stops the frame loop.
+`Start` loads the module, checks the view options, connects to the hub,
+loads the registry, and starts the frame loop; an error shows in the panel.
+Controls are those of the desktop (`docs/controls.md`); click the canvas
+first so it has the keyboard focus. `Escape` stops the frame loop.
+
+## View and time options
+
+Both builds start the same way from the same settings (`rendering.md`
+section 6 rule 5). The browser takes the native view and time flags under
+the same names in camelCase, from `web/config.js` (see
+`web/config.example.js`) and then from the page's query string, which
+overrides `config.js`, so a link opens a view:
+
+```
+http://localhost:8000/?startOn=3:0,0,1@%2B10&timeScale=60
+```
+
+(`+` in a query string is a space, so write `@+` as `@%2B`.)
+
+| Option | Native flag | Meaning |
+|---|---|---|
+| `start` | `--start` | `now` (default) or `origin` |
+| `startOffsetSeconds` | `--start-offset-seconds` | simulation time offset from the start, seconds, clamped between the origin and now (default 0) |
+| `timeScale` | `--time-scale` | playback rate of a start in the past, simulation seconds per wall second, negative backwards (default 1) |
+| `startOn` | `--start-on` | `<frame>:<x>,<y>,<z>[@[+]<m>[^<deg>]]`: spawn onto the frame along that direction, or with `@<m>` place the camera that far from its origin |
+| `view` | `--view` | `home` or `0` to `9`; only headless runs use it |
+| `viewDistanceScale` | `--view-distance-scale` | factor on the headless view's distance from its frame origin (default 1) |
+| `exposureStops` | `--exposure-stops` | fixed exposure, stops; leave out for automatic |
+| `meshMode` | `--mesh-mode` | `surfaces` (default), `vertices`, or `edges` |
+
+Without any the client enters at the hub's now at the `Home` view. The
+values go through the same parser as the native flags
+(`crates/renderer/src/options.rs`), and the same function places the
+camera and sets the clock at start. An invalid value shows the parser's
+message in the panel and nothing starts. `web/view-options.js` gathers the
+values; `scripts/web-options-check.mjs` checks it under Node in CI.
+
+## Keys
+
+The keys are those of `docs/controls.md`. The number keys, on the top row
+or the keypad (`Numpad0` to `Numpad9`), jump to a frame's view, or pick a
+frame while the spawn chooser (`G`) is open. While the speed field (`V`) is
+open both type digits instead.
 
 ## What the hub must allow
 

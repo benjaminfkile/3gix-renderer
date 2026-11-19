@@ -44,8 +44,8 @@ camera happens to be parented to play no part: it flies through the densest matt
 the same way it flies through empty space. The overlay's camera line
 shows the current flight speed.
 
-The number keys index the frames in registry order: frame ids sorted
-ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.
+The number keys, on the top row or the keypad, index the frames in
+registry order: frame ids sorted ascending, skipping the root. `1` is the first, `9` the ninth, `0` the tenth.
 A jump places the camera at `3 * root_extent / 8` from the frame origin,
 above it the way `Home` sees the root: along root `+z`, looking along root
 `-z` with root `+y` up. Because that direction is fixed in root axes, the
