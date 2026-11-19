@@ -141,6 +141,8 @@ fn job_for(store: &mut Store, module: [u8; 32], request: &[u8], tiles: &[u8]) ->
         module,
         manifest,
         request,
+        slots: Vec::new(),
+        frames: Vec::new(),
     }
 }
 
@@ -264,4 +266,129 @@ fn bad_inputs_fail_the_job() {
     // The good inputs work, and the module was admitted once.
     assert!(runner.run(&job, &store, None).is_ok());
     assert_eq!(runner.stats().snapshot().modules_loaded, 1);
+}
+
+fn data_v2() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/example-module-v2")
+}
+
+/// One version 2 vector (`client-compute.md` section 4.1): its name and
+/// the request, frame, tile, input list, and input bytes, and the
+/// expected SHA-256 of the output.
+struct VectorV2 {
+    name: String,
+    request: Vec<u8>,
+    frames: Vec<u8>,
+    tiles: Vec<u8>,
+    input_list: Vec<u8>,
+    inputs: Vec<u8>,
+    sha256: String,
+}
+
+fn vectors_v2() -> Vec<VectorV2> {
+    let dir = data_v2().join("vectors");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.unwrap()
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".request.bin"))
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    assert!(names.len() >= 5, "version 2 vectors are missing");
+    names
+        .into_iter()
+        .map(|n| {
+            let read = |ext: &str| std::fs::read(dir.join(format!("{n}.{ext}"))).unwrap();
+            VectorV2 {
+                request: read("request.bin"),
+                frames: read("frames.bin"),
+                tiles: read("tiles.bin"),
+                input_list: read("input-list.bin"),
+                inputs: read("inputs.bin"),
+                sha256: String::from_utf8(read("sha256"))
+                    .unwrap()
+                    .trim()
+                    .to_string(),
+                name: n,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn native_worker_reproduces_the_version_2_conformance_hashes() {
+    let wasm = std::fs::read(data_v2().join("module.wasm")).expect("the vendored v2 module");
+    let runner = ModuleRunner::new(HostConfig::default(), WorkerStats::new()).unwrap();
+    let module = runner.module(&sha256(&wasm), || Ok(wasm.clone())).unwrap();
+    assert_eq!(module.abi_version(), 2);
+    for v in vectors_v2() {
+        let list = module.inputs_raw(&v.request, &v.frames).unwrap();
+        assert_eq!(list, v.input_list, "{}: input list", v.name);
+        module.sources_v2_raw(&v.request, &v.frames).unwrap();
+        let out = module
+            .compile_v2_raw(&v.request, &v.tiles, &v.inputs)
+            .unwrap();
+        assert_eq!(to_hex(&sha256(&out)), v.sha256, "{}", v.name);
+    }
+}
+
+/// A version 2 job through the pool's runner: the frame records go to
+/// `gx_inputs`, `gx_sources`, and `gx_compile`. A request whose input list
+/// is empty (the registry and the frame key) is computed to the vector's
+/// hash; one that reads layer sections fails permanently, since this
+/// worker passes frame records only.
+#[test]
+fn runner_runs_version_2_jobs_with_their_frame_records() {
+    let wasm = std::fs::read(data_v2().join("module.wasm")).unwrap();
+    let mut store = Store::default();
+    let module = store.add(BlobKind::Module, wasm);
+    let store = Arc::new(Mutex::new(store));
+    let runner = ModuleRunner::new(HostConfig::default(), WorkerStats::new()).unwrap();
+    let mut computed = 0;
+    let mut refused = 0;
+    for v in vectors_v2() {
+        let mut job = job_for(&mut store.lock().unwrap(), module, &v.request, &v.tiles);
+        job.frames = module_io::decode_inputs(&v.frames)
+            .unwrap()
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        let blobs = std::mem::take(&mut *store.lock().unwrap());
+        let result = runner.run(&job, &blobs, None);
+        *store.lock().unwrap() = blobs;
+        if module_io::decode_input_list(&v.input_list)
+            .unwrap()
+            .is_empty()
+        {
+            let out = result.unwrap_or_else(|e| panic!("{}: {e}", v.name));
+            assert_eq!(to_hex(&sha256(&out.bytes)), v.sha256, "{}", v.name);
+            computed += 1;
+        } else {
+            let e = result.expect_err(&v.name);
+            assert_eq!(e.kind, FailureKind::Permanent, "{}", v.name);
+            assert!(e.message.contains("layer input"), "{}: {e}", v.name);
+            refused += 1;
+        }
+    }
+    assert!(
+        computed >= 2 && refused >= 1,
+        "{computed} computed, {refused} refused"
+    );
+}
+
+/// A version 1 module given frame records fails before it runs.
+#[test]
+fn runner_refuses_frame_records_for_a_version_1_module() {
+    let mut store = Store::default();
+    let module = store.add(BlobKind::Module, module_bytes());
+    let (name, request, tiles, _) = vectors().remove(0);
+    let mut job = job_for(&mut store, module, &request, &tiles);
+    job.frames = vec![Arc::from(&[0u8; 88][..])];
+    let runner = ModuleRunner::new(HostConfig::default(), WorkerStats::new()).unwrap();
+    let e = runner.run(&job, &store, None).expect_err(&name);
+    assert_eq!(e.kind, FailureKind::Permanent);
 }

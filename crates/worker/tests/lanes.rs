@@ -50,6 +50,8 @@ fn job(i: u32) -> ComputeJob {
             span_index: i as u64,
             key: key(i),
         },
+        slots: Vec::new(),
+        frames: Vec::new(),
     }
 }
 

@@ -9,14 +9,17 @@
 //! - [`HubClient::connect`] reads `GET /space/{s}/clock`, `GET
 //!   /space/{s}/build/active` (unless a build id is configured), and `GET
 //!   /space/{s}/build/{b}`, whose layer configs drive the depth of each
-//!   frame ([`crate::protocol::frame_system_from_registries`]).
+//!   frame ([`crate::protocol::frame_system_from_registries`]) and which
+//!   lists the build's frame record hashes
+//!   ([`crate::protocol::BuildDescription::frame_record_hashes`]).
 //! - [`HubClient::sync_clock`] measures the offset from the hub's clock,
 //!   at connect time and every minute after through
 //!   [`HubClient::keep_clock`] ([`crate::protocol::ClockSync`],
 //!   `space-model.md` section 7).
 //! - [`HubClient::directions`] posts one batch of at most 512 keys.
 //! - [`HubClient::get_blob`] reads `/module/{hash}`, `/source/{hash}`,
-//!   and `/source-manifest/{hash}` from the edge, and
+//!   `/source-manifest/{hash}`, and `/frame-record/{hash}` (section 10.2)
+//!   from the edge, and
 //!   [`HubClient::get_section`] reads `/section/{address}?sha256={hex}`,
 //!   one version of a stored section.
 //! - [`HubClient::upload`] offers a computed `missing` section once, with
@@ -40,6 +43,7 @@ use gx_core::key::ChunkKey;
 use gx_core::sha256::to_hex;
 use gx_worker::{BlobKind, ComputeJob};
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,6 +93,7 @@ impl HubClient {
             build: BuildDescription {
                 build_id: String::new(),
                 layers: Vec::new(),
+                frame_records: BTreeMap::new(),
             },
             clock: Mutex::new(ClockSync::measure(
                 Clock {

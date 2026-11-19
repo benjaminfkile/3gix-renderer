@@ -7,10 +7,11 @@
 //! 1. checks the job's address against its inputs ([`ComputeJob::check_address`]),
 //! 2. gets the module by hash (the local cache, else [`Blobs`]), checks the
 //!    hash, and admits it once per session ([`ModuleRunner`]),
-//! 3. runs `gx_sources`, resolves the ids through the layer's manifest
+//! 3. runs `gx_sources` (for a version 2 module, `gx_inputs` first, and
+//!    both with the job's frame records, section 4.1), resolves the ids through the layer's manifest
 //!    (fetched and checked the same way), and gets every tile, checking
 //!    its length and hash,
-//! 4. runs `gx_compile` and validates the section by decoding it with the
+//! 4. runs `gx_compile` (version 2: with the frame records as inputs) and validates the section by decoding it with the
 //!    library decoder (the one validation the section gets on its way in,
 //!    `rendering.md` section 3.5),
 //! 5. hands the bytes and the decoded section to the caller at once, stores them in the local cache
@@ -283,7 +284,21 @@ impl ModuleRunner {
             get_blob(BlobKind::Module, &job.module, blobs, cache, &self.flights)
         })?;
         self.stats.module_run();
-        let ids = module.sources(&job.request).map_err(host_error)?;
+        let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
+        let v2 = module.abi_version() >= 2;
+        if v2 {
+            check_input_list(&module.inputs(&job.request, &frames).map_err(host_error)?)?;
+        } else if !frames.is_empty() {
+            return Err(WorkerError::permanent(
+                "frame records given to a version 1 module, which reads none",
+            ));
+        }
+        let ids = if v2 {
+            module.sources_v2(&job.request, &frames)
+        } else {
+            module.sources(&job.request)
+        }
+        .map_err(host_error)?;
         let manifest = match &job.manifest {
             Some(h) if !ids.is_empty() => Some(self.manifest(h, blobs, cache)?),
             _ => None,
@@ -308,12 +323,31 @@ impl ModuleRunner {
             tiles.push((r.id, bytes.as_ref().clone()));
         }
         self.stats.module_run();
-        let bytes = module.compile(&job.request, &tiles).map_err(host_error)?;
+        let bytes = if v2 {
+            module.compile_v2(&job.request, &tiles, &frames)
+        } else {
+            module.compile(&job.request, &tiles)
+        }
+        .map_err(host_error)?;
         let section = check_section(&job.request.key, &bytes)?;
         Ok(Computed {
             bytes: Arc::from(bytes),
             section: section.map(Arc::new),
         })
+    }
+}
+
+/// Fails for a non-empty `gx_inputs` list (`client-compute.md` section
+/// 4.1): the sections a version 2 module reads from its layer slots are
+/// not resolved by this worker yet, so it passes only the frames slots'
+/// records, which is right exactly when the list is empty.
+fn check_input_list(list: &[(u32, ChunkKey)]) -> Result<(), WorkerError> {
+    match list.first() {
+        None => Ok(()),
+        Some((slot, key)) => Err(WorkerError::permanent(format!(
+            "the module reads {} layer input sections (first: slot {slot}, key {key}), which this worker does not resolve",
+            list.len()
+        ))),
     }
 }
 
@@ -353,7 +387,7 @@ struct Queue {
 
 /// One piece of work taken by a thread.
 enum Work {
-    Compute(Task),
+    Compute(Box<Task>),
     Lower(Box<dyn FnOnce() + Send>),
 }
 
@@ -364,7 +398,7 @@ impl Queue {
         let mut state = self.state.lock().expect("job queue");
         loop {
             if let Some((_, task)) = state.computes.pop() {
-                return Some(Work::Compute(task));
+                return Some(Work::Compute(Box::new(task)));
             }
             for (_, source) in &state.lanes {
                 if let Some(work) = source.next() {
@@ -479,7 +513,7 @@ impl WorkerPool {
                     .spawn(move || {
                         while let Some(work) = queue.take() {
                             match work {
-                                Work::Compute(task) => run_task(&shared, task),
+                                Work::Compute(task) => run_task(&shared, *task),
                                 Work::Lower(work) => work(),
                             }
                         }

@@ -111,9 +111,11 @@ There is no browser in CI. CI verifies that the crate builds for
 build, and that `web/build.sh` produces the package. Node (V8) stands in
 for the browser's `WebAssembly`: `node scripts/worker-node-check.mjs` runs
 `web/module-runner.js`, then `web/module-worker.js` in a worker thread
-through its message protocol, against the core example module's
-conformance vectors (`testdata/example-module/`), and fails unless every
-section's SHA-256 matches. The native worker checks the same vectors
+through its message protocol, against the core example modules'
+conformance vectors (`testdata/example-module/` for ABI version 1,
+`testdata/example-module-v2/` for version 2, whose `gx_inputs`,
+`gx_sources`, and `gx_compile` take the frame and input buffers), and
+fails unless every input list and section's SHA-256 matches. The native worker checks the same vectors
 (`crates/worker/tests/determinism.rs`), so the two runtimes give
 byte-identical sections. `scripts/ci.sh` runs it. Running it is verified
 by hand on a desktop browser, against a hub:

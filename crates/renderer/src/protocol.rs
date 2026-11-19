@@ -15,8 +15,12 @@
 //! layer contributes a registry section, and [`frame_system_from_registries`]
 //! validates each, takes their union, and raises every frame's depth to the
 //! deepest any layer config declares for it (`space-model.md` section 8).
+//! [`check_frame_records`] checks the build's frame records against that
+//! union (`client-compute.md` section 10.2, `matter-format.md` section
+//! 11.4).
 
 use anyhow::{anyhow, bail, Result};
+use gx_core::frame_record;
 use gx_core::frames::FrameSystem;
 use gx_core::key::{ChunkKey, REGISTRY_KEY};
 use gx_core::module_io::ModuleRequest;
@@ -260,9 +264,40 @@ pub struct BuildDescription {
     pub build_id: String,
     /// The layers.
     pub layers: Vec<LayerConfig>,
+    /// The hash of every frame record the build computed
+    /// (`client-compute.md` section 10.2), by layer id, then frame id
+    /// (decimal), as lowercase hex.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frame_records: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl BuildDescription {
+    /// Every frame record the build lists, as `(frame id, hash)` in layer
+    /// id, then frame id order, each hash once. Fails for a frame id that
+    /// is not a decimal `u64` or a hash that is not 64 lowercase hex.
+    pub fn frame_record_hashes(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let mut out = Vec::new();
+        for (layer, frames) in &self.frame_records {
+            let mut ordered = Vec::with_capacity(frames.len());
+            for (frame, hash) in frames {
+                let id: u64 = frame
+                    .parse()
+                    .map_err(|_| anyhow!("frame record of layer {layer}: frame id {frame:?}"))?;
+                let h = parse_hash(hash).ok_or_else(|| {
+                    anyhow!("frame record of layer {layer}, frame {id}: hash {hash:?}")
+                })?;
+                ordered.push((id, h));
+            }
+            ordered.sort_unstable();
+            for r in ordered {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `true` when `layer` is directed for matter cells of `frame_id`:
     /// attached, and no exclusive layer of another id owns the frame
     /// (`space-model.md` section 8).
@@ -327,6 +362,8 @@ pub fn check_job(
             span_index,
             key,
         },
+        slots: Vec::new(),
+        frames: Vec::new(),
     })
 }
 
@@ -463,6 +500,8 @@ impl RawDirection {
                     span_index: self.span_index.unwrap_or(0),
                     key: *key,
                 },
+                slots: Vec::new(),
+                frames: Vec::new(),
             })
         };
         Ok(match self.state.as_str() {
@@ -569,6 +608,44 @@ pub fn status_problem(status: u16) -> Option<String> {
         403 => Some("the API key lacks the fetch:chunks capability (403 Forbidden)".into()),
         other => Some(format!("hub answered {other}")),
     }
+}
+
+/// Checks every frame record of the build (`matter-format.md` section
+/// 11.4): each validates under its frame's key (section 11.3), and each
+/// non-empty record of a frame in the union of the registries `sections`
+/// (as decoded, before any layer depth is applied) agrees with it bitwise
+/// ([`frame_record::agrees`]). `records` are `(frame id, bytes)`. Fails
+/// with the first record that does not, naming the frame and the field: the
+/// caller refuses the build.
+pub fn check_frame_records(sections: &[Arc<[u8]>], records: &[(u64, Arc<[u8]>)]) -> Result<()> {
+    let mut frames = BTreeMap::new();
+    for bytes in sections {
+        let r = registry::decode(bytes)
+            .map_err(|e| anyhow!("registry is invalid: code {}: {}", e.code, e.reason))?;
+        for f in r.frames() {
+            frames.entry(f.frame_id).or_insert(*f);
+        }
+    }
+    for (frame_id, bytes) in records {
+        let record = frame_record::validate(*frame_id, bytes)
+            .and_then(|()| frame_record::decode(bytes))
+            .map_err(|e| {
+                anyhow!(
+                    "frame record of frame {frame_id} is invalid: code {}: {}",
+                    e.code,
+                    e.reason
+                )
+            })?;
+        if record.empty {
+            continue;
+        }
+        if let Some(f) = frames.get(frame_id) {
+            frame_record::agrees(f, &record).map_err(|field| {
+                anyhow!("frame record of frame {frame_id} disagrees with the registry on {field}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Builds the frame system from every layer's registry section: validates
@@ -776,10 +853,29 @@ mod tests {
     }
 
     #[test]
+    fn frame_record_hashes_are_read_from_the_build() {
+        let h = "ab".repeat(32);
+        let b: BuildDescription = serde_json::from_str(&format!(
+            r#"{{"buildId":"b","layers":[],"frameRecords":{{"l":{{"9":"{h}","7":"{h}"}}}}}}"#
+        ))
+        .unwrap();
+        let hashes = b.frame_record_hashes().unwrap();
+        assert_eq!(
+            hashes,
+            vec![(7, parse_hash(&h).unwrap()), (9, parse_hash(&h).unwrap())]
+        );
+        let bad: BuildDescription =
+            serde_json::from_str(r#"{"buildId":"b","layers":[],"frameRecords":{"l":{"x":"00"}}}"#)
+                .unwrap();
+        assert!(bad.frame_record_hashes().is_err());
+    }
+
+    #[test]
     fn invalid_registry_is_a_clear_error() {
         let b = BuildDescription {
             build_id: "b".into(),
             layers: Vec::new(),
+            frame_records: BTreeMap::new(),
         };
         let e = frame_system_from_registries(&[Arc::from(&[1u8, 2, 3][..])], &b)
             .unwrap_err()

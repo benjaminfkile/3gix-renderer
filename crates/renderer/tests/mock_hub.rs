@@ -666,3 +666,77 @@ fn a_lying_section_is_replaced_by_the_computed_one_and_disputed() {
         b.fetcher.wait_for_events(Duration::from_millis(20));
     }
 }
+
+/// The frame record of `frame_id` in the test registry, its mass scaled by
+/// `mass_scale` (1 for the record that agrees).
+fn record(frame_id: u64, mass_scale: f64) -> Vec<u8> {
+    let r = common::registry();
+    let f = r
+        .frames()
+        .iter()
+        .find(|f| f.frame_id == frame_id)
+        .expect("a frame of the registry");
+    let mut rec = gx_core::frame_record::FrameRecord::from_registry_frame(f);
+    rec.mass = gx_core::units::Kilograms::new(rec.mass.value() * mass_scale + (mass_scale - 1.0));
+    gx_core::frame_record::encode(&rec)
+}
+
+/// Loads the registry of `hub` with a cache in `cache`, without unwrapping.
+fn load(
+    rt: &tokio::runtime::Runtime,
+    hub: &MockHub,
+    cache: Option<&PathBuf>,
+) -> anyhow::Result<FrameSystem> {
+    let client = rt
+        .block_on(HubClient::open(
+            Routes::new(&hub.url(), None, MOCK_SPACE_ID),
+            ApiKey::new(MOCK_API_KEY),
+            None,
+        ))
+        .expect("the mock hub answers");
+    let cache = cache.map(|d| Arc::new(gx_worker::DiskCache::open(d, 1 << 30).unwrap()));
+    let mut fetcher = Fetcher::new(
+        rt.handle().clone(),
+        Arc::new(client),
+        FetcherOptions {
+            cache,
+            worker_threads: 1,
+            ..FetcherOptions::default()
+        },
+    )
+    .unwrap();
+    fetcher.load_registry(Duration::from_secs(60))
+}
+
+#[test]
+fn frame_records_are_streamed_cached_and_checked_against_the_registry() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut options = space();
+    options.frame_records = vec![
+        ("frames".into(), common::ROOT, record(common::ROOT, 1.0)),
+        ("frames".into(), common::CHILD, record(common::CHILD, 1.0)),
+    ];
+    let hub = rt.block_on(MockHub::start(options)).unwrap();
+    let dir = cache_dir("frame-records");
+    load(&rt, &hub, Some(&dir)).expect("records that agree are accepted");
+    assert_eq!(hub.counts().frame_record_reads, 2);
+    load(&rt, &hub, Some(&dir)).expect("cached records are accepted");
+    assert_eq!(hub.counts().frame_record_reads, 2, "read from the cache");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_build_whose_frame_record_disagrees_with_the_registry_is_refused() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut options = space();
+    options.frame_records = vec![
+        ("frames".into(), common::ROOT, record(common::ROOT, 1.0)),
+        ("frames".into(), common::CHILD, record(common::CHILD, 2.0)),
+    ];
+    let hub = rt.block_on(MockHub::start(options)).unwrap();
+    let e = load(&rt, &hub, None).expect_err("the build is refused");
+    let e = format!("{e:#}");
+    assert!(e.contains("refusing the build"), "{e}");
+    assert!(e.contains(&format!("frame {}", common::CHILD)), "{e}");
+    assert!(e.contains("mass"), "{e}");
+}

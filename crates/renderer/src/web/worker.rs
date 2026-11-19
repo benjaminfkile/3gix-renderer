@@ -9,7 +9,9 @@
 //! module, the manifest, and the tiles by hash (the local cache first,
 //! [`super::cache::WebCache`]), encodes the request and the tiles with
 //! `gx-core` built for WebAssembly, validates the section, and hands it
-//! over before the upload starts.
+//! over before the upload starts. A version 2 module (section 4.1) gets
+//! the job's frame records in `gx_inputs`, `gx_sources`, and `gx_compile`;
+//! a version 1 module gets empty buffers and runs as before.
 //!
 //! The memory limit is enforced inside the Web Worker. The time limit
 //! ([`TIME_LIMIT_MS`], as natively) is enforced here: a call that runs over
@@ -229,23 +231,49 @@ impl ModuleWorker {
         Ok(())
     }
 
-    /// Runs `gx_sources`: the source id list bytes for `request`.
-    pub async fn sources(&self, hash: &[u8; 32], request: &[u8]) -> Result<Vec<u8>, WorkerError> {
-        let msg = Self::message("sources", hash);
+    /// Runs `gx_inputs` (`client-compute.md` section 4.1): the input list
+    /// bytes for `request` and the frame bytes `frames`. A version 1 module
+    /// reads no inputs: the empty list.
+    pub async fn inputs(
+        &self,
+        hash: &[u8; 32],
+        request: &[u8],
+        frames: &[u8],
+    ) -> Result<Vec<u8>, WorkerError> {
+        let msg = Self::message("inputs", hash);
         set(&msg, "request", &js_sys::Uint8Array::from(request));
+        set(&msg, "frames", &js_sys::Uint8Array::from(frames));
         self.call(msg).await
     }
 
-    /// Runs `gx_compile`: the section bytes for `request` and `tiles`.
+    /// Runs `gx_sources`: the source id list bytes for `request`, with the
+    /// frame bytes `frames` for a version 2 module (empty for version 1).
+    pub async fn sources(
+        &self,
+        hash: &[u8; 32],
+        request: &[u8],
+        frames: &[u8],
+    ) -> Result<Vec<u8>, WorkerError> {
+        let msg = Self::message("sources", hash);
+        set(&msg, "request", &js_sys::Uint8Array::from(request));
+        set(&msg, "frames", &js_sys::Uint8Array::from(frames));
+        self.call(msg).await
+    }
+
+    /// Runs `gx_compile`: the section bytes for `request` and `tiles`, with
+    /// the input bytes `inputs` for a version 2 module (empty for version
+    /// 1).
     pub async fn compile(
         &self,
         hash: &[u8; 32],
         request: &[u8],
         tiles: &[u8],
+        inputs: &[u8],
     ) -> Result<Vec<u8>, WorkerError> {
         let msg = Self::message("compile", hash);
         set(&msg, "request", &js_sys::Uint8Array::from(request));
         set(&msg, "tiles", &js_sys::Uint8Array::from(tiles));
+        set(&msg, "inputs", &js_sys::Uint8Array::from(inputs));
         self.call(msg).await
     }
 }
@@ -323,8 +351,25 @@ pub async fn run_job(
         stats.module_loaded();
     }
     let request = module_io::encode_request(&job.request);
+    // The frames slots' records (section 4.1); with no layer sections
+    // resolved here they are also the whole input buffer, which is right
+    // exactly when `gx_inputs` asks for nothing.
+    let frames: Vec<&[u8]> = job.frames.iter().map(|f| f.as_ref()).collect();
+    let frames = module_io::encode_inputs(&frames)
+        .map_err(|e| WorkerError::permanent(format!("encoding the frame records: {e}")))?;
     stats.module_run();
-    let ids = worker.sources(&job.module, &request).await?;
+    let list = worker.inputs(&job.module, &request, &frames).await?;
+    let list = module_io::decode_input_list(&list)
+        .map_err(|e| WorkerError::permanent(format!("gx_inputs output is invalid: {e}")))?;
+    if let Some(first) = list.first() {
+        return Err(WorkerError::permanent(format!(
+            "the module reads {} layer input sections (first: slot {}, key {}), which this worker does not resolve",
+            list.len(),
+            first.slot,
+            first.key
+        )));
+    }
+    let ids = worker.sources(&job.module, &request, &frames).await?;
     let ids = module_io::decode_source_ids(&ids)
         .map_err(|e| WorkerError::permanent(format!("gx_sources output is invalid: {e}")))?;
     let manifest = match &job.manifest {
@@ -345,7 +390,9 @@ pub async fn run_job(
     let tiles = module_io::encode_tiles(&tile_list)
         .map_err(|e| WorkerError::permanent(format!("encoding the tiles: {e}")))?;
     stats.module_run();
-    let bytes = worker.compile(&job.module, &request, &tiles).await?;
+    let bytes = worker
+        .compile(&job.module, &request, &tiles, &frames)
+        .await?;
     let section = check_section(&job.request.key, &bytes)?;
     Ok(Computed {
         bytes: std::sync::Arc::from(bytes),
