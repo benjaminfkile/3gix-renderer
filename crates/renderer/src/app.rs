@@ -510,6 +510,9 @@ pub fn render_headless_view(
     if let Some(f) = &fetcher {
         world.start_layers(f.client().build(), run.hide_layers.as_deref());
     }
+    if let Some(f) = fetcher.as_mut() {
+        f.set_hidden_layers(world.hidden_layers().clone());
+    }
     let start = Instant::now();
     let limit = run.wait_ready_seconds.unwrap_or(HEADLESS_STREAM_SECONDS);
     let done = |world: &World| match run.wait_ready_seconds {
@@ -659,7 +662,7 @@ pub fn run_headless(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
 
 /// The desktop run: a window, the frame loop, and the controls. Cells come
 /// through `fetcher`.
-pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> Result<()> {
+pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) -> Result<()> {
     let event_loop = EventLoop::new().context("opening the window system")?;
     // Wait, not Poll: each frame asks for the next redraw, so the loop
     // still runs continuously, but paced by the surface's present mode (one
@@ -681,6 +684,7 @@ pub fn run_windowed(config: &Config, system: FrameSystem, fetcher: Fetcher) -> R
                 fetcher.client().build(),
                 config.options.hide_layers.as_deref(),
             );
+            fetcher.set_hidden_layers(w.hidden_layers().clone());
             w
         },
         fetcher,
@@ -912,8 +916,12 @@ impl App {
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
         set_fetch_time(&mut self.fetcher, &self.sim);
-        self.world
-            .toggle_layers(&self.controls.take_layer_toggles());
+        if self
+            .world
+            .toggle_layers(&self.controls.take_layer_toggles())
+        {
+            (self.fetcher).set_hidden_layers(self.world.hidden_layers().clone());
+        }
         let draw = matter_step(&mut self.world, &mut self.fetcher, &seen, size, t);
         let mut scene = scene_with(&draw, &seen, size);
         scene.mesh_mode = self.controls.mesh_mode;

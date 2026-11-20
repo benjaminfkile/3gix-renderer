@@ -126,7 +126,7 @@ impl WebFetcher {
                 // only chooses which downloads to check.
                 let mut c = Coordinator::new();
                 c.set_overlay_layers(overlay_layers);
-                c.set_hidden_layers(hidden_layers);
+                c.set_hidden_layers(hidden_layers, 0.0);
                 c.set_check_seed((js_sys::Math::random() * (u64::MAX as f64)) as u64);
                 c
             },
@@ -215,6 +215,16 @@ impl WebFetcher {
     pub fn request_surface(&mut self, key: gx_core::key::SurfaceKey) {
         let now = self.now();
         self.coordinator.request(ChunkKey::Surface(key), now);
+    }
+
+    /// The hidden layers, by index (`rendering.md` section 7 item 7): a
+    /// hidden overlay is not fetched for drawing, and one shown again is
+    /// wanted at once for every wanted surface tile
+    /// ([`Coordinator::set_hidden_layers`]).
+    pub fn set_hidden_layers(&mut self, hidden: std::collections::BTreeSet<usize>) {
+        let now = self.now();
+        self.coordinator.set_hidden_layers(hidden, now);
+        self.pump();
     }
 
     /// Starts a request for the registry key.
@@ -629,7 +639,7 @@ impl WebFetcher {
         self.pump();
         while let Some((key, done, extent, round_trip)) = self.completed.pop_front() {
             let bytes = done.sections.iter().map(|s| s.len() as u64).sum();
-            let outcome = cell_from_arrived(&key, &done.sections, extent);
+            let outcome = cell_from_arrived(&key, &done.sections, &done.layers, extent);
             self.out.push(FetchEvent::Completed {
                 key,
                 outcome,

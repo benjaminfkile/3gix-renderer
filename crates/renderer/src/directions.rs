@@ -396,8 +396,36 @@ impl Coordinator {
 
     /// The hidden layers, by index (`rendering.md` section 7 item 7): a
     /// hidden overlay is not fetched for surface keys answered from now on.
-    pub fn set_hidden_layers(&mut self, layers: BTreeSet<usize>) {
+    /// An overlay shown again is wanted at once for every wanted surface
+    /// key, at that key's priority: a finished key starts again (its kept
+    /// answer is reused, so no directions are asked again), and a key in
+    /// flight takes up the overlay's slot again.
+    pub fn set_hidden_layers(&mut self, layers: BTreeSet<usize>, now: f64) {
+        let shown: Vec<usize> = (self.hidden_layers.difference(&layers))
+            .filter(|l| self.overlay_layers.contains(l))
+            .copied()
+            .collect();
         self.hidden_layers = layers;
+        if shown.is_empty() {
+            return;
+        }
+        let surfaces: Vec<ChunkKey> = (self.wanted.keys())
+            .filter(|k| matches!(k, ChunkKey::Surface(_)))
+            .copied()
+            .collect();
+        for k in surfaces {
+            if self.finished.remove(&k) {
+                self.start(k, now);
+            } else if let Some(entry) = self.keys.get_mut(&k) {
+                for &l in &shown {
+                    if let Some(slot) = entry.slots.get_mut(l) {
+                        if *slot == Slot::Empty {
+                            *slot = Slot::Unknown;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Seeds the random source that chooses which downloads to check.

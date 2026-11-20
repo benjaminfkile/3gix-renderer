@@ -501,6 +501,13 @@ fn frame_step_at_4096_cells() {
         least >= MAX_CELLS_PER_FRAME * 9 / 10 && most <= MAX_CELLS_PER_FRAME,
         "the view selects about 4096 cells ({least} to {most})"
     );
+    let cache = world.cache();
+    println!(
+        "budget: cell cache {} ready cells, composites {} bytes, with kept layer sections {} bytes",
+        cache.ready_cells().count(),
+        cache.composite_bytes(),
+        cache.sample_bytes()
+    );
     world.finish_extraction();
     println!(
         "budget: extraction per cell over {} cells: p50 {:.3} ms, p95 {:.3} ms",
