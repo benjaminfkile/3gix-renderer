@@ -218,7 +218,7 @@ pub fn camera() -> Camera {
     }
 }
 
-/// The gas frame of the full scene: a child of the root holding a cloud of
+/// The gas frame of the full scene: a child of the root holding a ball of
 /// warm gas at its origin. Mass 0, so it never leaves for the far field.
 pub const GAS: u64 = 3;
 /// Gas frame cube edge, meters.
@@ -226,9 +226,9 @@ pub const GAS_EXTENT: f64 = 8.0;
 /// Gas frame origin relative to the root, meters: up and to the left of
 /// the hot blob as the fixed camera sees it.
 pub const GAS_OFFSET: [f64; 3] = [-12.0, 6.0, 7.0];
-/// Radius of the gas cloud, meters.
+/// Radius of the gas ball, meters.
 pub const GAS_RADIUS: f64 = 3.0;
-/// Temperature of the gas cloud, kelvin.
+/// Temperature of the gas ball, kelvin.
 pub const GAS_TEMPERATURE: f64 = 4000.0;
 
 /// The registry of the full scene: the D2 frames plus the gas frame.
@@ -249,12 +249,12 @@ pub fn full_system() -> FrameSystem {
     FrameSystem::from_tree(FrameTree::from_registries(&[full_registry()]).expect("valid union"))
 }
 
-/// The gas cloud's cell.
+/// The gas ball's cell.
 pub fn gas_key() -> CellKey {
     CellKey::new(GAS, 0, 0, 0, 0).unwrap()
 }
 
-/// The gas cloud section: gas at 2500 K, extinction 0.5 per meter.
+/// The gas ball section: gas at 2500 K, extinction 0.5 per meter.
 pub fn gas_section() -> Section {
     blob(
         gas_key(),

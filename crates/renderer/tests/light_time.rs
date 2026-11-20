@@ -5,7 +5,7 @@
 //! - a frame one light-hour from the observer is drawn where it was an
 //!   hour earlier, both its position and its orientation, and its marker
 //!   sits there too;
-//! - a lit frame's day side faces where the emitter was one light-travel
+//! - a lit frame's lit side faces where the emitter was one light-travel
 //!   time before the lit frame is seen, not where the observer sees the
 //!   emitter;
 //! - the frame nearest the crosshair reports its light time;
@@ -224,7 +224,7 @@ fn the_day_side_faces_the_emitters_retarded_position() {
     assert!(angle(want, seen_dir) > 1e-3, "{}", angle(want, seen_dir));
     assert!(angle(want, now_dir) > 1e-3, "{}", angle(want, now_dir));
 
-    // The day side: a surface facing the retarded emitter takes the full
+    // The lit side: a surface facing the retarded emitter takes the full
     // irradiance, one facing the observer's emitter a little less, and
     // the side turned away none.
     let point = lit_root - observer;

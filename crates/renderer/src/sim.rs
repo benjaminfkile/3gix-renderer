@@ -66,12 +66,12 @@ pub const MAX_STEP_SECONDS: f64 = 600.0;
 /// of any two frames ([`max_step`]): about 1600 per circular orbit.
 pub const STEPS_PER_DYNAMICAL_TIME: f64 = 256.0;
 
-/// Simulated seconds between two checkpoints of the coarse history: one
-/// day.
+/// Simulated seconds between two checkpoints of the coarse history:
+/// 86 400 s.
 pub const CHECKPOINT_SECONDS: f64 = 86_400.0;
 
 /// The most checkpoints the coarse history holds before it thins itself
-/// (doubling its interval): 1024 days at one per day.
+/// (doubling its interval): 1024 intervals of 86 400 s.
 pub const CHECKPOINT_CAPACITY: usize = 1024;
 
 /// The most checkpoints the fine history holds.

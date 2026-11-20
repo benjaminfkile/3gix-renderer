@@ -1,5 +1,5 @@
 //! Headless render of matter: a solid blob lit by a hot blob beside it, and
-//! the full scene with a gas cloud added.
+//! the full scene with a gas ball added.
 //!
 //! The cells go through the same path as on the desktop (selection, the
 //! cell cache, decoding and compositing, extraction on the worker pool,
@@ -289,11 +289,11 @@ fn full_scene_draws_soft_glowing_volumes() {
     scene.lines.clear();
     assert_eq!(scene.surfaces.len(), 1);
     assert_eq!(scene.volumes.len(), 2);
-    // Back to front: the gas cloud is farther than the hot blob.
+    // Back to front: the gas ball is farther than the hot blob.
     assert_eq!(scene.volumes[0].grid.key, gas_key());
     assert_eq!(scene.volumes[1].grid.key, hot_key());
     assert!(scene.volumes[0].distance > scene.volumes[1].distance);
-    // Hot blob and gas cloud both emit light.
+    // Hot blob and gas ball both emit light.
     assert_eq!(scene.lights.len(), 2);
 
     let mut headless =
@@ -316,7 +316,7 @@ fn full_scene_draws_soft_glowing_volumes() {
     );
     let mut report = format!("image {WIDTH} x {HEIGHT}\n");
     let mut checks = Vec::new();
-    for (name, d) in [("hot blob", &hot), ("gas cloud", &gas)] {
+    for (name, d) in [("hot blob", &hot), ("gas ball", &gas)] {
         let y = d.y as u32;
         let cx = brightest_near(&first, d.x, y, 3);
         // Twice the radius: the partly filled samples on the boundary
