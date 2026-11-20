@@ -88,6 +88,7 @@ fn center_pixel_matches_the_cpu_integration() {
         frame_lights: BTreeMap::new(),
         sprites: Vec::new(),
         cell_weights: BTreeMap::new(),
+        tile_weights: BTreeMap::new(),
     };
     add_matter(&mut scene, &system, &camera, &draw);
     assert_eq!(scene.volumes.len(), 1);
@@ -205,6 +206,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
         frame_lights: BTreeMap::new(),
         sprites: Vec::new(),
         cell_weights: BTreeMap::new(),
+        tile_weights: BTreeMap::new(),
     };
     add_matter(&mut scene, &system, &camera, &draw);
     let mut headless = Headless::new(SIZE, SIZE, None).expect("a wgpu adapter, software is fine");

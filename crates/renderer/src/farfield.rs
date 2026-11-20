@@ -27,6 +27,15 @@
 //! In the transition the sprite is weighted by `(8 - px) / 6` and the
 //! frame's cells by the rest ([`sprite_weight`]).
 //!
+//! # Cell reach and surface tiles
+//!
+//! Cells are selected only within [`CELL_REACH_EXTENTS`] root extents of a
+//! frame's cube ([`cells_out_of_reach`]); beyond it a frame drawn by cells
+//! is a sprite only, whatever its size. That reach is a limit of cell
+//! selection only (`rendering.md` section 7 item 8): a frame with surface
+//! tiles is drawn from its tiles by the same table at any distance, its
+//! tiles taking the place of its cells ([`FarFrame::tile_weight`]).
+//!
 //! # Brightness
 //!
 //! The depth-0 cell of every frame that may need a sprite is fetched once
@@ -153,8 +162,11 @@ pub struct FarFrame {
     /// are out of reach).
     pub sprite_weight: f64,
     /// Its cells are beyond the selection's reach ([`cells_out_of_reach`]):
-    /// it is a sprite only, whatever its size.
+    /// its cells are not selected, whatever its size.
     pub out_of_reach: bool,
+    /// It is drawn from surface tiles: the reach does not apply to them,
+    /// and its sprite weight follows its projected size alone.
+    pub surface: bool,
 }
 
 impl FarFrame {
@@ -164,8 +176,19 @@ impl FarFrame {
         self.out_of_reach || self.projected_px < SPRITE_ONLY_BELOW_PX
     }
 
-    /// The weight its cells are drawn with: `1 - sprite_weight`.
+    /// The weight its cells are drawn with: `1 - sprite_weight`, 0 when
+    /// they are out of reach.
     pub fn cell_weight(&self) -> f64 {
+        if self.out_of_reach {
+            0.0
+        } else {
+            1.0 - self.sprite_weight
+        }
+    }
+
+    /// The weight its surface tiles are drawn with: `1 - sprite_weight`,
+    /// at any distance (`rendering.md` section 7 item 8).
+    pub fn tile_weight(&self) -> f64 {
         1.0 - self.sprite_weight
     }
 }
@@ -181,6 +204,22 @@ pub fn far_frames(
     view_height_px: f64,
     radius_of: impl Fn(u64) -> Option<f64>,
 ) -> Vec<FarFrame> {
+    far_frames_with_surfaces(system, camera, view_height_px, radius_of, |_| false)
+}
+
+/// [`far_frames`], with `has_surface` telling which frames are drawn from
+/// surface tiles. For those the reach of the cells does not force a
+/// sprite: their sprite weight is [`sprite_weight`] of their projected size
+/// at any distance, and an out of reach one larger than
+/// [`CELLS_ONLY_FROM_PX`] is listed with sprite weight 0 (its cells still
+/// out of reach, its tiles at weight 1).
+pub fn far_frames_with_surfaces(
+    system: &FrameSystem,
+    camera: &Camera,
+    view_height_px: f64,
+    radius_of: impl Fn(u64) -> Option<f64>,
+    has_surface: impl Fn(u64) -> bool,
+) -> Vec<FarFrame> {
     system
         .tree()
         .frames()
@@ -192,11 +231,17 @@ pub fn far_frames(
                 .unwrap_or_else(|| unknown_radius(f));
             let px = region_projected_px(system, camera, f, radius, view_height_px);
             let out_of_reach = cells_out_of_reach(system, camera, f);
+            let surface = has_surface(f.frame_id);
             (px < CELLS_ONLY_FROM_PX || out_of_reach).then(|| FarFrame {
                 frame_id: f.frame_id,
                 projected_px: px,
-                sprite_weight: if out_of_reach { 1.0 } else { sprite_weight(px) },
+                sprite_weight: if out_of_reach && !surface {
+                    1.0
+                } else {
+                    sprite_weight(px)
+                },
                 out_of_reach,
+                surface,
             })
         })
         .collect()
@@ -420,6 +465,7 @@ mod tests {
             projected_px: 1.5,
             sprite_weight: sprite_weight(1.5),
             out_of_reach: false,
+            surface: false,
         };
         assert!(f.sprite_only());
         assert_eq!(f.cell_weight(), 0.0);

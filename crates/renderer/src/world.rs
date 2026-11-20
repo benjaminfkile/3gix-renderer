@@ -35,7 +35,7 @@
 use crate::camera::Camera;
 use crate::clock::{now_seconds, StepTimes};
 use crate::extract::{CellInputs, ExtractPool, Extraction, SurfaceMesh};
-use crate::farfield::{depth_zero_key, far_frames, frame_sprite, Sprite};
+use crate::farfield::{depth_zero_key, far_frames_with_surfaces, frame_sprite, Sprite};
 use crate::light::{lights_for, merge_frame_emitters, strongest_lights, PointLight};
 use crate::seen::Seen;
 use crate::selector::{SelectJob, Selected, SelectionLayout, Selector};
@@ -94,9 +94,18 @@ pub struct DrawList {
     /// Weight of the cells of frames in the far field transition, by
     /// frame id; frames not listed draw their cells at weight 1.
     pub cell_weights: BTreeMap<u64, f32>,
+    /// Weight of the surface tiles of frames in the far field transition,
+    /// by frame id ([`crate::farfield::FarFrame::tile_weight`]); frames not
+    /// listed draw their tiles at weight 1.
+    pub tile_weights: BTreeMap<u64, f32>,
 }
 
 impl DrawList {
+    /// The weight the surface tiles of `frame_id` are drawn with.
+    pub fn tile_weight(&self, frame_id: u64) -> f32 {
+        self.tile_weights.get(&frame_id).copied().unwrap_or(1.0)
+    }
+
     /// The weight the cells of `frame_id` are drawn with.
     pub fn cell_weight(&self, frame_id: u64) -> f32 {
         self.cell_weights.get(&frame_id).copied().unwrap_or(1.0)
@@ -1018,13 +1027,22 @@ impl World {
     pub fn draw_list(&mut self, seen: &Seen, view_px: (u32, u32), now: f64) -> DrawList {
         let (system, camera) = (seen.system(), seen.camera());
         let view_height = f64::from(view_px.1.max(1));
-        let far = far_frames(system, camera, view_height, |f| {
-            crate::stream::depth_zero_radius(&self.cache, f)
-        });
+        let far = far_frames_with_surfaces(
+            system,
+            camera,
+            view_height,
+            |f| crate::stream::depth_zero_radius(&self.cache, f),
+            |f| self.surfaces.has_surface(f),
+        );
         let cell_weights: BTreeMap<u64, f32> = far
             .iter()
             .map(|f| (f.frame_id, f.cell_weight() as f32))
             .collect();
+        let tile_weights: BTreeMap<u64, f32> = far
+            .iter()
+            .map(|f| (f.frame_id, f.tile_weight() as f32))
+            .collect();
+        let tile_weight = |frame: u64| tile_weights.get(&frame).copied().unwrap_or(1.0);
         let weight = |frame: u64| cell_weights.get(&frame).copied().unwrap_or(1.0);
         self.update_shown();
         let (keys, shown_meshes) = match &self.shown {
@@ -1068,7 +1086,7 @@ impl World {
             .surfaces
             .drawn()
             .iter()
-            .filter(|t| weight(t.geometry.key.frame_id) > 0.0)
+            .filter(|t| tile_weight(t.geometry.key.frame_id) > 0.0)
             .cloned()
             .collect();
         for t in &tiles {
@@ -1096,6 +1114,7 @@ impl World {
             frame_lights,
             sprites,
             cell_weights,
+            tile_weights,
         }
     }
 

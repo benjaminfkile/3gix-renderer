@@ -135,9 +135,13 @@ the frame's cube, which its matter cannot exceed) is drawn as follows:
 Cells farther than `4 * root_extent` from the frame's cube are never
 selected (`gx_core::lod`), so beyond that a frame is a sprite only at full
 weight whatever its size (`farfield::cells_out_of_reach`); otherwise a
-large frame between that reach and 8 px would show nothing.
+large frame between that reach and 8 px would show nothing. That reach is
+a limit of cell selection only (`rendering.md` section 7 item 8): a frame
+with surface tiles is drawn from its tiles by the table above at any
+distance, its tiles in place of its cells with the same weights
+(`farfield::FarFrame::tile_weight`, `farfield::far_frames_with_surfaces`).
 
-The cells' weight multiplies the radiance of their surfaces and the glow
+The cells' weight (and the tiles' weight) multiplies the radiance of their surfaces and the glow
 and opacity of their volumes, so the sprite blends out as the depth-0 mesh
 or volume blends in.
 

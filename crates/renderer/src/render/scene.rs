@@ -377,7 +377,7 @@ pub fn add_matter(scene: &mut Scene, system: &FrameSystem, camera: &Camera, draw
             tile: tile.clone(),
             offset: to_f32(offset),
             rotation: frame_rotation(system, frame),
-            weight: draw.cell_weight(frame),
+            weight: draw.tile_weight(frame),
             lights,
         });
     }
