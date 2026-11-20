@@ -8,7 +8,8 @@
 //! The tile of the overlay module's frame is drawn as soon as its base
 //! arrives, with the overlays it has; the overlays that arrive later
 //! update its material, in layer order, and never its geometry. A hidden
-//! overlay is neither fetched nor composited.
+//! overlay is neither fetched nor composited; once shown it is fetched at
+//! once for the tiles drawn and drawn on them.
 
 mod common;
 
@@ -314,12 +315,46 @@ fn a_hidden_base_layer_gives_way_to_the_next() {
 }
 
 #[test]
-fn a_hidden_overlay_is_not_fetched() {
+fn a_hidden_overlay_is_not_fetched_until_shown() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let hub = rt.block_on(MockHub::start(space(false))).unwrap();
     let mut fetcher = connect(&rt, &hub);
     let mut surfaces = Surfaces::new();
+    surfaces.set_hidden_layers([3].into());
     let key = SurfaceKey::new(PAINTED, 2, 0, 0, 0).unwrap();
-    let steps = fetch(&mut fetcher, &mut surfaces, key);
-    assert_eq!(steps.last().unwrap(), &vec![2], "{steps:?}");
+    // A tile the selection draws, wanted at its priority.
+    fetcher.set_wanted_surfaces(vec![(key, 100.0)]);
+    let run = |fetcher: &mut Fetcher, surfaces: &mut Surfaces| {
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(120), "the tile hangs");
+            for e in fetcher.wait(Duration::from_millis(50)) {
+                if let FetchEvent::Surface {
+                    key: k,
+                    outcome,
+                    partial,
+                    ..
+                } = e
+                {
+                    let tile = outcome.expect("a valid tile");
+                    let layers: Vec<usize> = tile.overlays.iter().map(|(l, _)| *l).collect();
+                    surfaces.complete_layers(k, Ok(tile), partial);
+                    if !partial {
+                        return layers;
+                    }
+                }
+            }
+        }
+    };
+    // Not fetched while hidden.
+    assert_eq!(run(&mut fetcher, &mut surfaces), vec![2]);
+    let before = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
+    // Shown: fetched at once for the drawn key, and drawn on the tile
+    // already on screen.
+    fetcher.set_hidden_layers(Default::default());
+    surfaces.set_hidden_layers(Default::default());
+    assert_eq!(run(&mut fetcher, &mut surfaces), vec![2, 3]);
+    let after = surfaces.drawn_geometry(&key).unwrap();
+    assert_eq!(after.positions, before.positions);
+    assert_ne!(after.albedo, before.albedo, "the stain is drawn");
 }

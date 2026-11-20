@@ -496,9 +496,32 @@ impl World {
     /// other one (`rendering.md` section 7 item 7): a hidden overlay is not
     /// composited. A client starts with the build's
     /// [`crate::protocol::BuildDescription::initially_hidden_layers`].
+    ///
+    /// Every cached cell whose shown layers change is composited again
+    /// from its kept layer sections, with nothing fetched again, and
+    /// marked as arrived, so its mesh is extracted again off the frame
+    /// thread and its far-field values follow it.
     pub fn set_hidden_layers(&mut self, hidden: std::collections::BTreeSet<usize>) {
+        let old = self.surfaces.hidden_layers().clone();
         self.layer_view.hidden = hidden.clone();
-        self.surfaces.set_hidden_layers(hidden);
+        self.surfaces.set_hidden_layers(hidden.clone());
+        if old == hidden {
+            return;
+        }
+        let changed: Vec<(CellKey, Arc<crate::stream::ReadyCell>)> = (self.cache.ready_cells())
+            .filter(|(_, c)| c.shown_layers(&old) != c.shown_layers(&hidden))
+            .map(|(k, c)| (*k, Arc::clone(c)))
+            .collect();
+        for (key, cell) in changed {
+            match cell.with_hidden(&hidden) {
+                Ok(c) => {
+                    self.cache.replace_ready(&key, Arc::new(c));
+                    self.changes.push((key, self.cache.state(&key).cloned()));
+                    self.marks.push_back(Mark::Arrival(key));
+                }
+                Err(reason) => tracing::warn!(key = %key, "cell composite failed: {reason}"),
+            }
+        }
     }
 
     /// Starts the layer view for `build` (`rendering.md` section 7 item
@@ -518,13 +541,16 @@ impl World {
 
     /// Applies the layer chooser's toggles
     /// ([`crate::controls::Controls::take_layer_toggles`]); they take
-    /// effect on the next frame drawn.
-    pub fn toggle_layers(&mut self, toggles: &[usize]) {
+    /// effect on the next frame drawn. Returns `true` when the hidden set
+    /// changed, so the caller tells the fetcher.
+    pub fn toggle_layers(&mut self, toggles: &[usize]) -> bool {
         let mut view = self.layer_view.clone();
         if view.apply(toggles) {
             self.set_hidden_layers(view.hidden.clone());
             self.layer_view = view;
+            return true;
         }
+        false
     }
 
     /// The build's layers and which are hidden.
@@ -549,7 +575,20 @@ impl World {
 
     /// Applies a fetch result: the cell's state, and marks for the cells
     /// whose extraction inputs it can change.
+    /// A cell with a hidden layer is composited from its shown layers.
     pub fn complete(&mut self, key: CellKey, outcome: FetchOutcome, now: f64) {
+        let hidden = self.surfaces.hidden_layers();
+        let outcome = match outcome {
+            FetchOutcome::Decoded(Some(cell))
+                if cell.layers.iter().any(|(l, _)| hidden.contains(l)) =>
+            {
+                match cell.with_hidden(hidden) {
+                    Ok(c) => FetchOutcome::Decoded(Some(Arc::new(c))),
+                    Err(reason) => FetchOutcome::Invalid(reason),
+                }
+            }
+            o => o,
+        };
         self.cache.complete(key, outcome, now);
         self.changes.push((key, self.cache.state(&key).cloned()));
         self.arrived_since_selection = true;
@@ -1223,6 +1262,39 @@ mod tests {
         .unwrap();
         let ready = ReadyCell::new(section);
         (key, FetchOutcome::Decoded(Some(Arc::new(ready))))
+    }
+
+    #[test]
+    fn a_hidden_plain_layer_is_composited_out_without_a_fetch() {
+        let section = |o: FetchOutcome| match o {
+            FetchOutcome::Decoded(Some(c)) => Arc::clone(&c.section),
+            _ => panic!("a cell"),
+        };
+        let (key, low) = cell(0, 0, 0, |p| p[2] < -4.0);
+        let (_, high) = cell(0, 0, 0, |p| p[2] > -4.0);
+        let both = crate::stream::cell_from_sections(
+            &key,
+            &[section(low), section(high)],
+            &[1, 2],
+            Meters::new(16.0),
+        );
+        let mut w = World::new(1);
+        w.complete(key, both, 0.0);
+        let drawn = |w: &World| match w.cache().state(&key) {
+            Some(CellState::Ready(c)) => Arc::clone(c),
+            s => panic!("{s:?}"),
+        };
+        let full = drawn(&w);
+        w.set_hidden_layers([2].into());
+        let low_only = drawn(&w);
+        assert_ne!(low_only.section, full.section);
+        assert_eq!(low_only.layers, full.layers);
+        assert_eq!(w.cache().counts().in_flight, 0, "nothing is fetched");
+        w.set_hidden_layers([1, 2].into());
+        assert!(!drawn(&w).has_matter);
+        w.set_hidden_layers(Default::default());
+        assert_eq!(drawn(&w).section, full.section);
+        assert_eq!(drawn(&w).mean_albedo, full.mean_albedo);
     }
 
     #[test]

@@ -430,8 +430,15 @@ fn crossing(m: u8) -> bool {
 /// A fetched and composited cell.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadyCell {
-    /// The composite of every layer's section for the cell.
+    /// The composite of the shown layers' sections for the cell.
     pub section: Arc<Section>,
+    /// Every non-empty layer's decoded section, with its layer index, in
+    /// layer order, kept so the cell can be composited again from the shown
+    /// layers when the hidden set changes (`rendering.md` section 7 item
+    /// 7) without fetching anything. A cell with one layer shares that
+    /// section with [`ReadyCell::section`]. Empty for a cell built from a
+    /// composite alone ([`ReadyCell::new`]).
+    pub layers: Vec<(usize, Arc<Section>)>,
     /// The light escaping the cell's matter as one emitter, if any
     /// ([`crate::light::cell_emitter`]). Computed for depth-0 cells only,
     /// the ones that hold a frame's whole matter and so the only ones
@@ -467,6 +474,11 @@ impl ReadyCell {
     /// its emitter, its volume, its mean albedo, whether it and its
     /// descendants are refinable. Runs off the frame thread.
     pub fn new(section: Section) -> ReadyCell {
+        ReadyCell::from_section(Arc::new(section))
+    }
+
+    /// [`ReadyCell::new`] for a section already shared.
+    pub fn from_section(section: Arc<Section>) -> ReadyCell {
         let volume = VolumeGrid::from_section(&section).map(Arc::new);
         let n = usize::from(section.resolution());
         let refinable = section.samples().is_some_and(|s| {
@@ -493,8 +505,59 @@ impl ReadyCell {
                 .is_some_and(|s| (0..s.len()).any(|i| s.density(i).value() > 0.0)),
             refinable,
             ahead: AheadBits::of(&section),
-            section: Arc::new(section),
+            layers: Vec::new(),
+            section,
         }
+    }
+
+    /// The layers this cell's composite is made of under `hidden`: its
+    /// layers not in `hidden`, by index.
+    pub fn shown_layers(&self, hidden: &BTreeSet<usize>) -> Vec<usize> {
+        (self.layers.iter())
+            .map(|(l, _)| *l)
+            .filter(|l| !hidden.contains(l))
+            .collect()
+    }
+
+    /// The cell composited again from its layers not in `hidden`
+    /// (`rendering.md` section 7 item 7), keeping every layer. With every
+    /// layer hidden it holds an empty section and no matter.
+    pub fn with_hidden(&self, hidden: &BTreeSet<usize>) -> Result<ReadyCell, String> {
+        let shown: Vec<&Section> = (self.layers.iter())
+            .filter(|(l, _)| !hidden.contains(l))
+            .map(|(_, s)| s.as_ref())
+            .collect();
+        let section = match shown.as_slice() {
+            [] => {
+                let s = &self.section;
+                Arc::new(
+                    Section::empty(s.key(), s.origin(), s.edge())
+                        .map_err(|e| format!("code {}: {}", e.code, e.reason))?,
+                )
+            }
+            [_] => (self.layers.iter())
+                .find(|(l, _)| !hidden.contains(l))
+                .map(|(_, s)| Arc::clone(s))
+                .expect("one shown layer"),
+            many => {
+                Arc::new(composite(many).map_err(|e| format!("code {}: {}", e.code, e.reason))?)
+            }
+        };
+        let mut cell = ReadyCell::from_section(section);
+        cell.layers = self.layers.clone();
+        Ok(cell)
+    }
+
+    /// Bytes held by the cell's decoded samples: its composite and every
+    /// layer's section not shared with it, at [`SAMPLE_BYTES`] per sample.
+    pub fn sample_bytes(&self) -> usize {
+        let len = |s: &Section| s.samples().map_or(0, |v| v.len());
+        let own = len(&self.section);
+        let layers: usize = (self.layers.iter())
+            .filter(|(_, s)| !Arc::ptr_eq(s, &self.section))
+            .map(|(_, s)| len(s))
+            .sum();
+        (own + layers) * SAMPLE_BYTES
     }
 
     /// What the far field needs from the cell.
@@ -506,6 +569,11 @@ impl ReadyCell {
         }
     }
 }
+
+/// Bytes one decoded sample takes in memory: density, state, temperature,
+/// three albedo channels, roughness, attenuation, radiating temperature,
+/// and occupancy (eight 4-byte values and one byte).
+pub const SAMPLE_BYTES: usize = 37;
 
 /// Where a cell is in its fetch.
 #[derive(Clone, Debug, PartialEq)]
@@ -569,13 +637,21 @@ pub fn decode_cell<S: AsRef<[u8]>>(
             }
         }
     }
-    cell_from_sections(key, &decoded, root_extent)
+    let layers: Vec<usize> = (0..decoded.len()).collect();
+    cell_from_sections(key, &decoded, &layers, root_extent)
 }
 
 /// The cell from every layer's arrived section: the decoded section where
 /// the stream or the worker decoded it on the way in, else decoded here.
 /// Each section is validated once (`rendering.md` 3.5).
-pub fn cell_from_arrived(key: &CellKey, sections: &[Arrived], root_extent: Meters) -> FetchOutcome {
+/// `layers` gives each section's layer index in the build, parallel to
+/// `sections`.
+pub fn cell_from_arrived(
+    key: &CellKey,
+    sections: &[Arrived],
+    layers: &[usize],
+    root_extent: Meters,
+) -> FetchOutcome {
     let mut decoded = Vec::with_capacity(sections.len());
     for (i, a) in sections.iter().enumerate() {
         match &a.decoded {
@@ -594,16 +670,19 @@ pub fn cell_from_arrived(key: &CellKey, sections: &[Arrived], root_extent: Meter
             },
         }
     }
-    cell_from_sections(key, &decoded, root_extent)
+    cell_from_sections(key, &decoded, layers, root_extent)
 }
 
 /// Checks each decoded section's geometry against the registry's
 /// `root_extent` (`matter-format.md` section 3.1) and composites them
 /// (section 3.5). The sections are the non-empty layers' in the build's
-/// layer order; none at all is a cell without matter.
+/// layer order, each with its layer index in `layers` (parallel); none at
+/// all is a cell without matter. The cell keeps every layer's section
+/// ([`ReadyCell::layers`]).
 pub fn cell_from_sections(
     key: &CellKey,
     decoded: &[Arc<Section>],
+    layers: &[usize],
     root_extent: Meters,
 ) -> FetchOutcome {
     let g = key.geometry(root_extent);
@@ -618,12 +697,26 @@ pub fn cell_from_sections(
     if decoded.is_empty() {
         return FetchOutcome::Decoded(None);
     }
-    let refs: Vec<&Section> = decoded.iter().map(|s| s.as_ref()).collect();
-    match composite(&refs) {
-        Ok(c) if c.is_empty() => FetchOutcome::Decoded(None),
-        Ok(c) => FetchOutcome::Decoded(Some(Arc::new(ReadyCell::new(c)))),
-        Err(e) => FetchOutcome::Invalid(format!("code {}: {}", e.code, e.reason)),
+    let kept: Vec<(usize, Arc<Section>)> = (decoded.iter().enumerate())
+        .map(|(i, s)| (layers.get(i).copied().unwrap_or(i), Arc::clone(s)))
+        .collect();
+    let section = if let [one] = decoded {
+        Arc::clone(one)
+    } else {
+        let refs: Vec<&Section> = decoded.iter().map(|s| s.as_ref()).collect();
+        match composite(&refs) {
+            Ok(c) => Arc::new(c),
+            Err(e) => return FetchOutcome::Invalid(format!("code {}: {}", e.code, e.reason)),
+        }
+    };
+    // A composite with no samples is a cell without matter, unless some
+    // layer holds samples a hidden layer could stop covering.
+    if section.is_empty() && kept.iter().all(|(_, s)| s.is_empty()) {
+        return FetchOutcome::Decoded(None);
     }
+    let mut cell = ReadyCell::from_section(section);
+    cell.layers = kept;
+    FetchOutcome::Decoded(Some(Arc::new(cell)))
 }
 
 /// The camera position in `frame_id`'s coordinates (relative to its
@@ -1601,6 +1694,39 @@ impl CellCache {
         e.last_used = now;
     }
 
+    /// Puts `cell` in place of `key`'s `Ready` cell, composited again
+    /// from its shown layers (`rendering.md` section 7 item 7). Does
+    /// nothing when `key` is not `Ready`.
+    pub fn replace_ready(&mut self, key: &CellKey, cell: Arc<ReadyCell>) {
+        if let Some(e) = self.entries.get_mut(key) {
+            if matches!(e.state, CellState::Ready(_)) {
+                e.state = CellState::Ready(cell);
+            }
+        }
+    }
+
+    /// The `Ready` cells, in key order.
+    pub fn ready_cells(&self) -> impl Iterator<Item = (&CellKey, &Arc<ReadyCell>)> {
+        self.entries.iter().filter_map(|(k, e)| match &e.state {
+            CellState::Ready(c) => Some((k, c)),
+            _ => None,
+        })
+    }
+
+    /// Bytes held by the cached cells' decoded samples
+    /// ([`ReadyCell::sample_bytes`]).
+    pub fn sample_bytes(&self) -> usize {
+        self.ready_cells().map(|(_, c)| c.sample_bytes()).sum()
+    }
+
+    /// Bytes held by the cached cells' composites alone, at
+    /// [`SAMPLE_BYTES`] per sample: what the cache held before cells kept
+    /// their layers' sections.
+    pub fn composite_bytes(&self) -> usize {
+        let len = |c: &ReadyCell| c.section.samples().map_or(0, |v| v.len());
+        self.ready_cells().map(|(_, c)| len(c)).sum::<usize>() * SAMPLE_BYTES
+    }
+
     /// Marks cells as used now (drawn as stand-ins), so eviction keeps them.
     pub fn touch(&mut self, keys: &[CellKey], now: f64) {
         for k in keys {
@@ -2316,7 +2442,7 @@ mod native {
             tracing::info!(threads = pool.size(), "worker started");
             let mut coordinator = Coordinator::new();
             coordinator.set_overlay_layers(client.build().overlay_layers());
-            coordinator.set_hidden_layers(client.build().initially_hidden_layers());
+            coordinator.set_hidden_layers(client.build().initially_hidden_layers(), 0.0);
             // Seeded once per run, never from an address: it only chooses
             // which downloads to check and never touches bytes.
             coordinator.set_check_seed(
@@ -2418,6 +2544,16 @@ mod native {
             let now = self.now();
             self.coordinator.set_wanted_surfaces(tiles, now);
             self.follow_wanted();
+        }
+
+        /// The hidden layers, by index (`rendering.md` section 7 item 7):
+        /// a hidden overlay is not fetched for drawing, and one shown again
+        /// is wanted at once for every wanted surface tile
+        /// ([`Coordinator::set_hidden_layers`]).
+        pub fn set_hidden_layers(&mut self, hidden: std::collections::BTreeSet<usize>) {
+            let now = self.now();
+            self.coordinator.set_hidden_layers(hidden, now);
+            self.pump();
         }
 
         /// Queues a request for a surface tile; the result arrives as
@@ -2637,7 +2773,8 @@ mod native {
                         let tx = self.tx.clone();
                         self.decoding += 1;
                         self.handle.spawn_blocking(move || {
-                            let outcome = cell_from_arrived(&key, &done.sections, extent);
+                            let outcome =
+                                cell_from_arrived(&key, &done.sections, &done.layers, extent);
                             let _ = tx.send(Internal::Event(FetchEvent::Completed {
                                 key,
                                 outcome,

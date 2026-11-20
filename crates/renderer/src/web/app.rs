@@ -190,7 +190,7 @@ impl WebApp {
     pub fn new(
         launch: crate::options::Launch,
         options: &crate::options::ViewOptions,
-        fetcher: WebFetcher,
+        mut fetcher: WebFetcher,
         canvas: web_sys::HtmlCanvasElement,
     ) -> WebApp {
         WebApp {
@@ -203,6 +203,7 @@ impl WebApp {
             world: {
                 let mut w = World::new(default_threads());
                 w.start_layers(fetcher.hub().build(), options.hide_layers.as_deref());
+                fetcher.set_hidden_layers(w.hidden_layers().clone());
                 w
             },
             fetcher,
@@ -278,8 +279,12 @@ impl WebApp {
         self.sim.prepare_light(&self.camera);
         let near = self.world.matter_distances(self.sim.system(), &self.camera);
         let seen = self.sim.seen_near(&self.camera, &near);
-        self.world
-            .toggle_layers(&self.controls.take_layer_toggles());
+        if self
+            .world
+            .toggle_layers(&self.controls.take_layer_toggles())
+        {
+            (self.fetcher).set_hidden_layers(self.world.hidden_layers().clone());
+        }
         let draw = matter_step(
             &mut self.world,
             &mut self.fetcher,

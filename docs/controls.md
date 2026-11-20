@@ -80,11 +80,14 @@ A toggle takes effect on the next frame (`rendering.md` section 7 item 7).
 A hidden overlay layer's material is not composited. A hidden plain
 layer's surface tiles are not drawn: where it gave a frame's base surface,
 the next non-empty surface tile in layer order is drawn, and where there is
-none the frame has no surface while it is hidden. Nothing computed changes,
-and input resolution is unaffected. An overlay hidden at start (by the
-build's `shown` or by `--hide-layers`) is not fetched for tiles requested
-while it is hidden, so tiles that arrived then show it only once they are
-fetched again.
+none the frame has no surface while it is hidden. A hidden plain layer's
+cells are not drawn either: each cached cell keeps every layer's decoded
+section and is composited again from the shown layers, with nothing
+fetched again, and its mesh and far-field values follow within a frame or
+two. Nothing computed changes, and input resolution is unaffected. An
+overlay hidden at start (by the build's `shown` or by `--hide-layers`) is
+not fetched while it is hidden; once shown it is wanted at once for every
+tile the view draws and drawn on them as it arrives.
 
 The layers hidden at start are the build's `shown: false` layers, or the
 ones listed by `--hide-layers <id,id,...>` instead (`hideLayers` in the
