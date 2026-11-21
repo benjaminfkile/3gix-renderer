@@ -2,7 +2,7 @@
 //! and 7, `matter-format.md` section 12, `client-compute.md` section 2.2).
 //!
 //! The space has the shared scene's registry layer (`frames`), a layer
-//! whose surface tiles are stored on the hub (`ground`), the core
+//! whose surface tiles are stored on the hub (`main`), the core
 //! library's example overlay module (`paint`, an overlay layer computed by
 //! the client), and a second overlay layer stored on the hub (`stain`).
 //! The tile of the overlay module's frame is drawn as soon as its base
@@ -38,7 +38,7 @@ const OVERLAY_MODULE: &[u8] = include_bytes!(concat!(
 const PAINTED: u64 = 7;
 
 /// A flat tile of `key` with a uniform material.
-fn ground(key: &SurfaceKey) -> Vec<u8> {
+fn base_tile(key: &SurfaceKey) -> Vec<u8> {
     let tile = SurfaceTile {
         key: *key,
         radius_equatorial: 6.0e6,
@@ -74,11 +74,11 @@ fn space(stain_shown: bool) -> MockHubOptions {
     MockHubOptions::new(space_layers(stain_shown), Vec::new())
 }
 
-/// The layers of [`space`]: the registry, the `ground` base, and the
+/// The layers of [`space`]: the registry, the `main` layer, and the
 /// `paint` and `stain` overlays.
 fn space_layers(stain_shown: bool) -> Vec<MockLayer> {
-    let mut base = stored_layer("ground", 4, SectionMaker(Arc::new(|_| Vec::new())));
-    base.stored_surfaces = Some(SurfaceMaker(Arc::new(ground)));
+    let mut base = stored_layer("main", 4, SectionMaker(Arc::new(|_| Vec::new())));
+    base.stored_surfaces = Some(SurfaceMaker(Arc::new(base_tile)));
     let paint = MockLayer {
         id: "paint".into(),
         module: OVERLAY_MODULE.to_vec(),
@@ -98,7 +98,7 @@ fn space_layers(stain_shown: bool) -> Vec<MockLayer> {
     let mut stain = stored_layer("stain", 4, SectionMaker(Arc::new(|_| Vec::new())));
     stain.overlay = true;
     // A custom section (`stain`) makes the module, and so every address of
-    // the layer, differ from `ground`'s.
+    // the layer, differ from `main`'s.
     stain
         .module
         .extend_from_slice(&[0, 6, 5, b's', b't', b'a', b'i', b'n']);
@@ -176,7 +176,7 @@ fn fetch(fetcher: &mut Fetcher, surfaces: &mut Surfaces, key: SurfaceKey) -> Vec
 /// The base and the two overlays of `key`, made as the hub makes them.
 fn expected(key: &SurfaceKey) -> (renderer::tiles::TileGeometry, OverlayTile, OverlayTile) {
     let decoded: DecodedTile =
-        renderer::tiles::decode_tile(key, &[ground(key)], &[1], &Default::default()).unwrap();
+        renderer::tiles::decode_tile(key, &[base_tile(key)], &[1], &Default::default()).unwrap();
     let base = Arc::unwrap_or_clone(decoded.base().cloned().unwrap());
     let paint = gx_module_overlay_tile(key);
     (base, paint, stain_tile(key))
@@ -251,14 +251,15 @@ fn overlays_draw_in_layer_order_as_they_arrive() {
 
 #[test]
 fn a_hidden_base_layer_gives_way_to_the_next() {
-    // A second plain layer with a surface: `rock`, layer 3 (the build
+    // A second plain layer with a surface: `second`, layer 3 (the build
     // orders layers by id).
     let mut layers = space_layers(true);
-    let mut rock = stored_layer("rock", 4, SectionMaker(Arc::new(|_| Vec::new())));
-    rock.module
-        .extend_from_slice(&[0, 5, 4, b'r', b'o', b'c', b'k']);
-    rock.stored_surfaces = Some(SurfaceMaker(Arc::new(ground)));
-    layers.push(rock);
+    let mut second = stored_layer("second", 4, SectionMaker(Arc::new(|_| Vec::new())));
+    second
+        .module
+        .extend_from_slice(&[0, 5, 4, b'a', b'l', b't', b'2']);
+    second.stored_surfaces = Some(SurfaceMaker(Arc::new(base_tile)));
+    layers.push(second);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let hub = rt
         .block_on(MockHub::start(MockHubOptions::new(layers, Vec::new())))
@@ -293,11 +294,11 @@ fn a_hidden_base_layer_gives_way_to_the_next() {
     assert!(surfaces.has_surface(PAINTED));
     let shown = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
 
-    // Hiding `ground` draws `rock`'s tile, with the overlays over it.
+    // Hiding `main` draws `second`'s tile, with the overlays over it.
     surfaces.set_hidden_layers([1].into());
-    let rock = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
-    assert!(!Arc::ptr_eq(&rock, &shown));
-    assert_eq!(rock.positions, shown.positions);
+    let second = Arc::clone(surfaces.drawn_geometry(&key).unwrap());
+    assert!(!Arc::ptr_eq(&second, &shown));
+    assert_eq!(second.positions, shown.positions);
     assert!(surfaces.has_surface(PAINTED));
 
     // Hiding both bases draws no tile: the frame has no surface, and its
@@ -306,7 +307,7 @@ fn a_hidden_base_layer_gives_way_to_the_next() {
     assert!(surfaces.drawn_geometry(&key).is_none());
     assert!(!surfaces.has_surface(PAINTED));
 
-    // Showing them again draws `ground` with its overlays as before.
+    // Showing them again draws `main` with its overlays as before.
     surfaces.set_hidden_layers(Default::default());
     let again = surfaces.drawn_geometry(&key).unwrap();
     assert_eq!(again.albedo, shown.albedo);

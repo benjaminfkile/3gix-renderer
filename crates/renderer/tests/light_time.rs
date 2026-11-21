@@ -232,9 +232,9 @@ fn the_day_side_faces_the_emitters_retarded_position() {
     let toward = want.normalized().unwrap();
     let full = irradiance([1.0e26; 3], light_at, point, toward)[1];
     let off = irradiance([1.0e26; 3], light_at, point, seen_dir.normalized().unwrap())[1];
-    let night = irradiance([1.0e26; 3], light_at, point, toward.scale(-1.0))[1];
+    let unlit = irradiance([1.0e26; 3], light_at, point, toward.scale(-1.0))[1];
     assert!(full > off && off > 0.0, "{full} {off}");
-    assert_eq!(night, 0.0);
+    assert_eq!(unlit, 0.0);
 
     // Without light time there is no shift.
     let instant = Seen::instant(sim.system(), &camera);

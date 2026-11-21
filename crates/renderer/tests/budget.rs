@@ -107,13 +107,13 @@ impl Shape {
                 r.hypot(q.z) - 0.06 * EXTENT
             }
             Shape::Overhang => {
-                let ground = q.z + 0.2 * EXTENT;
+                let floor = q.z + 0.2 * EXTENT;
                 let slab = boxed(q - Vec3::new(0.0, 0.0, 0.08 * EXTENT), [0.3, 0.3, 0.035]);
                 let pillar = boxed(
                     q - Vec3::new(-0.2 * EXTENT, 0.0, -0.06 * EXTENT),
                     [0.05, 0.05, 0.15],
                 );
-                ground.min(slab).min(pillar)
+                floor.min(slab).min(pillar)
             }
         }
     }

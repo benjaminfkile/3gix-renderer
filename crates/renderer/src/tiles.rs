@@ -995,16 +995,17 @@ mod tests {
             gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
         let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
-        let north = unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
+        let up_tangent =
+            unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
         let mut s = Surfaces::new();
-        let first = settle(&mut s, cam, north, 11);
+        let first = settle(&mut s, cam, up_tangent, 11);
         let keys =
             |d: &[TileDrawInfo]| -> Vec<SurfaceKey> { d.iter().map(|t| t.geometry.key).collect() };
         let want = keys(&first);
         for round in 0..6 {
             s.evict(0);
             let mut drawn = Vec::new();
-            s.select_in_frame(4, cam, north, focal_px(720.0), 0.9, &mut drawn);
+            s.select_in_frame(4, cam, up_tangent, focal_px(720.0), 0.9, &mut drawn);
             assert_eq!(keys(&drawn), want, "round {round}: what is drawn changed");
             // Serve whatever was asked for again, as the hub would.
             for key in s.take_requests() {
@@ -1020,8 +1021,8 @@ mod tests {
 
     #[test]
     fn hiding_follows_the_declared_floor() {
-        // The same relief, low camera looking level: with the floor the
-        // compiler declares (just under the relief) tiles past the horizon
+        // The same heights, low camera looking level: with the floor the
+        // compiler declares (just under the heights) tiles past the horizon
         // are hidden; declared far deeper, the occluding ball shrinks and
         // they are not. Nothing but the declared value differs.
         let (a, c) = (6_378_137.0, 6_356_752.3);
@@ -1029,9 +1030,10 @@ mod tests {
             gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
         let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
-        let north = unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
-        let shallow = settle_with_floor(&mut Surfaces::new(), cam, north, 9, -400.0);
-        let deep = settle_with_floor(&mut Surfaces::new(), cam, north, 9, -3.0e6);
+        let up_tangent =
+            unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
+        let shallow = settle_with_floor(&mut Surfaces::new(), cam, up_tangent, 9, -400.0);
+        let deep = settle_with_floor(&mut Surfaces::new(), cam, up_tangent, 9, -3.0e6);
         assert!(
             deep.len() > shallow.len(),
             "{} tiles with a deep floor, {} with the declared one",
@@ -1173,7 +1175,7 @@ mod tests {
     }
 
     /// The seam proof for surface tiles (`rendering.md` 7): from cameras
-    /// along a low flight over rough synthetic relief, every boundary
+    /// along a low flight over rough synthetic heights, every boundary
     /// vertex of every drawn tile, morphed as the GPU morphs it, lies on the
     /// boundary of another drawn tile (within a tenth of a millimeter), so
     /// tiles meet with no gap, whatever their levels.
@@ -1207,8 +1209,8 @@ mod tests {
             );
             let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
             let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 3000.0 * nrm[k]);
-            let east = unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from);
-            let forward: [f64; 3] = core::array::from_fn(|k| 0.9 * east[k] - 0.42 * nrm[k]);
+            let tangent = unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from);
+            let forward: [f64; 3] = core::array::from_fn(|k| 0.9 * tangent[k] - 0.42 * nrm[k]);
             let drawn = settle_full(&mut s, cam, forward, 11, -400.0, focal);
             assert!(drawn.len() > 20, "{} tiles drawn", drawn.len());
             let placed: Vec<Vec<[f64; 3]>> = drawn.iter().map(|t| morphed(t, cam)).collect();

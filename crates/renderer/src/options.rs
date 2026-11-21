@@ -321,10 +321,10 @@ mod tests {
 
     #[test]
     fn hide_layers_overrides_the_shown_defaults() {
-        let o = ViewOptions::from_camel_pairs([("hideLayers", " ground , ,stain,nope")]).unwrap();
+        let o = ViewOptions::from_camel_pairs([("hideLayers", " base , ,stain,nope")]).unwrap();
         let hide = o.hide_layers.clone().unwrap();
-        assert_eq!(hide, ["ground", "stain", "nope"]);
-        let ids = ["ground", "stain", "haze"];
+        assert_eq!(hide, ["base", "stain", "nope"]);
+        let ids = ["base", "stain", "haze"];
         let (hidden, unknown) = hidden_layer_indices(&ids, Some(&hide), [2].into());
         assert_eq!(hidden, [0, 1].into());
         assert_eq!(unknown, ["nope"]);

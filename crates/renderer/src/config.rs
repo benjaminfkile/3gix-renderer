@@ -749,11 +749,11 @@ mod tests {
 
     #[test]
     fn hide_layers_flag() {
-        let flags = parse_flags(["--hide-layers", "ground,stain"]).unwrap();
+        let flags = parse_flags(["--hide-layers", "base,stain"]).unwrap();
         let c = Config::resolve(&base_env(), &flags).unwrap();
         assert_eq!(
             c.options.hide_layers.as_deref(),
-            Some(&["ground".to_string(), "stain".to_string()][..])
+            Some(&["base".to_string(), "stain".to_string()][..])
         );
         let c = Config::resolve(&base_env(), &parse_flags(["--hide-layers="]).unwrap()).unwrap();
         assert_eq!(c.options.hide_layers, Some(Vec::new()));

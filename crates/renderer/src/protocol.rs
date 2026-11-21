@@ -257,7 +257,7 @@ pub struct LayerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputSlot>,
     /// The layer is a surface overlay (`client-compute.md` section 2.2,
-    /// `matter-format.md` section 12): it gives the ground's material only.
+    /// `matter-format.md` section 12): it gives the surface's material only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlay: bool,
     /// Whether clients start with the layer drawn (`client-compute.md`

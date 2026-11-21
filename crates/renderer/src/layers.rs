@@ -106,7 +106,7 @@ mod tests {
     use super::*;
 
     fn view() -> LayerView {
-        LayerView::new(vec!["ground".into(), "stain".into()], [1].into())
+        LayerView::new(vec!["base".into(), "stain".into()], [1].into())
     }
 
     #[test]
@@ -114,12 +114,12 @@ mod tests {
         let mut v = view();
         assert_eq!(
             v.chooser_line(),
-            "layers: 1:ground shown  2:stain hidden  (L closes)"
+            "layers: 1:base shown  2:stain hidden  (L closes)"
         );
         assert_eq!(v.hidden_line().as_deref(), Some("hidden layers: stain"));
         assert!(v.apply(&[1, 0]));
         assert_eq!(v.hidden, [0].into());
-        assert_eq!(v.hidden_line().as_deref(), Some("hidden layers: ground"));
+        assert_eq!(v.hidden_line().as_deref(), Some("hidden layers: base"));
         assert!(!v.apply(&[5]));
         assert!(v.apply(&[0]));
         assert_eq!(v.hidden_line(), None);

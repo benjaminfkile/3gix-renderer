@@ -71,10 +71,10 @@ is open every other key waits.
 
 `L` lists the build's layers in layer order with their number keys and
 whether each is shown or hidden, on the overlay's last line:
-`layers: 1:frames shown  2:ground hidden`. The chooser stays open while
+`layers: 1:frames shown  2:base hidden`. The chooser stays open while
 layers are toggled, and `L` closes it (`G` opens the spawn chooser
 instead). While any layer is hidden, an overlay line names them:
-`hidden layers: ground`.
+`hidden layers: base`.
 
 A toggle takes effect on the next frame (`rendering.md` section 7 item 7).
 A hidden overlay layer's material is not composited. A hidden plain
@@ -111,7 +111,7 @@ on that line, looking level. As finer cells arrive (for up to 20 s, until
 you fly) the point is found again with them.
 
 A spawned camera is attached to its frame: it moves and turns with it, so
-the ground stays under it, and the flight keys fly it relative to the
+the surface stays under it, and the flight keys fly it relative to the
 frame. Nothing else acts on it: no gravity, no collision, it flies through
 matter like the free camera. The overlay says `camera on frame <id>`.
 `Home` or a number-key view frees it, and it floats free in space again.
