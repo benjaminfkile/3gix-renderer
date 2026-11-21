@@ -2647,6 +2647,11 @@ mod native {
             {
                 self.asked_at.remove(key);
             }
+            // A partial completion draws the tile: its waiting jobs go before
+            // every job with nothing drawn (`rendering.md` section 7 item 6).
+            if matches!(&action, Action::Complete(c) if c.partial) {
+                self.follow_wanted();
+            }
             match action {
                 Action::Directions(keys) => {
                     let t = directions_time(
@@ -2792,7 +2797,8 @@ mod native {
                             let sections: Vec<Arc<[u8]>> =
                                 done.sections.iter().map(|a| a.bytes.clone()).collect();
                             let outcome =
-                                crate::tiles::decode_tile(&key, &sections, &done.layers, &overlays);
+                                crate::tiles::decode_tile(&key, &sections, &done.layers, &overlays)
+                                    .map(|d| d.waiting_on(done.waiting));
                             let _ = tx.send(Internal::Event(FetchEvent::Surface {
                                 key,
                                 outcome,

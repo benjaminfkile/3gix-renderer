@@ -66,7 +66,14 @@
 //!    ([`Coordinator::set_overlay_layers`], `rendering.md` section 7 item
 //!    6): it completes as soon as every other layer has its section, with
 //!    the overlays that have arrived, and completes again, with every
-//!    section so far, each time another overlay arrives.
+//!    section so far, each time another overlay arrives, listing the
+//!    overlays still to come ([`Completion::waiting`]). A permanent worker
+//!    failure of an overlay of a surface key is logged and the overlay is
+//!    not waited for: the key completes without it.
+//! 6. From its first partial completion until it completes, a surface
+//!    key's compute jobs go before every job of a key with nothing drawn
+//!    ([`drawn_first`], `rendering.md` section 7 item 6); the drivers give
+//!    the waiting jobs their new priorities on each partial completion.
 //!
 //! # Checks (`client-compute.md` sections 2.6, "On the client", and 2.8)
 //!
@@ -184,6 +191,10 @@ pub struct Completion {
     /// `true` while overlay layers of a surface key are still to come: the
     /// key stays in flight and completes again.
     pub partial: bool,
+    /// The overlay layers still to come, in layer order: empty unless
+    /// `partial`. A tile waits on these before it replaces its parent
+    /// (`rendering.md` section 7 item 6).
+    pub waiting: Vec<usize>,
     /// Session time, seconds, the key was requested.
     pub requested_at: f64,
 }
@@ -574,8 +585,17 @@ impl Coordinator {
     /// The priority a waiting compute job for `key` should have now, or
     /// `None` when the key is no longer wanted and the job is to be dropped
     /// before it starts (`client-compute.md` section 2.8).
+    /// A key whose surface tile is drawn and waits only on overlays (it
+    /// has had a partial completion) is raised above every key with
+    /// nothing drawn ([`drawn_first`], `rendering.md` section 7 item 6).
     pub fn compute_priority(&self, key: &ChunkKey) -> Option<f64> {
-        self.wanted.get(key).copied()
+        let p = self.wanted.get(key).copied()?;
+        Some(drawn_first(p, self.partly_done(key)))
+    }
+
+    /// Whether `key` has had a partial completion and is still in flight.
+    fn partly_done(&self, key: &ChunkKey) -> bool {
+        self.keys.get(key).is_some_and(|e| e.emitted > 0)
     }
 
     /// The kept directions answers, by key.
@@ -791,7 +811,10 @@ impl Coordinator {
             entry.slots = vec![Slot::Unknown; directions.len()];
         }
         let mut streams = Vec::new();
-        let priority = self.wanted.get(key).copied().unwrap_or(f64::NEG_INFINITY);
+        let priority = drawn_first(
+            self.wanted.get(key).copied().unwrap_or(f64::NEG_INFINITY),
+            entry.emitted > 0,
+        );
         for (layer, d) in directions.into_iter().enumerate() {
             let slot = &mut entry.slots[layer];
             // An answer already being acted on, or finished, stands.
@@ -934,6 +957,16 @@ impl Coordinator {
                     retry_at: now + backoff_seconds(entry.failures),
                 };
             }
+            Err(e)
+                if matches!(key, ChunkKey::Surface(_)) && self.overlay_layers.contains(&layer) =>
+            {
+                // A failed overlay is not waited for (`rendering.md`
+                // section 7 item 6): logged once, and the tile completes
+                // without it.
+                tracing::warn!(key = %key, layer, "overlay failed: {}", e.message);
+                *slot = Slot::Empty;
+                self.finish_if_done(key, &mut out);
+            }
             Err(e) => {
                 self.fail(key, e.message, &mut out);
             }
@@ -979,11 +1012,16 @@ impl Coordinator {
             if base_done && finished > e.emitted {
                 e.emitted = finished;
                 let (layers, sections) = done_sections(e.slots.iter().cloned());
+                let waiting = (e.slots.iter().enumerate())
+                    .filter(|(_, s)| !s.finished())
+                    .map(|(i, _)| i)
+                    .collect();
                 out.push(Action::Complete(Completion {
                     key: *key,
                     sections,
                     layers,
                     partial: true,
+                    waiting,
                     requested_at: e.requested_at,
                 }));
             }
@@ -998,8 +1036,34 @@ impl Coordinator {
             sections,
             layers,
             partial: false,
+            waiting: Vec::new(),
             requested_at: e.requested_at,
         }));
+    }
+}
+
+/// Projected sizes above this, pixels, are taken as this one when compute
+/// jobs are ordered ([`drawn_first`]): a tile this large on screen is as
+/// urgent as any larger one.
+pub const PRIORITY_CEILING: f64 = 1e12;
+
+/// The compute priority of a key at wanted priority `priority`
+/// (`rendering.md` section 7 item 6, `client-compute.md` section 2.8):
+/// a two-part order in one number. A key whose tile is drawn and waits
+/// only on overlays (`drawn`) goes before every key with nothing drawn;
+/// within each group the order is the projected size, capped at
+/// [`PRIORITY_CEILING`]. A requested key ([`REQUESTED_PRIORITY`]) and a
+/// key no longer wanted keep their infinite priorities. Only the order of
+/// work changes, never what is computed.
+pub fn drawn_first(priority: f64, drawn: bool) -> f64 {
+    if !priority.is_finite() {
+        return priority;
+    }
+    let p = priority.min(PRIORITY_CEILING);
+    if drawn {
+        p + 2.0 * PRIORITY_CEILING
+    } else {
+        p
     }
 }
 
@@ -1122,6 +1186,7 @@ mod tests {
         };
         assert!(early.partial);
         assert_eq!(early.layers, vec![0]);
+        assert_eq!(early.waiting, vec![1, 2]);
         assert_eq!(c.in_flight(), 1);
         let a = c.compute_done(&k, 2, [3; 32], Ok(computed(3)), 0.3);
         let [Action::Complete(more)] = &a[..] else {
@@ -1129,6 +1194,7 @@ mod tests {
         };
         assert!(more.partial);
         assert_eq!(more.layers, vec![0, 2]);
+        assert_eq!(more.waiting, vec![1]);
         let a = c.compute_done(&k, 1, [2; 32], Ok(computed(2)), 0.4);
         let [Action::Complete(all)] = &a[..] else {
             panic!("{a:?}")
@@ -1136,6 +1202,76 @@ mod tests {
         assert!(!all.partial);
         assert_eq!(all.layers, vec![0, 1, 2]);
         assert_eq!(c.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_drawn_partial_tile_computes_before_a_larger_undrawn_one() {
+        let mut c = Coordinator::new();
+        c.set_overlay_layers([1].into());
+        let a = SurfaceKey::new(1, 0, 0, 0, 0).unwrap();
+        let b = SurfaceKey::new(1, 1, 0, 0, 0).unwrap();
+        let (drawn, undrawn) = (ChunkKey::Surface(a), ChunkKey::Surface(b));
+        c.set_wanted_surfaces([(a, 1.0), (b, 100.0)], 0.0);
+        c.poll(0.0);
+        c.directions_done(
+            &[drawn, undrawn],
+            answer(vec![
+                (drawn, vec![ready("s", 1), compute("o", 2)]),
+                (undrawn, vec![compute("s", 3), compute("o", 4)]),
+            ]),
+            0.1,
+        );
+        c.poll(0.1);
+        assert!(c.compute_priority(&undrawn) > c.compute_priority(&drawn));
+        let done = c.stream_done(
+            &drawn,
+            0,
+            [1; 32],
+            [101; 32],
+            StreamResult::Bytes(bytes(1), Origin::Cache),
+            0.2,
+        );
+        assert!(done
+            .iter()
+            .any(|x| matches!(x, Action::Complete(d) if d.partial)));
+        let (p_drawn, p_undrawn) = (c.compute_priority(&drawn), c.compute_priority(&undrawn));
+        assert!(p_drawn > p_undrawn, "{p_drawn:?} {p_undrawn:?}");
+        // Within each group the order stays the projected size.
+        assert!(drawn_first(2.0, true) > drawn_first(1.0, true));
+        assert!(drawn_first(2.0, false) > drawn_first(1.0, false));
+        assert_eq!(drawn_first(REQUESTED_PRIORITY, false), REQUESTED_PRIORITY);
+        // Kept through a later change of the wanted set.
+        c.set_wanted_surfaces([(a, 1.0), (b, 1000.0)], 0.3);
+        assert!(c.compute_priority(&drawn) > c.compute_priority(&undrawn));
+    }
+
+    #[test]
+    fn a_failed_overlay_is_not_waited_for() {
+        let mut c = Coordinator::new();
+        c.set_overlay_layers([1].into());
+        let k = ChunkKey::Surface(SurfaceKey::new(1, 0, 0, 0, 0).unwrap());
+        c.request(k, 0.0);
+        c.poll(0.0);
+        c.directions_done(
+            &[k],
+            answer(vec![(k, vec![ready("s", 1), compute("o", 2)])]),
+            0.1,
+        );
+        c.poll(0.1);
+        c.stream_done(
+            &k,
+            0,
+            [1; 32],
+            [101; 32],
+            StreamResult::Bytes(bytes(1), Origin::Cache),
+            0.2,
+        );
+        let a = c.compute_done(&k, 1, [2; 32], Err(WorkerError::permanent("trap")), 0.3);
+        let [Action::Complete(done)] = &a[..] else {
+            panic!("{a:?}")
+        };
+        assert!(!done.partial);
+        assert_eq!(done.layers, vec![0]);
     }
 
     #[test]
@@ -1226,6 +1362,7 @@ mod tests {
                 sections: vec![bytes(1), bytes(3)],
                 layers: vec![0, 2],
                 partial: false,
+                waiting: Vec::new(),
                 requested_at: 0.0
             })]
         );

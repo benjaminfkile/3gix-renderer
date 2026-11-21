@@ -260,6 +260,12 @@ pub struct LayerConfig {
     /// `matter-format.md` section 12): it gives the surface's material only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlay: bool,
+    /// Tiles do not replace their parent until this overlay has arrived
+    /// or failed (`client-compute.md` section 2.2, `rendering.md` section
+    /// 7 item 6). Overlay layers only; false when absent, so older hubs
+    /// work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
     /// Whether clients start with the layer drawn (`client-compute.md`
     /// section 2.2).
     #[serde(default = "shared_by_default")]
@@ -318,6 +324,15 @@ impl BuildDescription {
     pub fn overlay_layers(&self) -> BTreeSet<usize> {
         (self.layers.iter().enumerate())
             .filter(|(_, l)| l.overlay)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The indices of the overlay layers whose `required` is true, in
+    /// layer order.
+    pub fn required_layers(&self) -> BTreeSet<usize> {
+        (self.layers.iter().enumerate())
+            .filter(|(_, l)| l.overlay && l.required)
             .map(|(i, _)| i)
             .collect()
     }

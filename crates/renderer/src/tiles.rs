@@ -14,6 +14,12 @@
 //! neighbor's exact shape and nothing changes when a tile is split or
 //! joined. Nothing here knows what the frame is.
 //!
+//! A tile replaces its parent only when each child has its surface tile
+//! and the overlays it waits for (`rendering.md` section 7 item 6): every
+//! shown overlay layer has arrived, failed, or is not `required` and
+//! [`OVERLAY_WAIT_SECONDS`] have passed since the child's surface tile
+//! arrived. Level-0 tiles are drawn without waiting.
+//!
 //! Positions are computed once per tile in `f64` frame coordinates
 //! ([`TileGeometry`]) by the core library's geometry, so a vertex shared by
 //! two tiles has the same bits in both; they reach the GPU relative to one
@@ -265,6 +271,14 @@ pub struct DecodedTile {
     /// The overlay layers' non-empty overlay tiles, each with its layer
     /// index, in layer order.
     pub overlays: Vec<(usize, Arc<OverlayTile>)>,
+    /// The overlay layers whose section is invalid, with why, in layer
+    /// order: they
+    /// contribute nothing and are not waited for (`rendering.md` section 7
+    /// item 6).
+    pub failed: Vec<(usize, String)>,
+    /// The overlay layers still to come ([`crate::directions::Completion`]),
+    /// in layer order; set by the driver with [`DecodedTile::waiting_on`].
+    pub waiting: Vec<usize>,
 }
 
 /// Decodes a surface key's sections, `layers[n]` the layer index of
@@ -284,7 +298,11 @@ pub fn decode_tile(
             match overlay::decode(key, bytes) {
                 Ok(Overlay::Tile(t)) => out.overlays.push((layer, Arc::new(t))),
                 Ok(Overlay::Empty(_)) => {}
-                Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
+                // An invalid overlay fails alone: the tile is drawn
+                // without it (logged once by [`Surfaces`]).
+                Err(e) => out
+                    .failed
+                    .push((layer, format!("code {}: {}", e.code, e.reason))),
             }
             continue;
         }
@@ -302,6 +320,12 @@ impl DecodedTile {
     /// every layer shown.
     pub fn base(&self) -> Option<&Arc<TileGeometry>> {
         self.bases.first().map(|(_, b)| b)
+    }
+
+    /// The tile with `waiting` as the overlay layers still to come.
+    pub fn waiting_on(mut self, waiting: Vec<usize>) -> DecodedTile {
+        self.waiting = waiting;
+        self
     }
 }
 
@@ -408,6 +432,13 @@ pub struct TileDrawInfo {
     pub morph: [f32; 2],
 }
 
+/// How long, seconds, a tile waits on an overlay that is not `required`
+/// before it replaces its parent without it (`rendering.md` section 7 item
+/// 6), counted from the arrival of the tile's surface tile on the clock
+/// the selection runs on ([`Surfaces::select`]). The selection runs every
+/// frame, so a still camera still splits once this has passed.
+pub const OVERLAY_WAIT_SECONDS: f64 = 2.0;
+
 /// Surface tiles of every frame: the cache, which frames have a surface,
 /// the anchors, and the latest selection.
 #[derive(Default)]
@@ -434,6 +465,12 @@ pub struct Surfaces {
     pending: std::collections::HashSet<SurfaceKey>,
     /// The hidden layers, by index (`rendering.md` section 7 item 7).
     hidden: BTreeSet<usize>,
+    /// The `required` overlay layers, by index (`client-compute.md`
+    /// section 2.2).
+    required: BTreeSet<usize>,
+    /// The time, seconds, of the latest selection: the clock tiles'
+    /// arrivals and [`OVERLAY_WAIT_SECONDS`] are measured on.
+    now: f64,
 }
 
 impl Surfaces {
@@ -502,6 +539,14 @@ impl Surfaces {
         }
     }
 
+    /// The `required` overlay layers, by index (`client-compute.md`
+    /// section 2.2, [`crate::protocol::BuildDescription::required_layers`]):
+    /// a tile waits on these until they arrive or fail before it replaces
+    /// its parent.
+    pub fn set_required_layers(&mut self, required: BTreeSet<usize>) {
+        self.required = required;
+    }
+
     /// The geometry drawn for `key`, if it is ready.
     pub fn drawn_geometry(&self, key: &SurfaceKey) -> Option<&Arc<TileGeometry>> {
         self.ready(key)
@@ -536,7 +581,7 @@ impl Surfaces {
             key,
             outcome.map(|base| DecodedTile {
                 bases: base.into_iter().map(|b| (0, b)).collect(),
-                overlays: Vec::new(),
+                ..DecodedTile::default()
             }),
             false,
         );
@@ -551,7 +596,7 @@ impl Surfaces {
     /// Completions of one request may arrive out of order (the native
     /// fetcher decodes each on its own thread): a partial completion is
     /// ignored when the tile already holds the request's final one, or as
-    /// many overlays, so a stale partial never replaces a fuller tile.
+    /// many overlays (arrived or failed), so a stale partial never replaces a fuller tile.
     pub fn complete_layers(
         &mut self,
         key: SurfaceKey,
@@ -560,7 +605,10 @@ impl Surfaces {
     ) {
         if partial {
             if let (Some(held), Ok(d)) = (self.layers.get(&key), &outcome) {
-                if !self.pending.contains(&key) || held.overlays.len() >= d.overlays.len() {
+                // Overlays that failed count as arrived: a later
+                // completion holds them too.
+                let had = held.overlays.len() + held.failed.len();
+                if !self.pending.contains(&key) || had >= d.overlays.len() + d.failed.len() {
                     return;
                 }
             }
@@ -570,10 +618,29 @@ impl Surfaces {
         } else {
             self.pending.remove(&key);
         }
-        self.layers.remove(&key);
+        let held = self.layers.remove(&key);
         let state = match outcome {
-            Ok(DecodedTile { bases, overlays }) if !bases.is_empty() => {
-                let layers = TileLayers { bases, overlays };
+            Ok(DecodedTile {
+                bases,
+                overlays,
+                failed,
+                waiting,
+            }) if !bases.is_empty() => {
+                let arrived_at = held.as_ref().map_or(self.now, |h| h.arrived_at);
+                let mut known = held.map(|h| h.failed).unwrap_or_default();
+                for (layer, reason) in failed {
+                    if known.insert(layer) {
+                        tracing::warn!(key = %key, layer, "overlay tile is invalid: {reason}");
+                    }
+                }
+                let waiting = if partial { waiting } else { Vec::new() };
+                let layers = TileLayers {
+                    bases,
+                    overlays,
+                    failed: known,
+                    waiting,
+                    arrived_at,
+                };
                 let drawn = layers.drawn(&self.hidden);
                 self.layers.insert(key, layers);
                 match drawn {
@@ -619,6 +686,26 @@ impl Surfaces {
         }
     }
 
+    /// Whether `key` has arrived as far as a split needs (`rendering.md`
+    /// section 7 item 6): it is empty, or it has its surface tile and
+    /// every shown overlay layer has arrived for it, failed for it, or is
+    /// not `required` and [`OVERLAY_WAIT_SECONDS`] have passed since its
+    /// surface tile arrived. A hidden overlay is never waited for.
+    fn arrived_for_split(&self, key: &SurfaceKey) -> bool {
+        match self.tiles.get(key) {
+            Some(State::Empty) => true,
+            Some(State::Ready(_)) => self.layers.get(key).is_none_or(|l| {
+                let waited = self.now - l.arrived_at >= OVERLAY_WAIT_SECONDS;
+                l.waiting.iter().all(|layer| {
+                    self.hidden.contains(layer)
+                        || l.failed.contains(layer)
+                        || (waited && !self.required.contains(layer))
+                })
+            }),
+            _ => false,
+        }
+    }
+
     fn ready(&self, key: &SurfaceKey) -> Option<&Arc<TileGeometry>> {
         match self.tiles.get(key) {
             Some(State::Ready(g)) => Some(g),
@@ -628,14 +715,17 @@ impl Surfaces {
 
     /// Selects the tiles to draw for `camera` and asks for missing ones
     /// (module docs). `frames` are the frames worth looking at (in range,
-    /// with mass); each gets its six roots asked for once.
+    /// with mass); each gets its six roots asked for once. `now`, seconds,
+    /// is the selection's clock ([`OVERLAY_WAIT_SECONDS`]).
     pub fn select(
         &mut self,
         system: &FrameSystem,
         camera: &Camera,
         view_px: (u32, u32),
         frames: &[u64],
+        now: f64,
     ) {
+        self.now = now;
         let focal = focal_px(f64::from(view_px.1.max(1)));
         let aspect = f64::from(view_px.0.max(1)) / f64::from(view_px.1.max(1));
         let half_y = 0.5 * FIELD_OF_VIEW_Y;
@@ -673,9 +763,6 @@ impl Surfaces {
         self.drawn = drawn;
     }
 
-    /// The selection of one frame with a surface (module docs): `cam` and
-    /// the unit `forward` in frame coordinates, the view's focal length in
-    /// pixels and the half angle of a cone holding the view.
     /// The selection of one frame with a surface (module docs): `cam` and
     /// the unit `forward` in frame coordinates, the view's focal length in
     /// pixels and the half angle of a cone holding the view.
@@ -731,11 +818,12 @@ impl Surfaces {
             }
             let split = d < r
                 && children.is_some_and(|ch| {
-                    // Every child arrived, and at least one has a
+                    // Every child arrived with the overlays it waits for
+                    // (`rendering.md` 7.6), and at least one has a
                     // surface: deeper keys a module leaves empty end
-                    // the refinement at this tile.
-                    ch.iter()
-                        .all(|c| matches!(self.tiles.get(c), Some(State::Ready(_) | State::Empty)))
+                    // the refinement at this tile. Level-0 tiles have no
+                    // parent and are drawn without waiting.
+                    ch.iter().all(|c| self.arrived_for_split(c))
                         && ch.iter().any(|c| self.ready(c).is_some())
                 });
             if split {
@@ -816,6 +904,12 @@ struct TileLayers {
     /// Every non-empty base, with its layer index, in layer order.
     bases: Vec<(usize, Arc<TileGeometry>)>,
     overlays: Vec<(usize, Arc<OverlayTile>)>,
+    /// Overlay layers whose section was invalid, already logged.
+    failed: BTreeSet<usize>,
+    /// Overlay layers still to come while the tile is pending.
+    waiting: Vec<usize>,
+    /// When the tile's surface tile arrived, on the selection's clock.
+    arrived_at: f64,
 }
 
 impl TileLayers {
@@ -994,6 +1088,119 @@ mod tests {
         );
         s.complete_layers(key, Ok(full), false);
         assert_eq!(s.drawn_geometry(&key).unwrap().albedo[v], done.albedo[v]);
+    }
+
+    /// A frame whose six roots have arrived plainly and whose face-0 root
+    /// is split from a camera at its box center as soon as its children
+    /// allow; every child arrives at `t = 0` with its surface tile and
+    /// overlay layer 1 still to come.
+    fn waiting_children(required: BTreeSet<usize>, hidden: BTreeSet<usize>) -> Surfaces {
+        let mut s = Surfaces::new();
+        s.set_required_layers(required);
+        s.set_hidden_layers(hidden);
+        for face in 0..SURFACE_FACES {
+            let key = SurfaceKey::new(4, face, 0, 0, 0).unwrap();
+            s.complete(key, Ok(Some(Arc::new(TileGeometry::new(&tile(key))))));
+        }
+        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        for c in root.children().unwrap() {
+            s.complete_layers(c, Ok(waiting_child(c, None)), true);
+        }
+        s
+    }
+
+    /// Child `c` with its surface tile, overlay layer 1 still to come
+    /// (`None`) or failed with an invalid section (`Some(reason)`).
+    fn waiting_child(c: SurfaceKey, failed: Option<&str>) -> DecodedTile {
+        DecodedTile {
+            bases: vec![(0, Arc::new(TileGeometry::new(&tile(c))))],
+            failed: failed.into_iter().map(|r| (1, r.to_string())).collect(),
+            waiting: if failed.is_some() { vec![2] } else { vec![1] },
+            ..DecodedTile::default()
+        }
+    }
+
+    /// The levels drawn from the face-0 root's box center at time `now`.
+    fn levels_at(s: &mut Surfaces, now: f64) -> BTreeSet<u8> {
+        s.now = now;
+        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let (lo, hi) = s.drawn_geometry(&root).unwrap().bounds;
+        let cam: [f64; 3] = core::array::from_fn(|n| 0.5 * (lo[n] + hi[n]));
+        let len = (cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2]).sqrt();
+        let forward = cam.map(|v| v / len);
+        let mut drawn = Vec::new();
+        s.select_in_frame(4, cam, forward, focal_px(720.0), 0.9, &mut drawn);
+        (drawn.iter())
+            .filter(|t| t.geometry.key.face == 0)
+            .map(|t| t.geometry.key.level)
+            .collect()
+    }
+
+    #[test]
+    fn a_required_overlay_keeps_the_parent_until_it_arrives() {
+        let mut s = waiting_children([1].into(), BTreeSet::new());
+        assert_eq!(levels_at(&mut s, 0.0), [0].into());
+        assert_eq!(
+            levels_at(&mut s, 60.0),
+            [0].into(),
+            "required: no time limit"
+        );
+        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        for c in root.children().unwrap() {
+            let d = DecodedTile {
+                bases: vec![(0, Arc::new(TileGeometry::new(&tile(c))))],
+                ..DecodedTile::default()
+            };
+            s.complete_layers(c, Ok(d), false);
+        }
+        assert_eq!(levels_at(&mut s, 60.0), [1].into());
+    }
+
+    #[test]
+    fn an_overlay_not_required_holds_the_split_at_most_the_wait() {
+        let mut s = waiting_children(BTreeSet::new(), BTreeSet::new());
+        assert_eq!(levels_at(&mut s, 0.0), [0].into());
+        assert_eq!(levels_at(&mut s, OVERLAY_WAIT_SECONDS * 0.99), [0].into());
+        // A still camera: the selection runs again and splits.
+        assert_eq!(levels_at(&mut s, OVERLAY_WAIT_SECONDS), [1].into());
+    }
+
+    #[test]
+    fn a_failed_required_overlay_releases_the_split() {
+        let mut s = waiting_children([1].into(), BTreeSet::new());
+        assert_eq!(levels_at(&mut s, 0.0), [0].into());
+        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        for c in root.children().unwrap() {
+            // Layer 1's section is invalid; layer 2, not required, is
+            // still to come and has waited long enough.
+            s.complete_layers(c, Ok(waiting_child(c, Some("code 1: bad"))), true);
+        }
+        assert_eq!(levels_at(&mut s, OVERLAY_WAIT_SECONDS), [1].into());
+        let c = root.children().unwrap()[0];
+        assert!(s.layers[&c].failed.contains(&1));
+    }
+
+    #[test]
+    fn a_hidden_required_overlay_is_not_waited_for() {
+        let mut s = waiting_children([1].into(), [1].into());
+        assert_eq!(levels_at(&mut s, 0.0), [1].into());
+    }
+
+    #[test]
+    fn level_zero_tiles_draw_with_no_overlay_yet() {
+        let mut s = Surfaces::new();
+        s.set_required_layers([1].into());
+        for face in 0..SURFACE_FACES {
+            let key = SurfaceKey::new(4, face, 0, 0, 0).unwrap();
+            let d = DecodedTile {
+                bases: vec![(0, Arc::new(TileGeometry::new(&tile(key))))],
+                waiting: vec![1],
+                ..DecodedTile::default()
+            };
+            s.complete_layers(key, Ok(d), true);
+        }
+        assert!(s.has_surface(4));
+        assert_eq!(levels_at(&mut s, 0.0), [0].into());
     }
 
     /// A tile whose heights are a smooth function of the vertex direction,

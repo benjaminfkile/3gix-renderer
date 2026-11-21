@@ -141,7 +141,7 @@ fn draw(system: &FrameSystem, view: (u32, u32)) -> (Drawn, World) {
     for round in 0..16 {
         let now = f64::from(round);
         world.select(system, &camera, view, now, true);
-        world.select_surfaces(system, &camera, view);
+        world.select_surfaces(system, &camera, view, now);
         for key in world.take_requests(now) {
             let outcome = if key == depth_zero_key(BODY) {
                 decode_cell(&key, &cell, Meters::new(EXTENT))

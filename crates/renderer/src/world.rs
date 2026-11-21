@@ -475,7 +475,14 @@ impl World {
 
     /// Selects surface tiles for every frame with mass in range
     /// ([`crate::tiles::Surfaces::select`]).
-    pub fn select_surfaces(&mut self, system: &FrameSystem, camera: &Camera, view_px: (u32, u32)) {
+    /// `now`, seconds, is the clock overlay waits are measured on.
+    pub fn select_surfaces(
+        &mut self,
+        system: &FrameSystem,
+        camera: &Camera,
+        view_px: (u32, u32),
+        now: f64,
+    ) {
         let aspect = f64::from(view_px.0.max(1)) / f64::from(view_px.1.max(1));
         let frames: Vec<u64> = system
             .tree()
@@ -487,7 +494,7 @@ impl World {
             })
             .map(|f| f.frame_id)
             .collect();
-        self.surfaces.select(system, camera, view_px, &frames);
+        self.surfaces.select(system, camera, view_px, &frames, now);
         self.surfaces.evict(SURFACE_TILES_KEPT);
     }
 
@@ -544,6 +551,7 @@ impl World {
     ) -> Vec<String> {
         let (view, unknown) = crate::layers::LayerView::for_build(build, hide);
         self.set_hidden_layers(view.hidden.clone());
+        self.surfaces.set_required_layers(build.required_layers());
         self.layer_view = view;
         unknown
     }
@@ -624,7 +632,7 @@ impl World {
             self.complete(key, outcome, now);
         }
         self.select(seen.system(), seen.camera(), view_px, now, false);
-        self.select_surfaces(seen.system(), seen.camera(), view_px);
+        self.select_surfaces(seen.system(), seen.camera(), view_px, now);
         let requests = self.take_wanted(now);
         if now - self.last_evict >= EVICT_INTERVAL_SECONDS {
             self.last_evict = now;
