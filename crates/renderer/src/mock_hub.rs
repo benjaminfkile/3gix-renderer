@@ -160,6 +160,7 @@ impl MockLayer {
             attachment: self.attachment.clone(),
             exclusive: self.exclusive,
             overlay: self.overlay,
+            required: false,
             shown: self.shown,
             max_depth: self.max_depth.clone(),
             span_seconds: self.span_seconds,

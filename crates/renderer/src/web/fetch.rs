@@ -467,6 +467,11 @@ impl WebFetcher {
         if let Action::Complete(Completion { key, .. }) | Action::Failed { key, .. } = &action {
             self.asked_at.remove(key);
         }
+        // A partial completion draws the tile: its waiting jobs go before
+        // every job with nothing drawn (`rendering.md` section 7 item 6).
+        if matches!(&action, Action::Complete(c) if c.partial) {
+            self.follow_wanted();
+        }
         match action {
             Action::Directions(keys) => {
                 let t = directions_time(
@@ -595,7 +600,8 @@ impl WebFetcher {
                             &sections,
                             &done.layers,
                             &overlays,
-                        ),
+                        )
+                        .map(|d| d.waiting_on(done.waiting)),
                         partial: done.partial,
                         bytes,
                     });

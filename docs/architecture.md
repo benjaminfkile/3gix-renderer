@@ -247,7 +247,13 @@ Work order (`client-compute.md` 2.8, `gx_worker::queue`): three lanes,
 strictly ordered: wanted computes, then uploads, then checks. A lower lane
 starts work only when no higher lane has any waiting, and a free thread
 never waits while a compute does. Computes start highest priority first
-(the key's projected size on screen); on every new wanted set the waiting
+(the key's projected size on screen), with one rule before it
+(`rendering.md` 7.6, `directions::drawn_first`): a surface tile already
+drawn and waiting only on overlays (it has had a partial completion) goes
+before every key with nothing drawn, from that completion on and through
+every later change of priorities; within each group the order stays the
+projected size. On every new wanted set, and on every partial
+completion, the waiting
 ones take their key's new priority, and those whose key left the set are
 removed before they start and reported as dropped, so the coordinator
 takes them up again from the kept answer if the key comes back. A
@@ -294,6 +300,15 @@ alone, least recently used first. A hit never touches the network.
 
 Each step knows physics and geometry only. A cell is a cell, a hot sample is
 a light, a dense sample is a surface.
+
+Surface tile selection (`tiles::Surfaces::select`, `rendering.md` 7.2
+and 7.6) runs every frame on the frame's clock. A tile replaces its
+parent only when each child has its surface tile and every shown overlay
+layer has arrived for it, failed for it (an invalid section or a module
+error, logged once), or is not `required` (`client-compute.md` 2.2) and
+`tiles::OVERLAY_WAIT_SECONDS` (2 s) have passed since the child's surface
+tile arrived. A hidden overlay is never waited for, and level-0 tiles draw
+as soon as their surface tiles arrive.
 
 1. **Selection** (`stream::select_all`, run by `selector` on its own thread natively and inline in the browser, when results arrive, when the camera or view changes, and every 100 ms). Pixel error, view cone, and refinability from occupancy only; no occlusion culling and no shape model (`rendering.md` 1.1 and 3.1). It builds the target (asking up to three depths ahead of what has arrived, balanced 2:1) and the drawn selection (only arrived cells, split only when every child and its same-depth neighbors have arrived). The `stream` module docs have the details; `rendering.md` is the contract.
 2. **The cell cache** (`stream::CellCache`), keyed by
