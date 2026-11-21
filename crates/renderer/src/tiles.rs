@@ -547,12 +547,24 @@ impl Surfaces {
     /// overlays it has, and a later completion with more overlays replaces
     /// its material (a new geometry, so its GPU copy is rebuilt).
     /// `partial` is `true` while overlays are still to come.
+    ///
+    /// Completions of one request may arrive out of order (the native
+    /// fetcher decodes each on its own thread): a partial completion is
+    /// ignored when the tile already holds the request's final one, or as
+    /// many overlays, so a stale partial never replaces a fuller tile.
     pub fn complete_layers(
         &mut self,
         key: SurfaceKey,
         outcome: Result<DecodedTile, String>,
         partial: bool,
     ) {
+        if partial {
+            if let (Some(held), Ok(d)) = (self.layers.get(&key), &outcome) {
+                if !self.pending.contains(&key) || held.overlays.len() >= d.overlays.len() {
+                    return;
+                }
+            }
+        }
         if partial {
             self.pending.insert(key);
         } else {
@@ -944,6 +956,44 @@ mod tests {
         let restored = s.drawn_geometry(&key).unwrap();
         assert_eq!(restored.albedo, plain.albedo);
         assert_eq!(restored.roughness, plain.roughness);
+    }
+
+    #[test]
+    fn a_stale_partial_completion_never_replaces_a_fuller_tile() {
+        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let base = gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
+        let first = overlay_tile(key, 255, 255, 255);
+        let second = overlay_tile(key, 128, 0, 0);
+        let overlays: BTreeSet<usize> = [1, 2].into();
+        let decode = |sections: &[Vec<u8>], layers: &[usize]| {
+            decode_tile(&key, sections, layers, &overlays).unwrap()
+        };
+        let v = TILE_VERTICES + 1;
+        let mut s = Surfaces::new();
+        // The final completion lands before the partial one sent earlier.
+        let full = decode(
+            &[base.clone(), overlay_bytes(&first), overlay_bytes(&second)],
+            &[0, 1, 2],
+        );
+        s.complete_layers(key, Ok(full), false);
+        let done = Arc::clone(s.drawn_geometry(&key).unwrap());
+        s.complete_layers(key, Ok(decode(std::slice::from_ref(&base), &[0])), true);
+        assert!(Arc::ptr_eq(s.drawn_geometry(&key).unwrap(), &done));
+        assert!(!s.pending.contains(&key));
+        // Two partials out of order: the one with fewer overlays is
+        // ignored, and the final completion still applies.
+        let mut s = Surfaces::new();
+        let one = decode(&[base.clone(), overlay_bytes(&second)], &[0, 2]);
+        s.complete_layers(key, Ok(one), true);
+        let with_one = Arc::clone(s.drawn_geometry(&key).unwrap());
+        s.complete_layers(key, Ok(decode(std::slice::from_ref(&base), &[0])), true);
+        assert!(Arc::ptr_eq(s.drawn_geometry(&key).unwrap(), &with_one));
+        let full = decode(
+            &[base.clone(), overlay_bytes(&first), overlay_bytes(&second)],
+            &[0, 1, 2],
+        );
+        s.complete_layers(key, Ok(full), false);
+        assert_eq!(s.drawn_geometry(&key).unwrap().albedo[v], done.albedo[v]);
     }
 
     /// A tile whose heights are a smooth function of the vertex direction,
