@@ -58,6 +58,7 @@
 
 #![warn(missing_docs)]
 
+pub mod api;
 pub mod camera;
 pub mod clock;
 pub mod config;
