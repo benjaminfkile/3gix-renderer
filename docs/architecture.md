@@ -58,7 +58,8 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `render::gpu` | wgpu pipelines: surface, volume, and sprite passes, exposure, display pass | |
 | `render::headless` | Offscreen RGBA8 target, readback of it and of the float radiance, PNG | |
 | `controls` | Keyboard and mouse bindings for the window and the canvas | |
-| `app` | Desktop window loop and the headless run | |
+| `api` | The renderer API (`docs/api.md`): command queue, state snapshot, events, the `Consumer` trait | |
+| `app` | Desktop window loop and the headless run; the window is a consumer of `api`, driving each tick through it | |
 | `redraw` | Whether a scene differs visibly from the last one drawn | `rendering.md` 4 |
 | `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, the Cache API cache, the Web Worker driver, the browser fetcher, `start` | `space-model.md` 2 and 10, `client-compute.md` 4 and 6 |
 

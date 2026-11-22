@@ -24,8 +24,15 @@
 //! The window, the headless run, and the budget test run the same
 //! [`matter_step`].
 //!
+//! The desktop window is a consumer of the renderer API ([`crate::api`],
+//! `docs/api.md`): each tick runs its [`Consumer`], applies the queued
+//! commands, flies the camera with [`Api::flight`] (the keys while the
+//! controls are [`api::Controls::Builtin`], plus any held flight input), and
+//! ends with [`Api::end_tick`], which queues the API events.
+//!
 //! Key and mouse bindings are listed in `docs/controls.md`.
 
+use crate::api::{self, Api, Consumer};
 use crate::camera::Camera;
 use crate::clock::now_seconds;
 use crate::config::{Config, View};
@@ -672,6 +679,8 @@ pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
     let now = tdb_of_utc_ms(fetcher.now_utc_ms());
     let launch = crate::options::launch(system, &config.options, now);
     let mut app = App {
+        api: Api::new(launch.sim.system().tree(), &launch.camera),
+        consumer: Box::new(()),
         sim: launch.sim,
         camera: launch.camera,
         spawner: crate::spawn::Spawner {
@@ -821,6 +830,11 @@ impl Gfx {
 }
 
 struct App {
+    /// The renderer API the window drives its loop through
+    /// (`docs/api.md` section 1).
+    api: Api,
+    /// The application on the API: none yet beyond the built-in controls.
+    consumer: Box<dyn Consumer>,
     sim: Simulation,
     camera: Camera,
     spawner: crate::spawn::Spawner,
@@ -880,7 +894,14 @@ impl App {
         self.last_tick = Some(now);
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
-        let input = self.controls.take_flight();
+        self.consumer.tick(&mut self.api);
+        self.api.begin_tick(
+            &self.sim,
+            &mut self.camera,
+            &mut self.spawner,
+            &mut self.controls.attached,
+        );
+        let input = self.api.flight(self.controls.take_flight());
         let flying = input.forward
             || input.back
             || input.left
@@ -905,6 +926,7 @@ impl App {
             &input,
             self.controls.attached,
         );
+        self.api.end_tick(&self.camera);
 
         let Some(gfx) = self.gfx.as_mut() else {
             self.next_tick = now + ACTIVE_TICK;
@@ -1109,9 +1131,13 @@ impl ApplicationHandler for App {
                         | WindowEvent::ScaleFactorChanged { .. }
                         | WindowEvent::Occluded(false)
                 );
-                if self
-                    .controls
-                    .handle(&other, &mut self.sim, &mut self.camera)
+                // With controls `None` the keyboard and mouse leave the
+                // camera, choosers, clock, and exposure alone.
+                let builtin = self.api.controls() == api::Controls::Builtin;
+                if builtin
+                    && self
+                        .controls
+                        .handle(&other, &mut self.sim, &mut self.camera)
                 {
                     event_loop.exit();
                 }

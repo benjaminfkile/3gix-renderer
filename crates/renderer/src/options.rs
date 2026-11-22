@@ -272,16 +272,22 @@ pub fn launch_clock(system: &FrameSystem, options: &ViewOptions, now: Seconds) -
 pub fn launch_camera(system: &FrameSystem, options: &ViewOptions) -> Camera {
     options
         .start_on
-        .and_then(|s| {
-            Camera::over_pitched(
-                system,
-                s.frame_id,
-                s.direction,
-                s.distance,
-                s.distance.and(s.pitch_deg),
-            )
-        })
+        .and_then(|s| launch_camera_at(system, s))
         .unwrap_or_else(|| Camera::home(system))
+}
+
+/// The camera a `start-on` starts with: over its frame, looking at it until
+/// a spawn lands (without a distance), or at its distance and pitch.
+/// `None` when the frame is not in the registry. Shared with
+/// [`crate::api::Api::place_over`].
+pub fn launch_camera_at(system: &FrameSystem, s: StartOn) -> Option<Camera> {
+    Camera::over_pitched(
+        system,
+        s.frame_id,
+        s.direction,
+        s.distance,
+        s.distance.and(s.pitch_deg),
+    )
 }
 
 /// Applies `options` to the clock and the camera at start, for both
