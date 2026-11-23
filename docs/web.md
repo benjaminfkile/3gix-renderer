@@ -51,10 +51,11 @@ sh web/build.sh
 ```
 
 This runs `wasm-pack build crates/renderer --target web --out-dir ../../web/pkg
---no-opt --release -- --features web`. There is no `wasm-opt` pass: binaryen
-108 rewrites the export of wasm-bindgen's externref table so the module no
-longer initializes (`WebAssembly.Table.grow(): failed to grow table`). The
-output is `web/pkg/renderer.js` and
+--no-opt --release -- --features web`, then `wasm-opt -O2` in place when the
+installed binaryen is version 133 or newer (about 3.1 MB instead of 4.2 MB).
+Older binaryen skips the pass with a message: version 108 rewrites the export
+of wasm-bindgen's externref table so the module no longer initializes
+(`WebAssembly.Table.grow(): failed to grow table`). The output is `web/pkg/renderer.js` and
 `web/pkg/renderer_bg.wasm` (ignored by git). `wasm-pack` options go before
 the `--`, and the cargo `--features web` after it; with the feature first,
 `wasm-pack` hands `--out-dir` to cargo as well, which fails.

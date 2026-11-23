@@ -754,25 +754,27 @@ impl WebFetcher {
     /// Asks for the registry key and waits for every layer's registry,
     /// then builds the frame system from their union.
     pub async fn load_registry(&mut self) -> Result<FrameSystem> {
+        // Frame records come from the build by hash before the registry is
+        // asked for, as the native fetcher does: a layer with inputs whose
+        // registry section the hub does not store is computed here, and its
+        // job takes these records (section 10.2).
+        let records = self.frame_records().await?;
+        self.records = Rc::new(
+            records
+                .iter()
+                .map(|(_, b)| (sha256(b), Arc::clone(b)))
+                .collect(),
+        );
         self.request_registry();
         let start = now_seconds();
         loop {
             for e in self.drain() {
                 if let FetchEvent::Registry(r) = e {
                     let sections = r.map_err(|e| anyhow!("registry: {e}"))?;
-                    let records = self.frame_records().await?;
                     if let Err(e) = crate::protocol::check_frame_records(&sections, &records) {
                         tracing::error!("refusing the build: {e}");
                         return Err(anyhow!("refusing the build: {e}"));
                     }
-                    // Input jobs take their frame records from these
-                    // (section 10.2).
-                    self.records = Rc::new(
-                        records
-                            .iter()
-                            .map(|(_, b)| (sha256(b), Arc::clone(b)))
-                            .collect(),
-                    );
                     return crate::protocol::frame_system_from_registries(
                         &sections,
                         self.hub.build(),

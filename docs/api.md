@@ -28,7 +28,7 @@ Approved 2026-11-22. This file is the contract for the API. `rendering.md` (the 
 | Item | Behavior |
 |---|---|
 | `create(target, connection, options)` | Connects to the hub (`hubUrl`, `apiKey`, `spaceId`, `buildId` may be empty), loads the registry, starts the loop. `options` are today's view and time options (`startOn`, `timeScale`, `exposureStops`, `hideLayers`, ...) parsed by `options.rs`, unchanged. Resolves (JS promise, Rust `Result`) once the loop runs. Native target: a window or a headless size; web target: a canvas element or its id. |
-| `destroy()` | Stops the loop, the module workers, and uploads; frees GPU memory. Any later call is an error. |
+| `destroy()` | Stops the loop, the module workers, and uploads; frees GPU memory. Any later setter or query is an error; getters return the state as of the last tick. |
 | `pause()` / `resume()` | Paused: no drawing, no streaming, no computing; simulation time stays where it was and resumes from there. |
 | `resize(width, height, pixelRatio)` | For hosts that size the surface themselves. The browser build also follows canvas size changes on its own, as now. |
 
