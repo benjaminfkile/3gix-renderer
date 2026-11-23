@@ -75,6 +75,7 @@ fn center_pixel_matches_the_cpu_integration() {
         orientation: look_rotation(Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 1.0, 0.0)),
         speed: 1.0,
         cruise: 1.0,
+        fov_y: renderer::camera::FIELD_OF_VIEW_Y,
     };
     let grid = Arc::new(VolumeGrid::from_section(&plasma_cell()).expect("plasma is a volume"));
     let mut scene = build_scene(&system, &camera, 1.0);
@@ -162,6 +163,7 @@ fn rays_stop_at_a_surface_inside_the_volume() {
         orientation: look_rotation(Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 1.0, 0.0)),
         speed: 1.0,
         cruise: 1.0,
+        fov_y: renderer::camera::FIELD_OF_VIEW_Y,
     };
     let plasma = plasma_cell();
     let mut samples = plasma.samples().unwrap().clone();

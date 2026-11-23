@@ -121,7 +121,7 @@
 //! browser has its own fetcher with the same coordinator (`crate::web`);
 //! it does not resolve layer inputs yet.
 
-use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::camera::Camera;
 use crate::directions::Arrived;
 use crate::farfield::focal_px;
 use crate::farfield::{far_frames, matter_radius, mean_albedo, FarFieldCell};
@@ -743,7 +743,7 @@ pub fn frame_in_range(system: &FrameSystem, camera: &Camera, frame_id: u64, aspe
     }
     // Camera axes: looking along -z.
     let c = camera.root_orientation(system).conjugate().rotate(rel);
-    let half_y = 0.5 * FIELD_OF_VIEW_Y;
+    let half_y = 0.5 * camera.fov_y;
     let half_x = (half_y.tan() * aspect.max(1.0)).atan();
     let half_diag = (half_x.tan().hypot(half_y.tan())).atan();
     let off_axis = (-c.z / d).clamp(-1.0, 1.0).acos();
@@ -785,7 +785,7 @@ pub fn select_all(
     skip_frames: &BTreeSet<u64>,
 ) -> Selection {
     let aspect = view_width_px / view_height_px.max(1.0);
-    let focal = focal_px(view_height_px);
+    let focal = focal_px(view_height_px, camera.fov_y);
     let sprites: BTreeSet<u64> = far_frames(system, camera, view_height_px, |f| {
         depth_zero_radius(cache, f)
     })
@@ -809,7 +809,7 @@ pub fn select_all(
                 .root_orientation(system)
                 .rotate(Vec3::new(0.0, 0.0, -1.0)),
         );
-        let half_y = 0.5 * FIELD_OF_VIEW_Y;
+        let half_y = 0.5 * camera.fov_y;
         let half_x = (half_y.tan() * aspect).atan();
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * VIEW_CONE_MARGIN;
         let view = FrameView {
@@ -826,7 +826,7 @@ pub fn select_all(
         let params = SelectionParams {
             pixel_error: PIXEL_ERROR,
             view_height_px,
-            vertical_fov_rad: FIELD_OF_VIEW_Y,
+            vertical_fov_rad: camera.fov_y,
             max_cells: budget,
         };
         let mut tree = target_tree(&view, &params, cache);
@@ -910,14 +910,14 @@ pub fn wants_refinement(
             .root_orientation(system)
             .rotate(Vec3::new(0.0, 0.0, -1.0)),
     );
-    let half_y = 0.5 * FIELD_OF_VIEW_Y;
+    let half_y = 0.5 * camera.fov_y;
     let half_x = (half_y.tan() * aspect).atan();
     let view = FrameView {
         frame,
         cam: camera_in_frame(system, camera, frame.frame_id),
         forward,
         cone: (half_x.tan().hypot(half_y.tan())).atan() * VIEW_CONE_MARGIN,
-        focal: focal_px(view_height_px),
+        focal: focal_px(view_height_px, camera.fov_y),
     };
     key.depth < frame.max_depth
         && view.in_view(*key)

@@ -344,7 +344,7 @@ pub struct SpriteStats {
 /// The [`SpriteStats`] of every sprite of `scene` in a view of
 /// `width` x `height` pixels.
 pub fn sprite_stats(scene: &Scene, width: u32, height: u32) -> Vec<SpriteStats> {
-    let f = focal_px(f64::from(height.max(1)));
+    let f = focal_px(f64::from(height.max(1)), f64::from(scene.fov_y));
     scene
         .sprites
         .iter()
@@ -679,7 +679,8 @@ pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
     let now = tdb_of_utc_ms(fetcher.now_utc_ms());
     let launch = crate::options::launch(system, &config.options, now);
     let mut app = App {
-        api: Api::new(launch.sim.system().tree(), &launch.camera),
+        api: Api::new(launch.sim.system().tree(), &launch.camera)
+            .with_build(fetcher.client().build()),
         consumer: Box::new(()),
         sim: launch.sim,
         camera: launch.camera,
@@ -895,12 +896,26 @@ impl App {
 
         let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
         self.consumer.tick(&mut self.api);
-        self.api.begin_tick(
-            &self.sim,
-            &mut self.camera,
-            &mut self.spawner,
-            &mut self.controls.attached,
-        );
+        self.api.begin_tick(api::Target {
+            sim: &mut self.sim,
+            camera: &mut self.camera,
+            spawner: &mut self.spawner,
+            keys: &mut self.controls,
+        });
+        if let Some(fps) = self.api.max_fps() {
+            self.frame_interval = Some(Duration::from_secs_f64(1.0 / f64::from(fps)));
+        }
+        if let (Some((w, h, _)), Some(gfx)) = (self.api.take_size(), self.gfx.as_mut()) {
+            gfx.resize(w, h);
+            self.force_draw = true;
+        }
+        if self.api.paused() || self.api.destroyed() {
+            // Paused: no simulation, streaming, computing, or drawing; the
+            // clock holds its time (`docs/api.md` section 3).
+            self.api.end_tick(&self.sim, &self.camera, &self.world);
+            self.next_tick = now + IDLE_TICK;
+            return;
+        }
         let input = self.api.flight(self.controls.take_flight());
         let flying = input.forward
             || input.back
@@ -926,7 +941,7 @@ impl App {
             &input,
             self.controls.attached,
         );
-        self.api.end_tick(&self.camera);
+        self.api.end_tick(&self.sim, &self.camera, &self.world);
 
         let Some(gfx) = self.gfx.as_mut() else {
             self.next_tick = now + ACTIVE_TICK;
@@ -986,8 +1001,9 @@ impl App {
             overlay.push('\n');
             overlay.push_str(&line);
         }
+        let overlay = self.api.overlay_text(overlay).unwrap_or_default();
         let exposure = self.controls.exposure(None);
-        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)));
+        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)), self.camera.fov_y);
         let need = self
             .redraw
             .decide(&scene, &overlay, &exposure, t, focal, self.force_draw);
@@ -1081,7 +1097,8 @@ impl App {
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        gfx.renderer.render(&view, &scene, Some(&overlay), exposure);
+        let text = (!overlay.is_empty()).then_some(overlay.as_str());
+        gfx.renderer.render(&view, &scene, text, exposure);
         gfx.window.pre_present_notify();
         gfx.queue.present(texture);
         let t = self.started.elapsed().as_secs_f64();
@@ -1162,6 +1179,13 @@ impl ApplicationHandler for App {
         // (`crate::redraw`). Between ticks the loop sleeps.
         if Instant::now() >= self.next_tick {
             self.tick();
+        }
+        if self.api.destroyed() {
+            // `destroy`: the loop stops; the window, its surface, and the
+            // fetcher's workers are dropped with the app.
+            self.gfx = None;
+            event_loop.exit();
+            return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
     }

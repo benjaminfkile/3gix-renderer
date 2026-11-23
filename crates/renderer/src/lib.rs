@@ -58,6 +58,9 @@
 
 #![warn(missing_docs)]
 
+// The API drives the built-in controls' state, so it is built where they
+// are: native, and the browser build (`web` feature).
+#[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
 pub mod api;
 pub mod camera;
 pub mod clock;

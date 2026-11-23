@@ -65,7 +65,7 @@
 //! camera ([`sprite_radiance`]). Sprites are drawn after volumes with
 //! additive blending.
 
-use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::camera::Camera;
 use crate::light::{radiant_intensity, PointLight};
 use gx_core::emission::Emitter;
 use gx_core::frames::FrameSystem;
@@ -95,9 +95,10 @@ pub const SPRITE_MIN_IRRADIANCE: f64 = 1.0e-8;
 /// exposure pass.
 pub const LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 
-/// Pixels per unit of `size / distance` for a view `view_height_px` tall.
-pub fn focal_px(view_height_px: f64) -> f64 {
-    view_height_px / (2.0 * (0.5 * FIELD_OF_VIEW_Y).tan())
+/// Pixels per unit of `size / distance` for a view `view_height_px` tall
+/// with the vertical field of view `fov_y`, radians ([`Camera::fov_y`]).
+pub fn focal_px(view_height_px: f64, fov_y: f64) -> f64 {
+    view_height_px / (2.0 * (0.5 * fov_y).tan())
 }
 
 /// How far from a frame's cube, in root extents, cells are selected:
@@ -140,7 +141,7 @@ pub fn region_projected_px(
     if d <= region {
         return f64::INFINITY;
     }
-    region / d * focal_px(view_height_px)
+    region / d * focal_px(view_height_px, camera.fov_y)
 }
 
 /// The weight of a frame's sprite for its projected size: 1 below
@@ -439,7 +440,7 @@ pub fn frame_sprite(
         return None;
     }
     let size = sprite_size_px(irradiance);
-    let radiance = sprite_radiance(irradiance, size, focal_px(view_height_px));
+    let radiance = sprite_radiance(irradiance, size, focal_px(view_height_px, camera.fov_y));
     Some(Sprite {
         frame_id: far.frame_id,
         position: [rel.x as f32, rel.y as f32, rel.z as f32],
@@ -510,6 +511,7 @@ mod tests {
                 orientation: gx_core::units::Quat::identity(),
                 speed: 1.0,
                 cruise: 1.0,
+                fov_y: crate::camera::FIELD_OF_VIEW_Y,
             };
             assert_eq!(selected, reach, "x {x}");
             assert_eq!(

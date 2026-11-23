@@ -33,7 +33,7 @@
 //! mesh depth and writing none; then point sprites of far frames, added on
 //! top and tested against the mesh depth (`docs/shading.md`).
 
-use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::camera::Camera;
 use crate::extract::SurfaceMesh;
 use crate::farfield::Sprite;
 use crate::light::{PointLight, MAX_LIGHTS};
@@ -220,10 +220,14 @@ pub const LINE_COLOR: [f32; 4] = [0.22, 0.28, 0.4, 1.0];
 
 /// The near plane for a set of camera-axes positions: [`NEAR_FRACTION`] of
 /// the distance to the nearest point in front of the camera and inside a
-/// cone a little wider than the field of view, at least [`MIN_NEAR`], or
+/// cone a little wider than the vertical field of view `fov_y` (radians), at least [`MIN_NEAR`], or
 /// [`DEFAULT_NEAR`] when nothing is in front.
-pub fn near_plane(points_in_camera_axes: impl IntoIterator<Item = Vec3>, aspect: f64) -> f64 {
-    let half_y = 0.5 * FIELD_OF_VIEW_Y;
+pub fn near_plane(
+    points_in_camera_axes: impl IntoIterator<Item = Vec3>,
+    aspect: f64,
+    fov_y: f64,
+) -> f64 {
+    let half_y = 0.5 * fov_y;
     let half_x = (half_y.tan() * aspect.max(1.0)).atan();
     let cone = half_x.max(half_y) * 1.5;
     let cos_cone = cone.min(std::f64::consts::FRAC_PI_2).cos();
@@ -300,8 +304,8 @@ pub fn build_scene(system: &FrameSystem, camera: &Camera, aspect: f64) -> Scene 
         sprites: Vec::new(),
         lights: Vec::new(),
         view_rotation,
-        near: near_plane(in_camera_axes, aspect) as f32,
-        fov_y: FIELD_OF_VIEW_Y as f32,
+        near: near_plane(in_camera_axes, aspect, camera.fov_y) as f32,
+        fov_y: camera.fov_y as f32,
     }
 }
 
@@ -472,6 +476,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::FIELD_OF_VIEW_Y;
 
     #[test]
     fn marker_sizes_are_logarithmic_and_bounded() {
@@ -500,8 +505,14 @@ mod tests {
             Vec3::new(0.0, 0.0, 10.0), // behind
             Vec3::new(0.0, 0.0, -40.0),
         ];
-        assert_eq!(near_plane(pts, 16.0 / 9.0), 20.0);
-        assert_eq!(near_plane([Vec3::new(0.0, 0.0, 5.0)], 1.0), DEFAULT_NEAR);
-        assert_eq!(near_plane([Vec3::new(0.0, 0.0, -1.0e-9)], 1.0), MIN_NEAR);
+        assert_eq!(near_plane(pts, 16.0 / 9.0, FIELD_OF_VIEW_Y), 20.0);
+        assert_eq!(
+            near_plane([Vec3::new(0.0, 0.0, 5.0)], 1.0, FIELD_OF_VIEW_Y),
+            DEFAULT_NEAR
+        );
+        assert_eq!(
+            near_plane([Vec3::new(0.0, 0.0, -1.0e-9)], 1.0, FIELD_OF_VIEW_Y),
+            MIN_NEAR
+        );
     }
 }

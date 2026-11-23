@@ -107,6 +107,12 @@ impl Controls {
         std::mem::take(&mut self.layer_toggles)
     }
 
+    /// Queues a toggle of the layer at `index` as the layer chooser's key
+    /// does, for [`Controls::take_layer_toggles`] (`setShown`).
+    pub fn toggle_layer(&mut self, index: usize) {
+        self.layer_toggles.push(index);
+    }
+
     /// Applies one window event. Returns `true` when the user asked to
     /// quit (`Escape`). Events that are not input are ignored.
     pub fn handle(
@@ -184,7 +190,10 @@ impl Controls {
             KeyCode::KeyN => clock(sim, camera, ClockAction::JumpToNow),
             KeyCode::Home => {
                 self.attached = false;
-                *camera = Camera::home(sim.system());
+                *camera = Camera {
+                    fov_y: camera.fov_y,
+                    ..Camera::home(sim.system())
+                };
             }
             KeyCode::KeyG => {
                 self.spawning = !self.spawning;
@@ -212,6 +221,7 @@ impl Controls {
                         *camera = Camera {
                             speed: camera.speed,
                             cruise: camera.cruise,
+                            fov_y: camera.fov_y,
                             ..cam
                         };
                     }
@@ -383,6 +393,7 @@ mod tests {
             orientation: gx_core::units::Quat::identity(),
             speed: 1.0,
             cruise: 1.0,
+            fov_y: crate::camera::FIELD_OF_VIEW_Y,
         };
         let typing = |c: &mut Controls, keys: &[KeyCode], cam: &mut Camera| {
             c.speed_entry = Some(String::new());

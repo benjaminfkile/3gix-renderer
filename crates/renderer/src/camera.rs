@@ -73,6 +73,15 @@ pub struct FlightInput {
     pub wheel: f64,
     /// Fly at [`BOOST_FACTOR`] times the set speed (Shift held).
     pub boost: bool,
+    /// Movement along the camera axes `(x right, y up, z back)`, each
+    /// -1 to 1, added to the keys' direction; the sum is cut to length 1
+    /// (`setFlightInput`'s `move`, `docs/api.md` section 4).
+    pub axes: (f64, f64, f64),
+    /// Turn this frame, radians: yaw about the camera's up axis (positive
+    /// left), pitch about its right axis (positive up), roll about its back
+    /// axis (positive counterclockwise as seen from behind), added to
+    /// `look` (`setFlightInput`'s `look`).
+    pub turn: (f64, f64, f64),
 }
 
 /// The free camera: a place and a view direction in one frame.
@@ -91,6 +100,10 @@ pub struct Camera {
     /// speed (times [`BOOST_FACTOR`] while boosting) in
     /// [`SPEED_GLIDE_SECONDS`], so a burst of wheel notches does not jump.
     pub cruise: f64,
+    /// The vertical field of view, radians ([`FIELD_OF_VIEW_Y`] unless
+    /// `setFov` set another): the one value projection, tile and cell
+    /// selection, and streaming read.
+    pub fov_y: f64,
 }
 
 /// The camera's place in space before a simulation step (see
@@ -172,12 +185,30 @@ pub fn selectable_frames(tree: &FrameTree) -> Vec<u64> {
 /// with none held (or opposite keys cancelling).
 fn flight_direction(input: &FlightInput) -> Option<Vec3> {
     let axis = |plus: bool, minus: bool| f64::from(u8::from(plus)) - f64::from(u8::from(minus));
-    Vec3::new(
+    let keys = Vec3::new(
         axis(input.right, input.left),
         axis(input.up, input.down),
         axis(input.back, input.forward),
     )
     .normalized()
+    .unwrap_or(Vec3::zero());
+    let (x, y, z) = input.axes;
+    let clamp = |v: f64| {
+        if v.is_finite() {
+            v.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let dir = keys + Vec3::new(clamp(x), clamp(y), clamp(z));
+    let length = dir.length();
+    if length == 0.0 {
+        None
+    } else if length > 1.0 {
+        Some(dir.scale(1.0 / length))
+    } else {
+        Some(dir)
+    }
 }
 
 impl Camera {
@@ -207,6 +238,16 @@ impl Camera {
             let yaw = axis_angle(Vec3::new(0.0, 1.0, 0.0), -dx * LOOK_RADIANS_PER_PIXEL);
             let pitch = axis_angle(Vec3::new(1.0, 0.0, 0.0), -dy * LOOK_RADIANS_PER_PIXEL);
             self.orientation = (self.orientation * yaw * pitch)
+                .normalized()
+                .unwrap_or(self.orientation);
+        }
+        let (yaw, pitch, roll) = input.turn;
+        if [yaw, pitch, roll].iter().all(|v| v.is_finite()) && (yaw, pitch, roll) != (0.0, 0.0, 0.0)
+        {
+            let yaw = axis_angle(Vec3::new(0.0, 1.0, 0.0), yaw);
+            let pitch = axis_angle(Vec3::new(1.0, 0.0, 0.0), pitch);
+            let roll = axis_angle(Vec3::new(0.0, 0.0, 1.0), roll);
+            self.orientation = (self.orientation * yaw * pitch * roll)
                 .normalized()
                 .unwrap_or(self.orientation);
         }
@@ -292,6 +333,7 @@ impl Camera {
             orientation: (to_frame * look).normalized().unwrap_or(look),
             speed: DEFAULT_SPEED_MPS,
             cruise: DEFAULT_SPEED_MPS,
+            fov_y: FIELD_OF_VIEW_Y,
         }
     }
 
@@ -380,6 +422,7 @@ impl Camera {
             orientation: look,
             speed: DEFAULT_SPEED_MPS,
             cruise: DEFAULT_SPEED_MPS,
+            fov_y: FIELD_OF_VIEW_Y,
         })
     }
 
@@ -626,6 +669,7 @@ pub(crate) mod tests {
             orientation: axis_angle(Vec3::new(0.0, 1.0, 0.0), 0.7),
             speed: 1.0,
             cruise: 1.0,
+            fov_y: FIELD_OF_VIEW_Y,
         };
         let before = cam.root_position(&s);
         let before_view = cam.root_orientation(&s);
@@ -712,6 +756,7 @@ pub(crate) mod tests {
             orientation: look_rotation(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
             speed: 2.0e10,
             cruise: 2.0e10,
+            fov_y: FIELD_OF_VIEW_Y,
         };
         let view = cam.root_orientation(&s);
         let w = FlightInput {

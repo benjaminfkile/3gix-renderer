@@ -109,6 +109,7 @@ fn camera() -> Camera {
         orientation: look_rotation(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
         speed: 1.0,
         cruise: 1.0,
+        fov_y: renderer::camera::FIELD_OF_VIEW_Y,
     }
 }
 
