@@ -1,5 +1,4 @@
-//! The renderer API, native binding: `docs/api.md` sections 1 to 7 (all
-//! but `setComputeBudget`) and 8. The queries of section 6 are in
+//! The renderer API, native binding: `docs/api.md` sections 1 to 8. The queries of section 6 are in
 //! [`query`]; [`create`] (section 3) is native only.
 //!
 //! One implementation for every build (`docs/api.md` section 1 item 1):
@@ -356,6 +355,8 @@ pub struct Api {
     destroyed: bool,
     hud: bool,
     max_fps: Option<u32>,
+    compute_budget: usize,
+    max_compute_budget: usize,
     size: Option<(u32, u32, f64)>,
     picture: Picture,
     press: Option<(f64, f64, u32)>,
@@ -385,6 +386,8 @@ impl Api {
             destroyed: false,
             hud: true,
             max_fps: None,
+            compute_budget: crate::extract::worker_threads(),
+            max_compute_budget: crate::extract::worker_threads(),
             size: None,
             picture: Picture::default(),
             press: None,
@@ -726,6 +729,42 @@ impl Api {
         self.live()?;
         self.max_fps = fps.filter(|&n| n > 0);
         Ok(())
+    }
+
+    /// The API with a compute budget of at most `max` module workers (the
+    /// loop's worker pool size, the default), starting at `start` clamped
+    /// to it (the `compute-budget` option), or at `max`.
+    pub fn with_compute_budget(mut self, max: usize, start: Option<usize>) -> Api {
+        self.max_compute_budget = max;
+        self.compute_budget = start.map_or(max, |n| n.min(max));
+        self
+    }
+
+    /// `setComputeBudget`: module workers this client may run, 0 to the
+    /// default ([`Api::max_compute_budget`]). 0 turns computing, checking,
+    /// and uploading off; the loop applies it to its worker pool without
+    /// restarting ([`crate::stream::Fetcher::set_compute_budget`]). Above
+    /// the default is an error.
+    pub fn set_compute_budget(&mut self, workers: usize) -> ApiResult<()> {
+        self.live()?;
+        if workers > self.max_compute_budget {
+            return error(format!(
+                "the compute budget {workers} is above the default of {} workers",
+                self.max_compute_budget
+            ));
+        }
+        self.compute_budget = workers;
+        Ok(())
+    }
+
+    /// `getComputeBudget`: the module workers this client may run.
+    pub fn compute_budget(&self) -> usize {
+        self.compute_budget
+    }
+
+    /// The default and largest compute budget.
+    pub fn max_compute_budget(&self) -> usize {
+        self.max_compute_budget
     }
 
     /// The frame cap set by [`Api::set_max_fps`], if any.

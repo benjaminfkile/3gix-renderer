@@ -15,6 +15,7 @@ export const VIEW_OPTION_NAMES = [
   "exposureStops",
   "meshMode",
   "hideLayers",
+  "computeBudget",
 ];
 
 // The options as flattened name and value pairs for start(): first the

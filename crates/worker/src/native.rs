@@ -34,6 +34,11 @@
 //! [`crate::FailureKind::Dropped`]. A running job finishes and its section
 //! is cached.
 //!
+//! [`WorkerPool::set_budget`] sets how many of the pool's threads may take
+//! work (`setComputeBudget`, `docs/api.md` section 7), from 0 to the pool
+//! size, without restarting a thread: a thread outside the budget finishes
+//! the job it runs and then waits.
+//!
 //! # Inputs (`client-compute.md` sections 2.8 and 10.3)
 //!
 //! Input resolution is the shared resolver ([`crate::resolve`]), the same
@@ -548,6 +553,9 @@ struct State {
     computes: ComputeQueue<Task>,
     /// The upload and check lanes, by [`Lane`].
     lanes: Vec<(Lane, Arc<dyn LaneSource>)>,
+    /// Threads that may take work ([`WorkerPool::set_budget`]): thread
+    /// `i` takes work only while `i < budget`.
+    budget: usize,
     stopping: bool,
 }
 
@@ -564,11 +572,17 @@ enum Work {
 }
 
 impl Queue {
-    /// Blocks until there is work, highest lane first, or the pool stops
-    /// with nothing left (`None`).
-    fn take(&self) -> Option<Work> {
+    /// Blocks until there is work thread `index` may take, highest lane
+    /// first, or the pool stops (`None`). A thread outside the budget
+    /// takes nothing; once the pool stops it takes what is left, so every
+    /// queued job ends.
+    fn take(&self, index: usize) -> Option<Work> {
         let mut state = self.state.lock().expect("job queue");
         loop {
+            if index >= state.budget && !state.stopping {
+                state = self.ready.wait(state).expect("job queue");
+                continue;
+            }
             if let Some((_, task)) = state.computes.pop() {
                 return Some(Work::Compute(Box::new(task)));
             }
@@ -675,6 +689,7 @@ impl WorkerPool {
             state: Mutex::new(State {
                 computes: ComputeQueue::new(),
                 lanes: Vec::new(),
+                budget: threads.max(1),
                 stopping: false,
             }),
             ready: Condvar::new(),
@@ -695,7 +710,7 @@ impl WorkerPool {
                 std::thread::Builder::new()
                     .name(format!("gx-worker-{i}"))
                     .spawn(move || {
-                        while let Some(work) = queue.take() {
+                        while let Some(work) = queue.take(i) {
                             match work {
                                 Work::Compute(task) => run_task(&shared, *task),
                                 Work::Lower(work) => work(),
@@ -714,9 +729,27 @@ impl WorkerPool {
         })
     }
 
-    /// Number of worker threads.
+    /// Number of worker threads: the largest budget.
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Lets `workers` threads take work (`setComputeBudget`,
+    /// `docs/api.md` section 7), clamped to [`WorkerPool::size`], without
+    /// restarting any thread. A job already running finishes; the others
+    /// wait. At 0 no thread takes a compute or a lower lane's work.
+    /// Returns the budget applied.
+    pub fn set_budget(&self, workers: usize) -> usize {
+        let workers = workers.min(self.size);
+        self.queue.state.lock().expect("job queue").budget = workers;
+        self.queue.ready.notify_all();
+        workers
+    }
+
+    /// Threads that may take work ([`WorkerPool::set_budget`]); the pool
+    /// size until set.
+    pub fn budget(&self) -> usize {
+        self.queue.state.lock().expect("job queue").budget
     }
 
     /// Takes `lane`'s work ([`Lane::Upload`] or [`Lane::Check`]) from

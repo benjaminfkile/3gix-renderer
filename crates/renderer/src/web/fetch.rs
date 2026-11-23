@@ -93,6 +93,9 @@ pub struct WebFetcher {
     inbox: Rc<RefCell<VecDeque<Internal>>>,
     jobs: ComputeQueue<(usize, ComputeJob)>,
     job_running: Rc<Cell<bool>>,
+    /// Module workers that may run: 0 or [`WEB_WORKERS`]
+    /// ([`WebFetcher::set_compute_budget`]).
+    budget: usize,
     extents: BTreeMap<CellKey, Meters>,
     completed: VecDeque<(CellKey, Completion, Meters, Duration)>,
     out: Vec<FetchEvent>,
@@ -101,7 +104,42 @@ pub struct WebFetcher {
     tally: FetchTally,
 }
 
+/// The browser's module workers: one Web Worker, the most a compute
+/// budget can be here.
+pub const WEB_WORKERS: usize = 1;
+
 impl WebFetcher {
+    /// `setComputeBudget` (`docs/api.md` section 7), as the native
+    /// [`crate::stream::Fetcher::set_compute_budget`]: `workers` clamped
+    /// to [`WEB_WORKERS`]. At 0 every waiting job is dropped before it
+    /// starts, no job, check, or upload starts, and `missing` and `local`
+    /// layers stay missing while `ready` ones still stream; a running job
+    /// finishes and an upload already sent completes, whole. Returns the
+    /// budget applied.
+    pub fn set_compute_budget(&mut self, workers: usize) -> usize {
+        self.budget = workers.min(WEB_WORKERS);
+        self.coordinator.set_compute(self.budget > 0);
+        if self.budget == 0 {
+            let dropped = self.jobs.reprioritize(|_| None);
+            let mut inbox = self.inbox.borrow_mut();
+            for (layer, job) in dropped {
+                inbox.push_back(Internal::Compute {
+                    key: job.key(),
+                    layer,
+                    address: job.address,
+                    result: Err(WorkerError::dropped()),
+                });
+            }
+        }
+        self.pump();
+        self.budget
+    }
+
+    /// The module workers this page may run now.
+    pub fn compute_budget(&self) -> usize {
+        self.budget
+    }
+
     /// A fetcher over `hub`, caching in `cache` when the page has one.
     /// Keeps the hub's clock measured ([`WebHub::keep_clock`]).
     pub fn new(hub: Rc<WebHub>, cache: Option<WebCache>) -> WebFetcher {
@@ -133,6 +171,7 @@ impl WebFetcher {
             inbox: Rc::default(),
             jobs: ComputeQueue::new(),
             job_running: Rc::new(Cell::new(false)),
+            budget: WEB_WORKERS,
             extents: BTreeMap::new(),
             completed: VecDeque::new(),
             out: Vec::new(),
@@ -297,7 +336,7 @@ impl WebFetcher {
 
     /// Starts the queued job of the highest priority if none is running.
     fn start_job(&mut self) {
-        if self.job_running.get() {
+        if self.job_running.get() || self.budget == 0 {
             return;
         }
         let Some((key, priority, (layer, job))) = self.jobs.pop_with_priority() else {
@@ -381,7 +420,7 @@ impl WebFetcher {
     /// let a burst of computes overflow the bounded lane and drop most
     /// offers. Each offer is sent once; a failure is counted and dropped.
     fn start_upload(&mut self) {
-        while self.uploading.get() < MAX_UPLOADS_IN_FLIGHT {
+        while self.budget > 0 && self.uploading.get() < MAX_UPLOADS_IN_FLIGHT {
             let Some((offer, ticket)) = self.lane.take() else {
                 return;
             };
@@ -404,7 +443,11 @@ impl WebFetcher {
     /// recompute that differs from the drawn bytes takes their place,
     /// whatever the hub answers.
     fn start_check(&mut self) {
-        if self.job_running.get() || !self.jobs.is_empty() || !self.lane.is_empty() {
+        if self.job_running.get()
+            || self.budget == 0
+            || !self.jobs.is_empty()
+            || !self.lane.is_empty()
+        {
             return;
         }
         let Some(check) = self.checks.take() else {

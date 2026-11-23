@@ -118,6 +118,9 @@ FLAGS:
                                    are drawn; X cycles them in the window
     --hide-layers <id,id,...>      layers to hide, overriding the build's shown defaults; L
                                    toggles layers in the window; unknown ids are reported
+    --compute-budget <n>           module workers this client may run, 0 to the default
+                                   (cores - 2, 3/4 of them); 0 computes and uploads nothing
+                                   and only streams what the hub stores
     --hub-url <url>                overrides GX_HUB_URL
     --space-id <id>                overrides GX_SPACE_ID
     --build-id <id>                overrides GX_BUILD_ID

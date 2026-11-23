@@ -111,6 +111,7 @@ http://localhost:8000/?startOn=3:0,0,1@%2B10&timeScale=60
 | `exposureStops` | `--exposure-stops` | fixed exposure, stops; leave out for automatic |
 | `meshMode` | `--mesh-mode` | `surfaces` (default), `vertices`, or `edges` |
 | `hideLayers` | `--hide-layers` | layer ids to hide, comma separated (an array in `config.js` is joined), overriding the build's `shown` defaults; unknown ids are reported in the console and ignored |
+| `computeBudget` | `--compute-budget` | module workers the client may run at start, 0 to the default (the browser has one Web Worker, so 0 or 1; natively cores - 2, 3/4 of them); 0 computes and uploads nothing and only streams what the hub stores, and what is missing stays missing (`setComputeBudget`, `docs/api.md` section 7) |
 
 Without any the client enters at the hub's now at the `Home` view. The
 values go through the same parser as the native flags
