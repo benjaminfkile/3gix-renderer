@@ -14,6 +14,8 @@
 //! - [`fetch`]: the client loop (directions, streams, compute, and the
 //!   upload lane) on the page's event loop.
 //! - [`app`]: the canvas frame loop, driving the [`crate::api::Api`].
+//! - [`host`]: the page's one event loop, which runs every renderer the
+//!   page creates, one after another or side by side.
 //! - [`binding`]: the `Renderer` class, the web binding of the API
 //!   (`docs/api.md` sections 3 to 8).
 //! - [`value`]: values across the binding (`docs/api.md` section 2).
@@ -25,6 +27,7 @@ pub mod app;
 pub mod binding;
 pub mod cache;
 pub mod fetch;
+pub mod host;
 pub mod hub;
 pub mod value;
 pub mod worker;
@@ -36,8 +39,6 @@ use fetch::WebFetcher;
 use hub::WebHub;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::platform::web::EventLoopExtWebSys;
 
 /// Installs the panic hook, so a panic shows in the browser console with
 /// its message.
@@ -172,17 +173,15 @@ async fn start(
         .with_build(fetcher.hub().build())
         .with_compute_budget(fetch::WEB_WORKERS, options.compute_budget);
     let shared = Rc::new(binding::Shared::new(api));
-    let event_loop = EventLoop::new().map_err(value::js_error)?;
-    // Wait, not Poll: on the web Poll is a busy loop that starves the page.
-    // Each frame requests the next redraw, which the browser delivers once
-    // per display refresh.
-    event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.spawn_app(app::WebApp::new(
+    // The page's one event loop takes it (`host`): a page may create a
+    // renderer after destroying another.
+    host::run(app::WebApp::new(
         launch,
         &options,
         fetcher,
         canvas,
         shared.clone(),
-    ));
+    ))
+    .map_err(value::js_error)?;
     Ok(shared)
 }

@@ -12,6 +12,9 @@ from one codebase). The browser-only code is the `web` module
   `fetch`) for the clock, the build, directions, edge reads, and uploads.
   Futures run on the page's event loop through `wasm-bindgen-futures`.
   There is no readiness socket.
+- `winit` allows one event loop per page, ever. The page's loop (`web::host`)
+  is made with the first renderer and runs every later one, so a page can
+  destroy a renderer and create another (a React component mounted again).
 - The client loop (`web::fetch`) is the same `directions::Coordinator` the
   desktop drives, so batching, deduplication, retries, and compositing are
   identical.

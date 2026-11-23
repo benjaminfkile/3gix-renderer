@@ -30,7 +30,6 @@ use gx_core::units::Seconds;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
 use winit::platform::web::WindowAttributesExtWebSys;
@@ -218,6 +217,9 @@ pub struct WebApp {
     shared: Rc<Shared>,
     /// The cursor, physical pixels.
     cursor: (f64, f64),
+    /// The canvas asked to close or the built-in controls asked to quit:
+    /// this renderer stops at the next [`WebApp::after_events`].
+    closing: bool,
 }
 
 impl WebApp {
@@ -262,6 +264,7 @@ impl WebApp {
             redraw: crate::redraw::Redraw::new(),
             shared,
             cursor: (0.0, 0.0),
+            closing: false,
         }
     }
 
@@ -486,8 +489,12 @@ impl WebApp {
     }
 }
 
-impl ApplicationHandler for WebApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+/// What the page's one event loop ([`super::host`]) calls on each
+/// renderer: one window per renderer, events routed by window.
+impl WebApp {
+    /// Creates this renderer's canvas window and, asynchronously, its
+    /// device. Called once, when the host first sees the renderer.
+    pub fn open(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
@@ -525,9 +532,15 @@ impl ApplicationHandler for WebApp {
         self.window = Some(window);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    /// The window of this renderer, once [`WebApp::open`] made it.
+    pub fn window_id(&self) -> Option<WindowId> {
+        self.window.as_ref().map(|w| w.id())
+    }
+
+    /// One event of this renderer's window.
+    pub fn window_event(&mut self, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.closing = true,
             WindowEvent::Resized(size) => {
                 if let Some(gfx) = self.gfx.borrow_mut().as_mut() {
                     gfx.resize(size.width, size.height);
@@ -580,24 +593,29 @@ impl ApplicationHandler for WebApp {
                         .controls
                         .handle(&other, &mut self.sim, &mut self.camera)
                 {
-                    event_loop.exit();
+                    self.closing = true;
                 }
             }
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    /// After each batch of events: asks for the next frame, or returns
+    /// false when this renderer is done (`destroy`, or a close), having
+    /// dropped its surface and device; the host then drops the rest of it,
+    /// the fetcher and its module worker included. The page's loop keeps
+    /// running for later renderers.
+    pub fn after_events(&mut self) -> bool {
+        if self.closing && !self.shared.api.borrow().destroyed() {
+            let _ = self.shared.api.borrow_mut().destroy();
+        }
         if self.shared.api.borrow().destroyed() {
-            // `destroy`: the loop stops; the surface and device are
-            // dropped here, the fetcher and its module worker with the
-            // app.
             *self.gfx.borrow_mut() = None;
             self.window = None;
-            event_loop.exit();
-            return;
+            return false;
         }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+        true
     }
 }

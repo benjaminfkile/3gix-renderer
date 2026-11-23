@@ -28,7 +28,7 @@ Approved 2026-11-22. This file holds the API's items; the rules they follow are 
 | Item | Behavior |
 |---|---|
 | `create(target, connection, options)` | Connects to the hub (`hubUrl`, `apiKey`, `spaceId`, `buildId` may be empty), loads the registry, starts the loop. `options` are today's view and time options (`startOn`, `timeScale`, `exposureStops`, `hideLayers`, ...) parsed by `options.rs`, unchanged. Resolves (JS promise, Rust `Result`) once the loop runs. Native target: a window or a headless size; web target: a canvas element or its id. |
-| `destroy()` | Stops the loop, the module workers, and uploads; frees GPU memory. Any later setter or query is an error; getters return the state as of the last tick. |
+| `destroy()` | Stops the loop, the module workers, and uploads; frees GPU memory. Any later setter or query is an error; getters return the state as of the last tick. The page or process may create a new renderer afterward. |
 | `pause()` / `resume()` | Paused: no drawing, no streaming, no computing; simulation time stays where it was and resumes from there. |
 | `resize(width, height, pixelRatio)` | For hosts that size the surface themselves. The browser build also follows canvas size changes on its own, as now. |
 
@@ -38,7 +38,7 @@ Approved 2026-11-22. This file holds the API's items; the rules they follow are 
 |---|---|
 | `getCamera()` | The pose. |
 | `setCamera(pose)` | Puts the camera exactly at the pose, reparented as `Camera::reparent_to` does if the frame differs from the current one. A pose with an unknown frame, a non-finite value, or a non-unit quaternion (beyond 1e-6) is an error. |
-| `placeOver(frameId, direction, height, pitchDeg)` | Same placement as `--start-on <frame>:<x>,<y>,<z>@+<height>^<pitch>`, shared code. |
+| `placeOver(frameId, direction, height, pitchDeg)` | Same placement as `--start-on <frame>:<x>,<y>,<z>@+<height>^<pitch>`, shared code. While it is pending, a change of time keeps the camera over the frame. |
 | `setControls("builtin" \| "none")` | `builtin` (the default): keyboard and mouse flight and the key bindings in `docs/controls.md`. `none`: the renderer ignores keyboard and mouse input for the camera, choosers, clock, and exposure; window events (resize, focus, close) still apply. |
 | `setFlightInput({ move: [x, y, z], look: [yaw, pitch, roll], boost })` | The free camera's input, the same `camera::FlightInput` the keys produce: `move` components in -1 to 1 along camera axes, `look` in radians to turn this tick, `boost` held or not. Held until replaced; `setFlightInput(null)` clears it. Works in both control modes. |
 | `setSpeed(mps)` | The set flight speed, within `SPEED_LIMITS`. |

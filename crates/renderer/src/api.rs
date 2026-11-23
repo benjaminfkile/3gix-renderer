@@ -308,6 +308,14 @@ enum Command {
     SetMeshMode(MeshMode),
 }
 
+/// Whether a clock change carries the camera with its frame: an attached
+/// camera rides with it, and so does one whose placement (`placeOver`, or
+/// a start) is still pending, since that placement is over the
+/// frame. Only a free camera stays where it is in space.
+fn with_frame(keys: &Keys, spawner: &Spawner) -> bool {
+    keys.attached || spawner.pending.is_some()
+}
+
 /// Replaces the clock, keeping a free camera at the same place and view
 /// direction in root coordinates across the jump in time, as the clock
 /// keys do ([`crate::camera::apply_clock`]).
@@ -950,11 +958,11 @@ impl Api {
                     if c.paused() && !next.is_at_now() {
                         next.apply(crate::sim::ClockAction::TogglePause);
                     }
-                    set_clock(sim, camera, keys.attached, next);
+                    set_clock(sim, camera, with_frame(keys, spawner), next);
                 }
                 Command::SetTimeScale(x) => {
                     let next = sim.clock().with_rate(x);
-                    set_clock(sim, camera, keys.attached, next);
+                    set_clock(sim, camera, with_frame(keys, spawner), next);
                 }
                 Command::SetShown(id, on) => match self.layers.iter().position(|l| l.id == id) {
                     Some(i) if shown[i] != on => {
@@ -1021,5 +1029,45 @@ impl Api {
         for (i, l) in self.layers.iter_mut().enumerate() {
             l.shown = !hidden.contains(&i);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::tests::{system, EPOCH};
+    use gx_core::timescale::tdb_seconds_to_utc_ms;
+
+    /// A clock jump moves the child frame along its orbit. A camera whose
+    /// `placeOver` is still pending stays over that frame; it would
+    /// otherwise be left in space and the frame's matter never asked for.
+    #[test]
+    fn a_placement_waiting_to_land_rides_with_its_frame_across_set_time() {
+        let now = EPOCH + 1.0e6;
+        let mut sim = Simulation::at_now(system(), Seconds::new(now));
+        let mut camera = Camera::home(sim.system());
+        let mut api = Api::new(sim.system().tree(), &camera);
+        let mut spawner = Spawner::default();
+        let mut keys = Keys::new(None);
+        let mut tick = |api: &mut Api, sim: &mut Simulation, camera: &mut Camera| {
+            api.begin_tick(Target {
+                sim,
+                camera,
+                spawner: &mut spawner,
+                keys: &mut keys,
+            })
+        };
+        api.place_over(2, [1.0, 0.0, 0.0], 3.0, 20.0).unwrap();
+        tick(&mut api, &mut sim, &mut camera);
+        assert_eq!(camera.frame_id, 2);
+        let before = camera.position;
+        api.set_time(tdb_seconds_to_utc_ms(EPOCH + 0.5e6)).unwrap();
+        tick(&mut api, &mut sim, &mut camera);
+        assert_eq!(camera.frame_id, 2);
+        assert!(
+            (camera.position - before).length() < 1e-6,
+            "kept over the frame: {:?} vs {before:?}",
+            camera.position
+        );
     }
 }

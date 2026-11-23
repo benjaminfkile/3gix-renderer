@@ -549,15 +549,16 @@ impl Simulation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use gx_core::integrate;
     use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
     use gx_core::units::{Kilograms, Meters, Quat};
 
-    const EPOCH: f64 = 1000.0;
+    pub(crate) const EPOCH: f64 = 1000.0;
 
-    fn system() -> FrameSystem {
+    /// A heavy root frame and a spinning child frame in orbit around it.
+    pub(crate) fn system() -> FrameSystem {
         let root = Frame {
             frame_id: 1,
             parent_frame_id: ROOT_PARENT,
