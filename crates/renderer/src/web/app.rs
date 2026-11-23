@@ -12,6 +12,7 @@
 //! `performance.now()`, and extraction runs inline because the page has no
 //! threads.
 
+use super::binding::Shared;
 use super::fetch::WebFetcher;
 use super::hub::now_seconds;
 use crate::camera::Camera;
@@ -160,6 +161,38 @@ fn matter_step(
     draw
 }
 
+/// The API's `stats` event values (`docs/api.md` section 8) of a drawn
+/// scene, as natively (`crate::app::api_stats`).
+fn api_stats(world: &World, fetcher: &WebFetcher, scene: &Scene, fps: f64) -> crate::api::Stats {
+    let m = MatterStats::from_stats(fetcher.stats());
+    crate::api::Stats {
+        fps,
+        tiles_drawn: scene.tiles.len(),
+        triangles: scene
+            .surfaces
+            .iter()
+            .map(|d| d.mesh.triangle_count())
+            .sum::<usize>()
+            + scene.tiles.len() * gx_core::surface::TILE_QUADS * gx_core::surface::TILE_QUADS * 2,
+        cells_drawn: scene.surfaces.len(),
+        streaming: world.counts().cache.pending,
+        computing: m.module_runs,
+        uploading: m.uploads_pending,
+    }
+}
+
+/// The picture the API's queries run against (`docs/api.md` section 6),
+/// as natively (`crate::app::api_picture`).
+fn api_picture(
+    world: &World,
+    draw: &DrawList,
+    seen: &Seen,
+    size: (u32, u32),
+) -> crate::api::Picture {
+    crate::api::Picture::new(seen.system(), seen.camera(), draw, size)
+        .with_coarse(world.surfaces().coarse_drawn())
+}
+
 /// The browser application: the simulation, the camera, the matter
 /// pipeline, and the canvas.
 pub struct WebApp {
@@ -181,17 +214,23 @@ pub struct WebApp {
     force_draw: bool,
     /// What was drawn last (`crate::redraw`).
     redraw: crate::redraw::Redraw,
+    /// The API and the listeners, shared with the `Renderer` class.
+    shared: Rc<Shared>,
+    /// The cursor, physical pixels.
+    cursor: (f64, f64),
 }
 
 impl WebApp {
     /// An application drawing the simulation of `launch` from its camera
     /// on `canvas`, fetching through `fetcher`, with the exposure and mesh
-    /// mode of `options` ([`crate::options::launch`], as natively).
+    /// mode of `options` ([`crate::options::launch`], as natively), driving
+    /// the API in `shared` each frame.
     pub fn new(
         launch: crate::options::Launch,
         options: &crate::options::ViewOptions,
         mut fetcher: WebFetcher,
         canvas: web_sys::HtmlCanvasElement,
+        shared: Rc<Shared>,
     ) -> WebApp {
         WebApp {
             sim: launch.sim,
@@ -221,6 +260,8 @@ impl WebApp {
             last_draw: None,
             force_draw: true,
             redraw: crate::redraw::Redraw::new(),
+            shared,
+            cursor: (0.0, 0.0),
         }
     }
 
@@ -243,7 +284,13 @@ impl WebApp {
         *value
     }
 
+    /// One frame, then the API's events to the listeners.
     fn frame(&mut self) {
+        self.tick();
+        self.shared.deliver();
+    }
+
+    fn tick(&mut self) {
         let now = now_seconds();
         let dt = self
             .last_frame
@@ -252,7 +299,28 @@ impl WebApp {
         let fps = self.fps(now, false);
 
         let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
-        let input = self.controls.take_flight();
+        let shared = self.shared.clone();
+        let mut api = shared.api.borrow_mut();
+        api.begin_tick(crate::api::Target {
+            sim: &mut self.sim,
+            camera: &mut self.camera,
+            spawner: &mut self.spawner,
+            keys: &mut self.controls,
+        });
+        if api.get_compute_budget() != self.fetcher.compute_budget() {
+            self.fetcher.set_compute_budget(api.get_compute_budget());
+        }
+        if let (Some((w, h, _)), Some(gfx)) = (api.take_size(), self.gfx.borrow_mut().as_mut()) {
+            gfx.resize(w, h);
+            self.force_draw = true;
+        }
+        if api.paused() || api.destroyed() {
+            // Paused: no simulation, streaming, computing, or drawing; the
+            // clock holds its time (`docs/api.md` section 3).
+            api.end_tick(&self.sim, &self.camera, &self.world);
+            return;
+        }
+        let input = api.flight(self.controls.take_flight());
         self.spawner.frame(
             self.sim.system(),
             &self.world,
@@ -269,6 +337,7 @@ impl WebApp {
             &input,
             self.controls.attached,
         );
+        api.end_tick(&self.sim, &self.camera, &self.world);
 
         let mut slot = self.gfx.borrow_mut();
         let Some(gfx) = slot.as_mut() else {
@@ -299,7 +368,23 @@ impl WebApp {
             scene.markers.clear();
             scene.lines.clear();
         }
-        let overlay = self.overlay(&seen, &scene, fps);
+        api.set_picture(api_picture(&self.world, &draw, &seen, size));
+        api.observe(
+            self.spawner.pending.is_none() && self.world.ready(),
+            api_stats(&self.world, &self.fetcher, &scene, fps.unwrap_or(0.0)),
+            t,
+        );
+        let overlay = api
+            .overlay_text(self.overlay(&seen, &scene, fps))
+            .unwrap_or_default();
+        // The frame cap of `setMaxFps`: a frame due sooner after the last
+        // one drawn is skipped.
+        if let (Some(cap), Some(last)) = (api.max_fps(), self.last_draw) {
+            if now - last < 1.0 / f64::from(cap) && !self.force_draw {
+                return;
+            }
+        }
+        drop(api);
         // Draw only what differs visibly from the last frame drawn
         // (`crate::redraw`); the browser still calls every display frame
         // for input, streaming, and the simulation.
@@ -414,13 +499,15 @@ impl ApplicationHandler for WebApp {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                web_sys::console::error_1(
-                    &format!("gx-renderer: creating the canvas window: {e}").into(),
-                );
+                let message = format!("creating the canvas window: {e}");
+                web_sys::console::error_1(&format!("gx-renderer: {message}").into());
+                self.shared.fail(&message);
                 return;
             }
         };
+        self.shared.scale.set(window.scale_factor());
         let slot = self.gfx.clone();
+        let shared = self.shared.clone();
         let display = event_loop.owned_display_handle();
         let for_gfx = window.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -431,6 +518,7 @@ impl ApplicationHandler for WebApp {
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("gx-renderer: {e:#}").into());
+                    shared.fail(&format!("{e:#}"));
                 }
             }
         });
@@ -448,6 +536,33 @@ impl ApplicationHandler for WebApp {
             }
             WindowEvent::RedrawRequested => self.frame(),
             other => {
+                match &other {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        self.cursor = (position.x, position.y);
+                    }
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        self.shared.scale.set(*scale_factor);
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        // `hit` in both control modes (`docs/api.md`
+                        // section 8), physical pixels as natively.
+                        let (x, y) = self.cursor;
+                        let b = match button {
+                            winit::event::MouseButton::Left => 0,
+                            winit::event::MouseButton::Right => 1,
+                            winit::event::MouseButton::Middle => 2,
+                            winit::event::MouseButton::Back => 3,
+                            winit::event::MouseButton::Forward => 4,
+                            winit::event::MouseButton::Other(n) => 5 + u32::from(*n),
+                        };
+                        let mut api = self.shared.api.borrow_mut();
+                        match state {
+                            winit::event::ElementState::Pressed => api.mouse_down(x, y, b),
+                            winit::event::ElementState::Released => api.mouse_up(x, y, b),
+                        }
+                    }
+                    _ => {}
+                }
                 if matches!(
                     other,
                     WindowEvent::KeyboardInput { .. }
@@ -457,9 +572,13 @@ impl ApplicationHandler for WebApp {
                 ) {
                     self.force_draw = true;
                 }
-                if self
-                    .controls
-                    .handle(&other, &mut self.sim, &mut self.camera)
+                // With controls `None` the keyboard and mouse leave the
+                // camera, choosers, clock, and exposure alone.
+                let builtin = self.shared.api.borrow().controls() == crate::api::Controls::Builtin;
+                if builtin
+                    && self
+                        .controls
+                        .handle(&other, &mut self.sim, &mut self.camera)
                 {
                     event_loop.exit();
                 }
@@ -467,7 +586,16 @@ impl ApplicationHandler for WebApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shared.api.borrow().destroyed() {
+            // `destroy`: the loop stops; the surface and device are
+            // dropped here, the fetcher and its module worker with the
+            // app.
+            *self.gfx.borrow_mut() = None;
+            self.window = None;
+            event_loop.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }

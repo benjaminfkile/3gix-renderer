@@ -1,30 +1,23 @@
 #!/bin/sh
 # Builds the browser version into web/pkg: wasm-pack compiles the renderer
 # crate for wasm32-unknown-unknown with the web feature and generates the
-# JavaScript bindings, then wasm-opt -O2 shrinks the module in place.
+# JavaScript bindings.
 #
-# Needs wasm-pack and wasm-opt (binaryen) on the PATH. Serve web/ with any
+# Needs wasm-pack on the PATH. Serve web/ with any
 # static file server afterwards, see docs/web.md.
 set -eu
 
 cd "$(dirname "$0")/.."
 
 # wasm-pack takes its own options before the crate path's extra cargo
-# arguments; --no-opt because wasm-opt runs below with the installed
-# binary instead of one wasm-pack would download.
+# arguments; --no-opt so wasm-pack does not download and run its own
+# wasm-opt (see below).
 wasm-pack build crates/renderer --target web --out-dir ../../web/pkg --no-opt --release -- --features web
 
-wasm=web/pkg/renderer_bg.wasm
-# The wasm features rustc enables by default for wasm32-unknown-unknown,
-# so wasm-opt accepts the module and keeps to them.
-wasm-opt -O2 \
-    --enable-bulk-memory \
-    --enable-mutable-globals \
-    --enable-nontrapping-float-to-int \
-    --enable-sign-ext \
-    --enable-reference-types \
-    --enable-multivalue \
-    "$wasm" -o "$wasm.opt"
-mv "$wasm.opt" "$wasm"
+# No wasm-opt pass: binaryen 108 (the installed one) rewrites the export
+# of wasm-bindgen's externref table to point at the function table, so
+# initSync fails with "WebAssembly.Table.grow(): failed to grow table"
+# (even a plain read and write with no passes does it). The module stays
+# as wasm-pack built it, in release; scripts/api-values-check.mjs loads it.
 
 ls -l web/pkg/renderer_bg.wasm web/pkg/renderer.js
