@@ -38,8 +38,21 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-/// The script the Web Worker runs, relative to the page.
+/// The script the Web Worker runs, relative to the page, unless
+/// [`set_worker_script`] named another.
 pub const WORKER_SCRIPT: &str = "./module-worker.js";
+
+thread_local! {
+    static SCRIPT: RefCell<String> = RefCell::new(WORKER_SCRIPT.to_string());
+}
+
+/// Sets the URL of the Web Worker's script for workers started from now
+/// on. The JS package (`docs/api.md` section 9) calls it with the URL of
+/// its own copy, resolved against the package, before `Renderer.create`.
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = setWorkerScript)]
+pub fn set_worker_script(url: &str) {
+    SCRIPT.with(|s| *s.borrow_mut() = url.to_string());
+}
 
 /// The time limit of one module call, milliseconds: 60 s, the native
 /// host's default.
@@ -126,7 +139,8 @@ impl ModuleWorker {
         }
         let options = web_sys::WorkerOptions::new();
         options.set_type(web_sys::WorkerType::Module);
-        let w = web_sys::Worker::new_with_options(WORKER_SCRIPT, &options)
+        let script = SCRIPT.with(|s| s.borrow().clone());
+        let w = web_sys::Worker::new_with_options(&script, &options)
             .map_err(|e| WorkerError::transient(format!("starting the module worker: {e:?}")))?;
         let weak: Weak<Inner> = Rc::downgrade(&self.inner);
         let on_message =

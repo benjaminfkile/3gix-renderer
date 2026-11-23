@@ -6,8 +6,11 @@
 # browser) against the example module's conformance hashes, the browser's
 # view options from config.js and the query string, the
 # wasm32 builds with the web feature off and on, and the browser package
-# built by web/build.sh (wasm-pack), then the web binding's surface against
-# docs/api.md and its value conversions under Node. There is no browser here:
+# built by web/build.sh (wasm-pack), then the JS package
+# (packages/3gix-renderer: npm ci, its build, tsc over the package and the
+# demo, the React component's unit tests, and the npm pack file list), then
+# the web binding's and the package's surface against docs/api.md and the
+# binding's value conversions under Node. There is no browser here:
 # running the browser build is verified by hand, see docs/web.md.
 #
 # Set GX_CORE_DIR to a checkout of the core library to also check that the
@@ -67,7 +70,25 @@ for f in web/pkg/renderer_bg.wasm web/pkg/renderer.js; do
 done
 echo "browser package ok"
 
-step "10. web binding: API surface and value conversions"
+step "10. packages/3gix-renderer"
+(
+    cd packages/3gix-renderer
+    npm ci --no-audit --no-fund
+    npm run build
+    npm run typecheck
+    npm test
+    list=$(npm pack --dry-run 2>&1)
+    printf '%s\n' "$list"
+    for f in dist/wasm/renderer_bg.wasm dist/wasm/module-worker.js dist/wasm/module-runner.js; do
+        if ! printf '%s\n' "$list" | grep -q " $f\$"; then
+            echo "npm pack does not list $f" >&2
+            exit 1
+        fi
+    done
+    echo "package ok"
+)
+
+step "11. web binding and package: API surface and value conversions"
 node scripts/api-surface-check.mjs
 node scripts/api-values-check.mjs
 
