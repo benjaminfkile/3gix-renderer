@@ -119,6 +119,38 @@ pub fn matter_step(
     draw
 }
 
+/// Whether everything the current view asked for has arrived and is
+/// drawn: no spawn is waiting and the world is ready
+/// ([`World::ready`]). The condition the headless run (and so the budget
+/// harness) times its settle by, and the API's `settled` event
+/// (`docs/api.md` section 8).
+pub fn view_settled(world: &World, spawner: &crate::spawn::Spawner) -> bool {
+    spawner.pending.is_none() && world.ready()
+}
+
+/// The API's `stats` event values (`docs/api.md` section 8) of a drawn
+/// scene.
+pub fn api_stats(world: &World, fetcher: &Fetcher, scene: &Scene, fps: f64) -> api::Stats {
+    let m = matter_stats(world, Some(fetcher), scene);
+    api::Stats {
+        fps,
+        tiles_drawn: scene.tiles.len(),
+        triangles: m.triangles_drawn,
+        cells_drawn: scene.surfaces.len(),
+        streaming: m.cells_pending,
+        computing: m.module_runs,
+        uploading: m.uploads_pending,
+    }
+}
+
+/// The picture the API's queries run against (`docs/api.md` section 6):
+/// the tiles and meshes of `draw` as `seen` saw them, with the drawn tiles
+/// a finer tile is still on its way for.
+pub fn api_picture(world: &World, draw: &DrawList, seen: &Seen, size: (u32, u32)) -> api::Picture {
+    api::Picture::new(seen.system(), seen.camera(), draw, size)
+        .with_coarse(world.surfaces().coarse_drawn())
+}
+
 /// The matter values for the overlay.
 pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> MatterStats {
     let counts = world.counts();
@@ -554,7 +586,7 @@ pub fn render_headless_view(
                     sim.prepare_light(&camera);
                 }
                 if !moved && spawner.pending.is_none() && done(&world) {
-                    if world.ready() {
+                    if view_settled(&world, &spawner) {
                         settle_seconds = Some(start.elapsed().as_secs_f64());
                     }
                     break;
@@ -667,9 +699,14 @@ pub fn run_headless(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
     Ok(())
 }
 
-/// The desktop run: a window, the frame loop, and the controls. Cells come
-/// through `fetcher`.
-pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) -> Result<()> {
+/// The desktop run: a window, the frame loop, and the controls, with
+/// `consumer` on the API each tick. Cells come through `fetcher`.
+pub fn run_windowed(
+    config: &Config,
+    system: FrameSystem,
+    mut fetcher: Fetcher,
+    consumer: Box<dyn Consumer>,
+) -> Result<()> {
     let event_loop = EventLoop::new().context("opening the window system")?;
     // Wait, not Poll: each frame asks for the next redraw, so the loop
     // still runs continuously, but paced by the surface's present mode (one
@@ -681,7 +718,7 @@ pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
     let mut app = App {
         api: Api::new(launch.sim.system().tree(), &launch.camera)
             .with_build(fetcher.client().build()),
-        consumer: Box::new(()),
+        consumer,
         sim: launch.sim,
         camera: launch.camera,
         spawner: crate::spawn::Spawner {
@@ -719,6 +756,7 @@ pub fn run_windowed(config: &Config, system: FrameSystem, mut fetcher: Fetcher) 
         occluded: false,
         occluded_try: None,
         fps: Fps::default(),
+        cursor: (0.0, 0.0),
         error: None,
     };
     event_loop
@@ -834,7 +872,7 @@ struct App {
     /// The renderer API the window drives its loop through
     /// (`docs/api.md` section 1).
     api: Api,
-    /// The application on the API: none yet beyond the built-in controls.
+    /// The application on the API (`()` for the built-in controls only).
     consumer: Box<dyn Consumer>,
     sim: Simulation,
     camera: Camera,
@@ -871,7 +909,23 @@ struct App {
     /// When a draw was last asked for while occluded.
     occluded_try: Option<Instant>,
     fps: Fps,
+    /// The cursor's last position, physical pixels.
+    cursor: (f64, f64),
     error: Option<anyhow::Error>,
+}
+
+/// The API's number for a mouse button: 0 left, 1 right, 2 middle, then
+/// back, forward, and others from 3.
+fn mouse_button(button: winit::event::MouseButton) -> u32 {
+    use winit::event::MouseButton as B;
+    match button {
+        B::Left => 0,
+        B::Right => 1,
+        B::Middle => 2,
+        B::Back => 3,
+        B::Forward => 4,
+        B::Other(n) => 5 + u32::from(n),
+    }
 }
 
 /// Time between ticks while anything moves, streams, or settles: about one
@@ -966,6 +1020,14 @@ impl App {
             scene.markers.clear();
             scene.lines.clear();
         }
+        self.api
+            .set_picture(api_picture(&self.world, &draw, &seen, size));
+        let fps = self.fps.value(now);
+        self.api.observe(
+            view_settled(&self.world, &self.spawner),
+            api_stats(&self.world, &self.fetcher, &scene, fps.unwrap_or(0.0)),
+            t,
+        );
         let stats = matter_stats(&self.world, Some(&self.fetcher), &scene);
         let mut overlay = OverlayInfo {
             ..overlay_info(
@@ -1135,8 +1197,22 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => self.draw(),
             other => {
-                if let WindowEvent::Occluded(o) = other {
-                    self.occluded = o;
+                match &other {
+                    WindowEvent::Occluded(o) => self.occluded = *o,
+                    WindowEvent::CursorMoved { position, .. } => {
+                        self.cursor = (position.x, position.y);
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        // `hit` in both control modes (`docs/api.md`
+                        // section 8).
+                        let (x, y) = self.cursor;
+                        let b = mouse_button(*button);
+                        match state {
+                            winit::event::ElementState::Pressed => self.api.mouse_down(x, y, b),
+                            winit::event::ElementState::Released => self.api.mouse_up(x, y, b),
+                        }
+                    }
+                    _ => {}
                 }
                 let input = matches!(
                     other,
