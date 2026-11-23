@@ -813,8 +813,16 @@ impl WorkerPool {
             return;
         }
         state.computes.push(task.job.key(), priority, task);
+        // Below the pool size, the one thread a single notify wakes may be
+        // outside the budget: it would wait again and the job would sit
+        // with an allowed thread asleep. Wake them all then.
+        let all = state.budget < self.size;
         drop(state);
-        self.queue.ready.notify_one();
+        if all {
+            self.queue.ready.notify_all();
+        } else {
+            self.queue.ready.notify_one();
+        }
     }
 
     /// Follows a new wanted set: every waiting job takes its key's
