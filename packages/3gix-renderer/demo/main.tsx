@@ -13,7 +13,9 @@ interface DemoConfig extends Connection {
 
 async function loadConfig(): Promise<DemoConfig | null> {
     try {
-        const path = "./config.js";
+        // Next to the page, not this module: a built demo keeps its
+        // modules under assets/.
+        const path = new URL("config.js", document.baseURI).href;
         return ((await import(/* @vite-ignore */ path)) as { default: DemoConfig }).default;
     } catch {
         return null;
