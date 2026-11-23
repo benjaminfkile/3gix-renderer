@@ -758,7 +758,7 @@ impl Api {
     }
 
     /// `getComputeBudget`: the module workers this client may run.
-    pub fn compute_budget(&self) -> usize {
+    pub fn get_compute_budget(&self) -> usize {
         self.compute_budget
     }
 

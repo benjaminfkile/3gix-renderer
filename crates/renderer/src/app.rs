@@ -957,8 +957,9 @@ impl App {
             spawner: &mut self.spawner,
             keys: &mut self.controls,
         });
-        if self.api.compute_budget() != self.fetcher.compute_budget() {
-            self.fetcher.set_compute_budget(self.api.compute_budget());
+        if self.api.get_compute_budget() != self.fetcher.compute_budget() {
+            self.fetcher
+                .set_compute_budget(self.api.get_compute_budget());
         }
         if let Some(fps) = self.api.max_fps() {
             self.frame_interval = Some(Duration::from_secs_f64(1.0 / f64::from(fps)));

@@ -145,7 +145,9 @@ fn run_headless_loop(
     let now = tdb_of_utc_ms(fetcher.now_utc_ms());
     let launch = crate::options::launch(system, &config.options, now);
     let (mut sim, mut camera) = (launch.sim, launch.camera);
-    let mut api = Api::new(sim.system().tree(), &camera).with_build(fetcher.client().build());
+    let mut api = Api::new(sim.system().tree(), &camera)
+        .with_build(fetcher.client().build())
+        .with_compute_budget(fetcher.max_compute_budget(), config.options.compute_budget);
     let mut spawner = Spawner {
         active: None,
         pending: launch.pending_spawn,

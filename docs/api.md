@@ -89,7 +89,7 @@ Rust: `Api::events()` drains the queue each tick. JS: `on(name, fn)` returns an 
 | `frameChanged` | `{ from, to }` | The camera's frame changed. |
 | `settled` | `{ seconds }` | Everything the current view asked for has arrived and is drawn; the same condition the budget harness waits for. Fires again after each later settle. |
 | `hit` | a `raycast` result or null, plus `{ x, y, button }` | A click (press and release within 4 px). Fired in both control modes. |
-| `stats` | `{ fps, tilesDrawn, triangles, cellsDrawn, streaming, computing, uploading }` | Once a second. |
+| `stats` | `{ fps, tilesDrawn, triangles, cellsDrawn, streaming, computing, uploading }`: `streaming` cells still waiting for sections, `computing` module runs so far this session, `uploading` offers waiting or being sent; `fps` 0 where nothing is drawn | Once a second. |
 
 ## 9. The JS package
 

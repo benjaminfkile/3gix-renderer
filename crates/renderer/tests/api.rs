@@ -146,8 +146,9 @@ impl Loop {
             keys: &mut self.keys,
         });
         // As the window applies it (`crate::app`).
-        if self.api.compute_budget() != self.fetcher.compute_budget() {
-            self.fetcher.set_compute_budget(self.api.compute_budget());
+        if self.api.get_compute_budget() != self.fetcher.compute_budget() {
+            self.fetcher
+                .set_compute_budget(self.api.get_compute_budget());
         }
         if self.api.paused() {
             self.api.end_tick(&self.sim, &self.camera, &self.world);
@@ -824,11 +825,11 @@ mod compute_budget {
     fn get_and_set_within_the_default() {
         let mut l = Loop::new();
         let max = l.api.max_compute_budget();
-        assert_eq!(l.api.compute_budget(), max, "the default");
+        assert_eq!(l.api.get_compute_budget(), max, "the default");
         l.api.set_compute_budget(0).unwrap();
-        assert_eq!(l.api.compute_budget(), 0);
+        assert_eq!(l.api.get_compute_budget(), 0);
         assert!(l.api.set_compute_budget(max + 1).is_err());
-        assert_eq!(l.api.compute_budget(), 0);
+        assert_eq!(l.api.get_compute_budget(), 0);
         l.tick();
         assert_eq!(l.fetcher.compute_budget(), 0, "applied at the tick");
         l.api.set_compute_budget(max).unwrap();
@@ -837,7 +838,7 @@ mod compute_budget {
         // The start option clamps to the default.
         let a = renderer::api::Api::new(l.sim.system().tree(), &l.camera)
             .with_compute_budget(3, Some(7));
-        assert_eq!((a.compute_budget(), a.max_compute_budget()), (3, 3));
+        assert_eq!((a.get_compute_budget(), a.max_compute_budget()), (3, 3));
     }
 
     #[test]
@@ -1212,6 +1213,47 @@ mod queries {
         let layers = vec![registry_layer("frames", &common::registry_bytes())];
         let (events, _) = run(layers, None, |e| e.contains(&Event::Ready));
         assert_eq!(events.first(), Some(&Event::Ready));
+    }
+
+    /// A consumer that records the compute budget it sees on its first
+    /// tick and then stops the loop.
+    struct BudgetProbe(Arc<Mutex<Option<usize>>>);
+
+    impl Consumer for BudgetProbe {
+        fn tick(&mut self, api: &mut Api) {
+            *self.0.lock().unwrap() = Some(api.get_compute_budget());
+            api.destroy().unwrap();
+        }
+    }
+
+    #[test]
+    fn create_takes_the_start_compute_budget() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = rt
+            .block_on(MockHub::start(MockHubOptions::new(
+                vec![registry_layer("frames", &common::registry_bytes())],
+                Vec::new(),
+            )))
+            .unwrap();
+        // Two workers and a start budget of one: below the default, and
+        // above 0 so the registry, which the mock hub does not store, is
+        // still computed.
+        let mut config = mock_config(&hub);
+        config.workers = Some(2);
+        let mut options = config.options.clone();
+        options.compute_budget = Some(1);
+        let seen = Arc::new(Mutex::new(None));
+        create(
+            CreateTarget::Headless {
+                width: SIZE.0,
+                height: SIZE.1,
+            },
+            &config,
+            options,
+            Box::new(BudgetProbe(seen.clone())),
+        )
+        .expect("create runs the loop");
+        assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 
     /// The radius of the served tiles, meters.
