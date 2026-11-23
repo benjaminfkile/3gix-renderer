@@ -239,3 +239,13 @@ by hand on a desktop browser, against a hub:
    reload the page and see the panel come back filled in.
 
 No automated test pretends to cover these steps.
+
+## The JS package
+
+Applications embed the browser build through the JS package and its React
+component in `packages/3gix-renderer`, see
+[its README](../packages/3gix-renderer/README.md). The package carries its
+own copy of the wasm and both worker files. It names the module worker's
+URL with `setWorkerScript` (exported by the binding, `web::worker`); without
+that call the worker is `./module-worker.js` relative to the page, as
+`web/index.html` uses it.
