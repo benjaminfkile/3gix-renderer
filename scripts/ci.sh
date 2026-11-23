@@ -6,7 +6,8 @@
 # browser) against the example module's conformance hashes, the browser's
 # view options from config.js and the query string, the
 # wasm32 builds with the web feature off and on, and the browser package
-# built by web/build.sh (wasm-pack and wasm-opt). There is no browser here:
+# built by web/build.sh (wasm-pack), then the web binding's surface against
+# docs/api.md and its value conversions under Node. There is no browser here:
 # running the browser build is verified by hand, see docs/web.md.
 #
 # Set GX_CORE_DIR to a checkout of the core library to also check that the
@@ -65,5 +66,9 @@ for f in web/pkg/renderer_bg.wasm web/pkg/renderer.js; do
     fi
 done
 echo "browser package ok"
+
+step "10. web binding: API surface and value conversions"
+node scripts/api-surface-check.mjs
+node scripts/api-values-check.mjs
 
 printf '\nci ok\n'

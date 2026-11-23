@@ -43,16 +43,18 @@ from one codebase). The browser-only code is the `web` module
 
 ## Building
 
-Needs the `wasm32-unknown-unknown` target (pinned in `rust-toolchain.toml`),
-`wasm-pack`, and `wasm-opt` from binaryen on the `PATH`.
+Needs the `wasm32-unknown-unknown` target (pinned in `rust-toolchain.toml`)
+and `wasm-pack` on the `PATH`.
 
 ```sh
 sh web/build.sh
 ```
 
 This runs `wasm-pack build crates/renderer --target web --out-dir ../../web/pkg
---no-opt --release -- --features web`, then `wasm-opt -O2` on
-`web/pkg/renderer_bg.wasm` in place. The output is `web/pkg/renderer.js` and
+--no-opt --release -- --features web`. There is no `wasm-opt` pass: binaryen
+108 rewrites the export of wasm-bindgen's externref table so the module no
+longer initializes (`WebAssembly.Table.grow(): failed to grow table`). The
+output is `web/pkg/renderer.js` and
 `web/pkg/renderer_bg.wasm` (ignored by git). `wasm-pack` options go before
 the `--`, and the cargo `--features web` after it; with the feature first,
 `wasm-pack` hands `--out-dir` to cargo as well, which fails.
@@ -85,6 +87,52 @@ URL, API key, space id, build id
 loads the registry, and starts the frame loop; an error shows in the panel.
 Controls are those of the desktop (`docs/controls.md`); click the canvas
 first so it has the keyboard focus. `Escape` stops the frame loop.
+
+## The Renderer class
+
+The page is one consumer of the web binding of the renderer API
+(`docs/api.md`): the wasm-bindgen class `Renderer` in `web/pkg/renderer.js`
+(`crates/renderer/src/web/binding.rs`). Every method calls the same
+`api::Api` as the desktop window; names are the contract's, in camelCase.
+
+```js
+import init, { Renderer } from "./pkg/renderer.js";
+
+await init();
+const renderer = await Renderer.create(
+  "gx-canvas", // or the canvas element
+  { hubUrl, apiKey, spaceId, buildId: "" },
+  { startOn: "3:0,0,1@+10", timeScale: 60 }, // or flattened pairs
+);
+const off = renderer.on("camera", (pose) => console.log(pose.frameId, pose.position));
+renderer.setControls("none");
+renderer.setFlightInput({ move: [0, 0, -1], look: [0, 0, 0], boost: false });
+const p = renderer.project(3, [0, 0, 1e6]); // { x, y, depth } or null
+off();
+renderer.destroy();
+```
+
+- `create` resolves once the loop runs (its first tick) and rejects with
+  the message if the connection is incomplete, an option is invalid, the
+  hub refuses, or the canvas has no WebGPU device. Listeners added after
+  it resolves do not see that first `ready`.
+- Values are plain JS objects and arrays shaped as `docs/api.md` section 2
+  says (a pose is `{ frameId, position, orientation, speed }`). Frame ids
+  are numbers; a frame id that is not a whole number from 0 to below 2^53
+  throws, in either direction.
+- Errors are thrown as `Error` with the API's message. Setters queue and
+  apply at the start of the next tick; a queued call that fails then
+  comes back as an `error` event.
+- `raycast`, `project`, and the `hit` event's `x` and `y` are in CSS pixels;
+  the binding scales them by the canvas's pixel ratio.
+- `on(name, fn)` takes one of the `RendererEvent` names (`ready`, `error`,
+  `camera`, `frameChanged`, `settled`, `hit`, `stats`) and returns the
+  function that unsubscribes. Events are delivered after each tick.
+- `checkPose(value)` and `checkFrameId(value)` run the binding's
+  conversions alone, without a GPU; CI calls them under Node.
+
+The page keeps the instance as `window.gxRenderer`, so the API can be
+tried from the browser console.
 
 ## View and time options
 
@@ -155,7 +203,12 @@ browser's own WebGPU status page for the current state.
 
 There is no browser in CI. CI verifies that the crate builds for
 `wasm32-unknown-unknown` with the `web` feature, that clippy passes on that
-build, and that `web/build.sh` produces the package. Node (V8) stands in
+build, and that `web/build.sh` produces the package.
+`node scripts/api-surface-check.mjs` fails unless `web/pkg/renderer.d.ts`
+exports every item of `docs/api.md` sections 3 to 8 as a method of
+`Renderer` and every event of section 8 in `RendererEvent`, and
+`node scripts/api-values-check.mjs` loads the package under Node and checks
+the pose and frame id conversions. Node (V8) stands in
 for the browser's `WebAssembly`: `node scripts/worker-node-check.mjs` runs
 `web/module-runner.js`, then `web/module-worker.js` in a worker thread
 through its message protocol, against the core example modules'
@@ -177,7 +230,10 @@ by hand on a desktop browser, against a hub:
 3. Matter streams in or is computed here (the overlay's cell counts,
    sections streamed, and sections computed here rise), surfaces are lit,
    hot gas glows as a volume, and far frames show as dots.
-4. Fly with the desktop controls, go back in time with `,` or `Backspace`
+4. In the console, `gxRenderer.getCamera()`, `gxRenderer.on("hit", console.log)`
+   then a click, and `gxRenderer.setControls("none")` answer as
+   `docs/api.md` says.
+5. Fly with the desktop controls, go back in time with `,` or `Backspace`
    and return with `N`,
    reload the page and see the panel come back filled in.
 

@@ -70,7 +70,7 @@
   <div id="status">Needs a browser with WebGPU.</div>
 </form>
 <script type="module">
-  import init, { start, check_options } from "./pkg/renderer.js";
+  import init, { Renderer, check_options } from "./pkg/renderer.js";
   import { viewOptionPairs } from "./view-options.js";
 
   // Settings come from three places, in order of priority: web/config.js
@@ -128,14 +128,20 @@
         return;
       }
       status.textContent = "Loading the registry...";
-      await start(
+      // The page is a consumer of the Renderer class (docs/api.md section
+      // 1); the view and time options go in as name and value pairs.
+      const renderer = await Renderer.create(
         "gx-canvas",
-        value("hub-url"),
-        value("api-key"),
-        value("space-id"),
-        value("build-id"),
+        {
+          hubUrl: value("hub-url"),
+          apiKey: value("api-key"),
+          spaceId: value("space-id"),
+          buildId: value("build-id"),
+        },
         options,
       );
+      renderer.on("error", (message) => console.error("gx-renderer:", message));
+      window.gxRenderer = renderer;
       form.classList.add("running");
       document.getElementById("gx-canvas").focus();
     } catch (e) {
