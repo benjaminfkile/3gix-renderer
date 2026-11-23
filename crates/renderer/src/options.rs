@@ -19,6 +19,10 @@
 //! `hide-layers` lists layer ids to hide (`rendering.md` section 7 item
 //! 7), overriding the build's `shown` defaults; [`hidden_layer_indices`]
 //! resolves it against the build and reports unknown ids.
+//!
+//! `compute-budget` is the start value of `setComputeBudget` (`docs/api.md`
+//! section 7): module workers the client may run, 0 to stream only what
+//! the hub stores.
 
 use crate::camera::Camera;
 use crate::config::{ConfigError, Start, StartOn, View};
@@ -28,7 +32,7 @@ use gx_core::frames::FrameSystem;
 use gx_core::units::Seconds;
 
 /// The option names, in the native flags' kebab case, in a fixed order.
-pub const OPTION_NAMES: [&str; 9] = [
+pub const OPTION_NAMES: [&str; 10] = [
     "start",
     "start-offset-seconds",
     "time-scale",
@@ -38,6 +42,7 @@ pub const OPTION_NAMES: [&str; 9] = [
     "exposure-stops",
     "mesh-mode",
     "hide-layers",
+    "compute-budget",
 ];
 
 /// The view and time options of one start, each at its default until set.
@@ -67,6 +72,10 @@ pub struct ViewOptions {
     /// `hide-layers`: layer ids to hide at start, overriding the build's
     /// `shown` defaults; `None` keeps the defaults.
     pub hide_layers: Option<Vec<String>>,
+    /// `compute-budget`: module workers the client may run at start
+    /// (`setComputeBudget`, `docs/api.md` section 7), clamped to the
+    /// build's default; `None` runs the default.
+    pub compute_budget: Option<usize>,
 }
 
 impl Default for ViewOptions {
@@ -81,6 +90,7 @@ impl Default for ViewOptions {
             exposure_stops: None,
             mesh_mode: MeshMode::Surfaces,
             hide_layers: None,
+            compute_budget: None,
         }
     }
 }
@@ -150,6 +160,13 @@ pub fn parse_mesh_mode(name: &str, v: &str) -> Result<MeshMode, ConfigError> {
     }
 }
 
+/// Parses a whole number of workers, 0 or more, for `compute-budget`.
+pub fn parse_workers(name: &str, v: &str) -> Result<usize, ConfigError> {
+    v.trim()
+        .parse()
+        .map_err(|_| err(format!("{name}: {v:?} is not a whole number of workers")))
+}
+
 /// Parses a comma-separated list of layer ids for `hide-layers`: blanks
 /// around ids are dropped, an empty list hides nothing.
 pub fn parse_layer_ids(v: &str) -> Vec<String> {
@@ -210,6 +227,7 @@ impl ViewOptions {
             "exposure-stops" => self.exposure_stops = Some(parse_f64(label, value)?),
             "mesh-mode" => self.mesh_mode = parse_mesh_mode(label, value)?,
             "hide-layers" => self.hide_layers = Some(parse_layer_ids(value)),
+            "compute-budget" => self.compute_budget = Some(parse_workers(label, value)?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -320,9 +338,18 @@ mod tests {
                 "viewDistanceScale",
                 "exposureStops",
                 "meshMode",
-                "hideLayers"
+                "hideLayers",
+                "computeBudget"
             ]
         );
+    }
+
+    #[test]
+    fn compute_budget_from_the_page() {
+        let o = ViewOptions::from_camel_pairs([("computeBudget", "3"), ("computeBudget", "1")])
+            .unwrap();
+        assert_eq!(o.compute_budget, Some(1));
+        assert_eq!(ViewOptions::default().compute_budget, None);
     }
 
     #[test]
@@ -354,6 +381,7 @@ mod tests {
             ("view-distance-scale", "0.5"),
             ("exposure-stops", "2"),
             ("mesh-mode", "edges"),
+            ("compute-budget", " 0 "),
         ] {
             assert!(o.set(n, n, v).unwrap(), "{n}");
         }
@@ -367,6 +395,7 @@ mod tests {
         assert_eq!(o.view_distance_scale, 0.5);
         assert_eq!(o.exposure_stops, Some(2.0));
         assert_eq!(o.mesh_mode, MeshMode::Edges);
+        assert_eq!(o.compute_budget, Some(0));
         assert!(!o.set("width", "width", "3").unwrap());
     }
 
@@ -382,6 +411,8 @@ mod tests {
             ("view-distance-scale", "0"),
             ("exposure-stops", ""),
             ("mesh-mode", "wire"),
+            ("compute-budget", "-1"),
+            ("compute-budget", "two"),
         ] {
             let e = o.set(n, "label", v).unwrap_err();
             assert!(e.0.starts_with("label: "), "{n}: {e}");

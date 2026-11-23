@@ -717,7 +717,8 @@ pub fn run_windowed(
     let launch = crate::options::launch(system, &config.options, now);
     let mut app = App {
         api: Api::new(launch.sim.system().tree(), &launch.camera)
-            .with_build(fetcher.client().build()),
+            .with_build(fetcher.client().build())
+            .with_compute_budget(fetcher.max_compute_budget(), config.options.compute_budget),
         consumer,
         sim: launch.sim,
         camera: launch.camera,
@@ -956,6 +957,9 @@ impl App {
             spawner: &mut self.spawner,
             keys: &mut self.controls,
         });
+        if self.api.compute_budget() != self.fetcher.compute_budget() {
+            self.fetcher.set_compute_budget(self.api.compute_budget());
+        }
         if let Some(fps) = self.api.max_fps() {
             self.frame_interval = Some(Duration::from_secs_f64(1.0 / f64::from(fps)));
         }

@@ -88,6 +88,10 @@ fn connect(config: &Config) -> anyhow::Result<Connected> {
         options.worker_threads = n;
     }
     let mut fetcher = Fetcher::new(runtime.handle().clone(), client, options)?;
+    // The start budget applies from the first key, the registry included.
+    if let Some(n) = config.options.compute_budget {
+        fetcher.set_compute_budget(n);
+    }
     let system = fetcher.load_registry(REGISTRY_DEADLINE)?;
     Ok(Connected {
         system,

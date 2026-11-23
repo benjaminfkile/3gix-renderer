@@ -2219,6 +2219,9 @@ mod native {
         client: Arc<HubClient>,
         lane: Arc<UploadLane>,
         in_flight: AtomicUsize,
+        /// `false` at a compute budget of 0: offers wait in the lane and
+        /// none is sent ([`Fetcher::set_compute_budget`]).
+        sending: std::sync::atomic::AtomicBool,
     }
 
     /// Frees an upload slot when the request ends, however it ends
@@ -2240,6 +2243,9 @@ mod native {
         /// the lane is empty.
         fn pump(self: &Arc<Self>) {
             loop {
+                if !self.sending.load(Ordering::SeqCst) {
+                    return;
+                }
                 let reserved = self
                     .in_flight
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -2371,6 +2377,7 @@ mod native {
         client: Arc<HubClient>,
         cache: Option<Arc<DiskCache>>,
         pool: WorkerPool,
+        uploads: Arc<UploadSender>,
         coordinator: Coordinator,
         checks: Arc<CheckLane>,
         inputs: Arc<HubInputs>,
@@ -2401,6 +2408,13 @@ mod native {
             let stats = WorkerStats::new();
             let lane = Arc::new(UploadLane::new(Arc::clone(&stats)));
             let checks = Arc::new(CheckLane::new(Arc::clone(&stats)));
+            let uploads = Arc::new(UploadSender {
+                handle: handle.clone(),
+                client: client.clone(),
+                lane: Arc::clone(&lane),
+                in_flight: AtomicUsize::new(0),
+                sending: std::sync::atomic::AtomicBool::new(true),
+            });
             let pool = WorkerPool::with_stats(
                 options.worker_threads,
                 options.host,
@@ -2411,12 +2425,7 @@ mod native {
                 options.cache.clone(),
                 Arc::new(HubUploader {
                     lane: Arc::clone(&lane),
-                    sender: Arc::new(UploadSender {
-                        handle: handle.clone(),
-                        client: client.clone(),
-                        lane: Arc::clone(&lane),
-                        in_flight: AtomicUsize::new(0),
-                    }),
+                    sender: Arc::clone(&uploads),
                 }),
                 stats,
             )
@@ -2457,6 +2466,7 @@ mod native {
                 client,
                 cache: options.cache,
                 pool,
+                uploads,
                 coordinator,
                 checks,
                 inputs,
@@ -2527,6 +2537,38 @@ mod native {
             }
             self.coordinator.set_wanted_cells(wanted, now);
             self.follow_wanted();
+        }
+
+        /// `setComputeBudget` (`docs/api.md` section 7): lets `workers`
+        /// module workers run, clamped to the pool size, without
+        /// restarting. At 0 every waiting job is dropped before it starts,
+        /// no new job, check, or upload starts, and `missing` and `local`
+        /// layers stay missing while `ready` ones still stream; a running
+        /// job finishes and its section is kept, and an upload already
+        /// sent completes, whole. Raising it from 0 takes up every held
+        /// layer and sends the waiting offers. Returns the budget applied.
+        pub fn set_compute_budget(&mut self, workers: usize) -> usize {
+            let workers = self.pool.set_budget(workers);
+            self.coordinator.set_compute(workers > 0);
+            self.uploads.sending.store(workers > 0, Ordering::SeqCst);
+            if workers == 0 {
+                self.pool.reprioritize(|_| None);
+            } else {
+                self.uploads.pump();
+            }
+            self.pump();
+            workers
+        }
+
+        /// The module workers this client may run now
+        /// ([`Fetcher::set_compute_budget`]).
+        pub fn compute_budget(&self) -> usize {
+            self.pool.budget()
+        }
+
+        /// The largest compute budget: the worker pool's size.
+        pub fn max_compute_budget(&self) -> usize {
+            self.pool.size()
         }
 
         /// Gives the worker's waiting jobs their keys' new priorities and
@@ -2750,6 +2792,10 @@ mod native {
                         }
                     }
                     match job {
+                        // No check is recomputed at a compute budget of 0.
+                        Some(_) if !self.coordinator.computes() => {
+                            self.pool.stats_handle().check_skipped()
+                        }
                         Some(job) => {
                             if self.checks.push(CheckJob {
                                 job,

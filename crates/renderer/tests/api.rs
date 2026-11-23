@@ -59,7 +59,6 @@ struct Loop {
 
 impl Loop {
     fn new() -> Loop {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let (matter, tiles) = example_matter_layer(
             "matter",
             EXAMPLE_MODULE,
@@ -71,11 +70,17 @@ impl Loop {
             20.0,
             6000.0,
         );
+        Loop::with(
+            vec![registry_layer("frames", &common::registry_bytes()), matter],
+            tiles,
+        )
+    }
+
+    /// The loop over a mock hub serving `layers` and source `tiles`.
+    fn with(layers: Vec<renderer::mock_hub::MockLayer>, tiles: Vec<Vec<u8>>) -> Loop {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let hub = rt
-            .block_on(MockHub::start(MockHubOptions::new(
-                vec![registry_layer("frames", &common::registry_bytes()), matter],
-                tiles,
-            )))
+            .block_on(MockHub::start(MockHubOptions::new(layers, tiles)))
             .unwrap();
         let client = rt
             .block_on(HubClient::open(
@@ -102,7 +107,9 @@ impl Loop {
         world.start_layers(&build, None);
         fetcher.set_hidden_layers(world.hidden_layers().clone());
         Loop {
-            api: Api::new(system.tree(), &camera).with_build(&build),
+            api: Api::new(system.tree(), &camera)
+                .with_build(&build)
+                .with_compute_budget(fetcher.max_compute_budget(), None),
             sim: Simulation::at_now(system, now),
             camera,
             spawner: Spawner::default(),
@@ -138,6 +145,10 @@ impl Loop {
             spawner: &mut self.spawner,
             keys: &mut self.keys,
         });
+        // As the window applies it (`crate::app`).
+        if self.api.compute_budget() != self.fetcher.compute_budget() {
+            self.fetcher.set_compute_budget(self.api.compute_budget());
+        }
         if self.api.paused() {
             self.api.end_tick(&self.sim, &self.camera, &self.world);
             return;
@@ -757,6 +768,136 @@ fn flight_look_turns_by_radians() {
     let angle = 2.0 * (x * x + y * y + z * z).sqrt().atan2(w);
     assert!((angle - 0.25).abs() < 1e-12, "{angle}");
     assert!(y > 0.0, "positive yaw turns left, about the up axis");
+}
+
+mod compute_budget {
+    //! `docs/api.md` section 7 (`setComputeBudget`, `getComputeBudget`)
+    //! against the mock hub.
+
+    use super::{common, Loop};
+    use renderer::mock_hub::{registry_layer, stored_layer, SectionMaker};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Ticks with streaming for `seconds`, waiting for the fetcher between
+    /// ticks.
+    fn run_for(l: &mut Loop, seconds: f64) {
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < seconds {
+            l.tick_with(true);
+            l.fetcher.wait_for_events(Duration::from_millis(20));
+        }
+    }
+
+    /// Ticks until `done` holds, failing after 60 s.
+    fn run_until(l: &mut Loop, what: &str, done: impl Fn(&Loop) -> bool) {
+        let start = Instant::now();
+        while !done(l) {
+            l.tick_with(true);
+            l.fetcher.wait_for_events(Duration::from_millis(20));
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "{what}: {:?} {:?}",
+                l.hub.counts(),
+                l.world.cache().counts()
+            );
+        }
+    }
+
+    fn computed(l: &Loop) -> u64 {
+        l.fetcher.stats().worker.sections_computed
+    }
+
+    /// A valid section with no matter, for either frame of the scene.
+    fn empty_cell(key: &gx_core::key::CellKey) -> Vec<u8> {
+        let extent = if key.frame_id == common::ROOT {
+            common::ROOT_EXTENT
+        } else {
+            common::CHILD_EXTENT
+        };
+        let g = key.geometry(gx_core::units::Meters::new(extent));
+        let section = gx_core::matter::Section::empty(*key, g.origin, g.edge).expect("valid");
+        gx_core::matter::encode(&section, gx_core::matter::Compression::None)
+    }
+
+    #[test]
+    fn get_and_set_within_the_default() {
+        let mut l = Loop::new();
+        let max = l.api.max_compute_budget();
+        assert_eq!(l.api.compute_budget(), max, "the default");
+        l.api.set_compute_budget(0).unwrap();
+        assert_eq!(l.api.compute_budget(), 0);
+        assert!(l.api.set_compute_budget(max + 1).is_err());
+        assert_eq!(l.api.compute_budget(), 0);
+        l.tick();
+        assert_eq!(l.fetcher.compute_budget(), 0, "applied at the tick");
+        l.api.set_compute_budget(max).unwrap();
+        l.tick();
+        assert_eq!(l.fetcher.compute_budget(), max);
+        // The start option clamps to the default.
+        let a = renderer::api::Api::new(l.sim.system().tree(), &l.camera)
+            .with_compute_budget(3, Some(7));
+        assert_eq!((a.compute_budget(), a.max_compute_budget()), (3, 3));
+    }
+
+    #[test]
+    fn at_zero_stored_sections_stream_and_draw_with_nothing_computed() {
+        let layers = vec![
+            registry_layer("frames", &common::registry_bytes()),
+            stored_layer("main", 1, SectionMaker(Arc::new(empty_cell))),
+        ];
+        let mut l = Loop::with(layers, Vec::new());
+        l.api.set_compute_budget(0).unwrap();
+        // The registry's own upload, sent before, lands first.
+        run_for(&mut l, 0.5);
+        let (jobs, uploads) = (computed(&l), l.hub.counts().uploads_stored);
+        run_until(&mut l, "stored cells ready at budget 0", |l| {
+            l.world.cache().counts().ready > 0
+        });
+        run_for(&mut l, 0.5);
+        assert_eq!(computed(&l), jobs, "no compute job at budget 0");
+        assert_eq!(l.hub.counts().uploads_stored, uploads, "no upload");
+        assert!(l.hub.counts().section_reads > 0, "stored sections stream");
+    }
+
+    #[test]
+    fn missing_stays_missing_at_zero_and_raising_starts_work() {
+        let mut l = Loop::new();
+        l.api.set_compute_budget(0).unwrap();
+        // The registry's own upload, sent before, lands first.
+        run_for(&mut l, 0.5);
+        let (jobs, uploads) = (computed(&l), l.hub.counts().uploads_stored);
+        run_until(&mut l, "directions answered", |l| {
+            l.hub.counts().missing_answers > 0
+        });
+        run_for(&mut l, 1.0);
+        assert_eq!(computed(&l), jobs, "no compute job at budget 0");
+        assert_eq!(l.hub.counts().uploads_stored, uploads, "no upload");
+        assert_eq!(l.world.cache().counts().ready, 0, "missing stays missing");
+        l.api.set_compute_budget(1).unwrap();
+        run_until(&mut l, "computing after raising the budget", |l| {
+            computed(l) > jobs && l.hub.counts().uploads_stored > uploads
+        });
+    }
+
+    #[test]
+    fn lowering_mid_run_never_sends_a_partial_upload() {
+        let mut l = Loop::new();
+        run_until(&mut l, "a module run", |l| {
+            l.fetcher.stats().worker.module_runs > 0
+        });
+        l.api.set_compute_budget(0).unwrap();
+        run_for(&mut l, 1.0);
+        let jobs = computed(&l);
+        let c = l.hub.counts();
+        run_for(&mut l, 1.0);
+        let after = l.hub.counts();
+        assert_eq!(computed(&l), jobs, "nothing starts after lowering");
+        assert_eq!(after.uploads_stored, c.uploads_stored, "nothing sent at 0");
+        // The mock checks every upload against its address: a partial
+        // section would be refused.
+        assert_eq!(after.uploads_refused, 0, "{after:?}");
+    }
 }
 
 mod queries {

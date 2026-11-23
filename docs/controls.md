@@ -94,6 +94,18 @@ ones listed by `--hide-layers <id,id,...>` instead (`hideLayers` in the
 browser). An id the build does not have is reported and ignored; an empty
 list shows every layer.
 
+## Compute budget
+
+`--compute-budget <n>` (`computeBudget` in the browser) sets how many
+module workers the client may run at start, 0 to the default (natively
+cores - 2, 3/4 of them; one Web Worker in the browser); a larger value is
+taken as the default. At 0 the client computes, checks, and uploads
+nothing: it streams only what the hub already stores, and a layer the hub
+does not store stays missing. `setComputeBudget` changes it while the
+client runs, without restarting: a job already running finishes and is
+kept, waiting jobs are dropped, and no upload is ever sent in part. No key
+sets it.
+
 ## Spawning
 
 | Input | Action |

@@ -39,6 +39,11 @@
 //!   [`FailureKind::Dropped`]: its layer goes back to unknown and starts
 //!   again from the kept answer if the key comes back. A running job
 //!   finishes and its section is cached.
+//! - With computing off ([`Coordinator::set_compute`], a compute budget
+//!   of 0, `docs/api.md` section 7) a `missing` or `local` layer starts no
+//!   job and stays missing, so its key does not complete; `ready` layers
+//!   still stream. Turned on again, each such layer starts from the kept
+//!   answer.
 //!
 //! For each wanted key (a cell, a surface tile, or the registry, which is
 //! just another key):
@@ -265,6 +270,10 @@ enum Slot {
     StreamQueued([u8; 32], [u8; 32]),
     Streaming([u8; 32], [u8; 32]),
     Computing([u8; 32]),
+    /// `missing` or `local` while computing is off
+    /// ([`Coordinator::set_compute`]): stays missing until computing is
+    /// on again, then is taken up from the kept answer.
+    Held,
     /// A stream or a job failed in a way that may go away: ask again.
     Retry {
         retry_at: f64,
@@ -391,6 +400,9 @@ pub struct Coordinator {
     overlay_layers: BTreeSet<usize>,
     /// The hidden layers, by index.
     hidden_layers: BTreeSet<usize>,
+    /// `true` while `missing` and `local` answers are held instead of
+    /// computed (a compute budget of 0, `docs/api.md` section 7).
+    compute_off: bool,
 }
 
 impl Coordinator {
@@ -596,6 +608,29 @@ impl Coordinator {
     /// Whether `key` has had a partial completion and is still in flight.
     fn partly_done(&self, key: &ChunkKey) -> bool {
         self.keys.get(key).is_some_and(|e| e.emitted > 0)
+    }
+
+    /// Turns computing on or off (`setComputeBudget`, `docs/api.md`
+    /// section 7). Off, a `missing` or `local` answer starts no job and
+    /// its layer stays missing; `ready` layers still stream. On again,
+    /// every held layer is taken up from its kept answer at the next
+    /// [`Coordinator::poll`].
+    pub fn set_compute(&mut self, on: bool) {
+        self.compute_off = !on;
+        if on {
+            for e in self.keys.values_mut() {
+                for s in &mut e.slots {
+                    if *s == Slot::Held {
+                        *s = Slot::Unknown;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether computing is on ([`Coordinator::set_compute`]).
+    pub fn computes(&self) -> bool {
+        !self.compute_off
     }
 
     /// The kept directions answers, by key.
@@ -843,6 +878,7 @@ impl Coordinator {
                         Slot::StreamQueued(address, sha256)
                     }
                 }
+                Direction::Missing(_) | Direction::Local(_) if self.compute_off => Slot::Held,
                 Direction::Missing(job) | Direction::Local(job) => {
                     if job.share {
                         self.stats.missing_answers += 1;

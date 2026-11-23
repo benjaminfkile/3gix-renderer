@@ -113,6 +113,10 @@ pub async fn start(
         web_sys::console::warn_1(&"gx-renderer: no Cache API here; nothing is cached".into());
     }
     let mut fetcher = WebFetcher::new(Rc::new(hub), cache);
+    // The start budget applies from the first key, the registry included.
+    if let Some(n) = options.compute_budget {
+        fetcher.set_compute_budget(n);
+    }
     let system = fetcher
         .load_registry()
         .await
