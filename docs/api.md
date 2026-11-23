@@ -2,7 +2,7 @@
 
 The renderer is a component other applications embed. It draws a universe and answers questions about it in runtime terms only: the camera, frames, surfaces over a frame's reference ellipsoid, layers, light, and time. Every convention of one body (coordinate names, place names, how an application likes to fly over a surface) belongs to the application that embeds the renderer, never to this API.
 
-Approved 2026-11-22. This file is the contract for the API. `rendering.md` (the rendering contract) still binds everything drawn.
+Approved 2026-11-22. This file holds the API's items; the rules they follow are `3GIXHub/docs/architecture/rendering.md` section 8, and that contract still binds everything drawn.
 
 ## 1. Shape
 
