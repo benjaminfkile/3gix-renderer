@@ -318,6 +318,24 @@ impl SimClock {
         self.settle();
     }
 
+    /// This clock at playback rate `rate` (`setTimeScale`): its size
+    /// clamped to [`RATE_LIMITS`], backwards when negative, playing. At
+    /// now a forward rate of 1 or more stays at now, since the time never
+    /// passes now; any other rate leaves now.
+    pub fn with_rate(self, rate: f64) -> SimClock {
+        let mut c = self;
+        if !rate.is_finite() || rate == 0.0 || (c.at_now && rate >= 1.0) {
+            return c;
+        }
+        let (lo, hi) = RATE_LIMITS;
+        c.at_now = false;
+        c.paused = false;
+        c.rate = rate.abs().clamp(lo, hi);
+        c.rewinding = rate < 0.0;
+        c.settle();
+        c
+    }
+
     /// Clamps the time between the origin and now: past now (or at now)
     /// it follows now.
     fn settle(&mut self) {

@@ -168,6 +168,7 @@ fn hiding_a_plain_layer_composites_its_cells_again_without_a_fetch() {
         orientation: look_rotation(Vec3::zero() - position, Vec3::new(0.0, 0.0, 1.0)),
         speed: 0.0,
         cruise: 0.0,
+        fov_y: renderer::camera::FIELD_OF_VIEW_Y,
     };
     let seen = Seen::instant(&system, &camera);
     let mut now = 0.0;

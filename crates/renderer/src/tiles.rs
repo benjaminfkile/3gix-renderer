@@ -25,7 +25,7 @@
 //! two tiles has the same bits in both; they reach the GPU relative to one
 //! anchor per frame ([`Anchor`]), so shared vertices stay identical there.
 
-use crate::camera::{Camera, FIELD_OF_VIEW_Y};
+use crate::camera::Camera;
 use crate::farfield::focal_px;
 use gx_core::frames::FrameSystem;
 use gx_core::key::{SurfaceKey, SURFACE_FACES};
@@ -101,6 +101,23 @@ pub struct TileGeometry {
     /// tile's `height_floor` (`matter-format.md` 10.3), the lowest height
     /// its compiler declares for the frame's whole surface.
     pub occluder: f64,
+    /// The reference ellipsoid's equatorial and polar radii and the
+    /// frame's `height_floor`, meters (`matter-format.md` section 10), as
+    /// the tile declares them.
+    pub shape: SurfaceShape,
+}
+
+/// A frame's surface as its tiles declare it (`matter-format.md` section
+/// 10): the reference ellipsoid and the lowest height above it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SurfaceShape {
+    /// Equatorial radius of the reference ellipsoid, meters.
+    pub radius_equatorial: f64,
+    /// Polar radius of the reference ellipsoid, meters.
+    pub radius_polar: f64,
+    /// The lowest height above the ellipsoid the compiler declares for
+    /// the whole surface, meters.
+    pub height_floor: f64,
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -242,6 +259,11 @@ impl TileGeometry {
             edge: std::f64::consts::FRAC_PI_2 * a / (1u64 << key.level) as f64,
             max_edge: 2.0 * a.max(c) / (1u64 << key.level) as f64,
             occluder: a.min(c) + t.height_floor,
+            shape: SurfaceShape {
+                radius_equatorial: a,
+                radius_polar: c,
+                height_floor: t.height_floor,
+            },
         }
     }
 
@@ -489,6 +511,24 @@ impl Surfaces {
         self.has_surface.get(&frame_id) == Some(&true)
     }
 
+    /// The surface of `frame_id` as its level-0 tiles declare it, once one
+    /// of them has arrived drawn; `None` before.
+    pub fn shape(&self, frame_id: u64) -> Option<SurfaceShape> {
+        (0..SURFACE_FACES).find_map(|face| {
+            let key = SurfaceKey {
+                frame_id,
+                face,
+                level: 0,
+                x: 0,
+                y: 0,
+            };
+            match self.tiles.get(&key) {
+                Some(State::Ready(g)) => Some(g.shape),
+                _ => None,
+            }
+        })
+    }
+
     /// Asks for `key` unless it is cached or asked for already, and adds
     /// it to the wanted set with `priority` (projected size, pixels)
     /// unless it has arrived.
@@ -726,9 +766,9 @@ impl Surfaces {
         now: f64,
     ) {
         self.now = now;
-        let focal = focal_px(f64::from(view_px.1.max(1)));
+        let focal = focal_px(f64::from(view_px.1.max(1)), camera.fov_y);
         let aspect = f64::from(view_px.0.max(1)) / f64::from(view_px.1.max(1));
-        let half_y = 0.5 * FIELD_OF_VIEW_Y;
+        let half_y = 0.5 * camera.fov_y;
         let half_x = (half_y.tan() * aspect).atan();
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
@@ -978,6 +1018,7 @@ fn in_cone(cam: [f64; 3], forward: [f64; 3], (lo, hi): ([f64; 3], [f64; 3]), con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::FIELD_OF_VIEW_Y;
     use gx_core::surface::{HEIGHT_SIDE, PARENT_SIDE};
 
     fn overlay_tile(key: SurfaceKey, coverage: u8, albedo: u8, roughness: u8) -> OverlayTile {
@@ -1129,7 +1170,14 @@ mod tests {
         let len = (cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2]).sqrt();
         let forward = cam.map(|v| v / len);
         let mut drawn = Vec::new();
-        s.select_in_frame(4, cam, forward, focal_px(720.0), 0.9, &mut drawn);
+        s.select_in_frame(
+            4,
+            cam,
+            forward,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            0.9,
+            &mut drawn,
+        );
         (drawn.iter())
             .filter(|t| t.geometry.key.face == 0)
             .map(|t| t.geometry.key.level)
@@ -1262,7 +1310,14 @@ mod tests {
         for round in 0..6 {
             s.evict(0);
             let mut drawn = Vec::new();
-            s.select_in_frame(4, cam, up_tangent, focal_px(720.0), 0.9, &mut drawn);
+            s.select_in_frame(
+                4,
+                cam,
+                up_tangent,
+                focal_px(720.0, FIELD_OF_VIEW_Y),
+                0.9,
+                &mut drawn,
+            );
             assert_eq!(keys(&drawn), want, "round {round}: what is drawn changed");
             // Serve whatever was asked for again, as the hub would.
             for key in s.take_requests() {
@@ -1352,7 +1407,14 @@ mod tests {
         max_level: u8,
         floor: f64,
     ) -> Vec<TileDrawInfo> {
-        settle_full(s, cam, forward, max_level, floor, focal_px(720.0))
+        settle_full(
+            s,
+            cam,
+            forward,
+            max_level,
+            floor,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+        )
     }
 
     fn settle_full(
@@ -1441,7 +1503,10 @@ mod tests {
         // A 720 px view (the morph bound sets the ranges) and a 1620 px one
         // (the pixel bound does), along a face edge and over a face center,
         // where tiles are largest.
-        for focal in [focal_px(720.0), focal_px(1620.0)] {
+        for focal in [
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            focal_px(1620.0, FIELD_OF_VIEW_Y),
+        ] {
             for (face, i0, j) in [(4u8, 20i64, 9i64), (0, 26, 32)] {
                 meet_without_gaps(focal, face, i0, j);
             }

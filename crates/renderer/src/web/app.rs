@@ -303,7 +303,7 @@ impl WebApp {
         // Draw only what differs visibly from the last frame drawn
         // (`crate::redraw`); the browser still calls every display frame
         // for input, streaming, and the simulation.
-        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)));
+        let focal = crate::farfield::focal_px(f64::from(size.1.max(1)), self.camera.fov_y);
         let need = self.redraw.decide(
             &scene,
             &overlay,

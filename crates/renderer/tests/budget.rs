@@ -265,6 +265,7 @@ fn camera(position: Vec3, target: Vec3) -> Camera {
         orientation: look_rotation(target - position, up),
         speed: 0.0,
         cruise: 0.0,
+        fov_y: renderer::camera::FIELD_OF_VIEW_Y,
     }
 }
 
