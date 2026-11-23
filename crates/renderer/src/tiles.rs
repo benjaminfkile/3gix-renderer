@@ -889,6 +889,24 @@ impl Surfaces {
         &self.drawn
     }
 
+    /// The drawn tiles a finer tile is on its way for: a child asked for
+    /// and not yet arrived (`surfaceHeight`'s `finer`, `docs/api.md`
+    /// section 6).
+    pub fn coarse_drawn(&self) -> Vec<SurfaceKey> {
+        self.drawn
+            .iter()
+            .map(|t| t.geometry.key)
+            .filter(|k| {
+                k.children().is_some_and(|ch| {
+                    ch.iter().any(|c| {
+                        matches!(self.tiles.get(c), Some(State::Requested))
+                            || self.requests.contains(c)
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// Whether every root and every tile the latest selection would split
     /// toward has arrived: nothing requested is outstanding.
     pub fn settled(&self) -> bool {

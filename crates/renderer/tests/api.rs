@@ -758,3 +758,383 @@ fn flight_look_turns_by_radians() {
     assert!((angle - 0.25).abs() < 1e-12, "{angle}");
     assert!(y > 0.0, "positive yaw turns left, about the up axis");
 }
+
+mod queries {
+    //! `docs/api.md` sections 3 (`create`), 6 (`surfaceHeight`,
+    //! `raycast`, `project`), and 8 (`settled`, `stats`) on synthetic
+    //! surface tiles.
+
+    use super::common;
+    use gx_core::key::SurfaceKey;
+    use gx_core::matter::Compression;
+    use gx_core::surface::{SurfaceTile, HEIGHT_SIDE, PARENT_SIDE, TILE_QUADS, VERTEX_COUNT};
+    use gx_core::units::{Quat, Vec3};
+    use renderer::api::query::{ellipsoid_height, morphed_vertex};
+    use renderer::api::{create, Api, Consumer, CreateTarget, Event, HitKind, Picture, Pose};
+    use renderer::camera::Camera;
+    use renderer::config::{parse_flags, Config};
+    use renderer::mock_hub::{
+        registry_layer, stored_layer, MockHub, MockHubOptions, SectionMaker, SurfaceMaker,
+        MOCK_API_KEY, MOCK_SPACE_ID,
+    };
+    use renderer::tiles::{Anchor, TileDrawInfo, TileGeometry};
+    use renderer::world::DrawList;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// Radius of the synthetic ball, meters.
+    const RADIUS: f64 = 1.0e6;
+
+    /// The view, pixels.
+    const SIZE: (u32, u32) = (320, 180);
+
+    /// A synthetic tile: heights varying over the tile, parent heights
+    /// different from them so the morph moves vertices.
+    fn tile(key: SurfaceKey, a: f64, c: f64) -> SurfaceTile {
+        let h = |n: usize| 200.0 + 50.0 * ((n % 13) as f32) + 7.0 * ((n / 11 % 5) as f32);
+        SurfaceTile {
+            key,
+            radius_equatorial: a,
+            radius_polar: c,
+            height_floor: 0.0,
+            heights: (0..HEIGHT_SIDE * HEIGHT_SIDE).map(h).collect(),
+            parent_heights: (0..PARENT_SIDE * PARENT_SIDE)
+                .map(|n| h(n) + 300.0)
+                .collect(),
+            albedo: vec![[100, 100, 100]; VERTEX_COUNT],
+            roughness: vec![200; VERTEX_COUNT],
+            temperature: vec![290.0; VERTEX_COUNT],
+        }
+    }
+
+    /// A flat tile: every height `h`.
+    fn flat(key: SurfaceKey, h: f32) -> SurfaceTile {
+        SurfaceTile {
+            heights: vec![h; HEIGHT_SIDE * HEIGHT_SIDE],
+            parent_heights: vec![h; PARENT_SIDE * PARENT_SIDE],
+            ..tile(key, RADIUS, RADIUS)
+        }
+    }
+
+    fn key(level: u8, x: u32, y: u32) -> SurfaceKey {
+        SurfaceKey {
+            frame_id: common::CHILD,
+            face: 0,
+            level,
+            x,
+            y,
+        }
+    }
+
+    fn drawn(t: &SurfaceTile, morph: [f32; 2]) -> TileDrawInfo {
+        TileDrawInfo {
+            geometry: Arc::new(TileGeometry::new(t)),
+            anchor: Anchor {
+                position: [0.0; 3],
+                generation: 0,
+            },
+            morph,
+        }
+    }
+
+    /// The camera at `position` in the tile frame, looking along -x.
+    fn camera(position: [f64; 3]) -> Camera {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        Camera {
+            frame_id: common::CHILD,
+            position: Vec3::new(position[0], position[1], position[2]),
+            orientation: Quat::new(0.0, s, 0.0, s),
+            speed: 1.0,
+            cruise: 1.0,
+            fov_y: 60f64.to_radians(),
+        }
+    }
+
+    fn picture(tiles: Vec<TileDrawInfo>, camera: &Camera) -> Picture {
+        let system = common::system();
+        let draw = DrawList {
+            tiles,
+            ..DrawList::default()
+        };
+        Picture::new(&system, camera, &draw, SIZE)
+    }
+
+    fn unit(p: [f64; 3]) -> [f64; 3] {
+        let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        p.map(|c| c / l)
+    }
+
+    #[test]
+    fn surface_height_is_the_vertex_height_at_vertices() {
+        let (a, c) = (RADIUS, 0.98 * RADIUS);
+        let t = tile(key(0, 0, 0), a, c);
+        let d = drawn(&t, [f32::INFINITY; 2]);
+        let cam = camera([3.0 * RADIUS, 0.0, 0.0]);
+        let p = picture(vec![d.clone()], &cam);
+        for (i, j) in [(32, 32), (10, 40), (63, 1), (5, 5)] {
+            let n = i + (TILE_QUADS + 1) * j;
+            let v = d.geometry.positions[n];
+            let got = p
+                .surface_height(common::CHILD, unit(v))
+                .expect("a tile is drawn");
+            let want = f64::from(t.height(i as i64, j as i64));
+            assert!(
+                (got.height - want).abs() < 1e-4,
+                "{i},{j}: {} vs {want}",
+                got.height
+            );
+            assert_eq!(got.level, 0);
+            assert!(!got.finer);
+        }
+        assert_eq!(p.surface_height(common::CHILD, [-1.0, 0.0, 0.0]), None);
+        assert_eq!(p.surface_height(common::ROOT, [1.0, 0.0, 0.0]), None);
+    }
+
+    #[test]
+    fn surface_height_is_morphed_between_levels() {
+        let t = tile(key(1, 1, 1), RADIUS, RADIUS);
+        let cam = camera([RADIUS + 50_000.0, 0.0, 0.0]);
+        let morph = [30_000.0f32, 80_000.0];
+        let d = drawn(&t, morph);
+        let p = picture(vec![d.clone()], &cam);
+        let c = [RADIUS + 50_000.0, 0.0, 0.0];
+        let mut moved = 0;
+        for (i, j) in [(1, 1), (3, 2), (20, 21), (40, 40)] {
+            let n = i + (TILE_QUADS + 1) * j;
+            let (v, q) = (d.geometry.positions[n], d.geometry.targets[n]);
+            // `vs_tile`'s weights, written out.
+            let dist = (0..3).map(|a| (v[a] - c[a]).powi(2)).sum::<f64>().sqrt();
+            let k = ((dist - 30_000.0) / 50_000.0).clamp(0.0, 1.0);
+            let m: [f64; 3] = std::array::from_fn(|a| v[a] + k * (q[a] - v[a]));
+            assert_eq!(morphed_vertex(&d, n, c), m);
+            let want = ellipsoid_height(m, RADIUS, RADIUS);
+            let got = p.surface_height(common::CHILD, unit(m)).unwrap();
+            assert!((got.height - want).abs() < 1e-4, "{} vs {want}", got.height);
+            if k > 0.0 && k < 1.0 {
+                moved += 1;
+                let own = f64::from(t.height(i as i64, j as i64));
+                assert!((got.height - own).abs() > 1.0, "the morph moved the vertex");
+            }
+        }
+        assert!(moved > 0, "some vertex is part way through the morph");
+    }
+
+    #[test]
+    fn raycast_down_project_back_and_occlusion() {
+        let h0 = 500.0f32;
+        let t = flat(key(0, 0, 0), h0);
+        let height = 12_345.0;
+        let cam = camera([RADIUS + f64::from(h0) + height, 0.0, 0.0]);
+        let p = picture(vec![drawn(&t, [f32::INFINITY; 2])], &cam);
+        let hit = p
+            .raycast(f64::from(SIZE.0) / 2.0, f64::from(SIZE.1) / 2.0)
+            .expect("straight down hits the tile");
+        assert_eq!(hit.kind, HitKind::Surface);
+        assert_eq!(hit.frame_id, common::CHILD);
+        assert!(
+            ((hit.distance - height) / height).abs() < 1e-6,
+            "{} vs {height}",
+            hit.distance
+        );
+        let system = common::system();
+        for (x, y) in [(160.0, 90.0), (100.5, 70.25), (250.0, 30.0), (20.0, 170.0)] {
+            let hit = p.raycast(x, y).expect("the tile fills the view");
+            let back = p
+                .project(&system, &cam, hit.frame_id, hit.position)
+                .expect("a hit is in view");
+            assert!(
+                (back.x - x).abs() < 0.5 && (back.y - y).abs() < 0.5,
+                "{back:?} vs {x},{y}"
+            );
+            assert!(back.depth > 0.0 && back.depth <= hit.distance * (1.0 + 1e-9));
+        }
+        // Through the ball: the near side of the drawn tile hides it.
+        let far = [-(RADIUS + f64::from(h0)), 0.0, 0.0];
+        assert_eq!(p.project(&system, &cam, common::CHILD, far), None);
+        // Above the surface, in front: shown.
+        let near = [RADIUS + f64::from(h0) + 0.5 * height, 0.0, 0.0];
+        assert!(p.project(&system, &cam, common::CHILD, near).is_some());
+        // Behind the camera.
+        let behind = [RADIUS + f64::from(h0) + 2.0 * height, 0.0, 0.0];
+        assert_eq!(p.project(&system, &cam, common::CHILD, behind), None);
+    }
+
+    #[test]
+    fn raycast_time_per_call() {
+        // A view filled by a 4 x 4 block of level-2 tiles, about the
+        // number a close view draws of one face.
+        let mut tiles = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                tiles.push(drawn(
+                    &tile(key(2, x, y), RADIUS, RADIUS),
+                    [f32::INFINITY; 2],
+                ));
+            }
+        }
+        let cam = camera([RADIUS + 200_000.0, 0.0, 0.0]);
+        let p = picture(tiles, &cam);
+        let n = 2000;
+        let start = Instant::now();
+        let mut hits = 0;
+        for k in 0..n {
+            let x = f64::from(k % 320);
+            let y = f64::from((k * 7) % 180);
+            hits += usize::from(p.raycast(x, y).is_some());
+        }
+        let per = start.elapsed().as_secs_f64() / f64::from(n);
+        eprintln!(
+            "raycast: {:.1} us per call over {n} calls, {hits} hits",
+            per * 1e6
+        );
+        assert!(hits > 0);
+    }
+
+    /// A consumer that records events and destroys the renderer once
+    /// `until` says so, or after a deadline.
+    struct Recorder {
+        events: Arc<Mutex<Vec<Event>>>,
+        heights: Arc<Mutex<Vec<Option<f64>>>>,
+        pose: Option<Pose>,
+        started: Instant,
+        until: fn(&[Event]) -> bool,
+    }
+
+    impl Consumer for Recorder {
+        fn tick(&mut self, api: &mut Api) {
+            if let Some(pose) = self.pose.take() {
+                api.set_camera(pose).unwrap();
+            }
+            let new = api.events();
+            let mut events = self.events.lock().unwrap();
+            for e in &new {
+                if matches!(e, Event::Settled { .. }) {
+                    let h = api
+                        .surface_height(common::CHILD, [1.0, 0.0, 0.0])
+                        .unwrap()
+                        .map(|s| s.height);
+                    self.heights.lock().unwrap().push(h);
+                }
+            }
+            events.extend(new);
+            if (self.until)(&events) || self.started.elapsed().as_secs() > 120 {
+                api.destroy().unwrap();
+            }
+        }
+    }
+
+    fn mock_config(hub: &MockHub) -> Config {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(renderer::config::ENV_HUB_URL.into(), hub.url());
+        env.insert(renderer::config::ENV_API_KEY.into(), MOCK_API_KEY.into());
+        env.insert(renderer::config::ENV_SPACE_ID.into(), MOCK_SPACE_ID.into());
+        let flags = parse_flags(["--workers", "1"]).unwrap();
+        Config::resolve(&env, &flags).unwrap()
+    }
+
+    fn run(
+        layers: Vec<renderer::mock_hub::MockLayer>,
+        pose: Option<Pose>,
+        until: fn(&[Event]) -> bool,
+    ) -> (Vec<Event>, Vec<Option<f64>>) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = rt
+            .block_on(MockHub::start(MockHubOptions::new(layers, Vec::new())))
+            .unwrap();
+        let config = mock_config(&hub);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let heights = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder {
+            events: events.clone(),
+            heights: heights.clone(),
+            pose,
+            started: Instant::now(),
+            until,
+        };
+        create(
+            CreateTarget::Headless {
+                width: SIZE.0,
+                height: SIZE.1,
+            },
+            &config,
+            config.options.clone(),
+            Box::new(recorder),
+        )
+        .expect("create runs the loop");
+        let e = events.lock().unwrap().clone();
+        let h = heights.lock().unwrap().clone();
+        (e, h)
+    }
+
+    #[test]
+    fn create_runs_the_loop_until_destroy() {
+        let layers = vec![registry_layer("frames", &common::registry_bytes())];
+        let (events, _) = run(layers, None, |e| e.contains(&Event::Ready));
+        assert_eq!(events.first(), Some(&Event::Ready));
+    }
+
+    /// The radius of the served tiles, meters.
+    const SERVED_RADIUS: f64 = 5.0;
+
+    fn served(key: &SurfaceKey) -> Vec<u8> {
+        let t = SurfaceTile {
+            key: *key,
+            radius_equatorial: SERVED_RADIUS,
+            radius_polar: SERVED_RADIUS,
+            height_floor: 0.0,
+            heights: vec![0.1; HEIGHT_SIDE * HEIGHT_SIDE],
+            parent_heights: vec![0.1; PARENT_SIDE * PARENT_SIDE],
+            albedo: vec![[100, 100, 100]; VERTEX_COUNT],
+            roughness: vec![200; VERTEX_COUNT],
+            temperature: vec![290.0; VERTEX_COUNT],
+        };
+        gx_core::surface::encode(&t, Compression::None)
+    }
+
+    /// A valid section with no matter, for either frame of the scene.
+    fn empty_cell(key: &gx_core::key::CellKey) -> Vec<u8> {
+        let extent = if key.frame_id == common::ROOT {
+            common::ROOT_EXTENT
+        } else {
+            common::CHILD_EXTENT
+        };
+        let g = key.geometry(gx_core::units::Meters::new(extent));
+        let section = gx_core::matter::Section::empty(*key, g.origin, g.edge).expect("valid");
+        gx_core::matter::encode(&section, Compression::None)
+    }
+
+    #[test]
+    fn settled_fires_after_the_last_tile_arrives_and_stats_once_a_second() {
+        let mut main = stored_layer("main", 2, SectionMaker(Arc::new(empty_cell)));
+        main.stored_surfaces = Some(SurfaceMaker(Arc::new(served)));
+        let layers = vec![registry_layer("frames", &common::registry_bytes()), main];
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let pose = Pose {
+            frame_id: common::CHILD,
+            position: [3.0 * SERVED_RADIUS, 0.0, 0.0],
+            orientation: [0.0, s, 0.0, s],
+            speed: 1.0,
+        };
+        let (events, heights) = run(layers, Some(pose), |e| {
+            e.iter().any(|e| matches!(e, Event::Settled { .. }))
+                && e.iter().filter(|e| matches!(e, Event::Stats(_))).count() >= 2
+        });
+        let settled = events
+            .iter()
+            .position(|e| matches!(e, Event::Settled { .. }))
+            .expect("the view settles");
+        // At the settle the surface is drawn and answers queries.
+        let h = heights[0].expect("a tile is drawn under +x at the settle");
+        assert!((h - 0.1).abs() < 0.01, "{h}");
+        let stats: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Stats(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(stats.len() >= 2);
+        assert!(stats.last().unwrap().tiles_drawn > 0);
+        assert!(settled > 0);
+    }
+}

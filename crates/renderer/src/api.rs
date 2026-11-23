@@ -1,6 +1,6 @@
-//! The renderer API, native binding: `docs/api.md` sections 1 to 5, 7
-//! (all but `setComputeBudget`), and 8 (the `ready`, `error`, `camera`, and
-//! `frameChanged` events).
+//! The renderer API, native binding: `docs/api.md` sections 1 to 7 (all
+//! but `setComputeBudget`) and 8. The queries of section 6 are in
+//! [`query`]; [`create`] (section 3) is native only.
 //!
 //! One implementation for every build (`docs/api.md` section 1 item 1):
 //! nothing here is native or web specific. A loop owns the simulation, the
@@ -29,7 +29,15 @@ use gx_core::frames::FrameSystem;
 use gx_core::registry::FrameTree;
 use gx_core::timescale::{tdb_seconds_to_utc_ms, utc_ms_to_tdb_seconds};
 use gx_core::units::{Quat, Seconds, Vec3};
+pub use query::{Hit, HitKind, Picture, Projected, SurfaceHeight};
 use std::collections::{BTreeSet, VecDeque};
+
+pub mod query;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod create;
+#[cfg(not(target_arch = "wasm32"))]
+pub use create::{create, Connection, CreateTarget};
 
 /// How far from one the length of a pose's quaternion may be.
 pub const UNIT_TOLERANCE: f64 = 1e-6;
@@ -111,6 +119,51 @@ pub enum Event {
         /// The frame after.
         to: u64,
     },
+    /// Everything the view asked for has arrived and is drawn
+    /// ([`crate::app::view_settled`], the budget harness's condition).
+    Settled {
+        /// Seconds from when the view last became unsettled (or the loop
+        /// started) to the settle.
+        seconds: f64,
+    },
+    /// A click: press and release within [`CLICK_PIXELS`].
+    Hit {
+        /// What the click's pixel hit, as [`Api::raycast`].
+        hit: Option<Hit>,
+        /// Pixels from the left edge.
+        x: f64,
+        /// Pixels from the top edge.
+        y: f64,
+        /// The mouse button: 0 left, 1 right, 2 middle, 3 and up others.
+        button: u32,
+    },
+    /// Once a second.
+    Stats(Stats),
+}
+
+/// Pixels a press and release may be apart and still be a click.
+pub const CLICK_PIXELS: f64 = 4.0;
+
+/// Seconds between [`Event::Stats`] events.
+pub const STATS_SECONDS: f64 = 1.0;
+
+/// The `stats` event (`docs/api.md` section 8).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct Stats {
+    /// Frames drawn in the last second.
+    pub fps: f64,
+    /// Surface tiles drawn.
+    pub tiles_drawn: usize,
+    /// Triangles drawn, cells and tiles.
+    pub triangles: usize,
+    /// Cell meshes drawn.
+    pub cells_drawn: usize,
+    /// Selected cells not yet arrived.
+    pub streaming: usize,
+    /// Module runs started by this client so far.
+    pub computing: u64,
+    /// Uploads waiting to be offered to the hub.
+    pub uploading: u64,
 }
 
 /// The free camera's input from the application (`setFlightInput`,
@@ -304,6 +357,11 @@ pub struct Api {
     hud: bool,
     max_fps: Option<u32>,
     size: Option<(u32, u32, f64)>,
+    picture: Picture,
+    press: Option<(f64, f64, u32)>,
+    settled: bool,
+    unsettled_since: f64,
+    last_stats: Option<f64>,
 }
 
 impl Api {
@@ -328,6 +386,11 @@ impl Api {
             hud: true,
             max_fps: None,
             size: None,
+            picture: Picture::default(),
+            press: None,
+            settled: false,
+            unsettled_since: 0.0,
+            last_stats: None,
         }
     }
 
@@ -668,6 +731,100 @@ impl Api {
     /// The frame cap set by [`Api::set_max_fps`], if any.
     pub fn max_fps(&self) -> Option<u32> {
         self.max_fps
+    }
+
+    /// `surfaceHeight`: the drawn surface of `frame_id` along `direction`
+    /// (frame axes, from the frame origin) as of the last tick drawn,
+    /// `None` where no tile of the frame is drawn ([`Picture::surface_height`]).
+    pub fn surface_height(
+        &self,
+        frame_id: u64,
+        direction: [f64; 3],
+    ) -> ApiResult<Option<SurfaceHeight>> {
+        self.live()?;
+        Ok(self.picture.surface_height(frame_id, direction))
+    }
+
+    /// `raycast`: the nearest drawn surface tile or cell mesh along the
+    /// ray through physical pixel `(x, y)` (top left origin) as of the
+    /// last tick drawn ([`Picture::raycast`]).
+    pub fn raycast(&self, x: f64, y: f64) -> ApiResult<Option<Hit>> {
+        self.live()?;
+        if !(x.is_finite() && y.is_finite()) {
+            return error("the pixel is not finite");
+        }
+        Ok(self.picture.raycast(x, y))
+    }
+
+    /// `project`: `point` (frame axes of `frame_id`) in the pixels of
+    /// [`Api::raycast`] with its depth, or `None` behind the camera,
+    /// outside the view, or hidden behind drawn matter or surface tiles
+    /// ([`Picture::project`]). Fails for a frame not in the registry or
+    /// before the first tick.
+    pub fn project(&self, frame_id: u64, point: [f64; 3]) -> ApiResult<Option<Projected>> {
+        self.live()?;
+        if !self.frames.contains(&frame_id) {
+            return error(format!("frame {frame_id} is not in the registry"));
+        }
+        let Some(system) = &self.system else {
+            return error("no tick has completed yet");
+        };
+        let [x, y, z, w] = self.pose.orientation;
+        let p = self.pose.position;
+        let camera = Camera {
+            frame_id: self.pose.frame_id,
+            position: Vec3::new(p[0], p[1], p[2]),
+            orientation: Quat::new(x, y, z, w),
+            speed: self.pose.speed,
+            cruise: self.pose.speed,
+            fov_y: self.fov_deg.to_radians(),
+        };
+        Ok(self.picture.project(system, &camera, frame_id, point))
+    }
+
+    /// The loop's side of the queries: what the tick drew.
+    pub fn set_picture(&mut self, picture: Picture) {
+        self.picture = picture;
+    }
+
+    /// The loop's side of `hit`: a mouse button went down at `(x, y)`.
+    /// Called in both control modes.
+    pub fn mouse_down(&mut self, x: f64, y: f64, button: u32) {
+        self.press = Some((x, y, button));
+    }
+
+    /// The loop's side of `hit`: a mouse button came up at `(x, y)`; a
+    /// release within [`CLICK_PIXELS`] of the press of the same button
+    /// queues [`Event::Hit`] against the last picture.
+    pub fn mouse_up(&mut self, x: f64, y: f64, button: u32) {
+        let Some((px, py, b)) = self.press.take() else {
+            return;
+        };
+        if b == button && (x - px).hypot(y - py) <= CLICK_PIXELS {
+            let hit = self.picture.raycast(x, y);
+            self.events.push_back(Event::Hit { hit, x, y, button });
+        }
+    }
+
+    /// The loop's side of `settled` and `stats`, after each drawn tick:
+    /// whether the view is settled ([`crate::app::view_settled`]) and the
+    /// stats, at `now` seconds of the loop's clock. Queues
+    /// [`Event::Settled`] when the view becomes settled and
+    /// [`Event::Stats`] once every [`STATS_SECONDS`].
+    pub fn observe(&mut self, settled: bool, stats: Stats, now: f64) {
+        if settled && !self.settled {
+            self.events.push_back(Event::Settled {
+                seconds: now - self.unsettled_since,
+            });
+        }
+        if !settled && self.settled {
+            self.unsettled_since = now;
+        }
+        self.settled = settled;
+        if self.last_stats.is_none_or(|t| now - t >= STATS_SECONDS) {
+            self.last_stats = Some(now);
+            self.events.push_back(Event::Stats(stats));
+        }
     }
 
     /// Drains the events queued since the last call, oldest first.
