@@ -41,7 +41,10 @@ function load(): Promise<void> {
         const worker = new URL("./wasm/module-worker.js", import.meta.url);
         const runner = new URL("./wasm/module-runner.js", import.meta.url);
         const source = await (await fetch(worker)).text();
-        const linked = source.replace('"./module-runner.js"', JSON.stringify(runner.href));
+        // A dev server may already have rewritten the specifier to its own
+        // path (and a ?t= query), so match any specifier naming
+        // module-runner.js.
+        const linked = source.replace(/(["'])[^"']*module-runner\.js(\?[^"']*)?\1/, JSON.stringify(runner.href));
         if (linked === source) {
             throw new Error("module-worker.js: no import of ./module-runner.js");
         }
