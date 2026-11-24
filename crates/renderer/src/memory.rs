@@ -181,14 +181,21 @@ pub struct SurfaceMemory {
     pub drawn: usize,
     /// Distinct tile geometries held, each `Arc` once.
     pub geometries: usize,
-    /// Bytes of those geometries.
+    /// Distinct tile shapes held, each `Arc` once: one per tile, shared
+    /// by its base and every composite of it.
+    pub shapes: usize,
+    /// Bytes of those shapes.
+    pub shape_bytes: u64,
+    /// Bytes of those geometries: each one's material, plus each shape
+    /// once ([`SurfaceMemory::shape_bytes`]).
     pub geometry_bytes: u64,
     /// Of those, composited copies: geometries that are no tile's base.
     pub composited: usize,
-    /// Bytes of the composited copies.
+    /// Bytes of the composited copies: their material only, since they
+    /// share their base's shape.
     pub composited_bytes: u64,
     /// Bytes of the geometries the drawn tiles need: the drawn geometry
-    /// and the tile's bases, each `Arc` once.
+    /// and the tile's bases, each material and each shape once.
     pub drawn_geometry_bytes: u64,
     /// Bytes of every distinct overlay tile held.
     pub overlay_bytes: u64,

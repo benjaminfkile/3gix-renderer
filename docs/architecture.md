@@ -197,7 +197,8 @@ unchanged. With it:
   `realloc`.
 - `World::memory_report()` returns `MemoryReport` (serde), in bytes and
   counts. Bytes are `Vec` capacity times element size plus the struct
-  itself, counted by each type (`TileGeometry::heap_bytes`,
+  itself, counted by each type (`TileGeometry::heap_bytes` for a geometry's
+  material, `TileShape::heap_bytes` for its shape,
   `SurfaceMesh::heap_bytes`, `tiles::overlay_heap_bytes`,
   `stream::section_heap_bytes`, which counts samples by length since the
   core library keeps their arrays private). Data shared through an `Arc`
@@ -206,9 +207,12 @@ unchanged. With it:
   - `surfaces`: entries `requested`, `ready`, `empty`, `gone`; the
     selection's `used` set and `drawn` count; `geometries` and
     `geometry_bytes`, every distinct `TileGeometry` held (tile states,
-    bases, the drawn list); of which `composited` copies (geometries that
-    are no tile's base) and their bytes; `drawn_geometry_bytes`, what the
-    drawn tiles need (their drawn geometry and their bases);
+    bases, the drawn list): each one's material plus each distinct
+    `TileShape` once (`shapes`, `shape_bytes`), since a base and its
+    composites share one shape `Arc`; of which `composited` copies
+    (geometries that are no tile's base) and their material bytes;
+    `drawn_geometry_bytes`, what the drawn tiles need (their drawn
+    geometry and their bases, each shape once);
     `overlay_bytes` and `drawn_overlay_bytes` for overlay tiles.
   - `cells`: `cached`, `ready`, `selected`; `sample_bytes` of every
     distinct decoded section held (composites and layers) and

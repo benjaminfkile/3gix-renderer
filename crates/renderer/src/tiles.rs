@@ -24,6 +24,9 @@
 //! ([`TileGeometry`]) by the core library's geometry, so a vertex shared by
 //! two tiles has the same bits in both; they reach the GPU relative to one
 //! anchor per frame ([`Anchor`]), so shared vertices stay identical there.
+//! A tile's shape ([`TileShape`]) is held once, behind an `Arc`, by its
+//! base and every composite of it; a composite owns only its material
+//! (`rendering.md` section 7 items 6 and 7).
 
 use crate::camera::Camera;
 use crate::farfield::focal_px;
@@ -64,10 +67,27 @@ pub const ANCHOR_REACH: f64 = 50_000.0;
 /// Grid the anchor snaps to, meters.
 pub const ANCHOR_GRID: f64 = 4096.0;
 
-/// One tile ready to draw: positions and their morph targets in `f64` frame
-/// coordinates, normals, and material, per vertex (row major, `j` outer).
+/// One tile ready to draw (`rendering.md` section 7 items 3 and 6): its
+/// shape, shared through an `Arc` by the base and every composite of it,
+/// and its own material per vertex (row major, `j` outer). The shape's
+/// fields read through the geometry ([`std::ops::Deref`]), so
+/// `geometry.positions` is the shape's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TileGeometry {
+    /// Everything compositing leaves alone, built once per tile.
+    pub tile_shape: Arc<TileShape>,
+    /// Albedo per vertex, three bands: the base's, or the composite's.
+    pub albedo: Vec<[f32; 3]>,
+    /// Roughness per vertex: the base's, or the composite's.
+    pub roughness: Vec<f32>,
+}
+
+/// A tile's shape: positions and their morph targets in `f64` frame
+/// coordinates, normals, temperature, and what the selection reads, per
+/// vertex (row major, `j` outer). Held once per tile however many
+/// composites of it there are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileShape {
     /// The tile.
     pub key: SurfaceKey,
     /// Vertex positions, frame coordinates, meters.
@@ -79,10 +99,6 @@ pub struct TileGeometry {
     pub normals: Vec<[f32; 3]>,
     /// Unit normals of the parent's surface at each vertex.
     pub target_normals: Vec<[f32; 3]>,
-    /// Albedo per vertex, three bands.
-    pub albedo: Vec<[f32; 3]>,
-    /// Roughness per vertex.
-    pub roughness: Vec<f32>,
     /// Radiating temperature per vertex, kelvin.
     pub temperature: Vec<f32>,
     /// Smallest and largest corner of the box holding every position and
@@ -105,6 +121,15 @@ pub struct TileGeometry {
     /// frame's `height_floor`, meters (`matter-format.md` section 10), as
     /// the tile declares them.
     pub shape: SurfaceShape,
+}
+
+impl std::ops::Deref for TileGeometry {
+    type Target = TileShape;
+
+    /// The tile's shared shape.
+    fn deref(&self) -> &TileShape {
+        &self.tile_shape
+    }
 }
 
 /// A frame's surface as its tiles declare it (`matter-format.md` section
@@ -246,14 +271,12 @@ impl TileGeometry {
             .map(|b| b.map(|v| f32::from(v) / 255.0))
             .collect();
         let roughness = t.roughness.iter().map(|&v| f32::from(v) / 255.0).collect();
-        TileGeometry {
+        let tile_shape = Arc::new(TileShape {
             key,
             positions,
             targets,
             normals,
             target_normals,
-            albedo,
-            roughness,
             temperature: t.temperature.clone(),
             bounds: (lo, hi),
             edge: std::f64::consts::FRAC_PI_2 * a / (1u64 << key.level) as f64,
@@ -264,6 +287,11 @@ impl TileGeometry {
                 radius_polar: c,
                 height_floor: t.height_floor,
             },
+        });
+        TileGeometry {
+            tile_shape,
+            albedo,
+            roughness,
         }
     }
 
@@ -355,21 +383,28 @@ impl DecodedTile {
 /// `overlays`, in order, per vertex by [`overlay::composite`]
 /// (`rendering.md` section 7 item 6). The parent values of each overlay
 /// are composited the same way over the base at the tile's even vertices
-/// ([`composite_parent`]). Positions and normals are the base's.
+/// ([`composite_parent`]). The shape is the base's own `Arc`: only the
+/// material arrays are new.
 pub fn composite_tile(base: &TileGeometry, overlays: &[&OverlayTile]) -> TileGeometry {
-    let mut out = base.clone();
     if overlays.is_empty() {
-        return out;
+        return base.clone();
     }
+    let n = base.albedo.len();
+    let mut albedo = Vec::with_capacity(n);
+    let mut roughness = Vec::with_capacity(n);
     let mut samples = Vec::with_capacity(overlays.len());
-    for v in 0..out.albedo.len() {
+    for v in 0..n {
         samples.clear();
         samples.extend(overlays.iter().map(|o| sample(o, v)));
         let (a, r) = overlay::composite(base.albedo[v], base.roughness[v], &samples);
-        out.albedo[v] = a;
-        out.roughness[v] = r;
+        albedo.push(a);
+        roughness.push(r);
     }
-    out
+    TileGeometry {
+        tile_shape: Arc::clone(&base.tile_shape),
+        albedo,
+        roughness,
+    }
 }
 
 fn sample(o: &OverlayTile, v: usize) -> overlay::OverlaySample {
@@ -1007,22 +1042,32 @@ pub(crate) fn decode_tile_timed(
 
 #[cfg(feature = "memory-report")]
 impl TileGeometry {
-    /// Bytes this geometry holds: the struct and each array's capacity
-    /// (the memory report, `docs/architecture.md`).
-    #[cfg(feature = "memory-report")]
+    /// Bytes this geometry's own material holds: the struct and each
+    /// material array's capacity (the memory report,
+    /// `docs/architecture.md`). The shape is counted apart
+    /// ([`TileShape::heap_bytes`]), once however many geometries share it.
     pub fn heap_bytes(&self) -> u64 {
-        fn cap<T>(v: &Vec<T>) -> usize {
-            v.capacity() * std::mem::size_of::<T>()
-        }
-        (std::mem::size_of::<TileGeometry>()
+        (std::mem::size_of::<TileGeometry>() + cap(&self.albedo) + cap(&self.roughness)) as u64
+    }
+}
+
+#[cfg(feature = "memory-report")]
+impl TileShape {
+    /// Bytes this shape holds: the struct and each array's capacity (the
+    /// memory report).
+    pub fn heap_bytes(&self) -> u64 {
+        (std::mem::size_of::<TileShape>()
             + cap(&self.positions)
             + cap(&self.targets)
             + cap(&self.normals)
             + cap(&self.target_normals)
-            + cap(&self.albedo)
-            + cap(&self.roughness)
             + cap(&self.temperature)) as u64
     }
+}
+
+#[cfg(feature = "memory-report")]
+fn cap<T>(v: &Vec<T>) -> usize {
+    v.capacity() * std::mem::size_of::<T>()
 }
 
 /// Bytes an overlay tile holds: the struct and each array's capacity (the
@@ -1042,7 +1087,8 @@ pub fn overlay_heap_bytes(o: &OverlayTile) -> u64 {
 impl Surfaces {
     /// What the surface tiles hold ([`crate::memory::SurfaceMemory`]):
     /// entries by state, the selection's sizes, and the bytes of every
-    /// distinct geometry and overlay tile, each `Arc` counted once.
+    /// distinct geometry's material, shape, and overlay tile, each `Arc`
+    /// counted once: a base and its composites share one shape.
     pub fn memory(&self) -> crate::memory::SurfaceMemory {
         use std::collections::BTreeMap as Distinct;
         let mut m = crate::memory::SurfaceMemory {
@@ -1051,15 +1097,23 @@ impl Surfaces {
             ..Default::default()
         };
         let ptr = |g: &Arc<TileGeometry>| Arc::as_ptr(g) as usize;
+        let shape_ptr = |g: &TileGeometry| Arc::as_ptr(&g.tile_shape) as usize;
         let mut geometries: Distinct<usize, u64> = Distinct::new();
+        let mut shapes: Distinct<usize, u64> = Distinct::new();
         let mut bases: BTreeSet<usize> = BTreeSet::new();
         let mut overlays: Distinct<usize, u64> = Distinct::new();
+        let hold = |g: &Arc<TileGeometry>,
+                    geometries: &mut Distinct<usize, u64>,
+                    shapes: &mut Distinct<usize, u64>| {
+            geometries.insert(ptr(g), g.heap_bytes());
+            shapes.insert(shape_ptr(g), g.tile_shape.heap_bytes());
+        };
         for state in self.tiles.values() {
             match state {
                 State::Requested => m.requested += 1,
                 State::Ready(g) => {
                     m.ready += 1;
-                    geometries.insert(ptr(g), g.heap_bytes());
+                    hold(g, &mut geometries, &mut shapes);
                 }
                 State::Empty => m.empty += 1,
                 State::Gone => m.gone += 1,
@@ -1068,21 +1122,22 @@ impl Surfaces {
         for l in self.layers.values() {
             for (_, b) in &l.bases {
                 bases.insert(ptr(b));
-                geometries.insert(ptr(b), b.heap_bytes());
+                hold(b, &mut geometries, &mut shapes);
             }
             for (_, o) in &l.overlays {
                 overlays.insert(Arc::as_ptr(o) as usize, overlay_heap_bytes(o));
             }
         }
         let mut drawn: Distinct<usize, u64> = Distinct::new();
+        let mut drawn_shapes: Distinct<usize, u64> = Distinct::new();
         let mut drawn_overlays: Distinct<usize, u64> = Distinct::new();
         for t in &self.drawn {
             let g = &t.geometry;
-            geometries.insert(ptr(g), g.heap_bytes());
-            drawn.insert(ptr(g), g.heap_bytes());
+            hold(g, &mut geometries, &mut shapes);
+            hold(g, &mut drawn, &mut drawn_shapes);
             if let Some(l) = self.layers.get(&g.key) {
                 for (_, b) in &l.bases {
-                    drawn.insert(ptr(b), b.heap_bytes());
+                    hold(b, &mut drawn, &mut drawn_shapes);
                 }
                 for (_, o) in &l.overlays {
                     drawn_overlays.insert(Arc::as_ptr(o) as usize, overlay_heap_bytes(o));
@@ -1090,14 +1145,16 @@ impl Surfaces {
             }
         }
         m.geometries = geometries.len();
-        m.geometry_bytes = geometries.values().sum();
+        m.shapes = shapes.len();
+        m.shape_bytes = shapes.values().sum();
+        m.geometry_bytes = geometries.values().sum::<u64>() + m.shape_bytes;
         for (p, bytes) in &geometries {
             if !bases.contains(p) {
                 m.composited += 1;
                 m.composited_bytes += bytes;
             }
         }
-        m.drawn_geometry_bytes = drawn.values().sum();
+        m.drawn_geometry_bytes = drawn.values().sum::<u64>() + drawn_shapes.values().sum::<u64>();
         m.overlay_bytes = overlays.values().sum();
         m.drawn_overlay_bytes = drawn_overlays.values().sum();
         m
@@ -1179,13 +1236,18 @@ mod tests {
 
     #[cfg(feature = "memory-report")]
     #[test]
-    fn the_memory_report_counts_each_geometry_once_by_its_arrays() {
+    fn the_memory_report_counts_each_shape_once_and_each_material_apart() {
         let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
         let g = Arc::new(TileGeometry::new(&tile(key)));
-        // Two f64 triples, three f32 triples, and two f32 per vertex.
-        let per_vertex = 2 * 24 + 3 * 12 + 2 * 4;
-        let one = (std::mem::size_of::<TileGeometry>() + VERTEX_COUNT * per_vertex) as u64;
-        assert_eq!(g.heap_bytes(), one);
+        // Material: one f32 triple and one f32 per vertex. Shape: two f64
+        // triples, two f32 triples, and one f32 per vertex.
+        let material = (std::mem::size_of::<TileGeometry>() + VERTEX_COUNT * (12 + 4)) as u64;
+        let shape =
+            (std::mem::size_of::<TileShape>() + VERTEX_COUNT * (2 * 24 + 2 * 12 + 4)) as u64;
+        assert_eq!(
+            (g.heap_bytes(), g.tile_shape.heap_bytes()),
+            (material, shape)
+        );
 
         // One geometry as a tile's state and its base, and as a second
         // tile's: counted once.
@@ -1194,10 +1256,14 @@ mod tests {
         let other = SurfaceKey::new(4, 1, 0, 0, 0).unwrap();
         s.complete(other, Ok(Some(Arc::clone(&g))));
         let m = s.memory();
-        assert_eq!((m.ready, m.geometries, m.composited), (2, 1, 0));
-        assert_eq!(m.geometry_bytes, one);
+        assert_eq!(
+            (m.ready, m.geometries, m.shapes, m.composited),
+            (2, 1, 1, 0)
+        );
+        assert_eq!((m.geometry_bytes, m.shape_bytes), (material + shape, shape));
 
-        // A shown overlay adds the composited copy and the overlay tile.
+        // A shown overlay adds the composited material, sharing the base's
+        // shape, and the overlay tile.
         let third = SurfaceKey::new(4, 2, 0, 0, 0).unwrap();
         let o = overlay_tile(third, 255, 128, 64);
         let o_bytes = (std::mem::size_of::<OverlayTile>()
@@ -1208,20 +1274,34 @@ mod tests {
         s.complete_layers(
             third,
             Ok(DecodedTile {
-                bases: vec![(0, base)],
+                bases: vec![(0, Arc::clone(&base))],
                 overlays: vec![(1, Arc::new(o))],
                 ..DecodedTile::default()
             }),
             false,
         );
+        let drawn = Arc::clone(s.drawn_geometry(&third).unwrap());
+        assert!(Arc::ptr_eq(&drawn.tile_shape, &base.tile_shape));
         let m = s.memory();
-        assert_eq!((m.geometries, m.composited), (3, 1));
-        assert_eq!((m.geometry_bytes, m.composited_bytes), (3 * one, one));
+        assert_eq!((m.geometries, m.shapes, m.composited), (3, 2, 1));
+        assert_eq!(
+            (m.geometry_bytes, m.composited_bytes),
+            (3 * material + 2 * shape, material)
+        );
         assert_eq!(m.overlay_bytes, o_bytes);
         assert_eq!(
             (m.drawn, m.drawn_geometry_bytes, m.drawn_overlay_bytes),
             (0, 0, 0)
         );
+        // Before the split every geometry held its own whole copy: the
+        // shape's struct and arrays and two material arrays.
+        let whole = shape + material - (std::mem::size_of::<TileGeometry>() - 2 * 24) as u64;
+        let before = 3 * whole;
+        println!(
+            "tile geometry bytes, these three geometries: before {before}, after {}",
+            m.geometry_bytes
+        );
+        assert!(m.geometry_bytes < before);
     }
 
     fn overlay_bytes(o: &OverlayTile) -> Vec<u8> {
