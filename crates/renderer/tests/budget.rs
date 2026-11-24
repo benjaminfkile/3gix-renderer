@@ -767,3 +767,59 @@ fn watertight_while_moving(shape: Shape) {
         }
     }
 }
+
+/// A small memory budget forced on a native run against the mock hub
+/// (`docs/architecture.md`, "Memory budget"): while the camera moves far
+/// enough to look at many times what fits, the held bytes after each
+/// eviction pass stay at or under the budget, and the view stays drawn.
+#[test]
+fn held_bytes_stay_under_a_small_budget_while_moving() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let depth = 12u8;
+    let mut rig = rig(Shape::Plane, depth);
+    let view = (1280, 720);
+    let c = Vec3::new(CENTER[0], CENTER[1], CENTER[2]);
+    let height = 300.0;
+    let place = |t: f64| {
+        let along = Vec3::new(1.0, 0.25, 0.0).scale(t);
+        camera(
+            c + along + Vec3::new(0.0, 0.0, height),
+            c + along + Vec3::new(0.2 * EXTENT, 0.05 * EXTENT, -0.02 * EXTENT),
+        )
+    };
+    let mut world = World::new(default_threads());
+    settle_in_rounds(&mut rig, &mut world, &place(0.0), view);
+    // A cell eviction pass counts every cell and mesh.
+    world.evict(1.0);
+    let settled = world.held_bytes();
+    // Room for about one view and a half: moving looks at many times that.
+    let budget = settled + settled / 2;
+    world.set_memory_budget(budget);
+    let mut now = 10.0;
+    let mut most = 0u64;
+    let mut passes = 0usize;
+    let mut last = world.total_evicted();
+    for i in 0..900usize {
+        now += 1.0 / 60.0;
+        let cam = place(4.0 * i as f64);
+        let seen = Seen::instant(&rig.system, &cam);
+        matter_step(&mut world, &mut rig.fetcher, &seen, view, now);
+        let held = world.held_bytes();
+        most = most.max(held);
+        assert!(held <= budget, "step {i}: {held} bytes held over {budget}");
+        assert!(
+            !world.cache().selection().is_empty(),
+            "step {i}: nothing drawn"
+        );
+        let total = world.total_evicted();
+        if total != last {
+            passes += 1;
+            last = total;
+        }
+        rig.fetcher.wait_for_events(Duration::from_millis(1));
+    }
+    println!(
+        "budget: memory budget {budget} bytes (settled view {settled}), highest held after a pass {most}, {passes} passes evicted, evicted in all {last:?}"
+    );
+    assert!(passes > 0, "nothing was evicted");
+}

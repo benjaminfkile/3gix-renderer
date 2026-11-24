@@ -185,6 +185,57 @@ plane removes the far plane choice. The near plane is chosen per frame as half
 the distance to the nearest marker in front of the camera or to the nearest
 drawn mesh's bounds, whichever is closer (at least 1 mm).
 
+## Memory budget
+
+One budget in bytes (`src/budget.rs`) covers everything the renderer
+caches: built surface tiles (section bytes, summary, geometry material and
+shape, composited material), compact surface tiles with their overlays,
+cached cells (each ready cell's decoded sections, counted by
+`stream::section_heap_bytes`), and extracted meshes
+(`SurfaceMesh::heap_bytes`). These byte counts are always compiled; only
+the counting allocator is behind the `memory-report` feature.
+
+The budget is chosen once at start by the platform layer
+(`budget::platform_budget`); no API option sets it:
+
+| Platform | Budget | Why |
+|---|---|---|
+| native | 2 GiB | memory to spare, and freed memory goes back to the system |
+| browser | 512 MiB | WebAssembly memory never shrinks: the highest point while loading is what the page keeps |
+| browser, `matchMedia("(pointer: coarse)")` matches or `navigator.deviceMemory` is at most 4 | 192 MiB | phones and small tablets end tabs that hold much more |
+
+Eviction runs where it ran before: after each surface selection and every
+`EVICT_INTERVAL_SECONDS` for cells (`World::enforce_budget`); the pass
+after a surface selection takes the cells' and meshes' bytes from the
+latest cell pass instead of counting every cell again. Under the
+budget nothing is evicted for size (cells still age out after 60 s).
+While over it, in this order:
+
+1. Built tiles not drawn and not wanted built go compact, least recently
+   looked at first.
+2. Compact tiles, cells, and meshes not drawn and not in the current
+   target go, least recently used first, the deepest level first on a tie
+   (then by key, so the order is the same on every run).
+
+What the current frame draws, the ancestors the selection walks to reach
+it, level-0 tiles, the cell target, and pinned cells are never evicted,
+even over the budget. The selection's `used` set protects nothing past the
+budget.
+
+While held bytes exceed the budget, the selection asks only for what it
+needs at the current view: children of tiles within their split distance
+(not out to `PREFETCH` times it) and cells of the drawn target (no cell
+whose parent has not arrived, the `AHEAD_DEPTHS` prediction). Asking ahead
+resumes once held bytes fall below 90 percent of the budget
+(`budget::RESUME_FRACTION`). This keeps the highest point near the budget.
+
+A compact tile is built off the frame thread (`tiles::build_tile`, on a
+decode thread natively, in the fetcher's slice in the browser), and
+composited there too for the hidden layers of the request, so
+`Surfaces::complete_build` only stores the result; it composites again
+only when the hidden layers or the tile's overlays changed meanwhile. A
+tile that arrives not wanted built is not composited.
+
 ## Memory report
 
 A developer tool for measuring what the renderer holds (`src/memory.rs`).
@@ -204,6 +255,9 @@ unchanged. With it:
   core library keeps their arrays private). Data shared through an `Arc`
   is counted once, by pointer.
   - `allocator`: `live` and `peak`.
+  - `budget`: the `budget`, the bytes it counts (`held`), whether asking
+    ahead is held, and what the latest pass and all passes evicted
+    (`compacted`, `tiles`, `cells`, `meshes`).
   - `surfaces`: entries `requested`, `ready` (built or compact),
     `empty`, `gone`; `compact` and `compact_bytes` (section bytes,
     summaries, overlays), `built` and `built_bytes` (the same plus their
@@ -390,9 +444,9 @@ wanted built for `tiles::BUILT_GRACE_SECONDS` (2 s) goes back to compact.
 
    A request stays `Requested` until every layer has its section; the
    client loop retries on its own. Cells not
-   selected (or drawn as a stand-in) for 60 s are evicted, and beyond 4096
-   cached cells the least recently used go first. Selected cells and
-   requests in flight are never evicted.
+   selected (or drawn as a stand-in) for 60 s are evicted; past that, the
+   memory budget evicts (see "Memory budget"). Cells of the target,
+   pinned cells, and requests in flight are never evicted.
 3. **Decode and composite** (`stream::decode_cell`).
    `gx_core::matter::decode` validates every layer's section; each
    section's `cell_origin` and `cell_edge` must also match the registry's

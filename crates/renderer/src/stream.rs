@@ -71,7 +71,7 @@
 //! with [`gx_core::matter::composite`] into `Ready` or, when the composite
 //! holds no matter, `Empty`. Sections that fail validation, or a module
 //! that fails, make a cell `Gone`. Cells of no target for 60 s are evicted,
-//! and the cache never holds more than 4096 cells it could drop.
+//! and past that the memory budget evicts (`crate::budget`).
 //!
 //! A frame that is a sprite only in the far field ([`crate::farfield`]) has
 //! no cells selected. The depth-0 cell of every frame that may need a sprite
@@ -174,9 +174,6 @@ pub const MAX_IN_FLIGHT: usize =
 
 /// Seconds a cell may be outside every target before it is evicted.
 pub const EVICT_AFTER_SECONDS: f64 = 60.0;
-
-/// Most cells the cache keeps once eviction has dropped what it can.
-pub const MAX_CACHED_CELLS: usize = 4096;
 
 /// How far below a cell [`CellCache::known_empty`] and
 /// [`CellCache::draw_set`] look for arrived descendants that cover it.
@@ -1364,6 +1361,9 @@ pub struct CellCache {
     /// A selection or a pin changed what is wanted since
     /// [`CellCache::take_wanted`] last ran.
     wanted_changed: bool,
+    /// Over the memory budget: cells asked ahead (whose parent has not
+    /// arrived, [`AHEAD_DEPTHS`]) are not requested (`crate::budget`).
+    hold_ahead: bool,
 }
 
 impl CellCache {
@@ -1592,6 +1592,9 @@ impl CellCache {
             let ahead = k
                 .parent()
                 .is_some_and(|p| !self.state(&p).is_some_and(CellState::arrived));
+            if ahead && self.hold_ahead && !self.pinned.contains(&k) {
+                continue;
+            }
             let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
             if e.state != CellState::Missing {
                 continue;
@@ -1647,6 +1650,9 @@ impl CellCache {
             let ahead = k
                 .parent()
                 .is_some_and(|p| !self.state(&p).is_some_and(CellState::arrived));
+            if ahead && self.hold_ahead && !self.pinned.contains(&k) {
+                continue;
+            }
             let e = self.entries.entry(k).or_insert_with(|| CellEntry::new(now));
             match e.state {
                 CellState::Missing => {
@@ -1736,13 +1742,29 @@ impl CellCache {
         }
     }
 
-    /// Evicts cells not used for [`EVICT_AFTER_SECONDS`], then, while more
-    /// than [`MAX_CACHED_CELLS`] remain, the least recently used (ties in key
-    /// order). Cells of the latest target (which holds the drawn selection
-    /// and every ancestor of it), pinned cells, and requests in flight are
-    /// never evicted and count as used now. Returns the evicted keys in key
-    /// order.
+    /// Evicts cells not used for [`EVICT_AFTER_SECONDS`]; the memory
+    /// budget then evicts more ([`CellCache::eviction_candidates`],
+    /// `crate::budget`). Cells of the latest target (which holds the drawn
+    /// selection and every ancestor of it), pinned cells, and requests in
+    /// flight are never evicted and count as used now. Returns the evicted
+    /// keys in key order.
     pub fn evict(&mut self, now: f64) -> Vec<CellKey> {
+        self.touch_target(now);
+        let mut gone: Vec<CellKey> = self
+            .entries
+            .iter()
+            .filter(|(k, e)| !self.keeps(k, e) && now - e.last_used >= EVICT_AFTER_SECONDS)
+            .map(|(k, _)| *k)
+            .collect();
+        gone.sort();
+        for k in &gone {
+            self.entries.remove(k);
+        }
+        gone
+    }
+
+    /// Marks the target's and the selection's cells used at `now`.
+    fn touch_target(&mut self, now: f64) {
         for k in self
             .target_cells
             .iter()
@@ -1752,38 +1774,54 @@ impl CellCache {
                 e.last_used = now;
             }
         }
-        let keep = |k: &CellKey, e: &CellEntry, cells: &CellSet| {
-            e.pinned || e.state == CellState::Requested || cells.contains(k)
-        };
-        let mut gone: Vec<CellKey> = self
-            .entries
+    }
+
+    /// Whether eviction never drops `k`: pinned, in flight, or in the
+    /// latest target.
+    fn keeps(&self, k: &CellKey, e: &CellEntry) -> bool {
+        e.pinned || e.state == CellState::Requested || self.target_cells.contains(k)
+    }
+
+    /// Whether `k` is in the latest target (the drawn selection and every
+    /// ancestor of it).
+    pub fn in_target(&self, k: &CellKey) -> bool {
+        self.target_cells.contains(k)
+    }
+
+    /// Holds asking ahead while `hold` is `true`: the memory budget is
+    /// exceeded (`crate::budget`).
+    pub fn set_hold_ahead(&mut self, hold: bool) {
+        self.hold_ahead = hold;
+    }
+
+    /// Bytes the cache counts against the memory budget
+    /// (`crate::budget`): each entry, and each ready cell's decoded
+    /// sections.
+    pub fn held_bytes(&self) -> u64 {
+        self.entries.values().map(entry_bytes).sum()
+    }
+
+    /// The cells eviction over the budget may drop (`crate::budget`):
+    /// every entry not pinned, not in flight, and not in the latest
+    /// target, with its last use, depth, and bytes.
+    pub fn eviction_candidates(&self) -> Vec<crate::budget::Candidate<CellKey>> {
+        self.entries
             .iter()
-            .filter(|(k, e)| {
-                !keep(k, e, &self.target_cells) && now - e.last_used >= EVICT_AFTER_SECONDS
+            .filter(|(k, e)| !self.keeps(k, e))
+            .map(|(k, e)| crate::budget::Candidate {
+                last_used: e.last_used,
+                level: k.depth,
+                key: *k,
+                bytes: entry_bytes(e),
             })
-            .map(|(k, _)| *k)
-            .collect();
-        let remaining = self.entries.len() - gone.len();
-        if remaining > MAX_CACHED_CELLS {
-            let dropped: CellSet = gone.iter().copied().collect();
-            let mut lru: Vec<(f64, CellKey)> = self
-                .entries
-                .iter()
-                .filter(|(k, e)| !keep(k, e, &self.target_cells) && !dropped.contains(k))
-                .map(|(k, e)| (e.last_used, *k))
-                .collect();
-            lru.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            gone.extend(
-                lru.into_iter()
-                    .take(remaining - MAX_CACHED_CELLS)
-                    .map(|(_, k)| k),
-            );
-        }
-        gone.sort();
-        for k in &gone {
+            .collect()
+    }
+
+    /// Drops `keys` from the cache (eviction over the budget).
+    pub fn drop_cells(&mut self, keys: &[CellKey]) {
+        for k in keys {
             self.entries.remove(k);
         }
-        gone
     }
 
     /// Counts for the overlay.
@@ -1992,7 +2030,7 @@ pub enum FetchEvent {
         /// The tile.
         key: gx_core::key::SurfaceKey,
         /// The built bases.
-        outcome: Result<Vec<(usize, Arc<crate::tiles::TileGeometry>)>, String>,
+        outcome: crate::tiles::BuildOutcome,
     },
 }
 
@@ -2070,11 +2108,25 @@ pub use native::{frame_records, Fetcher, FetcherOptions};
 /// (the memory report). The core library keeps the arrays private, so
 /// they are counted by length: eight arrays, nine `f32` and one state
 /// byte per sample. A free function since the type is the core library's.
-#[cfg(feature = "memory-report")]
 pub fn section_heap_bytes(s: &Section) -> u64 {
     const PER_SAMPLE: usize = 9 * std::mem::size_of::<f32>() + std::mem::size_of::<State>();
     let samples = s.samples().map_or(0, |v| v.len());
     (std::mem::size_of::<Section>() + samples * PER_SAMPLE) as u64
+}
+
+/// Bytes one cache entry counts against the memory budget: the entry,
+/// and a ready cell's decoded sections (the composite and each layer's).
+fn entry_bytes(e: &CellEntry) -> u64 {
+    let mut n = (std::mem::size_of::<(CellKey, CellEntry)>()) as u64;
+    if let CellState::Ready(cell) = &e.state {
+        n += section_heap_bytes(&cell.section);
+        n += cell
+            .layers
+            .iter()
+            .map(|(_, s)| section_heap_bytes(s))
+            .sum::<u64>();
+    }
+    n
 }
 
 #[cfg(feature = "memory-report")]
@@ -3413,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_by_age_and_cap() {
+    fn eviction_by_age() {
         let mut c = CellCache::new();
         let a = key(1, 0, 0, 0);
         c.set_cells(sel(&[a]));
@@ -3422,17 +3474,51 @@ mod tests {
         c.set_cells(Vec::new());
         assert!(c.evict(59.0).is_empty());
         assert_eq!(c.evict(60.0), vec![a]);
+    }
 
-        let many: Vec<CellKey> = (0..(MAX_CACHED_CELLS as u32 + 10))
-            .map(|i| CellKey::new(5, 13, i % 8192, i / 8192, 0).unwrap())
-            .collect();
-        for (i, k) in many.iter().enumerate() {
-            c.complete(*k, FetchOutcome::Decoded(None), i as f64 * 1e-3);
+    #[test]
+    fn eviction_over_the_budget_keeps_the_target() {
+        // Far more cells than fit: dropping the candidates least recently
+        // used first brings the held bytes to the budget, and the target's
+        // and pinned cells stay.
+        let mut c = CellCache::new();
+        let drawn = key(1, 0, 0, 0);
+        let pinned = key(0, 0, 0, 0);
+        c.pin(pinned, 0.0);
+        c.set_cells(sel(&[drawn]));
+        c.take_requests(0.0);
+        c.complete(drawn, ready(), 0.0);
+        c.complete(pinned, ready(), 0.0);
+        for i in 0..200u32 {
+            let k = CellKey::new(5, 13, i, 0, 0).unwrap();
+            c.complete(k, ready(), f64::from(i) * 1e-3);
         }
-        let gone = c.evict(10.0);
-        assert_eq!(gone.len(), 10);
-        assert_eq!(gone, many[..10].to_vec());
-        assert_eq!(c.counts().cached, MAX_CACHED_CELLS);
+        let full = c.held_bytes();
+        let budget = full / 4;
+        let mut items = c.eviction_candidates();
+        crate::budget::sort_candidates(&mut items);
+        for it in items {
+            if c.held_bytes() <= budget {
+                break;
+            }
+            c.drop_cells(&[it.key]);
+        }
+        assert!(c.held_bytes() <= budget, "{} over {budget}", c.held_bytes());
+        assert!(c.loaded(&drawn) && c.loaded(&pinned));
+    }
+
+    #[test]
+    fn asking_ahead_is_held_over_the_budget() {
+        let mut c = CellCache::new();
+        let child = key(2, 0, 0, 0);
+        c.set_cells(sel(&[child]));
+        c.set_hold_ahead(true);
+        assert!(
+            !c.take_requests(0.0).contains(&child),
+            "a cell asked ahead was requested"
+        );
+        c.set_hold_ahead(false);
+        assert!(c.take_requests(0.0).contains(&child));
     }
 
     #[test]

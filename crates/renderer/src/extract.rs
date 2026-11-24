@@ -93,7 +93,6 @@ pub struct SurfaceMesh {
 impl SurfaceMesh {
     /// Bytes this mesh holds: the struct and the capacity of its
     /// positions, vertices, and indices (the memory report).
-    #[cfg(feature = "memory-report")]
     pub fn heap_bytes(&self) -> u64 {
         (std::mem::size_of::<SurfaceMesh>()
             + self.positions.capacity() * std::mem::size_of::<[f64; 3]>()

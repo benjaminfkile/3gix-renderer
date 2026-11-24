@@ -175,8 +175,14 @@ impl Pose {
     }
 }
 
-/// Surface tiles kept cached beyond those the selection uses.
-pub const SURFACE_TILES_KEPT: usize = 4096;
+/// One item eviction over the memory budget may drop, in the order of
+/// [`crate::budget::sort_candidates`] on a full tie.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Held {
+    Tile(gx_core::key::SurfaceKey),
+    Cell(CellKey),
+    Mesh(CellKey),
+}
 
 /// Longest a selection waits for the one before it to be shown
 /// ([`World::select`]), seconds.
@@ -233,6 +239,19 @@ pub struct World {
     steps: StepTimes,
     extraction_times: StepTimes,
     last_evict: f64,
+    /// The memory budget, bytes (`crate::budget`).
+    budget: u64,
+    /// The bytes held after the latest eviction pass.
+    held: u64,
+    /// The cells' and meshes' bytes as the latest count found them.
+    cell_bytes: u64,
+    /// Asking ahead is held: the budget was exceeded and held bytes have
+    /// not yet fallen below [`crate::budget::RESUME_FRACTION`] of it.
+    holding_ahead: bool,
+    /// What the latest eviction pass over the budget did.
+    last_evicted: crate::budget::Evicted,
+    /// What every eviction pass over the budget did, summed.
+    total_evicted: crate::budget::Evicted,
 }
 
 impl World {
@@ -266,6 +285,12 @@ impl World {
             steps: StepTimes::new(),
             extraction_times: StepTimes::new(),
             last_evict: f64::NEG_INFINITY,
+            budget: crate::budget::platform_budget(),
+            held: 0,
+            cell_bytes: 0,
+            holding_ahead: false,
+            last_evicted: crate::budget::Evicted::default(),
+            total_evicted: crate::budget::Evicted::default(),
         }
     }
 
@@ -495,7 +520,160 @@ impl World {
             .map(|f| f.frame_id)
             .collect();
         self.surfaces.select(system, camera, view_px, &frames, now);
-        self.surfaces.evict(SURFACE_TILES_KEPT);
+        self.enforce_budget(false);
+    }
+
+    /// The memory budget, bytes (`crate::budget`): the platform's default
+    /// from [`crate::budget::platform_budget`] unless set.
+    pub fn memory_budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// Sets the memory budget, bytes: for tests and tools that force a
+    /// small one. No API option reaches it (`crate::budget`).
+    pub fn set_memory_budget(&mut self, bytes: u64) {
+        self.budget = bytes;
+    }
+
+    /// The bytes held after the latest eviction pass: surface tiles,
+    /// cells, and meshes, as the budget counts them.
+    pub fn held_bytes(&self) -> u64 {
+        self.held
+    }
+
+    /// Whether asking ahead is held by the budget (`crate::budget`).
+    pub fn holding_ahead(&self) -> bool {
+        self.holding_ahead
+    }
+
+    /// What the latest eviction pass over the budget did.
+    pub fn last_evicted(&self) -> crate::budget::Evicted {
+        self.last_evicted
+    }
+
+    /// What every eviction pass over the budget did, summed.
+    pub fn total_evicted(&self) -> crate::budget::Evicted {
+        self.total_evicted
+    }
+
+    fn mesh_bytes(&self) -> u64 {
+        self.meshes.values().map(|e| e.mesh.heap_bytes()).sum()
+    }
+
+    /// Counts the held bytes. Cells and meshes are counted again only
+    /// with `cells` (the cell eviction pass, every
+    /// [`EVICT_INTERVAL_SECONDS`]); the surface pass after each selection
+    /// takes their count from the latest cell pass, so it costs no walk
+    /// over every cell.
+    fn count_held(&mut self, cells: bool) -> u64 {
+        if cells {
+            self.cell_bytes = self.cache.held_bytes() + self.mesh_bytes();
+        }
+        self.surfaces.held_bytes() + self.cell_bytes
+    }
+
+    /// Evicts against the memory budget (`crate::budget`, `docs/architecture.md`,
+    /// "Memory budget"). While over it: built tiles not drawn and not
+    /// wanted built go compact; then compact tiles, cells, and meshes not
+    /// drawn and not in the current target go, least recently used first,
+    /// the deepest first on a tie. The drawn tiles, the ancestors the
+    /// selection walks to reach them, level-0 tiles, the cell target, and
+    /// pinned cells stay, even over the budget. Then holds asking ahead
+    /// while held bytes exceed the budget, until they fall below
+    /// [`crate::budget::RESUME_FRACTION`] of it.
+    fn enforce_budget(&mut self, cells: bool) {
+        let mut held = self.count_held(cells);
+        let mut ev = crate::budget::Evicted::default();
+        if held > self.budget {
+            let mut over = held - self.budget;
+            ev.compacted = self.surfaces.compact_over(&mut over);
+            if over > 0 {
+                let mut items: Vec<crate::budget::Candidate<Held>> = Vec::new();
+                for c in self.surfaces.eviction_candidates() {
+                    items.push(crate::budget::Candidate {
+                        last_used: c.last_used,
+                        level: c.level,
+                        key: Held::Tile(c.key),
+                        bytes: c.bytes,
+                    });
+                }
+                for c in self.cache.eviction_candidates() {
+                    items.push(crate::budget::Candidate {
+                        last_used: c.last_used,
+                        level: c.level,
+                        key: Held::Cell(c.key),
+                        bytes: c.bytes,
+                    });
+                }
+                let shown: CellSet = self.shown_keys().iter().copied().collect();
+                for (k, e) in &self.meshes {
+                    if shown.contains(k) || self.cache.in_target(k) {
+                        continue;
+                    }
+                    items.push(crate::budget::Candidate {
+                        last_used: self
+                            .cache
+                            .entry(k)
+                            .map_or(f64::NEG_INFINITY, |e| e.last_used),
+                        level: k.depth,
+                        key: Held::Mesh(*k),
+                        bytes: e.mesh.heap_bytes(),
+                    });
+                }
+                crate::budget::sort_candidates(&mut items);
+                let mut tiles = Vec::new();
+                for c in items {
+                    if over == 0 {
+                        break;
+                    }
+                    let freed = match c.key {
+                        Held::Tile(k) => {
+                            tiles.push(k);
+                            ev.tiles += 1;
+                            c.bytes
+                        }
+                        Held::Cell(k) => {
+                            self.cache.drop_cells(&[k]);
+                            ev.cells += 1;
+                            c.bytes + self.drop_mesh(k, false)
+                        }
+                        Held::Mesh(k) => {
+                            let b = self.drop_mesh(k, true);
+                            if b > 0 {
+                                ev.meshes += 1;
+                            }
+                            b
+                        }
+                    };
+                    over = over.saturating_sub(freed);
+                }
+                self.surfaces.drop_tiles(&tiles);
+            }
+            held = self.count_held(true);
+        }
+        self.holding_ahead = crate::budget::hold_ahead(held, self.budget, self.holding_ahead);
+        self.surfaces.set_hold_ahead(self.holding_ahead);
+        self.cache.set_hold_ahead(self.holding_ahead);
+        self.held = held;
+        self.last_evicted = ev;
+        self.total_evicted.compacted += ev.compacted;
+        self.total_evicted.tiles += ev.tiles;
+        self.total_evicted.cells += ev.cells;
+        self.total_evicted.meshes += ev.meshes;
+    }
+
+    /// Drops `k`'s mesh, if held, and returns its bytes. With `kept` the
+    /// cell stays cached: its mesh is extracted again when it is next in
+    /// the target. Without it the cell left the cache.
+    fn drop_mesh(&mut self, k: CellKey, kept: bool) -> u64 {
+        let bytes = self.meshes.get(&k).map_or(0, |e| e.mesh.heap_bytes());
+        if bytes > 0 || !kept {
+            self.changes.push((k, None));
+            self.meshes.remove(&k);
+            self.waiting.remove(&k);
+            self.marks.push_back(Mark::Arrival(k));
+        }
+        bytes
     }
 
     /// The compact surface tiles wanted built since the last call
@@ -510,7 +688,7 @@ impl World {
     pub fn complete_surface_build(
         &mut self,
         key: gx_core::key::SurfaceKey,
-        outcome: Result<Vec<(usize, std::sync::Arc<crate::tiles::TileGeometry>)>, String>,
+        outcome: crate::tiles::BuildOutcome,
     ) {
         self.surfaces.complete_build(key, outcome);
     }
@@ -852,7 +1030,8 @@ impl World {
         }
     }
 
-    /// Evicts old cells and their meshes.
+    /// Evicts old cells and their meshes, then evicts against the memory
+    /// budget (`crate::budget`).
     pub fn evict(&mut self, now: f64) {
         for k in self.cache.evict(now) {
             self.changes.push((k, None));
@@ -860,6 +1039,7 @@ impl World {
             self.waiting.remove(&k);
             self.marks.push_back(Mark::Arrival(k));
         }
+        self.enforce_budget(true);
     }
 
     /// For every frame with a drawn mesh, the distance from `camera` to
@@ -1254,6 +1434,13 @@ impl World {
                 bytes: all.values().sum(),
                 shown: shown.len(),
                 shown_bytes: shown.values().sum(),
+            },
+            budget: crate::memory::BudgetMemory {
+                budget: self.budget,
+                held: self.held,
+                holding_ahead: self.holding_ahead,
+                last: self.last_evicted,
+                total: self.total_evicted,
             },
             timings: crate::memory::Timings::now(),
         }

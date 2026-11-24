@@ -241,6 +241,21 @@ pub struct MeshMemory {
     pub shown_bytes: u64,
 }
 
+/// The memory budget (`crate::budget`) and what eviction against it did.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize)]
+pub struct BudgetMemory {
+    /// The budget, bytes.
+    pub budget: u64,
+    /// The bytes it counts, after the latest eviction pass.
+    pub held: u64,
+    /// Whether asking ahead is held.
+    pub holding_ahead: bool,
+    /// What the latest pass evicted.
+    pub last: crate::budget::Evicted,
+    /// What every pass evicted, summed.
+    pub total: crate::budget::Evicted,
+}
+
 /// What the renderer holds, in bytes and counts
 /// ([`crate::world::World::memory_report`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize)]
@@ -253,6 +268,8 @@ pub struct MemoryReport {
     pub cells: CellMemory,
     /// Extracted meshes.
     pub meshes: MeshMemory,
+    /// The memory budget.
+    pub budget: BudgetMemory,
     /// Decode timings.
     pub timings: Timings,
 }

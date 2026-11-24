@@ -559,12 +559,66 @@ pub struct BuildRequest {
     pub layers: Vec<usize>,
     /// Projected size, pixels.
     pub priority: f64,
+    /// The overlays that had arrived for the tile, with their layer
+    /// indices, in layer order.
+    pub overlays: Vec<(usize, Arc<OverlayTile>)>,
+    /// The hidden layers when the request was made: the drawn geometry is
+    /// composited for these.
+    pub hidden: BTreeSet<usize>,
 }
 
-/// The geometry of each base of a [`BuildRequest`], with its layer index
-/// (off the frame thread: what the fetchers run).
-pub fn build_tile(req: &BuildRequest) -> Result<Vec<(usize, Arc<TileGeometry>)>, String> {
-    decode_shared_tile(&req.key, &req.sections, &req.layers, &BTreeSet::new()).map(|d| d.bases)
+/// A finished [`build_tile`]: the geometry of each base with its layer
+/// index, and the geometry to draw composited for the hidden set the
+/// request was made with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuiltTile {
+    /// The built bases.
+    pub bases: Vec<(usize, Arc<TileGeometry>)>,
+    /// The hidden layers [`BuiltTile::drawn`] was composited for.
+    pub hidden: BTreeSet<usize>,
+    /// How many overlays the tile held when the request was made.
+    pub overlays: usize,
+    /// The first shown base with the shown overlays composited; `None`
+    /// when every base is hidden.
+    pub drawn: Option<Arc<TileGeometry>>,
+}
+
+/// What [`build_tile`] returns: the built tile, or why it is invalid.
+pub type BuildOutcome = Result<BuiltTile, String>;
+
+/// Builds a [`BuildRequest`] off the frame thread (what the fetchers
+/// run): each base's geometry, and the geometry to draw composited with
+/// the overlays shown under the request's hidden set, so the frame thread
+/// only stores the result ([`Surfaces::complete_build`]).
+pub fn build_tile(req: &BuildRequest) -> BuildOutcome {
+    let bases = decode_shared_tile(&req.key, &req.sections, &req.layers, &BTreeSet::new())?.bases;
+    let drawn = composite_shown(&bases, &req.overlays, &req.hidden);
+    Ok(BuiltTile {
+        bases,
+        hidden: req.hidden.clone(),
+        overlays: req.overlays.len(),
+        drawn,
+    })
+}
+
+/// The first base not in `hidden` with the overlays not in `hidden`
+/// composited over it, or that base itself when no overlay is shown;
+/// `None` when every base is hidden.
+fn composite_shown(
+    bases: &[(usize, Arc<TileGeometry>)],
+    overlays: &[(usize, Arc<OverlayTile>)],
+    hidden: &BTreeSet<usize>,
+) -> Option<Arc<TileGeometry>> {
+    let (_, g) = bases.iter().find(|(l, _)| !hidden.contains(l))?;
+    let shown: Vec<&OverlayTile> = (overlays.iter())
+        .filter(|(l, _)| !hidden.contains(l))
+        .map(|(_, o)| o.as_ref())
+        .collect();
+    Some(if shown.is_empty() {
+        Arc::clone(g)
+    } else {
+        Arc::new(composite_tile(g, &shown))
+    })
 }
 
 /// Sorts `builds` largest projected size first, ties by key, so the
@@ -646,6 +700,9 @@ pub struct Surfaces {
     builds: Vec<(SurfaceKey, f64)>,
     /// Compact tiles wanted built whose build has not come back.
     building: std::collections::HashSet<SurfaceKey>,
+    /// Over the memory budget: children are asked for only within the
+    /// split distance, not out to [`PREFETCH`] times it (`crate::budget`).
+    hold_ahead: bool,
 }
 
 impl Surfaces {
@@ -755,6 +812,8 @@ impl Surfaces {
                     sections,
                     layers,
                     priority,
+                    overlays: l.overlays.clone(),
+                    hidden: self.hidden.clone(),
                 })
             })
             .collect();
@@ -762,15 +821,13 @@ impl Surfaces {
         out
     }
 
-    /// Applies a finished build ([`build_tile`]): the tile is built again,
-    /// composited with its shown overlays, and drawn from the next
-    /// selection. A build for a tile no longer held, or already built
-    /// again by a later arrival, is dropped.
-    pub fn complete_build(
-        &mut self,
-        key: SurfaceKey,
-        outcome: Result<Vec<(usize, Arc<TileGeometry>)>, String>,
-    ) {
+    /// Applies a finished build ([`build_tile`]): the tile is built again
+    /// and drawn from the next selection with the geometry the build
+    /// composited. Only when the hidden set or the tile's overlays changed
+    /// since the request is it composited again here, as a layer toggle
+    /// does. A build for a tile no longer held, or already built again by
+    /// a later arrival, is dropped.
+    pub fn complete_build(&mut self, key: SurfaceKey, outcome: BuildOutcome) {
         self.building.remove(&key);
         let Some(l) = self.layers.get_mut(&key) else {
             return;
@@ -781,11 +838,17 @@ impl Surfaces {
         match outcome {
             Ok(built) => {
                 for b in &mut l.bases {
-                    if let Some((_, g)) = built.iter().find(|(layer, _)| *layer == b.layer) {
+                    if let Some((_, g)) = built.bases.iter().find(|(layer, _)| *layer == b.layer) {
                         b.geometry = Some(Arc::clone(g));
                     }
                 }
-                self.tiles.insert(key, l.state(&self.hidden));
+                let same = built.hidden == self.hidden && l.overlays.len() == built.overlays;
+                let state = match (same, built.drawn) {
+                    (true, Some(g)) => State::Ready(g),
+                    (true, None) => State::Empty,
+                    (false, _) => l.state(&self.hidden),
+                };
+                self.tiles.insert(key, state);
             }
             Err(reason) => {
                 tracing::warn!(key = %key, "surface tile is invalid: {reason}");
@@ -945,6 +1008,7 @@ impl Surfaces {
                     waiting,
                     arrived_at,
                     wanted_at,
+                    used_at: self.now,
                 };
                 if !keep && layers.can_compact() {
                     layers.compact();
@@ -1069,6 +1133,11 @@ impl Surfaces {
             self.select_in_frame(frame, cam, forward, focal, cone, &mut drawn);
         }
         self.drawn = drawn;
+        for k in &self.used {
+            if let Some(l) = self.layers.get_mut(k) {
+                l.used_at = now;
+            }
+        }
         self.compact_unwanted();
     }
 
@@ -1119,7 +1188,7 @@ impl Surfaces {
                 self.used.extend(ch);
                 // A child's projected edge: half the parent's.
                 let px = 0.5 * geo.edge * focal / d.max(f64::MIN_POSITIVE);
-                if d < r * PREFETCH {
+                if d < r * if self.hold_ahead { 1.0 } else { PREFETCH } {
                     for c in ch {
                         self.want(c, px);
                     }
@@ -1219,23 +1288,123 @@ impl Surfaces {
         }
     }
 
-    /// Drops cached tiles the latest selection did not look at, beyond
-    /// `keep` tiles: roots, tiles asked for, and every tile the selection
-    /// walked or checked as a child stay. Keeping only what is drawn and
-    /// its ancestors is not enough: a split tile whose children are all
-    /// hidden draws nothing, and dropping its children would make its
-    /// parent draw coarse until they come back, again and again.
-    pub fn evict(&mut self, keep: usize) {
-        if self.tiles.len() <= keep {
-            return;
+    /// Holds asking ahead ([`PREFETCH`]) while `hold` is `true`: the
+    /// memory budget is exceeded (`crate::budget`).
+    pub fn set_hold_ahead(&mut self, hold: bool) {
+        self.hold_ahead = hold;
+    }
+
+    /// Bytes every held tile counts against the memory budget
+    /// (`crate::budget`): each entry's key and state, and each arrived
+    /// tile's sections, overlays, and geometry.
+    pub fn held_bytes(&self) -> u64 {
+        let entry = std::mem::size_of::<(SurfaceKey, State)>() as u64;
+        let mut n = self.tiles.len() as u64 * entry;
+        for (k, l) in &self.layers {
+            if let Some(s) = self.tiles.get(k) {
+                n += l.bytes(s);
+            }
         }
-        let used = &self.used;
-        self.tiles
-            .retain(|k, s| k.level == 0 || matches!(s, State::Requested) || used.contains(k));
+        n
+    }
+
+    /// The drawn tiles and every ancestor the selection walks to reach
+    /// them: never evicted, even over the budget.
+    fn drawn_and_ancestors(&self) -> std::collections::HashSet<SurfaceKey> {
+        let mut out = std::collections::HashSet::new();
+        for t in &self.drawn {
+            let mut k = Some(t.geometry.key);
+            while let Some(key) = k {
+                if !out.insert(key) {
+                    break;
+                }
+                k = key.parent();
+            }
+        }
+        out
+    }
+
+    /// The first step of eviction over the budget (`crate::budget`):
+    /// while `over` bytes remain, built tiles that are not level-0, not
+    /// drawn or walked to, and not wanted built go compact, least recently
+    /// used first, the deepest on a tie. Takes the bytes freed off `over`
+    /// and returns how many tiles went compact.
+    pub fn compact_over(&mut self, over: &mut u64) -> usize {
+        if *over == 0 {
+            return 0;
+        }
+        let keep = self.drawn_and_ancestors();
+        let mut items: Vec<crate::budget::Candidate<SurfaceKey>> = Vec::new();
+        for (k, l) in &self.layers {
+            if k.level == 0
+                || !l.built()
+                || !l.can_compact()
+                || keep.contains(k)
+                || self.want_built.contains(k)
+            {
+                continue;
+            }
+            items.push(crate::budget::Candidate {
+                last_used: l.used_at,
+                level: k.level,
+                key: *k,
+                bytes: 0,
+            });
+        }
+        crate::budget::sort_candidates(&mut items);
+        let mut done = 0;
+        for c in items {
+            if *over == 0 {
+                break;
+            }
+            let Some(l) = self.layers.get_mut(&c.key) else {
+                continue;
+            };
+            let before = self.tiles.get(&c.key).map_or(0, |s| l.bytes(s));
+            l.compact();
+            let state = l.state(&self.hidden);
+            let after = l.bytes(&state);
+            self.tiles.insert(c.key, state);
+            *over = over.saturating_sub(before.saturating_sub(after));
+            done += 1;
+        }
+        done
+    }
+
+    /// The tiles eviction over the budget may drop (`crate::budget`):
+    /// every entry that is not level-0, not asked for, not drawn or walked
+    /// to, and not built and wanted built, with its last use and bytes.
+    pub fn eviction_candidates(&self) -> Vec<crate::budget::Candidate<SurfaceKey>> {
+        let keep = self.drawn_and_ancestors();
+        let entry = std::mem::size_of::<(SurfaceKey, State)>() as u64;
+        let mut out = Vec::new();
+        for (k, s) in &self.tiles {
+            if k.level == 0 || matches!(s, State::Requested) || keep.contains(k) {
+                continue;
+            }
+            let l = self.layers.get(k);
+            if l.is_some_and(|l| l.built()) && self.want_built.contains(k) {
+                continue;
+            }
+            out.push(crate::budget::Candidate {
+                last_used: l.map_or(f64::NEG_INFINITY, |l| l.used_at),
+                level: k.level,
+                key: *k,
+                bytes: entry + l.map_or(0, |l| l.bytes(s)),
+            });
+        }
+        out
+    }
+
+    /// Drops `keys` from the cache (eviction over the budget).
+    pub fn drop_tiles(&mut self, keys: &[SurfaceKey]) {
+        for k in keys {
+            self.tiles.remove(k);
+            self.layers.remove(k);
+            self.pending.remove(k);
+            self.building.remove(k);
+        }
         let tiles = &self.tiles;
-        self.layers.retain(|k, _| tiles.contains_key(k));
-        self.pending.retain(|k| tiles.contains_key(k));
-        self.building.retain(|k| tiles.contains_key(k));
         self.builds.retain(|(k, _)| tiles.contains_key(k));
     }
 }
@@ -1266,9 +1435,41 @@ struct TileLayers {
     arrived_at: f64,
     /// When the tile was last wanted built, on the selection's clock.
     wanted_at: f64,
+    /// When a selection last looked at the tile, on the selection's
+    /// clock: what eviction over the budget orders by.
+    used_at: f64,
 }
 
 impl TileLayers {
+    /// Bytes the tile holds (`crate::budget`): each base's section,
+    /// summary, and geometry while built (material and shape), each
+    /// overlay, and the drawn geometry's material when it is a composite.
+    fn bytes(&self, state: &State) -> u64 {
+        let mut n = std::mem::size_of::<TileLayers>() as u64;
+        for b in &self.bases {
+            n += std::mem::size_of::<Base>() as u64;
+            n += b.section.as_ref().map_or(0, |s| s.len() as u64);
+            if let Some(g) = &b.geometry {
+                n += g.heap_bytes() + g.tile_shape.heap_bytes();
+            }
+        }
+        n += self
+            .overlays
+            .iter()
+            .map(|(_, o)| overlay_heap_bytes(o))
+            .sum::<u64>();
+        if let State::Ready(g) = state {
+            let base = self
+                .bases
+                .iter()
+                .any(|b| b.geometry.as_ref().is_some_and(|bg| Arc::ptr_eq(bg, g)));
+            if !base {
+                n += g.heap_bytes();
+            }
+        }
+        n
+    }
+
     /// The geometry to draw: the first shown base with the shown overlays
     /// composited, or that base itself when no overlay is shown; `None`
     /// when every base is hidden.
@@ -1279,15 +1480,10 @@ impl TileLayers {
         let Some(g) = &base.geometry else {
             return State::Compact(base.summary);
         };
-        let shown: Vec<&OverlayTile> = (self.overlays.iter())
-            .filter(|(l, _)| !hidden.contains(l))
-            .map(|(_, o)| o.as_ref())
-            .collect();
-        State::Ready(if shown.is_empty() {
-            Arc::clone(g)
-        } else {
-            Arc::new(composite_tile(g, &shown))
-        })
+        match composite_shown(&[(base.layer, Arc::clone(g))], &self.overlays, hidden) {
+            Some(g) => State::Ready(g),
+            None => State::Empty,
+        }
     }
 
     /// Whether any base holds its geometry.
@@ -1329,7 +1525,6 @@ pub(crate) fn decode_tile_timed(
     )
 }
 
-#[cfg(feature = "memory-report")]
 impl TileGeometry {
     /// Bytes this geometry's own material holds: the struct and each
     /// material array's capacity (the memory report,
@@ -1340,7 +1535,6 @@ impl TileGeometry {
     }
 }
 
-#[cfg(feature = "memory-report")]
 impl TileShape {
     /// Bytes this shape holds: the struct and each array's capacity (the
     /// memory report).
@@ -1354,14 +1548,12 @@ impl TileShape {
     }
 }
 
-#[cfg(feature = "memory-report")]
 fn cap<T>(v: &Vec<T>) -> usize {
     v.capacity() * std::mem::size_of::<T>()
 }
 
 /// Bytes an overlay tile holds: the struct and each array's capacity (the
 /// memory report). A free function since the type is the core library's.
-#[cfg(feature = "memory-report")]
 pub fn overlay_heap_bytes(o: &OverlayTile) -> u64 {
     (std::mem::size_of::<OverlayTile>()
         + o.coverage.capacity()
@@ -1879,10 +2071,11 @@ mod tests {
     }
 
     #[test]
-    fn eviction_keeps_what_the_selection_uses() {
-        // Low camera looking level: some split tiles have every child
-        // hidden. Eviction at its most eager (keep nothing it may drop)
-        // must not change what is drawn from one selection to the next.
+    fn eviction_over_the_budget_keeps_what_is_drawn() {
+        // Low camera looking level, looking at far more tiles than fit:
+        // after each eviction pass the held bytes are at or under the
+        // budget, or only what is drawn, walked to, and level-0 remains,
+        // and every drawn tile stays.
         let (a, c) = (6_378_137.0, 6_356_752.3);
         let d =
             gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
@@ -1895,28 +2088,56 @@ mod tests {
         let keys =
             |d: &[TileDrawInfo]| -> Vec<SurfaceKey> { d.iter().map(|t| t.geometry.key).collect() };
         let want = keys(&first);
-        for round in 0..6 {
-            s.evict(0);
-            let mut drawn = Vec::new();
-            s.select_in_frame(
-                4,
-                cam,
-                up_tangent,
-                focal_px(720.0, FIELD_OF_VIEW_Y),
-                0.9,
-                &mut drawn,
+        let full = s.held_bytes();
+        let budget = full / 2;
+        let mut over = full - budget;
+        s.compact_over(&mut over);
+        let mut items = s.eviction_candidates();
+        crate::budget::sort_candidates(&mut items);
+        let mut gone = Vec::new();
+        for c in items {
+            if s.held_bytes() <= budget {
+                break;
+            }
+            gone.push(c.key);
+            s.drop_tiles(&[c.key]);
+        }
+        assert!(!gone.is_empty(), "nothing was evicted from {full} bytes");
+        let held = s.held_bytes();
+        assert!(
+            held <= budget || s.eviction_candidates().is_empty(),
+            "{held} bytes held over a budget of {budget}"
+        );
+        for k in &want {
+            assert!(
+                s.ready(k).is_some() || matches!(s.tiles.get(k), Some(State::Compact(_))),
+                "drawn tile {k} was evicted"
             );
-            assert_eq!(keys(&drawn), want, "round {round}: what is drawn changed");
-            // Serve whatever was asked for again, as the hub would.
-            for key in s.take_requests() {
-                let outcome = if key.level <= 11 {
-                    Ok(Some(Arc::new(TileGeometry::new(&tile(key)))))
-                } else {
-                    Ok(None)
-                };
-                s.complete(key, outcome);
+            let mut up = k.parent();
+            while let Some(p) = up {
+                assert!(s.tiles.contains_key(&p), "ancestor {p} of {k} was evicted");
+                up = p.parent();
             }
         }
+    }
+
+    #[test]
+    fn asking_ahead_is_held_over_the_budget() {
+        let (a, c) = (6_378_137.0, 6_356_752.3);
+        let d =
+            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
+        let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
+        let up_tangent =
+            unit_cross(nrm, unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from)).map(f64::from);
+        let asked = |hold: bool| {
+            let mut s = Surfaces::new();
+            s.set_hold_ahead(hold);
+            settle(&mut s, cam, up_tangent, 11);
+            s.cached()
+        };
+        let (ahead, held) = (asked(false), asked(true));
+        assert!(held < ahead, "{held} tiles held back, {ahead} asking ahead");
     }
 
     #[test]

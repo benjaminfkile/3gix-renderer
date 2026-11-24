@@ -79,6 +79,7 @@ macro_rules! timed {
 // are: native, and the browser build (`web` feature).
 #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
 pub mod api;
+pub mod budget;
 pub mod camera;
 pub mod clock;
 pub mod config;
