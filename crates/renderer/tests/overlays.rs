@@ -158,7 +158,12 @@ fn fetch(fetcher: &mut Fetcher, surfaces: &mut Surfaces, key: SurfaceKey) -> Vec
             else {
                 continue;
             };
-            assert_eq!(k, key);
+            // A late completion of the tile fetched before this one may
+            // still arrive (the fetcher decodes each on its own thread);
+            // it is not this tile's.
+            if k != key {
+                continue;
+            }
             let tile = outcome.expect("a valid tile");
             assert!(tile.base().is_some(), "the base came first");
             steps.push(tile.overlays.iter().map(|(l, _)| *l).collect());
