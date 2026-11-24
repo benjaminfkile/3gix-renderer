@@ -93,6 +93,11 @@ pub struct MatterStats {
     /// latest steps, milliseconds (`rendering.md` section 4), or `None`
     /// before the first step.
     pub frame_step_p95_ms: Option<f64>,
+    /// Bytes the allocator holds and bytes of surface tile geometry
+    /// (the memory report, `docs/architecture.md`), or `None` where not
+    /// measured.
+    #[cfg(feature = "memory-report")]
+    pub memory_bytes: Option<(u64, u64)>,
 }
 
 impl MatterStats {
@@ -240,6 +245,14 @@ impl OverlayInfo {
             "uploads pending {}  modules loaded {}",
             m.uploads_pending, m.modules_loaded
         ));
+        #[cfg(feature = "memory-report")]
+        if let Some((live, tiles)) = m.memory_bytes {
+            lines.push(format!(
+                "memory live {:.1} MB  tile geometry {:.1} MB",
+                crate::memory::megabytes(live),
+                crate::memory::megabytes(tiles)
+            ));
+        }
         lines
     }
 
@@ -374,8 +387,22 @@ mod tests {
                 uploads_failed: 0,
                 directions_requests: 5,
                 frame_step_p95_ms: None,
+                #[cfg(feature = "memory-report")]
+                memory_bytes: None,
             },
         }
+    }
+
+    #[cfg(feature = "memory-report")]
+    #[test]
+    fn the_memory_line_gives_live_and_tile_geometry_megabytes() {
+        let mut i = info();
+        i.matter.memory_bytes = Some((2_500_000, 1_000_000));
+        let l = i.lines();
+        assert_eq!(
+            l.last().unwrap(),
+            "memory live 2.5 MB  tile geometry 1.0 MB"
+        );
     }
 
     #[test]

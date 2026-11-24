@@ -243,6 +243,34 @@ by hand on a desktop browser, against a hub:
 
 No automated test pretends to cover these steps.
 
+## Measuring memory
+
+`sh web/build.sh --memory-report` builds the package with the
+`memory-report` feature: the page then logs `console.log("gx-memory",
+<json>)` every 5 s, one JSON object holding the memory report
+(`docs/architecture.md`, "Memory report"). The default build has none of it.
+
+`scripts/memory-pan.mjs` (Node 22 or later, no dependencies) measures a
+served page while the camera pans:
+
+```sh
+node scripts/memory-pan.mjs <url> [--seconds 300] [--wait 20] [--phone] [--chrome <path>]
+```
+
+It starts headless Chrome with WebGPU (`--chrome`, else `$CHROME`, else
+`google-chrome`) and drives it over the DevTools protocol on a pipe, so it
+opens no port. It opens the URL (put the hub settings in the page's
+`config.js` or its query string), in a 1280 x 720 view or, with `--phone`,
+an emulated phone (390 x 844 CSS pixels, scale 3, touch), waits `--wait`
+seconds, then drags 300 pixels across the view every 10 s for `--seconds`
+seconds. Every 30 s it prints one line: the elapsed seconds, the byte
+length of every `WebAssembly.Memory` alive on the page and in each of its
+workers (`Runtime.queryObjects` on `WebAssembly.Memory.prototype` in each
+target), the resident size of Chrome's renderer processes (read from
+`/proc`, so Linux only), and the latest `gx-memory` object if the page logs
+one. It ends with a forced garbage collection in every target and a final
+line.
+
 ## The JS package
 
 Applications embed the browser build through the JS package and its React

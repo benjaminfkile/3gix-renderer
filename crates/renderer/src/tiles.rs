@@ -329,7 +329,7 @@ pub fn decode_tile(
             continue;
         }
         match gx_core::surface::decode(key, bytes) {
-            Ok(Tile::Surface(t)) => out.bases.push((layer, Arc::new(TileGeometry::new(&t)))),
+            Ok(Tile::Surface(t)) => out.bases.push((layer, Arc::new(geometry(&t)))),
             Ok(Tile::Empty(_)) => {}
             Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
         }
@@ -988,6 +988,127 @@ impl TileLayers {
     }
 }
 
+/// [`TileGeometry::new`], timed for the memory report with the
+/// `memory-report` feature.
+fn geometry(t: &SurfaceTile) -> TileGeometry {
+    timed!(TILE_GEOMETRY, TileGeometry::new(t))
+}
+
+/// [`decode_tile`], timed for the memory report with the `memory-report`
+/// feature: what both fetchers call.
+pub(crate) fn decode_tile_timed(
+    key: &SurfaceKey,
+    sections: &[impl AsRef<[u8]>],
+    layers: &[usize],
+    overlays: &BTreeSet<usize>,
+) -> Result<DecodedTile, String> {
+    timed!(DECODE_TILE, decode_tile(key, sections, layers, overlays))
+}
+
+#[cfg(feature = "memory-report")]
+impl TileGeometry {
+    /// Bytes this geometry holds: the struct and each array's capacity
+    /// (the memory report, `docs/architecture.md`).
+    #[cfg(feature = "memory-report")]
+    pub fn heap_bytes(&self) -> u64 {
+        fn cap<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        (std::mem::size_of::<TileGeometry>()
+            + cap(&self.positions)
+            + cap(&self.targets)
+            + cap(&self.normals)
+            + cap(&self.target_normals)
+            + cap(&self.albedo)
+            + cap(&self.roughness)
+            + cap(&self.temperature)) as u64
+    }
+}
+
+/// Bytes an overlay tile holds: the struct and each array's capacity (the
+/// memory report). A free function since the type is the core library's.
+#[cfg(feature = "memory-report")]
+pub fn overlay_heap_bytes(o: &OverlayTile) -> u64 {
+    (std::mem::size_of::<OverlayTile>()
+        + o.coverage.capacity()
+        + o.albedo.capacity() * 3
+        + o.roughness.capacity()
+        + o.parent_coverage.capacity()
+        + o.parent_albedo.capacity() * 3
+        + o.parent_roughness.capacity()) as u64
+}
+
+#[cfg(feature = "memory-report")]
+impl Surfaces {
+    /// What the surface tiles hold ([`crate::memory::SurfaceMemory`]):
+    /// entries by state, the selection's sizes, and the bytes of every
+    /// distinct geometry and overlay tile, each `Arc` counted once.
+    pub fn memory(&self) -> crate::memory::SurfaceMemory {
+        use std::collections::BTreeMap as Distinct;
+        let mut m = crate::memory::SurfaceMemory {
+            used: self.used.len(),
+            drawn: self.drawn.len(),
+            ..Default::default()
+        };
+        let ptr = |g: &Arc<TileGeometry>| Arc::as_ptr(g) as usize;
+        let mut geometries: Distinct<usize, u64> = Distinct::new();
+        let mut bases: BTreeSet<usize> = BTreeSet::new();
+        let mut overlays: Distinct<usize, u64> = Distinct::new();
+        for state in self.tiles.values() {
+            match state {
+                State::Requested => m.requested += 1,
+                State::Ready(g) => {
+                    m.ready += 1;
+                    geometries.insert(ptr(g), g.heap_bytes());
+                }
+                State::Empty => m.empty += 1,
+                State::Gone => m.gone += 1,
+            }
+        }
+        for l in self.layers.values() {
+            for (_, b) in &l.bases {
+                bases.insert(ptr(b));
+                geometries.insert(ptr(b), b.heap_bytes());
+            }
+            for (_, o) in &l.overlays {
+                overlays.insert(Arc::as_ptr(o) as usize, overlay_heap_bytes(o));
+            }
+        }
+        let mut drawn: Distinct<usize, u64> = Distinct::new();
+        let mut drawn_overlays: Distinct<usize, u64> = Distinct::new();
+        for t in &self.drawn {
+            let g = &t.geometry;
+            geometries.insert(ptr(g), g.heap_bytes());
+            drawn.insert(ptr(g), g.heap_bytes());
+            if let Some(l) = self.layers.get(&g.key) {
+                for (_, b) in &l.bases {
+                    drawn.insert(ptr(b), b.heap_bytes());
+                }
+                for (_, o) in &l.overlays {
+                    drawn_overlays.insert(Arc::as_ptr(o) as usize, overlay_heap_bytes(o));
+                }
+            }
+        }
+        m.geometries = geometries.len();
+        m.geometry_bytes = geometries.values().sum();
+        for (p, bytes) in &geometries {
+            if !bases.contains(p) {
+                m.composited += 1;
+                m.composited_bytes += bytes;
+            }
+        }
+        m.drawn_geometry_bytes = drawn.values().sum();
+        m.overlay_bytes = overlays.values().sum();
+        m.drawn_overlay_bytes = drawn_overlays.values().sum();
+        m
+    }
+
+    /// Bytes of every distinct tile geometry held, for the overlay line.
+    pub fn geometry_bytes(&self) -> u64 {
+        self.memory().geometry_bytes
+    }
+}
+
 /// Whether every point of the box is hidden from `cam` behind the ball of
 /// radius `r` about the frame origin: farther from the camera than the
 /// camera's horizon on the ball plus the horizon of the box's highest
@@ -1054,6 +1175,53 @@ mod tests {
             parent_albedo: vec![[albedo; 3]; overlay::PARENT_COUNT],
             parent_roughness: vec![roughness; overlay::PARENT_COUNT],
         }
+    }
+
+    #[cfg(feature = "memory-report")]
+    #[test]
+    fn the_memory_report_counts_each_geometry_once_by_its_arrays() {
+        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let g = Arc::new(TileGeometry::new(&tile(key)));
+        // Two f64 triples, three f32 triples, and two f32 per vertex.
+        let per_vertex = 2 * 24 + 3 * 12 + 2 * 4;
+        let one = (std::mem::size_of::<TileGeometry>() + VERTEX_COUNT * per_vertex) as u64;
+        assert_eq!(g.heap_bytes(), one);
+
+        // One geometry as a tile's state and its base, and as a second
+        // tile's: counted once.
+        let mut s = Surfaces::new();
+        s.complete(key, Ok(Some(Arc::clone(&g))));
+        let other = SurfaceKey::new(4, 1, 0, 0, 0).unwrap();
+        s.complete(other, Ok(Some(Arc::clone(&g))));
+        let m = s.memory();
+        assert_eq!((m.ready, m.geometries, m.composited), (2, 1, 0));
+        assert_eq!(m.geometry_bytes, one);
+
+        // A shown overlay adds the composited copy and the overlay tile.
+        let third = SurfaceKey::new(4, 2, 0, 0, 0).unwrap();
+        let o = overlay_tile(third, 255, 128, 64);
+        let o_bytes = (std::mem::size_of::<OverlayTile>()
+            + VERTEX_COUNT * 5
+            + overlay::PARENT_COUNT * 5) as u64;
+        assert_eq!(overlay_heap_bytes(&o), o_bytes);
+        let base = Arc::new(TileGeometry::new(&tile(third)));
+        s.complete_layers(
+            third,
+            Ok(DecodedTile {
+                bases: vec![(0, base)],
+                overlays: vec![(1, Arc::new(o))],
+                ..DecodedTile::default()
+            }),
+            false,
+        );
+        let m = s.memory();
+        assert_eq!((m.geometries, m.composited), (3, 1));
+        assert_eq!((m.geometry_bytes, m.composited_bytes), (3 * one, one));
+        assert_eq!(m.overlay_bytes, o_bytes);
+        assert_eq!(
+            (m.drawn, m.drawn_geometry_bytes, m.drawn_overlay_bytes),
+            (0, 0, 0)
+        );
     }
 
     fn overlay_bytes(o: &OverlayTile) -> Vec<u8> {

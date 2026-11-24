@@ -6,14 +6,29 @@
 #
 # Needs wasm-pack on the PATH, and wasm-opt (binaryen) for the size pass.
 # Serve web/ with any static file server afterwards, see docs/web.md.
+#
+# --memory-report builds with the memory-report feature as well: the page
+# then logs the memory report every 5 s (docs/architecture.md, "Memory
+# report"). A developer build; the default build is without it.
 set -eu
 
 cd "$(dirname "$0")/.."
 
+features=web
+for arg in "$@"; do
+    case "$arg" in
+        --memory-report) features=web,memory-report ;;
+        *)
+            echo "web/build.sh: unknown argument $arg (only --memory-report)" >&2
+            exit 2
+            ;;
+    esac
+done
+
 # wasm-pack takes its own options before the crate path's extra cargo
 # arguments; --no-opt because wasm-opt runs below with the installed
 # binary instead of one wasm-pack would download.
-wasm-pack build crates/renderer --target web --out-dir ../../web/pkg --no-opt --release -- --features web
+wasm-pack build crates/renderer --target web --out-dir ../../web/pkg --no-opt --release -- --features "$features"
 
 # binaryen 108 rewrites the export of wasm-bindgen's externref table to
 # point at the function table, so initSync fails with
