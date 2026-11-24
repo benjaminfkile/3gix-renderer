@@ -204,7 +204,10 @@ unchanged. With it:
   core library keeps their arrays private). Data shared through an `Arc`
   is counted once, by pointer.
   - `allocator`: `live` and `peak`.
-  - `surfaces`: entries `requested`, `ready`, `empty`, `gone`; the
+  - `surfaces`: entries `requested`, `ready` (built or compact),
+    `empty`, `gone`; `compact` and `compact_bytes` (section bytes,
+    summaries, overlays), `built` and `built_bytes` (the same plus their
+    geometries); the
     selection's `used` set and `drawn` count; `geometries` and
     `geometry_bytes`, every distinct `TileGeometry` held (tile states,
     bases, the drawn list): each one's material plus each distinct
@@ -362,6 +365,16 @@ error, logged once), or is not `required` (`client-compute.md` 2.2) and
 `tiles::OVERLAY_WAIT_SECONDS` (2 s) have passed since the child's surface
 tile arrived. A hidden overlay is never waited for, and level-0 tiles draw
 as soon as their surface tiles arrive.
+
+An arrived tile is held built (its geometry) or compact (its surface
+section bytes, its overlays, and a `tiles::TileSummary`). It is built
+while it is drawn, while it is a level-0 tile, or while its parent is
+within its split distance; a compact tile wanted built is built off the
+frame thread (`tiles::Surfaces::take_builds`, on the native fetcher's
+decode threads, in the browser fetcher's slice of at most
+`web::fetch::BUILD_SLICE_SECONDS`, largest projected size first). A child
+counts as arrived for a split only once it is built. A built tile not
+wanted built for `tiles::BUILT_GRACE_SECONDS` (2 s) goes back to compact.
 
 1. **Selection** (`stream::select_all`, run by `selector` on its own thread natively and inline in the browser, when results arrive, when the camera or view changes, and every 100 ms). Pixel error, view cone, and refinability from occupancy only; no occlusion culling and no shape model (`rendering.md` 1.1 and 3.1). It builds the target (asking up to three depths ahead of what has arrived, balanced 2:1) and the drawn selection (only arrived cells, split only when every child and its same-depth neighbors have arrived). The `stream` module docs have the details; `rendering.md` is the contract.
 2. **The cell cache** (`stream::CellCache`), keyed by

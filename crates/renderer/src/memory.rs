@@ -169,8 +169,17 @@ impl Timings {
 pub struct SurfaceMemory {
     /// Entries requested and not arrived.
     pub requested: usize,
-    /// Entries ready to draw.
+    /// Entries arrived with a surface, built or compact.
     pub ready: usize,
+    /// Arrived tiles held compact (`crate::tiles` module docs).
+    pub compact: usize,
+    /// Bytes of the compact tiles: section bytes, summary, and overlays.
+    pub compact_bytes: u64,
+    /// Arrived tiles held built.
+    pub built: usize,
+    /// Bytes of the built tiles: section bytes, summary, overlays, and
+    /// geometry (material and shape).
+    pub built_bytes: u64,
     /// Entries known empty (or with every base hidden).
     pub empty: usize,
     /// Entries whose sections were invalid.

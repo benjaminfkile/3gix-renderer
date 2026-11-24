@@ -498,6 +498,30 @@ impl World {
         self.surfaces.evict(SURFACE_TILES_KEPT);
     }
 
+    /// The compact surface tiles wanted built since the last call
+    /// ([`crate::tiles::Surfaces::take_builds`]), for the fetcher to build
+    /// off the frame thread.
+    pub fn take_surface_builds(&mut self) -> Vec<crate::tiles::BuildRequest> {
+        self.surfaces.take_builds()
+    }
+
+    /// Applies a finished surface tile build
+    /// ([`crate::tiles::Surfaces::complete_build`]).
+    pub fn complete_surface_build(
+        &mut self,
+        key: gx_core::key::SurfaceKey,
+        outcome: Result<Vec<(usize, std::sync::Arc<crate::tiles::TileGeometry>)>, String>,
+    ) {
+        self.surfaces.complete_build(key, outcome);
+    }
+
+    /// Builds every surface tile wanted built on this thread
+    /// ([`crate::tiles::Surfaces::build_now`]): for tests and tools that
+    /// drive a world without a fetcher.
+    pub fn build_surfaces_now(&mut self) {
+        self.surfaces.build_now();
+    }
+
     /// Applies a finished surface tile request.
     pub fn complete_surface(
         &mut self,

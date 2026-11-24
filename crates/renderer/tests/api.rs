@@ -1172,7 +1172,9 @@ mod queries {
         env.insert(renderer::config::ENV_HUB_URL.into(), hub.url());
         env.insert(renderer::config::ENV_API_KEY.into(), MOCK_API_KEY.into());
         env.insert(renderer::config::ENV_SPACE_ID.into(), MOCK_SPACE_ID.into());
-        let flags = parse_flags(["--workers", "1"]).unwrap();
+        // No cache: a test never opens the platform cache directory of
+        // whoever runs it.
+        let flags = parse_flags(["--workers", "1", "--no-cache"]).unwrap();
         Config::resolve(&env, &flags).unwrap()
     }
 

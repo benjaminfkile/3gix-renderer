@@ -1985,6 +1985,15 @@ pub enum FetchEvent {
         /// Section bytes received.
         bytes: u64,
     },
+    /// A compact surface tile was built again on request
+    /// ([`crate::tiles::build_tile`]): the geometry of each base, with its
+    /// layer index, or why it is invalid.
+    SurfaceBuilt {
+        /// The tile.
+        key: gx_core::key::SurfaceKey,
+        /// The built bases.
+        outcome: Result<Vec<(usize, Arc<crate::tiles::TileGeometry>)>, String>,
+    },
 }
 
 /// Running totals over finished cell requests, for the overlay and the
@@ -2643,6 +2652,25 @@ mod native {
             let now = self.now();
             self.coordinator.set_hidden_layers(hidden, now);
             self.pump();
+        }
+
+        /// Builds compact surface tiles again (`rendering.md` sections 3.5
+        /// and 4): each on a decode thread, never this one, in the order
+        /// given (largest projected size first,
+        /// [`crate::tiles::Surfaces::take_builds`]); each result arrives
+        /// as [`FetchEvent::SurfaceBuilt`] through [`Fetcher::drain`].
+        pub fn build_surfaces(&mut self, builds: Vec<crate::tiles::BuildRequest>) {
+            for req in builds {
+                let tx = self.tx.clone();
+                self.decoding += 1;
+                self.handle.spawn_blocking(move || {
+                    let outcome = crate::tiles::build_tile(&req);
+                    let _ = tx.send(Internal::Event(FetchEvent::SurfaceBuilt {
+                        key: req.key,
+                        outcome,
+                    }));
+                });
+            }
         }
 
         /// Queues a request for a surface tile; the result arrives as

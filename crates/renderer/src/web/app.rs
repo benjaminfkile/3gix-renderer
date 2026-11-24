@@ -140,6 +140,7 @@ fn matter_step(
                 partial,
                 ..
             } => world.complete_surface(key, outcome, partial),
+            FetchEvent::SurfaceBuilt { key, outcome } => world.complete_surface_build(key, outcome),
             FetchEvent::Registry(_) => {}
         }
     }
@@ -156,6 +157,7 @@ fn matter_step(
     if let Some(tiles) = world.take_wanted_surfaces() {
         fetcher.set_wanted_surfaces(tiles);
     }
+    fetcher.build_surfaces(world.take_surface_builds());
     world.record_step((crate::clock::now_seconds() - started) * 1e3);
     draw
 }

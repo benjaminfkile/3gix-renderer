@@ -97,6 +97,7 @@ pub fn matter_step(
                 partial,
                 ..
             } => world.complete_surface(key, outcome, partial),
+            FetchEvent::SurfaceBuilt { key, outcome } => world.complete_surface_build(key, outcome),
             // Loaded once at startup, before the integrator.
             FetchEvent::Registry(_) => {}
         }
@@ -114,6 +115,7 @@ pub fn matter_step(
     if let Some(tiles) = world.take_wanted_surfaces() {
         fetcher.set_wanted_surfaces(tiles);
     }
+    fetcher.build_surfaces(world.take_surface_builds());
     fetcher.flush();
     world.record_step((now_seconds() - started) * 1e3);
     draw

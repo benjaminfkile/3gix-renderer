@@ -27,6 +27,18 @@
 //! A tile's shape ([`TileShape`]) is held once, behind an `Arc`, by its
 //! base and every composite of it; a composite owns only its material
 //! (`rendering.md` section 7 items 6 and 7).
+//!
+//! An arrived tile is held in one of two forms (`rendering.md` sections
+//! 3.5 and 4): built, with its geometry, or compact, with only its
+//! surface section bytes, its overlays, and a [`TileSummary`]. A tile is
+//! built while it is drawn, while it is a level-0 tile, or while it is a
+//! child of a tile the selection walks within that tile's [`range`];
+//! every other arrived tile goes back to compact [`BUILT_GRACE_SECONDS`]
+//! after it was last wanted built. A compact tile wanted built is handed
+//! to the fetcher ([`Surfaces::take_builds`]), which builds it off the
+//! frame thread ([`build_tile`]) and hands the geometry back
+//! ([`Surfaces::complete_build`]). A child counts as arrived for a split
+//! only once it is built, so its parent keeps drawing until then.
 
 use crate::camera::Camera;
 use crate::farfield::focal_px;
@@ -310,6 +322,36 @@ impl TileGeometry {
     }
 }
 
+/// What the selection needs of a tile without its geometry: taken from
+/// the geometry the first time the tile is built and kept while the tile
+/// is compact (module docs). A tile with a summary has a surface.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TileSummary {
+    /// The geometry's [`TileShape::bounds`].
+    pub bounds: ([f64; 3], [f64; 3]),
+    /// The geometry's [`TileShape::edge`].
+    pub edge: f64,
+    /// The geometry's [`TileShape::max_edge`].
+    pub max_edge: f64,
+    /// The geometry's [`TileShape::occluder`].
+    pub occluder: f64,
+    /// The frame's surface as the tile declares it.
+    pub shape: SurfaceShape,
+}
+
+impl TileSummary {
+    /// The summary of `g`.
+    pub fn of(g: &TileGeometry) -> TileSummary {
+        TileSummary {
+            bounds: g.bounds,
+            edge: g.edge,
+            max_edge: g.max_edge,
+            occluder: g.occluder,
+            shape: g.shape,
+        }
+    }
+}
+
 /// A surface key's sections decoded (`rendering.md` section 7 item 6):
 /// the base surface and the overlays that have arrived.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -318,6 +360,9 @@ pub struct DecodedTile {
     /// layer index, in layer order: the first shown one is the base
     /// (`rendering.md` section 7 item 7).
     pub bases: Vec<(usize, Arc<TileGeometry>)>,
+    /// The section bytes of each of [`DecodedTile::bases`], in the same
+    /// order: what a compact tile keeps to be built again.
+    pub sections: Vec<Arc<[u8]>>,
     /// The overlay layers' non-empty overlay tiles, each with its layer
     /// index, in layer order.
     pub overlays: Vec<(usize, Arc<OverlayTile>)>,
@@ -340,10 +385,33 @@ pub fn decode_tile(
     layers: &[usize],
     overlay_layers: &BTreeSet<usize>,
 ) -> Result<DecodedTile, String> {
+    decode_sections(key, sections, layers, overlay_layers, |b| {
+        Arc::from(b.as_ref())
+    })
+}
+
+/// [`decode_tile`] over sections already shared: a compact tile keeps the
+/// fetcher's own `Arc` of each base section.
+pub fn decode_shared_tile(
+    key: &SurfaceKey,
+    sections: &[Arc<[u8]>],
+    layers: &[usize],
+    overlay_layers: &BTreeSet<usize>,
+) -> Result<DecodedTile, String> {
+    decode_sections(key, sections, layers, overlay_layers, Arc::clone)
+}
+
+fn decode_sections<S: AsRef<[u8]>>(
+    key: &SurfaceKey,
+    sections: &[S],
+    layers: &[usize],
+    overlay_layers: &BTreeSet<usize>,
+    share: impl Fn(&S) -> Arc<[u8]>,
+) -> Result<DecodedTile, String> {
     let mut out = DecodedTile::default();
-    for (n, bytes) in sections.iter().enumerate() {
+    for (n, section) in sections.iter().enumerate() {
         let layer = layers.get(n).copied().unwrap_or(n);
-        let bytes = bytes.as_ref();
+        let bytes = section.as_ref();
         if overlay_layers.contains(&layer) {
             match overlay::decode(key, bytes) {
                 Ok(Overlay::Tile(t)) => out.overlays.push((layer, Arc::new(t))),
@@ -357,7 +425,10 @@ pub fn decode_tile(
             continue;
         }
         match gx_core::surface::decode(key, bytes) {
-            Ok(Tile::Surface(t)) => out.bases.push((layer, Arc::new(geometry(&t)))),
+            Ok(Tile::Surface(t)) => {
+                out.bases.push((layer, Arc::new(geometry(&t))));
+                out.sections.push(share(section));
+            }
             Ok(Tile::Empty(_)) => {}
             Err(e) => return Err(format!("code {}: {}", e.code, e.reason)),
         }
@@ -461,9 +532,49 @@ pub fn range(edge: f64, max_edge: f64, focal: f64) -> f64 {
 #[derive(Clone, Debug)]
 enum State {
     Requested,
+    /// Built: the geometry drawn.
     Ready(Arc<TileGeometry>),
+    /// Arrived with a surface and not built (module docs).
+    Compact(TileSummary),
     Empty,
     Gone,
+}
+
+/// How long, seconds, a built tile that is neither drawn nor wanted built
+/// stays built before it goes back to compact (module docs, the
+/// selection's clock). Without it a camera resting near a split distance
+/// would drop and rebuild the same tiles every frame.
+pub const BUILT_GRACE_SECONDS: f64 = 2.0;
+
+/// A compact tile to build ([`Surfaces::take_builds`]): its base sections
+/// and their layer indices, in layer order, and its projected size,
+/// pixels, as priority (largest first).
+#[derive(Clone, Debug)]
+pub struct BuildRequest {
+    /// The tile.
+    pub key: SurfaceKey,
+    /// The base layers' section bytes.
+    pub sections: Vec<Arc<[u8]>>,
+    /// The layer index of each section.
+    pub layers: Vec<usize>,
+    /// Projected size, pixels.
+    pub priority: f64,
+}
+
+/// The geometry of each base of a [`BuildRequest`], with its layer index
+/// (off the frame thread: what the fetchers run).
+pub fn build_tile(req: &BuildRequest) -> Result<Vec<(usize, Arc<TileGeometry>)>, String> {
+    decode_shared_tile(&req.key, &req.sections, &req.layers, &BTreeSet::new()).map(|d| d.bases)
+}
+
+/// Sorts `builds` largest projected size first, ties by key, so the
+/// order is the same on every run.
+pub fn sort_builds(builds: &mut [BuildRequest]) {
+    builds.sort_by(|a, b| {
+        b.priority
+            .total_cmp(&a.priority)
+            .then_with(|| a.key.cmp(&b.key))
+    });
 }
 
 /// The point a frame's tiles are drawn relative to.
@@ -528,6 +639,13 @@ pub struct Surfaces {
     /// The time, seconds, of the latest selection: the clock tiles'
     /// arrivals and [`OVERLAY_WAIT_SECONDS`] are measured on.
     now: f64,
+    /// The tiles the latest selection wants built (module docs).
+    want_built: std::collections::HashSet<SurfaceKey>,
+    /// Compact tiles wanted built and not yet handed to the fetcher, with
+    /// their projected size, pixels.
+    builds: Vec<(SurfaceKey, f64)>,
+    /// Compact tiles wanted built whose build has not come back.
+    building: std::collections::HashSet<SurfaceKey>,
 }
 
 impl Surfaces {
@@ -559,6 +677,7 @@ impl Surfaces {
             };
             match self.tiles.get(&key) {
                 Some(State::Ready(g)) => Some(g.shape),
+                Some(State::Compact(s)) => Some(s.shape),
                 _ => None,
             }
         })
@@ -602,11 +721,7 @@ impl Surfaces {
         self.hidden = hidden;
         let mut frames = BTreeSet::new();
         for (key, layers) in &self.layers {
-            let state = match layers.drawn(&self.hidden) {
-                Some(g) => State::Ready(g),
-                None => State::Empty,
-            };
-            self.tiles.insert(*key, state);
+            self.tiles.insert(*key, layers.state(&self.hidden));
             frames.insert(key.frame_id);
         }
         for frame in frames {
@@ -620,6 +735,101 @@ impl Surfaces {
     /// its parent.
     pub fn set_required_layers(&mut self, required: BTreeSet<usize>) {
         self.required = required;
+    }
+
+    /// The compact tiles wanted built since the last call, largest
+    /// projected size first: the fetcher builds each off the frame thread
+    /// ([`build_tile`]) and hands it back to [`Surfaces::complete_build`].
+    pub fn take_builds(&mut self) -> Vec<BuildRequest> {
+        let mut out: Vec<BuildRequest> = std::mem::take(&mut self.builds)
+            .into_iter()
+            .filter_map(|(key, priority)| {
+                let l = self.layers.get(&key)?;
+                let (layers, sections) = l
+                    .bases
+                    .iter()
+                    .filter_map(|b| Some((b.layer, Arc::clone(b.section.as_ref()?))))
+                    .unzip();
+                Some(BuildRequest {
+                    key,
+                    sections,
+                    layers,
+                    priority,
+                })
+            })
+            .collect();
+        sort_builds(&mut out);
+        out
+    }
+
+    /// Applies a finished build ([`build_tile`]): the tile is built again,
+    /// composited with its shown overlays, and drawn from the next
+    /// selection. A build for a tile no longer held, or already built
+    /// again by a later arrival, is dropped.
+    pub fn complete_build(
+        &mut self,
+        key: SurfaceKey,
+        outcome: Result<Vec<(usize, Arc<TileGeometry>)>, String>,
+    ) {
+        self.building.remove(&key);
+        let Some(l) = self.layers.get_mut(&key) else {
+            return;
+        };
+        if l.built() {
+            return;
+        }
+        match outcome {
+            Ok(built) => {
+                for b in &mut l.bases {
+                    if let Some((_, g)) = built.iter().find(|(layer, _)| *layer == b.layer) {
+                        b.geometry = Some(Arc::clone(g));
+                    }
+                }
+                self.tiles.insert(key, l.state(&self.hidden));
+            }
+            Err(reason) => {
+                tracing::warn!(key = %key, "surface tile is invalid: {reason}");
+                self.layers.remove(&key);
+                self.pending.remove(&key);
+                self.tiles.insert(key, State::Gone);
+            }
+        }
+    }
+
+    /// Builds every compact tile wanted built on this thread: for tests
+    /// and tools that run the selection without a fetcher.
+    pub fn build_now(&mut self) {
+        for req in self.take_builds() {
+            let outcome = build_tile(&req);
+            self.complete_build(req.key, outcome);
+        }
+    }
+
+    /// Marks `key` wanted built by this selection and asks for its build
+    /// when it is compact (module docs).
+    fn want_built(&mut self, key: SurfaceKey, priority: f64) {
+        self.want_built.insert(key);
+        if let Some(l) = self.layers.get_mut(&key) {
+            l.wanted_at = self.now;
+        }
+        if matches!(self.tiles.get(&key), Some(State::Compact(_))) && self.building.insert(key) {
+            self.builds.push((key, priority));
+        }
+    }
+
+    /// Returns every built tile that is not a level-0 tile and has not
+    /// been wanted built for [`BUILT_GRACE_SECONDS`] to compact.
+    fn compact_unwanted(&mut self) {
+        let now = self.now;
+        for (key, l) in &mut self.layers {
+            if key.level == 0 || !l.built() || !l.can_compact() {
+                continue;
+            }
+            if now - l.wanted_at >= BUILT_GRACE_SECONDS {
+                l.compact();
+                self.tiles.insert(*key, l.state(&self.hidden));
+            }
+        }
     }
 
     /// The geometry drawn for `key`, if it is ready.
@@ -697,11 +907,30 @@ impl Surfaces {
         let state = match outcome {
             Ok(DecodedTile {
                 bases,
+                sections,
                 overlays,
                 failed,
                 waiting,
             }) if !bases.is_empty() => {
                 let arrived_at = held.as_ref().map_or(self.now, |h| h.arrived_at);
+                // Kept built only when wanted built now or within the
+                // grace time (module docs); level-0 tiles always are.
+                let wanted_at = if key.level == 0 || self.want_built.contains(&key) {
+                    self.now
+                } else {
+                    held.as_ref().map_or(f64::NEG_INFINITY, |h| h.wanted_at)
+                };
+                let keep = self.now - wanted_at < BUILT_GRACE_SECONDS;
+                let mut sections = sections.into_iter();
+                let bases = bases
+                    .into_iter()
+                    .map(|(layer, g)| Base {
+                        layer,
+                        section: sections.next(),
+                        summary: TileSummary::of(&g),
+                        geometry: Some(g),
+                    })
+                    .collect();
                 let mut known = held.map(|h| h.failed).unwrap_or_default();
                 for (layer, reason) in failed {
                     if known.insert(layer) {
@@ -709,19 +938,20 @@ impl Surfaces {
                     }
                 }
                 let waiting = if partial { waiting } else { Vec::new() };
-                let layers = TileLayers {
+                let mut layers = TileLayers {
                     bases,
                     overlays,
                     failed: known,
                     waiting,
                     arrived_at,
+                    wanted_at,
                 };
-                let drawn = layers.drawn(&self.hidden);
-                self.layers.insert(key, layers);
-                match drawn {
-                    Some(g) => State::Ready(g),
-                    None => State::Empty,
+                if !keep && layers.can_compact() {
+                    layers.compact();
                 }
+                let state = layers.state(&self.hidden);
+                self.layers.insert(key, layers);
+                state
             }
             Ok(_) => State::Empty,
             Err(reason) => {
@@ -755,14 +985,16 @@ impl Surfaces {
                 .iter()
                 .all(|s| !matches!(s, None | Some(State::Requested)))
             {
-                let any = roots.iter().any(|s| matches!(s, Some(State::Ready(_))));
+                let any = roots
+                    .iter()
+                    .any(|s| matches!(s, Some(State::Ready(_) | State::Compact(_))));
                 self.has_surface.insert(frame_id, any);
             }
         }
     }
 
     /// Whether `key` has arrived as far as a split needs (`rendering.md`
-    /// section 7 item 6): it is empty, or it has its surface tile and
+    /// section 7 item 6): it is empty, or it is built and
     /// every shown overlay layer has arrived for it, failed for it, or is
     /// not `required` and [`OVERLAY_WAIT_SECONDS`] have passed since its
     /// surface tile arrived. A hidden overlay is never waited for.
@@ -808,6 +1040,7 @@ impl Surfaces {
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
         self.used.clear();
+        self.want_built.clear();
         self.wanted = Some(Vec::new());
         for &frame in frames {
             for face in 0..SURFACE_FACES {
@@ -836,6 +1069,7 @@ impl Surfaces {
             self.select_in_frame(frame, cam, forward, focal, cone, &mut drawn);
         }
         self.drawn = drawn;
+        self.compact_unwanted();
     }
 
     /// The selection of one frame with a surface (module docs): `cam` and
@@ -883,11 +1117,18 @@ impl Surfaces {
             let children = key.children();
             if let Some(ch) = children {
                 self.used.extend(ch);
+                // A child's projected edge: half the parent's.
+                let px = 0.5 * geo.edge * focal / d.max(f64::MIN_POSITIVE);
                 if d < r * PREFETCH {
-                    // A child's projected edge: half the parent's.
-                    let px = 0.5 * geo.edge * focal / d.max(f64::MIN_POSITIVE);
                     for c in ch {
                         self.want(c, px);
+                    }
+                }
+                // Within the split distance the children are wanted
+                // built, split or waiting on them (module docs).
+                if d < r {
+                    for c in ch {
+                        self.want_built(c, px);
                     }
                 }
             }
@@ -911,6 +1152,7 @@ impl Surfaces {
                 let parent_range = r * 2.0;
                 [(MORPH_START * parent_range) as f32, parent_range as f32]
             };
+            self.want_built(key, f64::INFINITY);
             drawn.push(TileDrawInfo {
                 geometry: geo,
                 anchor,
@@ -936,6 +1178,7 @@ impl Surfaces {
                     ch.iter().any(|c| {
                         matches!(self.tiles.get(c), Some(State::Requested))
                             || self.requests.contains(c)
+                            || self.building.contains(c)
                     })
                 })
             })
@@ -943,9 +1186,13 @@ impl Surfaces {
     }
 
     /// Whether every root and every tile the latest selection would split
-    /// toward has arrived: nothing requested is outstanding.
+    /// toward has arrived and is built: nothing requested or wanted built
+    /// is outstanding.
     pub fn settled(&self) -> bool {
-        self.requests.is_empty() && !self.tiles.values().any(|s| matches!(s, State::Requested))
+        self.requests.is_empty()
+            && self.builds.is_empty()
+            && self.building.is_empty()
+            && !self.tiles.values().any(|s| matches!(s, State::Requested))
     }
 
     /// Cached tiles, for the overlay.
@@ -988,14 +1235,28 @@ impl Surfaces {
         let tiles = &self.tiles;
         self.layers.retain(|k, _| tiles.contains_key(k));
         self.pending.retain(|k| tiles.contains_key(k));
+        self.building.retain(|k| tiles.contains_key(k));
+        self.builds.retain(|(k, _)| tiles.contains_key(k));
     }
+}
+
+/// One non-empty base surface of a tile: its section, kept to build it
+/// again, its summary, and its geometry while the tile is built.
+#[derive(Clone, Debug)]
+struct Base {
+    layer: usize,
+    /// The section bytes; `None` when the tile came without them, and
+    /// then it is never made compact.
+    section: Option<Arc<[u8]>>,
+    summary: TileSummary,
+    geometry: Option<Arc<TileGeometry>>,
 }
 
 /// A tile's base surfaces and the overlays that have arrived for it.
 #[derive(Clone, Debug)]
 struct TileLayers {
-    /// Every non-empty base, with its layer index, in layer order.
-    bases: Vec<(usize, Arc<TileGeometry>)>,
+    /// Every non-empty base, in layer order.
+    bases: Vec<Base>,
     overlays: Vec<(usize, Arc<OverlayTile>)>,
     /// Overlay layers whose section was invalid, already logged.
     failed: BTreeSet<usize>,
@@ -1003,23 +1264,48 @@ struct TileLayers {
     waiting: Vec<usize>,
     /// When the tile's surface tile arrived, on the selection's clock.
     arrived_at: f64,
+    /// When the tile was last wanted built, on the selection's clock.
+    wanted_at: f64,
 }
 
 impl TileLayers {
     /// The geometry to draw: the first shown base with the shown overlays
     /// composited, or that base itself when no overlay is shown; `None`
     /// when every base is hidden.
-    fn drawn(&self, hidden: &BTreeSet<usize>) -> Option<Arc<TileGeometry>> {
-        let (_, base) = self.bases.iter().find(|(l, _)| !hidden.contains(l))?;
+    fn state(&self, hidden: &BTreeSet<usize>) -> State {
+        let Some(base) = self.bases.iter().find(|b| !hidden.contains(&b.layer)) else {
+            return State::Empty;
+        };
+        let Some(g) = &base.geometry else {
+            return State::Compact(base.summary);
+        };
         let shown: Vec<&OverlayTile> = (self.overlays.iter())
             .filter(|(l, _)| !hidden.contains(l))
             .map(|(_, o)| o.as_ref())
             .collect();
-        Some(if shown.is_empty() {
-            Arc::clone(base)
+        State::Ready(if shown.is_empty() {
+            Arc::clone(g)
         } else {
-            Arc::new(composite_tile(base, &shown))
+            Arc::new(composite_tile(g, &shown))
         })
+    }
+
+    /// Whether any base holds its geometry.
+    fn built(&self) -> bool {
+        self.bases.iter().any(|b| b.geometry.is_some())
+    }
+
+    /// Whether every base keeps its section, so the tile can be built
+    /// again.
+    fn can_compact(&self) -> bool {
+        self.bases.iter().all(|b| b.section.is_some())
+    }
+
+    /// Drops every base's geometry.
+    fn compact(&mut self) {
+        for b in &mut self.bases {
+            b.geometry = None;
+        }
     }
 }
 
@@ -1033,11 +1319,14 @@ fn geometry(t: &SurfaceTile) -> TileGeometry {
 /// feature: what both fetchers call.
 pub(crate) fn decode_tile_timed(
     key: &SurfaceKey,
-    sections: &[impl AsRef<[u8]>],
+    sections: &[Arc<[u8]>],
     layers: &[usize],
     overlays: &BTreeSet<usize>,
 ) -> Result<DecodedTile, String> {
-    timed!(DECODE_TILE, decode_tile(key, sections, layers, overlays))
+    timed!(
+        DECODE_TILE,
+        decode_shared_tile(key, sections, layers, overlays)
+    )
 }
 
 #[cfg(feature = "memory-report")]
@@ -1115,17 +1404,50 @@ impl Surfaces {
                     m.ready += 1;
                     hold(g, &mut geometries, &mut shapes);
                 }
+                State::Compact(_) => m.ready += 1,
                 State::Empty => m.empty += 1,
                 State::Gone => m.gone += 1,
             }
         }
-        for l in self.layers.values() {
-            for (_, b) in &l.bases {
-                bases.insert(ptr(b));
-                hold(b, &mut geometries, &mut shapes);
+        for (key, l) in &self.layers {
+            for b in &l.bases {
+                if let Some(g) = &b.geometry {
+                    bases.insert(ptr(g));
+                    hold(g, &mut geometries, &mut shapes);
+                }
             }
             for (_, o) in &l.overlays {
                 overlays.insert(Arc::as_ptr(o) as usize, overlay_heap_bytes(o));
+            }
+            // The tile's own bytes in its form: its sections, summaries,
+            // and overlays, and when built its geometries.
+            let mut bytes: u64 = l
+                .bases
+                .iter()
+                .map(|b| {
+                    (b.section.as_ref().map_or(0, |s| s.len()) + std::mem::size_of::<TileSummary>())
+                        as u64
+                })
+                .sum::<u64>()
+                + l.overlays
+                    .iter()
+                    .map(|(_, o)| overlay_heap_bytes(o))
+                    .sum::<u64>();
+            if l.built() {
+                let mut own: Distinct<usize, u64> = Distinct::new();
+                let mut own_shapes: Distinct<usize, u64> = Distinct::new();
+                for g in l.bases.iter().filter_map(|b| b.geometry.as_ref()) {
+                    hold(g, &mut own, &mut own_shapes);
+                }
+                if let Some(State::Ready(g)) = self.tiles.get(key) {
+                    hold(g, &mut own, &mut own_shapes);
+                }
+                bytes += own.values().sum::<u64>() + own_shapes.values().sum::<u64>();
+                m.built += 1;
+                m.built_bytes += bytes;
+            } else {
+                m.compact += 1;
+                m.compact_bytes += bytes;
             }
         }
         let mut drawn: Distinct<usize, u64> = Distinct::new();
@@ -1136,7 +1458,7 @@ impl Surfaces {
             hold(g, &mut geometries, &mut shapes);
             hold(g, &mut drawn, &mut drawn_shapes);
             if let Some(l) = self.layers.get(&g.key) {
-                for (_, b) in &l.bases {
+                for b in l.bases.iter().filter_map(|b| b.geometry.as_ref()) {
                     hold(b, &mut drawn, &mut drawn_shapes);
                 }
                 for (_, o) in &l.overlays {
@@ -1713,6 +2035,156 @@ mod tests {
             }
         }
         panic!("the selection never settled");
+    }
+
+    /// One selection at `now` over tiles that arrive with their sections
+    /// (so they may be compact), answering every request and every build
+    /// at once, as [`Surfaces::select`] runs it.
+    fn compact_round(
+        s: &mut Surfaces,
+        cam: [f64; 3],
+        forward: [f64; 3],
+        max_level: u8,
+        now: f64,
+    ) -> Vec<TileDrawInfo> {
+        s.now = now;
+        for key in s.take_requests() {
+            let outcome = if key.level <= max_level {
+                let bytes =
+                    gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
+                decode_tile(&key, &[bytes], &[0], &BTreeSet::new())
+            } else {
+                Ok(DecodedTile::default())
+            };
+            s.complete_layers(key, outcome, false);
+        }
+        s.build_now();
+        s.want_built.clear();
+        let mut drawn = Vec::new();
+        s.select_in_frame(
+            4,
+            cam,
+            forward,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            0.9,
+            &mut drawn,
+        );
+        s.compact_unwanted();
+        drawn
+    }
+
+    /// [`compact_round`] until nothing is asked for or wanted built.
+    fn settle_compact(
+        s: &mut Surfaces,
+        cam: [f64; 3],
+        forward: [f64; 3],
+        max_level: u8,
+        now: f64,
+    ) -> Vec<TileDrawInfo> {
+        for face in 0..SURFACE_FACES {
+            s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap(), 1.0);
+        }
+        for _ in 0..64 {
+            let drawn = compact_round(s, cam, forward, max_level, now);
+            if s.requests.is_empty() && s.builds.is_empty() {
+                return drawn;
+            }
+        }
+        panic!("the selection never settled");
+    }
+
+    /// The camera `height` meters over a fixed point of face 4, looking
+    /// down 25 degrees.
+    fn low_camera(height: f64) -> ([f64; 3], [f64; 3]) {
+        let d = gx_core::surface::vertex_direction(&SurfaceKey::new(4, 4, 0, 0, 0).unwrap(), 20, 9);
+        let (p, nrm) = gx_core::surface::ellipsoid_point(d, 6_378_137.0, 6_356_752.3);
+        let cam: [f64; 3] = core::array::from_fn(|k| p[k] + height * nrm[k]);
+        let tangent = unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from);
+        let forward: [f64; 3] = core::array::from_fn(|k| 0.9 * tangent[k] - 0.42 * nrm[k]);
+        (cam, forward)
+    }
+
+    fn by_key(drawn: &[TileDrawInfo]) -> BTreeMap<SurfaceKey, TileDrawInfo> {
+        drawn.iter().map(|t| (t.geometry.key, t.clone())).collect()
+    }
+
+    fn built_keys(s: &Surfaces) -> BTreeSet<SurfaceKey> {
+        (s.layers.iter())
+            .filter(|(_, l)| l.built())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    #[test]
+    fn a_descending_camera_draws_what_it_drew_when_every_tile_was_built() {
+        // The same tiles, the same vertex data, with tiles built only when
+        // about to be drawn as with every arrived tile built.
+        let mut s = Surfaces::new();
+        let mut levels = BTreeSet::new();
+        for (step, height) in [2.0e6, 4.0e5, 6.0e4, 1.0e4, 3000.0].into_iter().enumerate() {
+            let (cam, forward) = low_camera(height);
+            let now = 10.0 * step as f64;
+            let drawn = settle_compact(&mut s, cam, forward, 11, now);
+            let mut all_built = Surfaces::new();
+            let expected = settle(&mut all_built, cam, forward, 11);
+            let (got, want) = (by_key(&drawn), by_key(&expected));
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>(),
+                "{height} m"
+            );
+            for (k, t) in &got {
+                assert_eq!(t.geometry, want[k].geometry, "{k} at {height} m");
+                assert_eq!(t.morph, want[k].morph);
+            }
+            levels.extend(got.keys().map(|k| k.level));
+            // Built: the drawn tiles and the children of the tiles within
+            // their split distance (wanted built), and the roots.
+            let built = built_keys(&s);
+            let roots = built.iter().filter(|k| k.level == 0).count();
+            assert!(built.len() <= drawn.len() + s.want_built.len() + roots);
+            for k in &built {
+                assert!(k.level == 0 || s.want_built.contains(k), "{k} built");
+            }
+            // Far more arrived than are built.
+            if height < 1.0e5 {
+                let compact = s.layers.values().filter(|l| !l.built()).count();
+                assert!(compact > 0, "nothing compact at {height} m");
+            }
+        }
+        assert!(levels.len() >= 4, "levels {levels:?}");
+    }
+
+    #[test]
+    fn a_tile_out_of_view_goes_compact_and_is_rebuilt_the_same() {
+        let mut s = Surfaces::new();
+        let (cam, forward) = low_camera(1.0e4);
+        let before = by_key(&settle_compact(&mut s, cam, forward, 11, 0.0));
+        let deep: Vec<SurfaceKey> = before.keys().filter(|k| k.level > 1).copied().collect();
+        assert!(!deep.is_empty());
+        // Away from the surface: the deep tiles are neither drawn nor
+        // wanted built, and stay built only for the grace time.
+        let away = forward.map(|v| -v);
+        compact_round(&mut s, cam, away, 11, 1.0);
+        assert!(deep.iter().all(|k| built_keys(&s).contains(k)));
+        compact_round(&mut s, cam, away, 11, 1.0 + BUILT_GRACE_SECONDS);
+        for k in &deep {
+            assert!(matches!(s.tiles.get(k), Some(State::Compact(_))), "{k}");
+        }
+        let after = by_key(&settle_compact(
+            &mut s,
+            cam,
+            forward,
+            11,
+            2.0 + BUILT_GRACE_SECONDS,
+        ));
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        for (k, t) in &before {
+            assert_eq!(t.geometry, after[k].geometry, "{k}");
+        }
     }
 
     /// A drawn tile's vertices where the GPU puts them (`vs_tile`): moved

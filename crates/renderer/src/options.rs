@@ -439,7 +439,7 @@ mod tests {
     fn start_on_puts_the_camera_where_the_native_flag_does() {
         use crate::config::{parse_flags, ApiKey, Config};
         let place = "5:0,1,1@300^-10";
-        let flags = parse_flags(["--start-on", place, "--time-scale=-2"]).unwrap();
+        let flags = parse_flags(["--start-on", place, "--time-scale=-2", "--no-cache"]).unwrap();
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             crate::config::ENV_HUB_URL.into(),

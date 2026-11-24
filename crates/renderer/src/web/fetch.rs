@@ -52,6 +52,13 @@ use std::time::Duration;
 /// Seconds the registry may take to arrive.
 pub const REGISTRY_DEADLINE_SECONDS: f64 = 120.0;
 
+/// Longest the browser fetcher builds compact surface tiles in one call
+/// of [`WebFetcher::drain_until`], seconds (`rendering.md` sections 3.5
+/// and 4): 3 ms, a fifth of a 60 Hz frame, holds about 4 to 7 builds of
+/// 0.4 to 0.8 ms each, so the frame keeps its rate while tiles about to
+/// be drawn are built within a few frames.
+pub const BUILD_SLICE_SECONDS: f64 = 0.003;
+
 enum Internal {
     Replace {
         key: ChunkKey,
@@ -98,6 +105,9 @@ pub struct WebFetcher {
     budget: usize,
     extents: BTreeMap<CellKey, Meters>,
     completed: VecDeque<(CellKey, Completion, Meters, Duration)>,
+    /// Compact surface tiles to build, largest projected size first
+    /// ([`WebFetcher::build_surfaces`]).
+    builds: Vec<crate::tiles::BuildRequest>,
     out: Vec<FetchEvent>,
     started: f64,
     wanted_utc_ms: Option<i64>,
@@ -174,6 +184,7 @@ impl WebFetcher {
             budget: WEB_WORKERS,
             extents: BTreeMap::new(),
             completed: VecDeque::new(),
+            builds: Vec::new(),
             out: Vec::new(),
             started: now_seconds(),
             wanted_utc_ms: None,
@@ -247,6 +258,18 @@ impl WebFetcher {
         let now = self.now();
         self.coordinator.set_wanted_surfaces(tiles, now);
         self.follow_wanted();
+    }
+
+    /// Queues compact surface tiles to build (`rendering.md` section 3.5):
+    /// they are built in [`WebFetcher::drain_until`]'s time slice, at most
+    /// [`BUILD_SLICE_SECONDS`] a call, largest projected size first, and
+    /// each result arrives as [`FetchEvent::SurfaceBuilt`], as natively.
+    pub fn build_surfaces(&mut self, builds: Vec<crate::tiles::BuildRequest>) {
+        if builds.is_empty() {
+            return;
+        }
+        self.builds.extend(builds);
+        crate::tiles::sort_builds(&mut self.builds);
     }
 
     /// Queues a request for a surface tile; the result arrives as
@@ -696,6 +719,20 @@ impl WebFetcher {
                 round_trip,
             });
             if crate::clock::now_seconds() > deadline {
+                break;
+            }
+        }
+        // Builds take their own slice after the cells', at least one a
+        // call so they always move on.
+        let until = crate::clock::now_seconds() + BUILD_SLICE_SECONDS;
+        while !self.builds.is_empty() {
+            let req = self.builds.remove(0);
+            let outcome = crate::tiles::build_tile(&req);
+            self.out.push(FetchEvent::SurfaceBuilt {
+                key: req.key,
+                outcome,
+            });
+            if crate::clock::now_seconds() > until {
                 break;
             }
         }
