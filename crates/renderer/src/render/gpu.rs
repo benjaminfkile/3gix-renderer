@@ -1450,26 +1450,7 @@ impl Renderer {
 
     /// Uploads a surface tile relative to its frame's anchor.
     fn upload_tile(&mut self, t: &crate::tiles::TileDrawInfo) -> GpuTile {
-        let g = &t.geometry;
-        let a = t.anchor.position;
-        let rel = |p: &[f64; 3]| -> [f32; 3] {
-            [
-                (p[0] - a[0]) as f32,
-                (p[1] - a[1]) as f32,
-                (p[2] - a[2]) as f32,
-            ]
-        };
-        let vertices: Vec<TileGpuVertex> = (0..g.positions.len())
-            .map(|i| TileGpuVertex {
-                position: rel(&g.positions[i]),
-                target: rel(&g.targets[i]),
-                normal: g.normals[i],
-                target_normal: g.target_normals[i],
-                albedo: g.albedo[i],
-                roughness: g.roughness[i],
-                emission_index: self.emission.index_for(f64::from(g.temperature[i])),
-            })
-            .collect();
+        let vertices = tile_vertices(t, &mut self.emission);
         GpuTile {
             vertices: self
                 .device
@@ -2142,6 +2123,140 @@ impl Renderer {
     /// (module docs): divide the target by it for radiance.
     pub fn pre_exposure(&self) -> f32 {
         self.pre_used
+    }
+}
+
+/// A surface tile's vertices as the GPU reads them, relative to its
+/// frame's anchor: the shape's positions, targets, normals, and
+/// temperature, and the drawn geometry's own material.
+fn tile_vertices(
+    t: &crate::tiles::TileDrawInfo,
+    emission: &mut EmissionTable,
+) -> Vec<TileGpuVertex> {
+    let g = &t.geometry;
+    let a = t.anchor.position;
+    let rel = |p: &[f64; 3]| -> [f32; 3] {
+        [
+            (p[0] - a[0]) as f32,
+            (p[1] - a[1]) as f32,
+            (p[2] - a[2]) as f32,
+        ]
+    };
+    (0..g.positions.len())
+        .map(|i| TileGpuVertex {
+            position: rel(&g.positions[i]),
+            target: rel(&g.targets[i]),
+            normal: g.normals[i],
+            target_normal: g.target_normals[i],
+            albedo: g.albedo[i],
+            roughness: g.roughness[i],
+            emission_index: emission.index_for(f64::from(g.temperature[i])),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tile_vertex_tests {
+    use super::*;
+    use crate::tiles::{composite_tile, Anchor, TileDrawInfo, TileGeometry, TileShape};
+    use gx_core::key::SurfaceKey;
+    use gx_core::overlay::{self, OverlayTile};
+    use gx_core::surface::{SurfaceTile, HEIGHT_SIDE, PARENT_SIDE, VERTEX_COUNT};
+    use std::sync::Arc;
+
+    fn surface(key: SurfaceKey) -> SurfaceTile {
+        SurfaceTile {
+            key,
+            radius_equatorial: 6.0e6,
+            radius_polar: 5.9e6,
+            height_floor: -500.0,
+            heights: (0..HEIGHT_SIDE * HEIGHT_SIDE)
+                .map(|n| (n % 97) as f32 * 3.0)
+                .collect(),
+            parent_heights: (0..PARENT_SIDE * PARENT_SIDE)
+                .map(|n| (n % 89) as f32 * 3.0)
+                .collect(),
+            albedo: (0..VERTEX_COUNT)
+                .map(|n| [(n % 251) as u8, 90, (n % 13) as u8])
+                .collect(),
+            roughness: (0..VERTEX_COUNT).map(|n| (n % 199) as u8).collect(),
+            temperature: (0..VERTEX_COUNT).map(|n| 250.0 + (n % 7) as f32).collect(),
+        }
+    }
+
+    fn overlay_tile(key: SurfaceKey, coverage: u8, albedo: u8, roughness: u8) -> OverlayTile {
+        OverlayTile {
+            key,
+            coverage: (0..VERTEX_COUNT)
+                .map(|n| if n % 3 == 0 { 0 } else { coverage })
+                .collect(),
+            albedo: vec![[albedo, 7, 200]; VERTEX_COUNT],
+            roughness: vec![roughness; VERTEX_COUNT],
+            parent_coverage: vec![coverage; overlay::PARENT_COUNT],
+            parent_albedo: vec![[albedo; 3]; overlay::PARENT_COUNT],
+            parent_roughness: vec![roughness; overlay::PARENT_COUNT],
+        }
+    }
+
+    /// The composite as it was made before the shape was shared: a whole
+    /// copy of the base, shape included, with its material replaced.
+    fn whole_copy_composite(base: &TileGeometry, overlays: &[&OverlayTile]) -> TileGeometry {
+        let mut out = TileGeometry {
+            tile_shape: Arc::new(TileShape::clone(&base.tile_shape)),
+            albedo: base.albedo.clone(),
+            roughness: base.roughness.clone(),
+        };
+        for v in 0..out.albedo.len() {
+            let samples: Vec<overlay::OverlaySample> = overlays
+                .iter()
+                .map(|o| {
+                    (
+                        overlay::unit(o.coverage[v]),
+                        o.albedo[v].map(overlay::unit),
+                        overlay::unit(o.roughness[v]),
+                    )
+                })
+                .collect();
+            let (a, r) = overlay::composite(base.albedo[v], base.roughness[v], &samples);
+            out.albedo[v] = a;
+            out.roughness[v] = r;
+        }
+        out
+    }
+
+    #[test]
+    fn a_tile_with_two_overlays_uploads_the_same_bytes_with_a_shared_shape() {
+        let key = SurfaceKey::new(9, 3, 2, 1, 2).unwrap();
+        let base = TileGeometry::new(&surface(key));
+        let (paint, stain) = (
+            overlay_tile(key, 255, 40, 10),
+            overlay_tile(key, 128, 220, 90),
+        );
+        let shown = [&paint, &stain];
+        let old = whole_copy_composite(&base, &shown);
+        let new = composite_tile(&base, &shown);
+        assert!(Arc::ptr_eq(&new.tile_shape, &base.tile_shape));
+        assert!(!Arc::ptr_eq(&old.tile_shape, &base.tile_shape));
+        let draw = |g: TileGeometry| TileDrawInfo {
+            geometry: Arc::new(g),
+            anchor: Anchor {
+                position: [4096.0, -8192.0, 5.9e6],
+                generation: 3,
+            },
+            morph: [1.0e5, 2.0e5],
+        };
+        let bytes = |t: &TileDrawInfo| -> Vec<u8> {
+            bytemuck::cast_slice(&tile_vertices(t, &mut EmissionTable::new())).to_vec()
+        };
+        let (old, new) = (bytes(&draw(old)), bytes(&draw(new)));
+        assert_eq!(
+            old.len(),
+            VERTEX_COUNT * std::mem::size_of::<TileGpuVertex>()
+        );
+        assert!(old == new, "the vertex bytes differ");
+        // The overlays changed the material: the comparison is not of
+        // the plain base.
+        assert_ne!(bytes(&draw(base)), new);
     }
 }
 
