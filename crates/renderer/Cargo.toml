@@ -35,6 +35,11 @@ web = [
     "dep:console_error_panic_hook",
 ]
 
+# The memory report (`docs/architecture.md`, "Memory report"): a counting
+# global allocator, decode timings, and `World::memory_report`. A developer
+# tool; off by default, and nothing of it is built without it.
+memory-report = []
+
 [dependencies]
 gx-core = { git = "https://github.com/benjaminfkile/3gix-core", branch = "grunt" }
 gx-worker = { path = "../worker" }

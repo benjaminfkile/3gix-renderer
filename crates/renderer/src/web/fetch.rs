@@ -638,7 +638,7 @@ impl WebFetcher {
                     let overlays = self.hub.build().overlay_layers();
                     self.out.push(FetchEvent::Surface {
                         key,
-                        outcome: crate::tiles::decode_tile(
+                        outcome: crate::tiles::decode_tile_timed(
                             &key,
                             &sections,
                             &done.layers,
@@ -796,7 +796,7 @@ impl WebFetcher {
 fn decode_arrived(key: ChunkKey, bytes: Vec<u8>) -> Result<Arrived, String> {
     let bytes: Arc<[u8]> = Arc::from(bytes);
     match key {
-        ChunkKey::Cell(cell) => gx_core::matter::decode(&cell, &bytes)
+        ChunkKey::Cell(cell) => timed!(CELL_DECODE, gx_core::matter::decode(&cell, &bytes))
             .map(|s| Arrived {
                 bytes: bytes.clone(),
                 decoded: Some(Arc::new(s)),

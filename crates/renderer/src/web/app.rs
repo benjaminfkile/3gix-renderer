@@ -220,7 +220,15 @@ pub struct WebApp {
     /// The canvas asked to close or the built-in controls asked to quit:
     /// this renderer stops at the next [`WebApp::after_events`].
     closing: bool,
+    /// When the memory report was last logged ([`MEMORY_LOG_SECONDS`]).
+    #[cfg(feature = "memory-report")]
+    memory_logged: f64,
 }
+
+/// Seconds between two `gx-memory` console lines (the memory report,
+/// `docs/architecture.md`).
+#[cfg(feature = "memory-report")]
+pub const MEMORY_LOG_SECONDS: f64 = 5.0;
 
 impl WebApp {
     /// An application drawing the simulation of `launch` from its camera
@@ -258,6 +266,8 @@ impl WebApp {
             gfx: Rc::default(),
             started: now_seconds(),
             last_frame: None,
+            #[cfg(feature = "memory-report")]
+            memory_logged: f64::NEG_INFINITY,
             fps_window: (0.0, 0, None),
             last_draw: None,
             force_draw: true,
@@ -300,6 +310,13 @@ impl WebApp {
             .map_or(0.0, |t| (now - t).clamp(0.0, MAX_FRAME_SECONDS));
         self.last_frame = Some(now);
         let fps = self.fps(now, false);
+        #[cfg(feature = "memory-report")]
+        if now - self.memory_logged >= MEMORY_LOG_SECONDS {
+            self.memory_logged = now;
+            if let Ok(json) = serde_json::to_string(&self.world.memory_report()) {
+                web_sys::console::log_2(&"gx-memory".into(), &json.into());
+            }
+        }
 
         let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
         let shared = self.shared.clone();

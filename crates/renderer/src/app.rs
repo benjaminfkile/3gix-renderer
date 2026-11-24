@@ -171,6 +171,11 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
         frame_step_p95_ms: world
             .step_times()
             .recent_percentile(crate::clock::OVERLAY_STEPS, 95.0),
+        #[cfg(feature = "memory-report")]
+        memory_bytes: Some((
+            crate::memory::AllocatorBytes::now().live,
+            world.surfaces().geometry_bytes(),
+        )),
         ..MatterStats::from_stats(fetcher.map(Fetcher::stats).unwrap_or_default())
     }
 }
@@ -355,6 +360,10 @@ pub struct HeadlessStats {
     pub cells_requested_ahead: u64,
     /// The far field sprites drawn, in ascending frame id order.
     pub sprites: Vec<SpriteStats>,
+    /// What the renderer held when the frame was drawn
+    /// ([`World::memory_report`]).
+    #[cfg(feature = "memory-report")]
+    pub memory: crate::memory::MemoryReport,
 }
 
 /// What one far field sprite delivered, for `--stats-json`.
@@ -474,6 +483,10 @@ impl HeadlessStats {
             if let (Some(all), serde_json::Value::Object(more)) = (out.as_object_mut(), more) {
                 all.extend(more);
             }
+        }
+        #[cfg(feature = "memory-report")]
+        if let (Some(all), Ok(memory)) = (out.as_object_mut(), serde_json::to_value(self.memory)) {
+            all.insert("memory".to_string(), memory);
         }
         out
     }
@@ -659,6 +672,8 @@ pub fn render_headless_view(
             selection_rounds: world.selection_rounds(),
             cells_requested_ahead: world.cache().requested_ahead(),
             sprites: sprite_stats(&scene, width, height),
+            #[cfg(feature = "memory-report")]
+            memory: world.memory_report(),
         },
     })
 }

@@ -1206,6 +1206,35 @@ impl World {
         self.shown_switches
     }
 
+    /// What the renderer holds now (`docs/architecture.md`, "Memory
+    /// report"): the allocator's counters, surface tiles, cells, meshes
+    /// (each `Arc` counted once), and the decode timings.
+    #[cfg(feature = "memory-report")]
+    pub fn memory_report(&self) -> crate::memory::MemoryReport {
+        let ptr = |m: &Arc<SurfaceMesh>| Arc::as_ptr(m) as usize;
+        let mut all = BTreeMap::new();
+        for e in self.meshes.values() {
+            all.insert(ptr(&e.mesh), e.mesh.heap_bytes());
+        }
+        let mut shown = BTreeMap::new();
+        for m in self.shown.iter().flat_map(|s| &s.meshes) {
+            all.insert(ptr(m), m.heap_bytes());
+            shown.insert(ptr(m), m.heap_bytes());
+        }
+        crate::memory::MemoryReport {
+            allocator: crate::memory::AllocatorBytes::now(),
+            surfaces: self.surfaces.memory(),
+            cells: self.cache.memory(),
+            meshes: crate::memory::MeshMemory {
+                count: all.len(),
+                bytes: all.values().sum(),
+                shown: shown.len(),
+                shown_bytes: shown.values().sum(),
+            },
+            timings: crate::memory::Timings::now(),
+        }
+    }
+
     /// Counts for the overlay.
     pub fn counts(&self) -> WorldCounts {
         WorldCounts {

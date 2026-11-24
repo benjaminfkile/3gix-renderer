@@ -630,7 +630,7 @@ pub fn decode_cell<S: AsRef<[u8]>>(
 ) -> FetchOutcome {
     let mut decoded = Vec::with_capacity(sections.len());
     for (i, bytes) in sections.iter().enumerate() {
-        match matter::decode(key, bytes.as_ref()) {
+        match timed!(CELL_DECODE, matter::decode(key, bytes.as_ref())) {
             Ok(s) => decoded.push(Arc::new(s)),
             Err(e) => {
                 return FetchOutcome::Invalid(format!("section {i}: code {}: {}", e.code, e.reason))
@@ -659,7 +659,7 @@ pub fn cell_from_arrived(
             Some(_) => {
                 return FetchOutcome::Invalid(format!("section {i}: decoded for another key"))
             }
-            None => match matter::decode(key, &a.bytes) {
+            None => match timed!(CELL_DECODE, matter::decode(key, &a.bytes)) {
                 Ok(s) => decoded.push(Arc::new(s)),
                 Err(e) => {
                     return FetchOutcome::Invalid(format!(
@@ -2057,6 +2057,53 @@ pub fn directions_time(wanted: Option<i64>, origin: Option<i64>, now: i64) -> i6
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{frame_records, Fetcher, FetcherOptions};
 
+/// Bytes a decoded section holds: the struct and its samples' arrays
+/// (the memory report). The core library keeps the arrays private, so
+/// they are counted by length: eight arrays, nine `f32` and one state
+/// byte per sample. A free function since the type is the core library's.
+#[cfg(feature = "memory-report")]
+pub fn section_heap_bytes(s: &Section) -> u64 {
+    const PER_SAMPLE: usize = 9 * std::mem::size_of::<f32>() + std::mem::size_of::<State>();
+    let samples = s.samples().map_or(0, |v| v.len());
+    (std::mem::size_of::<Section>() + samples * PER_SAMPLE) as u64
+}
+
+#[cfg(feature = "memory-report")]
+impl CellCache {
+    /// What the cell cache holds ([`crate::memory::CellMemory`]): cached,
+    /// ready, and selected cells, and the bytes of every distinct decoded
+    /// section, each `Arc` counted once.
+    pub fn memory(&self) -> crate::memory::CellMemory {
+        let ptr = |s: &Arc<Section>| Arc::as_ptr(s) as usize;
+        let sections = |cell: &ReadyCell, into: &mut BTreeMap<usize, u64>| {
+            for s in std::iter::once(&cell.section).chain(cell.layers.iter().map(|(_, s)| s)) {
+                into.insert(ptr(s), section_heap_bytes(s));
+            }
+        };
+        let mut all = BTreeMap::new();
+        let mut ready = 0;
+        for e in self.entries.values() {
+            if let CellState::Ready(cell) = &e.state {
+                ready += 1;
+                sections(cell, &mut all);
+            }
+        }
+        let mut selected = BTreeMap::new();
+        for s in &self.selection {
+            if let Some(CellState::Ready(cell)) = self.state(&s.key) {
+                sections(cell, &mut selected);
+            }
+        }
+        crate::memory::CellMemory {
+            cached: self.entries.len(),
+            ready,
+            selected: self.selection.len(),
+            sample_bytes: all.values().sum(),
+            selected_sample_bytes: selected.values().sum(),
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{
@@ -2842,9 +2889,13 @@ mod native {
                         self.handle.spawn_blocking(move || {
                             let sections: Vec<Arc<[u8]>> =
                                 done.sections.iter().map(|a| a.bytes.clone()).collect();
-                            let outcome =
-                                crate::tiles::decode_tile(&key, &sections, &done.layers, &overlays)
-                                    .map(|d| d.waiting_on(done.waiting));
+                            let outcome = crate::tiles::decode_tile_timed(
+                                &key,
+                                &sections,
+                                &done.layers,
+                                &overlays,
+                            )
+                            .map(|d| d.waiting_on(done.waiting));
                             let _ = tx.send(Internal::Event(FetchEvent::Surface {
                                 key,
                                 outcome,
@@ -3067,7 +3118,7 @@ mod native {
         };
         let raw = bytes.clone();
         tokio::task::spawn_blocking(move || {
-            gx_core::matter::decode(&cell, &raw)
+            timed!(CELL_DECODE, gx_core::matter::decode(&cell, &raw))
                 .map(|s| Arrived {
                     bytes: raw.clone(),
                     decoded: Some(Arc::new(s)),

@@ -5,7 +5,8 @@
 # browser worker's module runner under Node (V8, standing in for the
 # browser) against the example module's conformance hashes, the browser's
 # view options from config.js and the query string, the
-# wasm32 builds with the web feature off and on, and the browser package
+# wasm32 builds with the web feature off and on, the memory-report
+# feature's clippy and tests (natively and for the browser), and the browser package
 # built by web/build.sh (wasm-pack), then the JS package
 # (packages/3gix-renderer: npm ci, its build, tsc over the package and the
 # demo, the React component's unit tests, and the npm pack file list), then
@@ -35,6 +36,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 step "4. cargo test"
 cargo test --workspace
+
+step "4a. memory-report feature: clippy and tests (docs/architecture.md)"
+cargo clippy -p renderer --all-targets --features memory-report -- -D warnings
+cargo test -p renderer --features memory-report
+cargo clippy -p renderer --target wasm32-unknown-unknown --features web,memory-report -- -D warnings
 
 step "4b. budget test (release, rendering.md section 5.3)"
 cargo test --release -p renderer --test budget

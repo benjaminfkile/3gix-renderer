@@ -60,6 +60,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `controls` | Keyboard and mouse bindings for the window and the canvas | |
 | `api` | The renderer API (`docs/api.md`): command queue, state snapshot, events, the `Consumer` trait | |
 | `app` | Desktop window loop and the headless run; the window is a consumer of `api`, driving each tick through it | |
+| `memory` | The memory report, `memory-report` feature only: counting allocator, decode timings, the report types | |
 | `redraw` | Whether a scene differs visibly from the last one drawn | `rendering.md` 4 |
 | `web` | The browser build: canvas loop, `fetch` and `WebSocket` hub client, the Cache API cache, the Web Worker driver, the browser fetcher, the `Renderer` class (the web binding of `docs/api.md`) | `space-model.md` 2 and 10, `client-compute.md` 4 and 6 |
 
@@ -183,6 +184,53 @@ distances, which is where a perspective depth needs it, and the infinite far
 plane removes the far plane choice. The near plane is chosen per frame as half
 the distance to the nearest marker in front of the camera or to the nearest
 drawn mesh's bounds, whichever is closer (at least 1 mm).
+
+## Memory report
+
+A developer tool for measuring what the renderer holds (`src/memory.rs`).
+It is the cargo feature `memory-report`, off by default; without it none
+of it is compiled, the allocator is the system's, and the release wasm is
+unchanged. With it:
+
+- A counting global allocator wraps `std::alloc::System`: live and peak
+  bytes in atomics, updated in `alloc`, `alloc_zeroed`, `dealloc`, and
+  `realloc`.
+- `World::memory_report()` returns `MemoryReport` (serde), in bytes and
+  counts. Bytes are `Vec` capacity times element size plus the struct
+  itself, counted by each type (`TileGeometry::heap_bytes`,
+  `SurfaceMesh::heap_bytes`, `tiles::overlay_heap_bytes`,
+  `stream::section_heap_bytes`, which counts samples by length since the
+  core library keeps their arrays private). Data shared through an `Arc`
+  is counted once, by pointer.
+  - `allocator`: `live` and `peak`.
+  - `surfaces`: entries `requested`, `ready`, `empty`, `gone`; the
+    selection's `used` set and `drawn` count; `geometries` and
+    `geometry_bytes`, every distinct `TileGeometry` held (tile states,
+    bases, the drawn list); of which `composited` copies (geometries that
+    are no tile's base) and their bytes; `drawn_geometry_bytes`, what the
+    drawn tiles need (their drawn geometry and their bases);
+    `overlay_bytes` and `drawn_overlay_bytes` for overlay tiles.
+  - `cells`: `cached`, `ready`, `selected`; `sample_bytes` of every
+    distinct decoded section held (composites and layers) and
+    `selected_sample_bytes` for the drawn selection.
+  - `meshes`: `count` and `bytes` (positions, vertices, indices by
+    capacity) of every held mesh, `shown` and `shown_bytes` for the shown
+    selection.
+  - `timings`: `count` and `mean_us` of `TileGeometry::new`, of
+    `decode_tile` (which includes its `TileGeometry::new` calls), and of a
+    cell section's decode, on the session clock (`performance.now()` in
+    the browser, which some browsers coarsen).
+- Native: `--stats-json` gains a `memory` object, the report when the
+  headless frame was drawn, and the overlay gains the line
+  `memory live <MB> MB  tile geometry <MB> MB` (megabytes of 10^6 bytes).
+  Build with `cargo build --release --features memory-report`.
+- Browser: `sh web/build.sh --memory-report`; the loop logs
+  `console.log("gx-memory", <json>)` every 5 s. `scripts/memory-pan.mjs`
+  pans a page in headless Chrome and prints the WebAssembly memory sizes
+  and the latest report every 30 s (`docs/web.md`, "Measuring memory").
+
+`scripts/ci.sh` runs clippy and the renderer's tests with the feature, so
+it builds on both platforms.
 
 ## Overlay text
 

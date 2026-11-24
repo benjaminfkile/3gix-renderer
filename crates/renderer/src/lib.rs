@@ -58,6 +58,23 @@
 
 #![warn(missing_docs)]
 
+/// Runs `$e`, timed into `crate::memory::$timer` with the `memory-report`
+/// feature; without it, just `$e`.
+#[cfg(feature = "memory-report")]
+macro_rules! timed {
+    ($timer:ident, $e:expr) => {
+        crate::memory::timed(&crate::memory::$timer, || $e)
+    };
+}
+
+/// Without the `memory-report` feature: `$e` itself.
+#[cfg(not(feature = "memory-report"))]
+macro_rules! timed {
+    ($timer:ident, $e:expr) => {
+        $e
+    };
+}
+
 // The API drives the built-in controls' state, so it is built where they
 // are: native, and the browser build (`web` feature).
 #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
@@ -72,6 +89,8 @@ pub mod extract;
 pub mod farfield;
 pub mod layers;
 pub mod light;
+#[cfg(feature = "memory-report")]
+pub mod memory;
 pub mod options;
 pub mod protocol;
 pub mod redraw;
