@@ -263,11 +263,11 @@ opens no port. It opens the URL (put the hub settings in the page's
 `config.js` or its query string), in a 1280 x 720 view or, with `--phone`,
 an emulated phone (390 x 844 CSS pixels, scale 3, touch), waits `--wait`
 seconds, then drags 300 pixels across the view every 10 s for `--seconds`
-seconds. Every 30 s it prints one line: the elapsed seconds, the byte
+seconds, always the same way so new places keep loading. Every 30 s it prints one line: the elapsed seconds, the byte
 length of every `WebAssembly.Memory` alive on the page and in each of its
 workers (`Runtime.queryObjects` on `WebAssembly.Memory.prototype` in each
 target), the resident size of Chrome's renderer processes (read from
-`/proc`, so Linux only), and the latest `gx-memory` object if the page logs
+`/proc` on Linux, `ps` on macOS), and the latest `gx-memory` object if the page logs
 one. It ends with a forced garbage collection in every target and a final
 line.
 

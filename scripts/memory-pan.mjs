@@ -10,11 +10,12 @@
 // protocol on a pipe (--remote-debugging-pipe, so no port is opened). It
 // opens <url>, emulates a phone (390 x 844 CSS pixels, scale 3, touch) with
 // --phone or a 1280 x 720 window otherwise, waits --wait seconds, then
-// drags 300 pixels across the view every 10 s for --seconds seconds. Every
+// drags 300 pixels across the view, always the same way so new places keep
+// loading, every 10 s for --seconds seconds. Every
 // 30 s it prints one line: elapsed seconds, the byte length of every
 // WebAssembly.Memory alive on the page and in each of its workers (found
 // with Runtime.queryObjects on WebAssembly.Memory.prototype), the resident
-// size of Chrome's renderer processes (from /proc, Linux only), and the
+// size of Chrome's renderer processes (from /proc, or ps on macOS), and the
 // latest `gx-memory` object the page logged (a build made with
 // `sh web/build.sh --memory-report`). It ends with a forced garbage
 // collection in every target and a final line.
@@ -23,6 +24,7 @@
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -52,6 +54,8 @@ function parseArgs(argv) {
 
 const PAN_PX = 300;
 const PAN_EVERY_S = 10;
+/** Seconds between two moves of one drag. */
+const MOVE_GAP_S = 0.03;
 const REPORT_EVERY_S = 30;
 const VIEW = { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false };
 const PHONE = { width: 390, height: 844, deviceScaleFactor: 3, mobile: true };
@@ -132,17 +136,32 @@ async function wasmMemories(pipe, sessionId) {
     }
 }
 
-/** Resident bytes of each of Chrome's renderer processes (Linux /proc). */
+/**
+ * Resident bytes of a process: `/proc` on Linux, `ps` elsewhere (macOS);
+ * null when neither answers.
+ */
+function residentBytes(pid) {
+    try {
+        const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+        const kb = /VmRSS:\s+(\d+) kB/.exec(status);
+        return kb ? Number(kb[1]) * 1024 : null;
+    } catch {
+        try {
+            const kb = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' }).trim());
+            return Number.isFinite(kb) && kb > 0 ? kb * 1024 : null;
+        } catch {
+            return null;
+        }
+    }
+}
+
+/** Resident bytes of each of Chrome's renderer processes. */
 async function rendererResident(pipe) {
     try {
         const info = await pipe.send('SystemInfo.getProcessInfo');
         return info.processInfo
             .filter((p) => p.type === 'renderer')
-            .map((p) => {
-                const status = readFileSync(`/proc/${p.id}/status`, 'utf8');
-                const kb = /VmRSS:\s+(\d+) kB/.exec(status);
-                return kb ? Number(kb[1]) * 1024 : null;
-            })
+            .map((p) => residentBytes(p.id))
             .filter((v) => v !== null);
     } catch {
         return null;
@@ -170,13 +189,16 @@ async function main() {
         { stdio: ['ignore', 'ignore', 'inherit', 'pipe', 'pipe'] },
     );
     const pipe = new Pipe(chrome.stdio[3], chrome.stdio[4]);
-    const done = () => {
+    // Chrome still writes into its profile while it exits, so the profile
+    // is removed only once the process has gone.
+    const exited = new Promise((r) => chrome.once('exit', r));
+    const done = async () => {
         chrome.kill();
-        rmSync(profile, { recursive: true, force: true });
+        await Promise.race([exited, sleep(10)]);
+        rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     };
     process.on('SIGINT', () => {
-        done();
-        process.exit(130);
+        done().finally(() => process.exit(130));
     });
 
     const workers = new Map();
@@ -242,14 +264,20 @@ async function main() {
     const { width, height } = view;
     const drag = async (step) => {
         const y = height / 2;
-        const sign = step % 2 === 0 ? 1 : -1;
-        const x0 = width / 2 - (sign * PAN_PX) / 2;
-        const points = Array.from({ length: 11 }, (_, n) => x0 + (sign * PAN_PX * n) / 10);
+        // Always the same way, so the view keeps moving over new places and
+        // new tiles keep loading; each move is paced like a hand (a drag
+        // sent all at once is not taken as a pan).
+        void step;
+        const x0 = width / 2 + PAN_PX / 2;
+        const points = Array.from({ length: 21 }, (_, n) => x0 - (PAN_PX * n) / 20);
         if (o.phone) {
             const touch = (type, x) =>
                 pipe.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] }, sessionId);
             await touch('touchStart', points[0]);
-            for (const x of points.slice(1)) await touch('touchMove', x);
+            for (const x of points.slice(1)) {
+                await sleep(MOVE_GAP_S);
+                await touch('touchMove', x);
+            }
             await touch('touchEnd', points[points.length - 1]);
         } else {
             const mouse = (type, x) =>
@@ -258,8 +286,12 @@ async function main() {
                     { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1 },
                     sessionId,
                 );
+            await pipe.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: points[0], y, button: 'none' }, sessionId);
             await mouse('mousePressed', points[0]);
-            for (const x of points.slice(1)) await mouse('mouseMoved', x);
+            for (const x of points.slice(1)) {
+                await sleep(MOVE_GAP_S);
+                await mouse('mouseMoved', x);
+            }
             await mouse('mouseReleased', points[points.length - 1]);
         }
     };
@@ -286,7 +318,7 @@ async function main() {
     }
     await sleep(2);
     await line('final');
-    done();
+    await done();
 }
 
 main().catch((e) => {
