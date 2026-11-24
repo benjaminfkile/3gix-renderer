@@ -8,6 +8,12 @@ export type FrameId = number;
 export type Vec3 = [number, number, number];
 
 /** A camera pose (section 2): position in meters, orientation a unit quaternion `[x, y, z, w]`, speed in m/s. */
+/** Options of `setCamera`. */
+export interface SetCameraOptions {
+    /** The camera moves and turns with its frame (default false: free). */
+    ride?: boolean;
+}
+
 export interface Pose {
     /** The frame the camera is in. */
     frameId: FrameId;

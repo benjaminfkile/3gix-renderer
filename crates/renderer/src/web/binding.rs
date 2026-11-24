@@ -212,11 +212,13 @@ impl Renderer {
         value::pose_to_js(&self.api().get_camera())
     }
 
-    /// `setCamera(pose)`: puts the camera exactly at the pose next tick.
+    /// `setCamera(pose, { ride })`: puts the camera exactly at the pose
+    /// next tick; with `ride` it then moves and turns with its frame.
     #[wasm_bindgen(js_name = setCamera)]
-    pub fn set_camera(&self, pose: JsValue) -> Result<(), JsValue> {
+    pub fn set_camera(&self, pose: JsValue, options: JsValue) -> Result<(), JsValue> {
         let pose = value::pose(&pose)?;
-        self.api().set_camera(pose).map_err(api_error)
+        let ride = value::ride(&options)?;
+        self.api().set_camera(pose, ride).map_err(api_error)
     }
 
     /// `placeOver(frameId, direction, height, pitchDeg)`: the placement of

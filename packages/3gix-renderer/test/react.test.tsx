@@ -68,7 +68,7 @@ describe("GxRenderer", () => {
         expect(instances).toHaveLength(1);
         const r = instances[0];
         expect(r.setCamera).toHaveBeenCalledTimes(1);
-        expect(r.setCamera).toHaveBeenLastCalledWith(pose(1));
+        expect(r.setCamera).toHaveBeenLastCalledWith(pose(1), {});
         expect(r.setControls).toHaveBeenLastCalledWith("none");
         expect(r.setHud).toHaveBeenLastCalledWith(false);
         expect(r.setComputeBudget).toHaveBeenLastCalledWith(2);
@@ -80,7 +80,7 @@ describe("GxRenderer", () => {
 
         await render(<GxRenderer {...props} camera={pose(2)} hud={true} computeBudget={0} shownLayers={{ a: true, b: false }} />);
         expect(r.setCamera).toHaveBeenCalledTimes(2);
-        expect(r.setCamera).toHaveBeenLastCalledWith(pose(2));
+        expect(r.setCamera).toHaveBeenLastCalledWith(pose(2), {});
         expect(r.setHud).toHaveBeenLastCalledWith(true);
         expect(r.setComputeBudget).toHaveBeenLastCalledWith(0);
         expect(r.setShown).toHaveBeenCalledTimes(2);

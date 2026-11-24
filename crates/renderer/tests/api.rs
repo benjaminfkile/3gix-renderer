@@ -208,7 +208,7 @@ fn set_camera_puts_the_camera_at_the_pose_next_tick() {
     l.tick();
     let home = l.api.get_camera();
     let p = pose(common::ROOT, [-20.0, 20.0, 20.0]);
-    l.api.set_camera(p).unwrap();
+    l.api.set_camera(p, false).unwrap();
     assert_eq!(l.api.get_camera(), home, "getters read the last tick");
     l.tick();
     assert_eq!(l.api.get_camera(), p);
@@ -218,23 +218,25 @@ fn set_camera_puts_the_camera_at_the_pose_next_tick() {
 #[test]
 fn set_camera_errors() {
     let mut l = Loop::new();
-    let unknown = l.api.set_camera(pose(99, [0.0; 3]));
+    let unknown = l.api.set_camera(pose(99, [0.0; 3]), false);
     assert!(unknown.unwrap_err().0.contains("not in the registry"));
-    let nan = l.api.set_camera(pose(common::ROOT, [f64::NAN, 0.0, 0.0]));
+    let nan = l
+        .api
+        .set_camera(pose(common::ROOT, [f64::NAN, 0.0, 0.0]), false);
     assert!(nan.unwrap_err().0.contains("not finite"));
     let mut q = pose(common::ROOT, [0.0; 3]);
     q.orientation = [0.0, 0.0, 0.0, 1.0 + 2e-6];
     assert!(l
         .api
-        .set_camera(q)
+        .set_camera(q, false)
         .unwrap_err()
         .0
         .contains("unit quaternion"));
     q.orientation = [0.0, 0.0, 0.0, 1.0 + 5e-7];
-    assert!(l.api.set_camera(q).is_ok(), "within 1e-6 is unit");
+    assert!(l.api.set_camera(q, false).is_ok(), "within 1e-6 is unit");
     let mut s = pose(common::ROOT, [0.0; 3]);
     s.speed = 0.0;
-    assert!(l.api.set_camera(s).is_err());
+    assert!(l.api.set_camera(s, false).is_err());
 }
 
 #[test]
@@ -242,14 +244,14 @@ fn commands_apply_in_call_order_within_one_tick() {
     let mut l = Loop::new();
     l.tick();
     l.api
-        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]), false)
         .unwrap();
     l.api.set_speed(5.0).unwrap();
     l.tick();
     assert_eq!(l.api.get_camera().speed, 5.0, "the speed after the pose");
     l.api.set_speed(7.0).unwrap();
     l.api
-        .set_camera(pose(common::ROOT, [-21.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-21.0, 20.0, 20.0]), false)
         .unwrap();
     l.tick();
     assert_eq!(l.api.get_camera().speed, 1.0, "the pose after the speed");
@@ -295,7 +297,7 @@ fn fov_is_one_value_on_the_camera() {
     let narrow = build_scene(l.sim.system(), &l.camera, 2.0);
     assert_eq!(narrow.fov_y, 30f64.to_radians() as f32);
     l.api
-        .set_camera(pose(l.camera.frame_id, [1.0, 2.0, 3.0]))
+        .set_camera(pose(l.camera.frame_id, [1.0, 2.0, 3.0]), false)
         .unwrap();
     l.tick();
     assert!(
@@ -334,7 +336,7 @@ fn fly_forward(by_key: bool, controls: Controls) -> Camera {
     let mut l = Loop::new();
     l.api.set_controls(controls);
     l.api
-        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]), false)
         .unwrap();
     l.tick();
     if by_key {
@@ -366,7 +368,7 @@ fn flight_input_moves_the_camera_as_the_keys_do() {
 fn flight_input_is_held_until_cleared() {
     let mut l = Loop::new();
     l.api
-        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]), false)
         .unwrap();
     l.tick();
     l.api.set_flight_input(Some(FlightInput {
@@ -420,10 +422,10 @@ fn camera_event_once_per_tick_only_on_change() {
     l.tick();
     l.api.events();
     l.api
-        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]), false)
         .unwrap();
     l.api
-        .set_camera(pose(common::ROOT, [-21.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-21.0, 20.0, 20.0]), false)
         .unwrap();
     l.tick();
     let events = l.api.events();
@@ -451,7 +453,7 @@ fn frame_changed_on_reparent() {
     l.api.events();
     // At the child's origin in root axes: the next step reparents there.
     l.api
-        .set_camera(pose(common::ROOT, common::CHILD_OFFSET))
+        .set_camera(pose(common::ROOT, common::CHILD_OFFSET), false)
         .unwrap();
     l.tick();
     let events = l.api.events();
@@ -757,7 +759,7 @@ fn resize_and_destroy() {
 fn flight_look_turns_by_radians() {
     let mut l = Loop::new();
     l.api
-        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]))
+        .set_camera(pose(common::ROOT, [-20.0, 20.0, 20.0]), false)
         .unwrap();
     l.tick();
     l.api.set_flight_input(Some(FlightInput {
@@ -1145,7 +1147,7 @@ mod queries {
     impl Consumer for Recorder {
         fn tick(&mut self, api: &mut Api) {
             if let Some(pose) = self.pose.take() {
-                api.set_camera(pose).unwrap();
+                api.set_camera(pose, false).unwrap();
             }
             let new = api.events();
             let mut events = self.events.lock().unwrap();

@@ -15,6 +15,7 @@ import type {
     LayerInfo,
     MeshMode,
     Pose,
+    SetCameraOptions,
     Projection,
     RaycastHit,
     RendererEvent,
@@ -97,9 +98,13 @@ export class Renderer {
         return this.inner.getCamera() as Pose;
     }
 
-    /** `setCamera(pose)`: puts the camera exactly at the pose next tick. */
-    setCamera(pose: Pose): void {
-        this.inner.setCamera(pose);
+    /**
+     * `setCamera(pose, { ride })`: puts the camera exactly at the pose next
+     * tick. With `ride` the camera then moves and turns with its frame;
+     * without it the camera is free and keeps its place in space.
+     */
+    setCamera(pose: Pose, options: SetCameraOptions = {}): void {
+        this.inner.setCamera(pose, options);
     }
 
     /** `placeOver(frameId, direction, height, pitchDeg)`: the placement of `--start-on`. */

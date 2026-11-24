@@ -297,7 +297,7 @@ pub struct Target<'a> {
 /// A queued setter, applied at the start of the next tick.
 #[derive(Clone, Debug, PartialEq)]
 enum Command {
-    SetCamera(Pose),
+    SetCamera(Pose, bool),
     PlaceOver(StartOn),
     SetSpeed(f64),
     SetFov(f64),
@@ -491,10 +491,13 @@ impl Api {
     }
 
     /// `setCamera`: puts the camera exactly at `pose` next tick, detached
-    /// from any spawn. Fails for a frame not in the registry, a non-finite
-    /// value, or a quaternion whose length is off one by more than
-    /// [`UNIT_TOLERANCE`].
-    pub fn set_camera(&mut self, pose: Pose) -> ApiResult<()> {
+    /// from any spawn. With `ride` the camera then moves and turns with its
+    /// frame, keeping its place in the frame's axes as an attached camera
+    /// does ([`crate::camera::advance`]); without it the camera is free and
+    /// keeps its place in space. Fails for a frame not in the registry, a
+    /// non-finite value, or a quaternion whose length is off one by more
+    /// than [`UNIT_TOLERANCE`].
+    pub fn set_camera(&mut self, pose: Pose, ride: bool) -> ApiResult<()> {
         self.live()?;
         if !self.frames.contains(&pose.frame_id) {
             return error(format!("frame {} is not in the registry", pose.frame_id));
@@ -514,7 +517,7 @@ impl Api {
         if !(lo..=hi).contains(&pose.speed) {
             return error(format!("speed {} is outside {lo} to {hi} m/s", pose.speed));
         }
-        self.commands.push(Command::SetCamera(pose));
+        self.commands.push(Command::SetCamera(pose, ride));
         Ok(())
     }
 
@@ -913,7 +916,7 @@ impl Api {
         let mut shown: Vec<bool> = self.layers.iter().map(|l| l.shown).collect();
         for command in std::mem::take(&mut self.commands) {
             match command {
-                Command::SetCamera(p) => {
+                Command::SetCamera(p, ride) => {
                     let [x, y, z, w] = p.orientation;
                     *camera = Camera {
                         frame_id: p.frame_id,
@@ -926,7 +929,7 @@ impl Api {
                         fov_y: camera.fov_y,
                     };
                     *spawner = Spawner::default();
-                    keys.attached = false;
+                    keys.attached = ride;
                 }
                 Command::PlaceOver(s) => match crate::options::launch_camera_at(sim.system(), s) {
                     Some(c) => {
@@ -1069,5 +1072,47 @@ mod tests {
             "kept over the frame: {:?} vs {before:?}",
             camera.position
         );
+    }
+
+    /// `setCamera` with `ride` keeps the camera's place in its frame's
+    /// axes as the frame moves on; without it the camera stays in space.
+    #[test]
+    fn set_camera_rides_with_its_frame_only_when_asked() {
+        for ride in [true, false] {
+            let now = EPOCH + 1.0e6;
+            let mut sim = Simulation::at_now(system(), Seconds::new(now));
+            let mut camera = Camera::home(sim.system());
+            let mut api = Api::new(sim.system().tree(), &camera);
+            let mut spawner = Spawner::default();
+            let mut keys = Keys::new(None);
+            let mut tick = |api: &mut Api, sim: &mut Simulation, camera: &mut Camera| {
+                api.begin_tick(Target {
+                    sim,
+                    camera,
+                    spawner: &mut spawner,
+                    keys: &mut keys,
+                })
+            };
+            let pose = Pose {
+                frame_id: 2,
+                position: [7.0e6, 0.0, 0.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                speed: 10.0,
+            };
+            api.set_camera(pose, ride).unwrap();
+            tick(&mut api, &mut sim, &mut camera);
+            api.set_time(tdb_seconds_to_utc_ms(EPOCH + 0.5e6)).unwrap();
+            tick(&mut api, &mut sim, &mut camera);
+            let moved = (camera.position - Vec3::new(7.0e6, 0.0, 0.0)).length();
+            if ride {
+                assert_eq!(camera.frame_id, 2);
+                assert!(moved < 1e-6, "rides with the frame: moved {moved} m");
+            } else {
+                assert!(
+                    camera.frame_id != 2 || moved > 1.0e6,
+                    "free: left in space, moved {moved} m"
+                );
+            }
+        }
     }
 }

@@ -110,6 +110,15 @@ pub fn flight_input(value: &JsValue) -> Result<Option<FlightInput>, JsValue> {
     }))
 }
 
+/// The `ride` of `setCamera`'s options `{ ride }`: false for null,
+/// undefined, or a missing field.
+pub fn ride(options: &JsValue) -> Result<bool, JsValue> {
+    if options.is_null() || options.is_undefined() {
+        return Ok(false);
+    }
+    Ok(get(options, "ride")?.is_truthy())
+}
+
 /// An exposure from `{ mode: "auto", biasStops }` or `{ mode: "fixed",
 /// stops }`.
 pub fn exposure(value: &JsValue) -> Result<Exposure, JsValue> {
