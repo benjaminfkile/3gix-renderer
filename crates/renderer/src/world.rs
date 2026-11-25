@@ -691,6 +691,18 @@ impl World {
         }
         self.holding_ahead = crate::budget::hold_ahead(held, limit, self.holding_ahead);
         self.surfaces.set_hold_ahead(self.holding_ahead);
+        // At a still camera the look-ahead never fills the room a step up
+        // in detail needs (`crate::budget::Detail`); while it moves the
+        // detail does not go up and it fills at most to the fraction
+        // asking ahead resumes below, leaving the rest to what the view
+        // just left.
+        let step = if self.detail.moving() {
+            crate::budget::RESUME_FRACTION
+        } else {
+            crate::budget::DETAIL_STEP * crate::budget::DETAIL_STEP
+        };
+        self.surfaces
+            .set_ahead_room(Some(((step * limit as f64) as u64).saturating_sub(held)));
         self.cache.set_hold_ahead(self.holding_ahead);
         self.held = held;
         self.last_evicted = ev;
@@ -1861,6 +1873,83 @@ mod tests {
             world.complete_surface_build(req.key, outcome);
         }
         keys
+    }
+
+    /// `rig`'s camera at its place with its view turned `angle` radians
+    /// to the right about the local up, and the turned forward.
+    fn rig_turned(rig: &SurfaceRig, angle: f64) -> (Camera, [f64; 3]) {
+        let c = rig.cam;
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let n: [f64; 3] = std::array::from_fn(|k| c[k] / l);
+        let f = rig.forward;
+        let cross = [
+            n[1] * f[2] - n[2] * f[1],
+            n[2] * f[0] - n[0] * f[2],
+            n[0] * f[1] - n[1] * f[0],
+        ];
+        let dot = n[0] * f[0] + n[1] * f[1] + n[2] * f[2];
+        let (sin, cos) = (-angle).sin_cos();
+        let forward: [f64; 3] =
+            std::array::from_fn(|k| f[k] * cos + cross[k] * sin + n[k] * dot * (1.0 - cos));
+        let mut camera = rig.camera;
+        camera.orientation = crate::camera::look_rotation(
+            Vec3::new(forward[0], forward[1], forward[2]),
+            Vec3::new(n[0], n[1], n[2]),
+        );
+        (camera, forward)
+    }
+
+    /// Turns the view at 90 degrees a second for 4 s at 60 frames a
+    /// second from `now`, every request and build done each frame as in
+    /// [`surface_frame`]: every frame covers the view. Returns the largest
+    /// number of levels a point of the view went coarser from one frame to
+    /// the next, and the most bytes held.
+    fn turn(world: &mut World, rig: &SurfaceRig, now: &mut f64) -> (i32, u64) {
+        let mut before: Vec<crate::tiles::TileDrawInfo> = world.surfaces().drawn().to_vec();
+        let (mut most, mut peak) = (0, 0);
+        for i in 1..=240 {
+            *now += 1.0 / 60.0;
+            let angle = 0.5 * std::f64::consts::PI * f64::from(i) / 60.0;
+            let (camera, forward) = rig_turned(rig, angle);
+            surface_frame_keys(world, rig, &camera, *now);
+            let drawn = world.surfaces().drawn();
+            crate::tiles::tests::view_covered(drawn, rig.cam, forward, BELOW_SURFACE);
+            let jump = crate::tiles::tests::largest_coarsening(
+                &before,
+                drawn,
+                rig.cam,
+                forward,
+                BELOW_SURFACE,
+            );
+            most = most.max(jump);
+            peak = peak.max(world.held_bytes());
+            before = drawn.to_vec();
+        }
+        (most, peak)
+    }
+
+    #[test]
+    fn a_turn_goes_at_most_one_level_coarser_from_frame_to_frame() {
+        let rig = surface_rig();
+        let mut world = World::new(0);
+        let mut now = 0.0;
+        settle_surfaces(&mut world, &rig, &mut now);
+        let (most, peak) = turn(&mut world, &rig, &mut now);
+        println!("turn: largest level jump {most}, peak held {peak}");
+        assert!(most <= 1, "a point of the view went {most} levels coarser");
+    }
+
+    #[test]
+    fn a_turn_over_the_budget_goes_at_most_one_level_coarser() {
+        let rig = surface_rig();
+        let (mut world, budget, mut now) = settled_at_seventy_percent(&rig);
+        let (most, peak) = turn(&mut world, &rig, &mut now);
+        println!(
+            "turn over the budget: largest level jump {most}, peak held {peak} of {budget}, detail {}",
+            world.detail_factor()
+        );
+        assert!(peak <= budget, "{peak} bytes held over {budget}");
+        assert!(most <= 1, "a point of the view went {most} levels coarser");
     }
 
     #[test]
