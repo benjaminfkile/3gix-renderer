@@ -48,18 +48,6 @@
 //! which builds it off the frame thread ([`build_tile`]) and hands the
 //! geometry back ([`Surfaces::complete_build`]).
 //!
-//! The walk asks ahead in angle: outside the view cone, inside a cone
-//! [`LOOK_AHEAD_RADIANS`] wider (capped at pi) and not below the horizon,
-//! it goes on as in the view, asking for children by the same distance
-//! rules, and wants built the tiles it would draw there, drawing none, so
-//! a turn of the camera finds them built. Its work ranks below the
-//! view's, the view counts as settled without it, it adds no more bytes
-//! than the room the memory budget leaves ([`Surfaces::set_ahead_room`]),
-//! eviction compacts its tiles first, and it is held with asking ahead
-//! ([`Surfaces::set_hold_ahead`]). The parent of every drawn tile is
-//! wanted built too, so a split that cannot be covered falls back one
-//! level; ancestors above it go compact as any other tile.
-//!
 //! The view is never open (`rendering.md` 3.3): a tile splits only when
 //! the tiles its children will draw are built, so its parent keeps
 //! drawing until then; a split tile beyond its [`range`] that is not
@@ -574,16 +562,6 @@ enum State {
     Gone,
 }
 
-/// How far, radians, the selection asks ahead in angle beyond the view
-/// cone (module docs): the tiles a turn of the camera brings in are asked
-/// for and built inside a cone this much wider, capped at pi, unless
-/// asking ahead is held ([`Surfaces::set_hold_ahead`]).
-pub const LOOK_AHEAD_RADIANS: f64 = 0.5;
-
-/// Work asked for only by the look-ahead ranks below the view's: its
-/// projected size, pixels, is scaled by this as priority.
-const LOOK_AHEAD_PRIORITY: f64 = 1.0e-6;
-
 /// How long, seconds, a built tile that is neither drawn nor wanted built
 /// stays built before it goes back to compact (module docs, the
 /// selection's clock). Without it a camera resting near a split distance
@@ -760,17 +738,6 @@ pub struct Surfaces {
     /// Every tile the latest selection asked for (arrived or not):
     /// eviction keeps them.
     asked: std::collections::HashSet<SurfaceKey>,
-    /// Of those, the tiles only the look-ahead asked for: the view is
-    /// settled without them ([`Surfaces::settled`]).
-    asked_ahead: std::collections::HashSet<SurfaceKey>,
-    /// Bytes the look-ahead may add under the memory budget
-    /// ([`Surfaces::set_ahead_room`]); `None`, no limit.
-    ahead_room: Option<u64>,
-    /// What is left of it in the current selection; `None`, no limit.
-    ahead_left: Option<u64>,
-    /// What one tile asked for or built by the look-ahead is counted as,
-    /// bytes: a built level-0 tile's (every tile has as many vertices).
-    ahead_cost: u64,
 }
 
 impl Surfaces {
@@ -812,39 +779,6 @@ impl Surfaces {
     /// it to the wanted set with `priority` (projected size, pixels)
     /// unless it has arrived.
     fn want(&mut self, key: SurfaceKey, priority: f64) {
-        self.asked_ahead.remove(&key);
-        self.ask(key, priority);
-    }
-
-    /// [`Surfaces::want`] for the look-ahead (module docs): at a priority
-    /// below the view's, and left out of [`Surfaces::settled`] unless the
-    /// view asks for it too.
-    fn want_ahead(&mut self, key: SurfaceKey, priority: f64) {
-        if !self.tiles.contains_key(&key) && !self.charge_ahead() {
-            return;
-        }
-        if !self.asked.contains(&key) {
-            self.asked_ahead.insert(key);
-        }
-        self.ask(key, priority * LOOK_AHEAD_PRIORITY);
-    }
-
-    /// Takes one tile's bytes ([`Surfaces::ahead_cost`]) off the
-    /// look-ahead's room; `false`, leaving it as it was, when it has not
-    /// that much left.
-    fn charge_ahead(&mut self) -> bool {
-        match self.ahead_left {
-            None => true,
-            Some(left) if left >= self.ahead_cost => {
-                self.ahead_left = Some(left - self.ahead_cost);
-                true
-            }
-            Some(_) => false,
-        }
-    }
-
-    /// Asks for `key` at `priority` unless it has arrived.
-    fn ask(&mut self, key: SurfaceKey, priority: f64) {
         self.asked.insert(key);
         match self.tiles.entry(key) {
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -971,13 +905,9 @@ impl Surfaces {
     }
 
     /// Marks `key` wanted built by this selection and asks for its build
-    /// when it is compact (module docs). The first reason holds, except
-    /// that any other replaces the look-ahead.
+    /// when it is compact (module docs).
     fn want_built(&mut self, key: SurfaceKey, priority: f64, reason: BuiltReason) {
-        let held = self.want_built.entry(key).or_insert(reason);
-        if *held == BuiltReason::LookAhead {
-            *held = reason;
-        }
+        self.want_built.entry(key).or_insert(reason);
         if let Some(l) = self.layers.get_mut(&key) {
             l.wanted_at = self.now;
         }
@@ -1194,17 +1124,7 @@ impl Surfaces {
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
         self.used.clear();
-        // The look-ahead's room, less what it asked for or wants built
-        // that has not come back.
-        self.ahead_left = self.ahead_room.map(|room| {
-            let outstanding = (self.asked_ahead.iter())
-                .filter(|k| matches!(self.tiles.get(k), Some(State::Requested)))
-                .count()
-                + self.building.len();
-            room.saturating_sub(outstanding as u64 * self.ahead_cost)
-        });
         self.asked.clear();
-        self.asked_ahead.clear();
         self.want_built.clear();
         self.wanted = Some(Vec::new());
         for &frame in frames {
@@ -1271,44 +1191,16 @@ impl Surfaces {
             .filter_map(|k| self.summary(k).map(|s| s.occluder))
             .fold(f64::INFINITY, f64::min);
         let occluder = if occluder.is_finite() { occluder } else { 0.0 };
-        // A built level-0 tile's bytes: what a tile the look-ahead adds
-        // is counted as.
-        if let Some(cost) = (roots.iter())
-            .filter_map(|k| Some(self.layers.get(k)?.bytes(self.tiles.get(k)?)))
-            .max()
-        {
-            self.ahead_cost = self.ahead_cost.max(cost);
-        }
-        let ahead = if self.hold_ahead {
-            cone
-        } else {
-            (cone + LOOK_AHEAD_RADIANS).min(std::f64::consts::PI)
-        };
         let walk = Walk {
             cam,
             forward,
             focal,
             cone,
-            ahead,
             occluder,
             anchor,
         };
-        let start = drawn.len();
         for key in roots.into_iter().rev() {
             self.cover(key, &walk, drawn);
-        }
-        // One level of fallback: every drawn tile's parent stays built
-        // (module docs).
-        let parents: BTreeSet<SurfaceKey> = drawn[start..]
-            .iter()
-            .filter_map(|t| t.geometry.key.parent())
-            .collect();
-        for p in parents {
-            if let Some(ps) = self.summary(&p) {
-                let d = box_distance(cam, ps.bounds);
-                let px = ps.edge * focal / d.max(f64::MIN_POSITIVE);
-                self.want_built(p, px, BuiltReason::Fallback);
-            }
         }
     }
 
@@ -1366,9 +1258,6 @@ impl Surfaces {
             return matches!(self.tiles.get(&key), Some(State::Empty));
         };
         if !Self::visible(walk, &s) {
-            if walk.ahead > walk.cone {
-                self.look_ahead(key, &s, walk);
-            }
             return true;
         }
         let d = box_distance(walk.cam, s.bounds);
@@ -1435,47 +1324,6 @@ impl Surfaces {
         true
     }
 
-    /// Asks ahead in angle from `key`, with summary `s`, outside the view
-    /// cone (module docs): inside the look-ahead cone and not below the
-    /// horizon, the walk goes on as [`Surfaces::cover`] does in the view,
-    /// asking for children by the same distance rules, and wants built the
-    /// tiles it would draw, without drawing any.
-    fn look_ahead(&mut self, key: SurfaceKey, s: &TileSummary, walk: &Walk) {
-        self.used.insert(key);
-        if !in_cone(walk.cam, walk.forward, s.bounds, walk.ahead)
-            || below_horizon(walk.cam, s.bounds, walk.occluder)
-        {
-            return;
-        }
-        let d = box_distance(walk.cam, s.bounds);
-        let r = range(s.edge, s.max_edge, walk.focal) * self.detail_factor();
-        let px = 0.5 * s.edge * walk.focal / d.max(f64::MIN_POSITIVE);
-        if let Some(ch) = key.children() {
-            self.used.extend(ch);
-            if d < r * if self.hold_ahead { 1.0 } else { PREFETCH } {
-                for c in ch {
-                    self.want_ahead(c, px);
-                }
-            }
-            if d < r
-                && ch.iter().all(|c| self.arrived_for_split(c))
-                && ch.iter().any(|c| self.summary(c).is_some())
-            {
-                for c in ch.into_iter().rev() {
-                    if let Some(cs) = self.summary(&c) {
-                        self.look_ahead(c, &cs, walk);
-                    }
-                }
-                return;
-            }
-        }
-        let compact = matches!(self.tiles.get(&key), Some(State::Compact(_)));
-        if compact && !self.building.contains(&key) && !self.charge_ahead() {
-            return;
-        }
-        self.want_built(key, 2.0 * px * LOOK_AHEAD_PRIORITY, BuiltReason::LookAhead);
-    }
-
     /// Covers each of `children`, last first (the walk's order), and
     /// pushes what they draw onto `drawn` only when every one is covered.
     fn cover_by(
@@ -1520,14 +1368,12 @@ impl Surfaces {
 
     /// Whether every root and every tile the latest selection would split
     /// toward has arrived and is built: nothing requested or wanted built
-    /// is outstanding but what only the look-ahead wants (module docs).
+    /// is outstanding.
     pub fn settled(&self) -> bool {
-        let ahead = |k: &SurfaceKey| self.asked_ahead.contains(k);
-        let build_ahead = |k: &SurfaceKey| self.want_built.get(k) == Some(&BuiltReason::LookAhead);
-        self.requests.iter().all(ahead)
-            && self.builds.iter().all(|(k, _)| build_ahead(k))
-            && self.building.iter().all(build_ahead)
-            && !(self.tiles.iter()).any(|(k, s)| matches!(s, State::Requested) && !ahead(k))
+        self.requests.is_empty()
+            && self.builds.is_empty()
+            && self.building.is_empty()
+            && !self.tiles.values().any(|s| matches!(s, State::Requested))
     }
 
     /// Cached tiles, for the overlay.
@@ -1559,15 +1405,6 @@ impl Surfaces {
     /// what the view just left (`crate::budget::SETTLE_FRACTION`).
     pub fn set_keep_built(&mut self, keep: bool) {
         self.keep_built = keep;
-    }
-
-    /// Sets the bytes the look-ahead may add (module docs): the room the
-    /// memory budget leaves after the latest eviction pass, or `None` for
-    /// no limit. Each tile it asks for or wants built that is not already
-    /// held counts as a built level-0 tile, and so does each such tile not
-    /// yet come back; past the room it asks for and builds nothing more.
-    pub fn set_ahead_room(&mut self, room: Option<u64>) {
-        self.ahead_room = room;
     }
 
     /// Holds asking ahead ([`PREFETCH`]) while `hold` is `true`: the
@@ -1622,28 +1459,21 @@ impl Surfaces {
     }
 
     /// The first step of eviction over the budget (`crate::budget`):
-    /// while `over` bytes remain, built tiles that are not level-0 go
-    /// compact, least recently used first, the deepest on a tie: first
-    /// those only the look-ahead wants built, then those not wanted built
-    /// (drawn ones and their parents are): the ancestors the walk passes
-    /// through need only their summaries. Takes the bytes freed off `over` and
+    /// while `over` bytes remain, built tiles that are not level-0 and not
+    /// wanted built (drawn ones are) go compact, least recently used
+    /// first, the deepest on a tie: the ancestors the walk passes through
+    /// need only their summaries. Takes the bytes freed off `over` and
     /// returns how many tiles went compact.
     pub fn compact_over(&mut self, over: &mut u64) -> usize {
         if *over == 0 {
             return 0;
         }
         let mut items: Vec<crate::budget::Candidate<SurfaceKey>> = Vec::new();
-        let mut ahead: Vec<crate::budget::Candidate<SurfaceKey>> = Vec::new();
         for (k, l) in &self.layers {
-            if k.level == 0 || !l.built() || !l.can_compact() {
+            if k.level == 0 || !l.built() || !l.can_compact() || self.want_built.contains_key(k) {
                 continue;
             }
-            let list = match self.want_built.get(k) {
-                None => &mut items,
-                Some(BuiltReason::LookAhead) => &mut ahead,
-                Some(_) => continue,
-            };
-            list.push(crate::budget::Candidate {
+            items.push(crate::budget::Candidate {
                 last_used: l.used_at,
                 level: k.level,
                 key: *k,
@@ -1651,9 +1481,6 @@ impl Surfaces {
             });
         }
         crate::budget::sort_candidates(&mut items);
-        crate::budget::sort_candidates(&mut ahead);
-        ahead.append(&mut items);
-        let items = ahead;
         let mut done = 0;
         for c in items {
             if *over == 0 {
@@ -1725,10 +1552,6 @@ enum BuiltReason {
     /// It is split, beyond its split distance, and about to be drawn
     /// again.
     Join,
-    /// It is the parent of a drawn tile: one level of fallback.
-    Fallback,
-    /// Outside the view cone, the look-ahead would draw it.
-    LookAhead,
 }
 
 /// What one frame's selection walks with ([`Surfaces::select_in_frame`]).
@@ -1737,9 +1560,6 @@ struct Walk {
     forward: [f64; 3],
     focal: f64,
     cone: f64,
-    /// The look-ahead cone's half angle: `cone` while asking ahead is
-    /// held.
-    ahead: f64,
     occluder: f64,
     anchor: Anchor,
 }
@@ -1976,8 +1796,6 @@ impl Surfaces {
                     (_, Some(BuiltReason::Drawn)) => m.built_drawn += 1,
                     (_, Some(BuiltReason::Split)) => m.built_for_split += 1,
                     (_, Some(BuiltReason::Join)) => m.built_for_join += 1,
-                    (_, Some(BuiltReason::Fallback)) => m.built_fallback += 1,
-                    (_, Some(BuiltReason::LookAhead)) => m.built_look_ahead += 1,
                     (0, None) => m.built_level_0 += 1,
                     (_, None) => m.built_in_grace += 1,
                 }
@@ -2847,46 +2665,6 @@ pub(crate) mod tests {
     /// surface) lies in a tile of `drawn`: no point of the view is open,
     /// with no reference selection needed (for a moving camera).
     pub(crate) fn view_covered(drawn: &[TileDrawInfo], cam: [f64; 3], fwd: [f64; 3], r: f64) {
-        for (a, b, p) in view_points(cam, fwd, r, 8) {
-            assert!(
-                locate_drawn(drawn, p, usize::MAX).is_some(),
-                "the view is open at ({a}, {b})"
-            );
-        }
-    }
-
-    /// The largest number of levels a point of the view from `cam`
-    /// looking along `fwd` (the grid of [`view_covered`], `n` steps a
-    /// side, at radius `r`) went coarser from `before` to `drawn`: at each
-    /// point drawn in both, the level drawn before less the level drawn
-    /// now; 0 when no point went coarser.
-    pub(crate) fn largest_coarsening(
-        before: &[TileDrawInfo],
-        drawn: &[TileDrawInfo],
-        cam: [f64; 3],
-        fwd: [f64; 3],
-        r: f64,
-    ) -> i32 {
-        let mut most = 0;
-        for (_, _, p) in view_points(cam, fwd, r, 16) {
-            let (Some(b), Some(d)) = (
-                locate_drawn(before, p, usize::MAX),
-                locate_drawn(drawn, p, usize::MAX),
-            ) else {
-                continue;
-            };
-            let jump =
-                i32::from(before[b].geometry.key.level) - i32::from(drawn[d].geometry.key.level);
-            most = most.max(jump);
-        }
-        most
-    }
-
-    /// The directions, unit, of a grid of `n` by `n` steps over the middle
-    /// of the view from `cam` looking along `fwd`, where each ray first
-    /// reaches radius `r` from the center, with the grid coordinates.
-    fn view_points(cam: [f64; 3], fwd: [f64; 3], r: f64, n: u32) -> Vec<(f64, f64, [f64; 3])> {
-        let mut out = Vec::new();
         let norm = |a: [f64; 3]| {
             let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
             [a[0] / l, a[1] / l, a[2] / l]
@@ -2901,6 +2679,7 @@ pub(crate) mod tests {
         let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let u = norm(cross(fwd, norm(cam)));
         let v = cross(u, fwd);
+        let n = 8;
         for i in 0..=n {
             for j in 0..=n {
                 let (a, b) = (
@@ -2919,10 +2698,12 @@ pub(crate) mod tests {
                     continue;
                 }
                 let p: [f64; 3] = std::array::from_fn(|k| cam[k] + t * d[k]);
-                out.push((a, b, norm(p)));
+                assert!(
+                    locate_drawn(drawn, norm(p), usize::MAX).is_some(),
+                    "the view is open at ({a}, {b})"
+                );
             }
         }
-        out
     }
 
     #[test]
@@ -3008,8 +2789,6 @@ pub(crate) mod tests {
                     m.built_drawn
                         + m.built_for_split
                         + m.built_for_join
-                        + m.built_fallback
-                        + m.built_look_ahead
                         + m.built_level_0
                         + m.built_in_grace,
                     m.built
@@ -3024,57 +2803,6 @@ pub(crate) mod tests {
                 drawn.len()
             );
             assert!(built.len() < arrived);
-        }
-    }
-
-    #[test]
-    fn a_still_camera_holds_built_what_it_draws_its_parents_and_the_look_ahead() {
-        for height in [1.8e4, 3000.0] {
-            let mut s = Surfaces::new();
-            let (cam, forward) = low_camera(height);
-            settle_compact(&mut s, cam, forward, 11, 0.0);
-            let drawn = compact_round(&mut s, cam, forward, 11, 1.0 + BUILT_GRACE_SECONDS);
-            let drawn = by_key(&drawn);
-            let built = built_keys(&s);
-            let bytes = |keys: &mut dyn Iterator<Item = &SurfaceKey>| -> u64 {
-                keys.map(|k| s.layers[k].bytes(&s.tiles[k])).sum()
-            };
-            let parents: BTreeSet<SurfaceKey> = drawn.keys().filter_map(|k| k.parent()).collect();
-            let ahead: BTreeSet<SurfaceKey> = (s.want_built.iter())
-                .filter(|(_, r)| **r == BuiltReason::LookAhead)
-                .map(|(k, _)| *k)
-                .collect();
-            for k in &built {
-                assert!(
-                    k.level == 0
-                        || drawn.contains_key(k)
-                        || parents.contains(k)
-                        || ahead.contains(k),
-                    "{k} built at {height} m"
-                );
-            }
-            let held_parents: Vec<&SurfaceKey> =
-                built.iter().filter(|k| parents.contains(k)).collect();
-            let held_ahead: Vec<&SurfaceKey> = built.iter().filter(|k| ahead.contains(k)).collect();
-            assert_eq!(held_parents.len(), parents.len(), "{height} m");
-            println!(
-                "still {height} m: {} built in {} bytes, {} drawn in {} bytes, {} parents in {} bytes, {} look-ahead in {} bytes, held {}",
-                built.len(),
-                bytes(&mut built.iter()),
-                drawn.len(),
-                bytes(&mut drawn.keys()),
-                held_parents.len(),
-                bytes(&mut held_parents.into_iter()),
-                held_ahead.len(),
-                bytes(&mut held_ahead.into_iter()),
-                s.held_bytes()
-            );
-            #[cfg(feature = "memory-report")]
-            {
-                let m = s.memory();
-                assert_eq!(m.built_fallback, parents.len(), "{height} m");
-                assert_eq!(m.built_look_ahead, ahead.len(), "{height} m");
-            }
         }
     }
 

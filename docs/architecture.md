@@ -213,25 +213,19 @@ to a limit (`budget::Detail::limit`): the budget while the camera moves,
 and 70 percent of it (`budget::SETTLE_FRACTION`) once the camera has
 been still for 2 s (`budget::DETAIL_WAIT_SECONDS`), so a still view
 leaves about 30 percent free for the tiles a pan or a zoom brings in.
-The surface selection's look-ahead in angle (`tiles` module docs) adds
-at most the room the limit leaves after a pass (`Surfaces::set_ahead_room`:
-up to 90 percent of the limit while the camera moves, up to 0.64 of it
-while still, so it never takes the room a step up in detail needs), and
-is held with asking ahead. Under the limit nothing is evicted for size (cells still age out after
+Under the limit nothing is evicted for size (cells still age out after
 60 s). While over it, in this order:
 
-1. Built tiles not level-0 wanted built only by the look-ahead, then
-   built tiles not level-0 and not wanted built (drawn tiles and their
-   parents are), go compact, least recently looked at first; the
-   ancestors the selection walks need only their summaries.
+1. Built tiles not level-0 and not wanted built (drawn tiles are) go
+   compact, least recently looked at first; the ancestors the selection
+   walks need only their summaries.
 2. Compact tiles, cells, and meshes not drawn and not in the current
    target go, least recently used first, the deepest level first on a tie
    (then by key, so the order is the same on every run).
 
 What the current frame draws, the ancestors the selection walks to reach
 it, level-0 tiles, the tiles the latest selection wants built (drawn,
-parents of drawn tiles, children a split waits on, split tiles about to
-join) or asked for, the
+children a split waits on, split tiles about to join) or asked for, the
 cell target, and pinned cells are never evicted, even over the limit.
 The rest of the selection's `used` set protects nothing past the budget.
 
@@ -304,9 +298,6 @@ unchanged. With it:
     geometries), and the built tiles by reason: `built_drawn`,
     `built_for_split` (children a drawn tile's split waits for),
     `built_for_join` (split tiles about to be drawn again),
-    `built_fallback` (parents of drawn tiles, one level of fallback),
-    `built_look_ahead` (tiles the look-ahead outside the view cone would
-    draw),
     `built_level_0`, and `built_in_grace` (within the grace time); the
     selection's `used` set and `drawn` count; `geometries` and
     `geometry_bytes`, every distinct `TileGeometry` held (tile states,
