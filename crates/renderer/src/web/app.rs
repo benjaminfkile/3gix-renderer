@@ -174,7 +174,11 @@ fn api_stats(world: &World, fetcher: &WebFetcher, scene: &Scene, fps: f64) -> cr
             .iter()
             .map(|d| d.mesh.triangle_count())
             .sum::<usize>()
-            + scene.tiles.len() * gx_core::surface::TILE_QUADS * gx_core::surface::TILE_QUADS * 2,
+            + scene
+                .tiles
+                .iter()
+                .map(|d| d.tile.indices.len() / 3)
+                .sum::<usize>(),
         cells_drawn: scene.surfaces.len(),
         streaming: world.counts().cache.pending,
         computing: m.module_runs,

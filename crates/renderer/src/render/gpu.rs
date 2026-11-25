@@ -1857,9 +1857,13 @@ impl Renderer {
                         &[((first_tile + i) as u64 * MODEL_STRIDE) as u32],
                     );
                     pass.set_vertex_buffer(0, g.vertices.slice(..));
-                    pass.draw_indexed(0..self.tile_index_count, 0, 0..1);
+                    // The whole index list or one quarter's range
+                    // (`crate::tiles::quarter_indices`).
+                    let range = t.indices.start.min(self.tile_index_count)
+                        ..t.indices.end.min(self.tile_index_count);
+                    stats.triangles += range.len() / 3;
+                    pass.draw_indexed(range, 0, 0..1);
                     stats.meshes += 1;
-                    stats.triangles += self.tile_index_count as usize / 3;
                 }
             }
         }
@@ -2244,6 +2248,7 @@ mod tile_vertex_tests {
                 generation: 3,
             },
             morph: [1.0e5, 2.0e5],
+            indices: crate::tiles::WHOLE_INDICES,
         };
         let bytes = |t: &TileDrawInfo| -> Vec<u8> {
             bytemuck::cast_slice(&tile_vertices(t, &mut EmissionTable::new())).to_vec()

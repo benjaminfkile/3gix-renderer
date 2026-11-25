@@ -978,6 +978,7 @@ mod queries {
                 generation: 0,
             },
             morph,
+            indices: renderer::tiles::WHOLE_INDICES,
         }
     }
 

@@ -1125,7 +1125,10 @@ impl World {
                 {
                     continue;
                 }
-                for tri in indices.as_chunks::<3>().0 {
+                for tri in indices[t.indices.start as usize..t.indices.end as usize]
+                    .as_chunks::<3>()
+                    .0
+                {
                     let [a, b, c] = tri.map(|i| g.positions[i as usize]);
                     if let Some(t) = ray_triangle(d, a, b, c) {
                         if best.is_none_or(|r| t > r) {
@@ -1981,5 +1984,133 @@ mod tests {
                 "under the budget, tiles drawn before the pan were built again: {again:?}"
             );
         }
+    }
+
+    /// `rig` turned `angle` radians about the local up at its place.
+    fn rig_turned(rig: &SurfaceRig, angle: f64) -> (Camera, [f64; 3]) {
+        let c = rig.cam;
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let k: [f64; 3] = std::array::from_fn(|n| c[n] / l);
+        let v = rig.forward;
+        let kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+        let kxv = [
+            k[1] * v[2] - k[2] * v[1],
+            k[2] * v[0] - k[0] * v[2],
+            k[0] * v[1] - k[1] * v[0],
+        ];
+        let (sn, cs) = angle.sin_cos();
+        let f: [f64; 3] = std::array::from_fn(|n| v[n] * cs + kxv[n] * sn + k[n] * kv * (1.0 - cs));
+        let mut camera = rig.camera;
+        camera.orientation =
+            crate::camera::look_rotation(Vec3::new(f[0], f[1], f[2]), Vec3::new(k[0], k[1], k[2]));
+        (camera, f)
+    }
+
+    /// The level drawn at each point of a grid over the middle of the
+    /// view from `cam` along `fwd` (the grid of
+    /// [`crate::tiles::tests::view_covered`]), by face direction; each
+    /// point is drawn by exactly one tile or quarter.
+    fn levels_in_view(
+        drawn: &[crate::tiles::TileDrawInfo],
+        cam: [f64; 3],
+        fwd: [f64; 3],
+    ) -> Vec<([f64; 3], u8)> {
+        let norm = |a: [f64; 3]| {
+            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            [a[0] / l, a[1] / l, a[2] / l]
+        };
+        let cross = |a: [f64; 3], b: [f64; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let u = norm(cross(fwd, norm(cam)));
+        let v = cross(u, fwd);
+        let n = 16;
+        let mut out = Vec::new();
+        for i in 0..=n {
+            for j in 0..=n {
+                let (a, b) = (
+                    0.4 * (2.0 * f64::from(i) / f64::from(n) - 1.0),
+                    0.3 * (2.0 * f64::from(j) / f64::from(n) - 1.0),
+                );
+                let d = norm(std::array::from_fn(|k| fwd[k] + a * u[k] + b * v[k]));
+                let (bh, c) = (dot(cam, d), dot(cam, cam) - BELOW_SURFACE * BELOW_SURFACE);
+                let disc = bh * bh - c;
+                if disc < 0.0 || -bh - disc.sqrt() <= 0.0 {
+                    continue;
+                }
+                let t = -bh - disc.sqrt();
+                let p = norm(std::array::from_fn(|k| cam[k] + t * d[k]));
+                let at = crate::tiles::tests::drawn_at(drawn, p);
+                assert_eq!(
+                    at.len(),
+                    1,
+                    "the view at ({a}, {b}) is drawn {} times: {:?}",
+                    at.len(),
+                    at.iter()
+                        .map(|&n| (drawn[n].geometry.key, drawn[n].indices.clone()))
+                        .collect::<Vec<_>>()
+                );
+                out.push((p, drawn[at[0]].geometry.key.level));
+            }
+        }
+        out
+    }
+
+    /// The turn of `world` settled at `rig`: 4 s at 90 degrees a second,
+    /// 60 frames a second, every request answered and every build done
+    /// each frame. Every frame covers the view once; returns the largest
+    /// step coarser at a point between consecutive frames, the peak held
+    /// bytes, and the drawn quarters seen.
+    fn turn(world: &mut World, rig: &SurfaceRig, now: &mut f64) -> (u8, u64, usize) {
+        let mut before: Vec<crate::tiles::TileDrawInfo> = world.surfaces().drawn().to_vec();
+        let (mut jump, mut peak, mut quarters) = (0u8, 0u64, 0usize);
+        for i in 1..=240 {
+            *now += 1.0 / 60.0;
+            let angle = std::f64::consts::FRAC_PI_2 * f64::from(i) / 60.0;
+            let (camera, fwd) = rig_turned(rig, angle);
+            surface_frame_keys(world, rig, &camera, *now);
+            let drawn = world.surfaces().drawn().to_vec();
+            quarters += drawn.iter().filter(|t| t.is_part()).count();
+            for (p, level) in levels_in_view(&drawn, rig.cam, fwd) {
+                let was = crate::tiles::tests::drawn_at(&before, p);
+                if let Some(&w) = was.first() {
+                    let w = before[w].geometry.key.level;
+                    jump = jump.max(w.saturating_sub(level));
+                }
+            }
+            peak = peak.max(world.held_bytes());
+            before = drawn;
+        }
+        (jump, peak, quarters)
+    }
+
+    #[test]
+    fn a_turn_covers_the_view_and_falls_back_one_level() {
+        let rig = surface_rig();
+        // The default budget.
+        let mut world = World::new(0);
+        let mut now = 0.0;
+        settle_surfaces(&mut world, &rig, &mut now);
+        let budget = world.memory_budget();
+        let (jump, peak, quarters) = turn(&mut world, &rig, &mut now);
+        println!(
+            "turn at the default budget: largest jump {jump} levels, peak held {peak} of {budget}, drawn quarters over the turn {quarters}"
+        );
+        assert!(peak <= budget, "{peak} bytes over {budget}");
+        assert!(jump <= 1, "a point fell back {jump} levels");
+        // The M7 over-budget setting: 70 percent of what the view needs.
+        let (mut world, budget, mut now) = settled_at_seventy_percent(&rig);
+        let (jump, peak, quarters) = turn(&mut world, &rig, &mut now);
+        println!(
+            "turn at 70 percent: largest jump {jump} levels, peak held {peak} of {budget}, drawn quarters over the turn {quarters}, detail {}",
+            world.detail_factor()
+        );
+        assert!(peak <= budget, "{peak} bytes over {budget}");
+        assert!(jump <= 1, "a point fell back {jump} levels");
     }
 }
