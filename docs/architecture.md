@@ -211,8 +211,9 @@ latest cell pass instead of counting every cell again. Under the
 budget nothing is evicted for size (cells still age out after 60 s).
 While over it, in this order:
 
-1. Built tiles not drawn and not wanted built go compact, least recently
-   looked at first.
+1. Built tiles not level-0 and not wanted built (drawn tiles are) go
+   compact, least recently looked at first; the ancestors the selection
+   walks need only their summaries.
 2. Compact tiles, cells, and meshes not drawn and not in the current
    target go, least recently used first, the deepest level first on a tie
    (then by key, so the order is the same on every run).
@@ -261,7 +262,10 @@ unchanged. With it:
   - `surfaces`: entries `requested`, `ready` (built or compact),
     `empty`, `gone`; `compact` and `compact_bytes` (section bytes,
     summaries, overlays), `built` and `built_bytes` (the same plus their
-    geometries); the
+    geometries), and the built tiles by reason: `built_drawn`,
+    `built_for_split` (children a drawn tile's split waits for),
+    `built_for_join` (split tiles about to be drawn again),
+    `built_level_0`, and `built_in_grace` (within the grace time); the
     selection's `used` set and `drawn` count; `geometries` and
     `geometry_bytes`, every distinct `TileGeometry` held (tile states,
     bases, the drawn list): each one's material plus each distinct
@@ -421,13 +425,19 @@ tile arrived. A hidden overlay is never waited for, and level-0 tiles draw
 as soon as their surface tiles arrive.
 
 An arrived tile is held built (its geometry) or compact (its surface
-section bytes, its overlays, and a `tiles::TileSummary`). It is built
-while it is drawn, while it is a level-0 tile, or while its parent is
-within its split distance; a compact tile wanted built is built off the
+section bytes, its overlays, and a `tiles::TileSummary`). The selection
+walks on summaries, so only drawn tiles need geometry. A tile is built
+while it is drawn, while it is a level-0 tile, while it is a child (in
+the view cone, not below the horizon) of a drawn tile within its split
+distance, or while it is split, beyond its split distance, and about to
+be drawn again; split ancestors the walk passes through are not; a
+compact tile wanted built is built off the
 frame thread (`tiles::Surfaces::take_builds`, on the native fetcher's
 decode threads, in the browser fetcher's slice of at most
-`web::fetch::BUILD_SLICE_SECONDS`, largest projected size first). A child
-counts as arrived for a split only once it is built. A built tile not
+`web::fetch::BUILD_SLICE_SECONDS`, largest projected size first). A tile
+splits only when the tiles its children will draw are built; a split
+tile beyond its split distance and not built keeps drawing its children
+until it is built, then joins. A built tile not
 wanted built for `tiles::BUILT_GRACE_SECONDS` (2 s) goes back to compact.
 
 1. **Selection** (`stream::select_all`, run by `selector` on its own thread natively and inline in the browser, when results arrive, when the camera or view changes, and every 100 ms). Pixel error, view cone, and refinability from occupancy only; no occlusion culling and no shape model (`rendering.md` 1.1 and 3.1). It builds the target (asking up to three depths ahead of what has arrived, balanced 2:1) and the drawn selection (only arrived cells, split only when every child and its same-depth neighbors have arrived). The `stream` module docs have the details; `rendering.md` is the contract.

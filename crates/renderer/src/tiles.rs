@@ -30,15 +30,27 @@
 //!
 //! An arrived tile is held in one of two forms (`rendering.md` sections
 //! 3.5 and 4): built, with its geometry, or compact, with only its
-//! surface section bytes, its overlays, and a [`TileSummary`]. A tile is
-//! built while it is drawn, while it is a level-0 tile, or while it is a
-//! child of a tile the selection walks within that tile's [`range`];
-//! every other arrived tile goes back to compact [`BUILT_GRACE_SECONDS`]
-//! after it was last wanted built. A compact tile wanted built is handed
-//! to the fetcher ([`Surfaces::take_builds`]), which builds it off the
-//! frame thread ([`build_tile`]) and hands the geometry back
-//! ([`Surfaces::complete_build`]). A child counts as arrived for a split
-//! only once it is built, so its parent keeps drawing until then.
+//! surface section bytes, its overlays, and a [`TileSummary`]. The
+//! selection walks on summaries: visibility, distance, splitting, and
+//! asking ahead read each arrived tile's summary, built or compact, and
+//! only a tile pushed to be drawn needs its geometry. A tile is wanted
+//! built while it is drawn; while it is a child, in the view cone and
+//! not below the horizon, of a drawn tile within its [`range`] (the
+//! children that tile's split will draw); and while it is split, beyond
+//! its [`range`], and not built (it is about to be drawn again). Level-0
+//! tiles stay built; every other arrived tile, the split ancestors the
+//! walk only passes through among them, goes back to compact
+//! [`BUILT_GRACE_SECONDS`] after it was last wanted built. A compact tile
+//! wanted built is handed to the fetcher ([`Surfaces::take_builds`]),
+//! which builds it off the frame thread ([`build_tile`]) and hands the
+//! geometry back ([`Surfaces::complete_build`]).
+//!
+//! The view is never open (`rendering.md` 3.3): a tile splits only when
+//! the tiles its children will draw are built, so its parent keeps
+//! drawing until then; a split tile beyond its [`range`] that is not
+//! built keeps drawing its built children until it is, then joins, so
+//! the view is briefly finer than needed. Where a part of the view cannot
+//! be covered yet with built tiles, the nearest built ancestor is drawn.
 
 use crate::camera::Camera;
 use crate::farfield::focal_px;
@@ -693,8 +705,9 @@ pub struct Surfaces {
     /// The time, seconds, of the latest selection: the clock tiles'
     /// arrivals and [`OVERLAY_WAIT_SECONDS`] are measured on.
     now: f64,
-    /// The tiles the latest selection wants built (module docs).
-    want_built: std::collections::HashSet<SurfaceKey>,
+    /// The tiles the latest selection wants built, each with why
+    /// (module docs).
+    want_built: HashMap<SurfaceKey, BuiltReason>,
     /// Compact tiles wanted built and not yet handed to the fetcher, with
     /// their projected size, pixels.
     builds: Vec<(SurfaceKey, f64)>,
@@ -870,8 +883,8 @@ impl Surfaces {
 
     /// Marks `key` wanted built by this selection and asks for its build
     /// when it is compact (module docs).
-    fn want_built(&mut self, key: SurfaceKey, priority: f64) {
-        self.want_built.insert(key);
+    fn want_built(&mut self, key: SurfaceKey, priority: f64, reason: BuiltReason) {
+        self.want_built.entry(key).or_insert(reason);
         if let Some(l) = self.layers.get_mut(&key) {
             l.wanted_at = self.now;
         }
@@ -978,7 +991,7 @@ impl Surfaces {
                 let arrived_at = held.as_ref().map_or(self.now, |h| h.arrived_at);
                 // Kept built only when wanted built now or within the
                 // grace time (module docs); level-0 tiles always are.
-                let wanted_at = if key.level == 0 || self.want_built.contains(&key) {
+                let wanted_at = if key.level == 0 || self.want_built.contains_key(&key) {
                     self.now
                 } else {
                     held.as_ref().map_or(f64::NEG_INFINITY, |h| h.wanted_at)
@@ -1054,26 +1067,6 @@ impl Surfaces {
                     .any(|s| matches!(s, Some(State::Ready(_) | State::Compact(_))));
                 self.has_surface.insert(frame_id, any);
             }
-        }
-    }
-
-    /// Whether `key` has arrived as far as a split needs (`rendering.md`
-    /// section 7 item 6): it is empty, or it is built and
-    /// every shown overlay layer has arrived for it, failed for it, or is
-    /// not `required` and [`OVERLAY_WAIT_SECONDS`] have passed since its
-    /// surface tile arrived. A hidden overlay is never waited for.
-    fn arrived_for_split(&self, key: &SurfaceKey) -> bool {
-        match self.tiles.get(key) {
-            Some(State::Empty) => true,
-            Some(State::Ready(_)) => self.layers.get(key).is_none_or(|l| {
-                let waited = self.now - l.arrived_at >= OVERLAY_WAIT_SECONDS;
-                l.waiting.iter().all(|layer| {
-                    self.hidden.contains(layer)
-                        || l.failed.contains(layer)
-                        || (waited && !self.required.contains(layer))
-                })
-            }),
-            _ => false,
         }
     }
 
@@ -1154,7 +1147,7 @@ impl Surfaces {
         drawn: &mut Vec<TileDrawInfo>,
     ) {
         let anchor = self.anchor(frame, cam);
-        let mut stack: Vec<SurfaceKey> = (0..SURFACE_FACES)
+        let roots: Vec<SurfaceKey> = (0..SURFACE_FACES)
             .map(|face| SurfaceKey {
                 frame_id: frame,
                 face,
@@ -1165,69 +1158,160 @@ impl Surfaces {
             .collect();
         // The ball the frame's surface never dips into, from its level-0
         // tiles' declared floor (`rendering.md` 7.2); none, no hiding.
-        let occluder = stack
+        let occluder = roots
             .iter()
-            .filter_map(|k| self.ready(k).map(|g| g.occluder))
+            .filter_map(|k| self.summary(k).map(|s| s.occluder))
             .fold(f64::INFINITY, f64::min);
         let occluder = if occluder.is_finite() { occluder } else { 0.0 };
-        while let Some(key) = stack.pop() {
-            self.used.insert(key);
-            let Some(geo) = self.ready(&key).cloned() else {
-                continue;
-            };
-            // Outside the view, or behind the reference shape as seen
-            // from the camera, nothing is drawn or refined.
-            if !in_cone(cam, forward, geo.bounds, cone) || below_horizon(cam, geo.bounds, occluder)
-            {
-                continue;
-            }
-            let d = box_distance(cam, geo.bounds);
-            let r = range(geo.edge, geo.max_edge, focal);
-            let children = key.children();
-            if let Some(ch) = children {
-                self.used.extend(ch);
-                // A child's projected edge: half the parent's.
-                let px = 0.5 * geo.edge * focal / d.max(f64::MIN_POSITIVE);
-                if d < r * if self.hold_ahead { 1.0 } else { PREFETCH } {
-                    for c in ch {
-                        self.want(c, px);
-                    }
-                }
-                // Within the split distance the children are wanted
-                // built, split or waiting on them (module docs).
-                if d < r {
-                    for c in ch {
-                        self.want_built(c, px);
-                    }
-                }
-            }
-            let split = d < r
-                && children.is_some_and(|ch| {
-                    // Every child arrived with the overlays it waits for
-                    // (`rendering.md` 7.6), and at least one has a
-                    // surface: deeper keys a module leaves empty end
-                    // the refinement at this tile. Level-0 tiles have no
-                    // parent and are drawn without waiting.
-                    ch.iter().all(|c| self.arrived_for_split(c))
-                        && ch.iter().any(|c| self.ready(c).is_some())
-                });
-            if split {
-                stack.extend(children.into_iter().flatten());
-                continue;
-            }
-            let morph = if key.level == 0 {
-                [f32::INFINITY; 2]
-            } else {
-                let parent_range = r * 2.0;
-                [(MORPH_START * parent_range) as f32, parent_range as f32]
-            };
-            self.want_built(key, f64::INFINITY);
-            drawn.push(TileDrawInfo {
-                geometry: geo,
-                anchor,
-                morph,
-            });
+        let walk = Walk {
+            cam,
+            forward,
+            focal,
+            cone,
+            occluder,
+            anchor,
+        };
+        for key in roots.into_iter().rev() {
+            self.cover(key, &walk, drawn);
         }
+    }
+
+    /// What the selection holds of `key` without its geometry: its
+    /// summary, built or compact (`rendering.md` 3.5).
+    fn summary(&self, key: &SurfaceKey) -> Option<TileSummary> {
+        match self.tiles.get(key) {
+            Some(State::Ready(g)) => Some(TileSummary::of(g)),
+            Some(State::Compact(s)) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// Whether a tile with `summary` is in the view and not below the
+    /// horizon: otherwise nothing of it is drawn or refined.
+    fn visible(walk: &Walk, summary: &TileSummary) -> bool {
+        in_cone(walk.cam, walk.forward, summary.bounds, walk.cone)
+            && !below_horizon(walk.cam, summary.bounds, walk.occluder)
+    }
+
+    /// Whether `key` may take its part in its parent's split before its
+    /// geometry is needed: it is empty, or it has arrived with a surface
+    /// and the overlays it waits for (`rendering.md` section 7 item 6):
+    /// every shown overlay layer has arrived for it, failed for it, or is
+    /// not `required` and [`OVERLAY_WAIT_SECONDS`] have passed since its
+    /// surface tile arrived. A hidden overlay is never waited for.
+    fn arrived_for_split(&self, key: &SurfaceKey) -> bool {
+        match self.tiles.get(key) {
+            Some(State::Empty) => true,
+            Some(State::Ready(_) | State::Compact(_)) => self.layers.get(key).is_none_or(|l| {
+                let waited = self.now - l.arrived_at >= OVERLAY_WAIT_SECONDS;
+                l.waiting.iter().all(|layer| {
+                    self.hidden.contains(layer)
+                        || l.failed.contains(layer)
+                        || (waited && !self.required.contains(layer))
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    /// Covers the part of the view `key` holds (module docs), pushing
+    /// what it draws onto `drawn` in walk order. The walk reads only
+    /// summaries; geometry is needed only for a tile drawn. A tile within
+    /// its split distance splits when its children cover their parts; a
+    /// tile beyond it is drawn when built, and covered by its children
+    /// until it is (it is about to join). Returns `false`, pushing
+    /// nothing, when the part cannot be covered yet with built tiles, so
+    /// the caller draws a coarser tile instead and the view is never open
+    /// (`rendering.md` 3.3).
+    fn cover(&mut self, key: SurfaceKey, walk: &Walk, drawn: &mut Vec<TileDrawInfo>) -> bool {
+        self.used.insert(key);
+        let Some(s) = self.summary(&key) else {
+            // Empty: nothing to draw. Not arrived: nothing to draw with.
+            return matches!(self.tiles.get(&key), Some(State::Empty));
+        };
+        if !Self::visible(walk, &s) {
+            return true;
+        }
+        let d = box_distance(walk.cam, s.bounds);
+        let r = range(s.edge, s.max_edge, walk.focal);
+        let children = key.children();
+        // A child's projected edge: half the parent's.
+        let px = 0.5 * s.edge * walk.focal / d.max(f64::MIN_POSITIVE);
+        if let Some(ch) = children {
+            self.used.extend(ch);
+            if d < r * if self.hold_ahead { 1.0 } else { PREFETCH } {
+                for c in ch {
+                    self.want(c, px);
+                }
+            }
+        }
+        let built = matches!(self.tiles.get(&key), Some(State::Ready(_)));
+        if d < r {
+            if let Some(ch) = children {
+                // Every child arrived with the overlays it waits for
+                // (`rendering.md` 7.6), and at least one has a surface:
+                // deeper keys a module leaves empty end the refinement at
+                // this tile.
+                let arrived = ch.iter().all(|c| self.arrived_for_split(c))
+                    && ch.iter().any(|c| self.summary(c).is_some());
+                if arrived && self.cover_by(ch, walk, drawn) {
+                    return true;
+                }
+                // Not split yet: the children the split will draw are
+                // wanted built (module docs).
+                for c in ch {
+                    if self.summary(&c).is_some_and(|cs| Self::visible(walk, &cs)) {
+                        self.want_built(c, px, BuiltReason::Split);
+                    }
+                }
+            }
+            if !built {
+                return false;
+            }
+        } else if !built {
+            // Beyond its split distance and not built: its built children
+            // keep drawing until it is, then it joins.
+            self.want_built(key, 2.0 * px, BuiltReason::Join);
+            let covered = children.is_some_and(|ch| {
+                ch.iter().all(|c| self.arrived_for_split(c)) && self.cover_by(ch, walk, drawn)
+            });
+            return covered;
+        }
+        let Some(State::Ready(geo)) = self.tiles.get(&key) else {
+            return false;
+        };
+        let geo = Arc::clone(geo);
+        let morph = if key.level == 0 {
+            [f32::INFINITY; 2]
+        } else {
+            let parent_range = r * 2.0;
+            [(MORPH_START * parent_range) as f32, parent_range as f32]
+        };
+        self.want_built(key, f64::INFINITY, BuiltReason::Drawn);
+        drawn.push(TileDrawInfo {
+            geometry: geo,
+            anchor: walk.anchor,
+            morph,
+        });
+        true
+    }
+
+    /// Covers each of `children`, last first (the walk's order), and
+    /// pushes what they draw onto `drawn` only when every one is covered.
+    fn cover_by(
+        &mut self,
+        children: [SurfaceKey; 4],
+        walk: &Walk,
+        drawn: &mut Vec<TileDrawInfo>,
+    ) -> bool {
+        let mut part = Vec::new();
+        for c in children.into_iter().rev() {
+            if !self.cover(c, walk, &mut part) {
+                return false;
+            }
+        }
+        drawn.append(&mut part);
+        true
     }
 
     /// The tiles of the latest selection.
@@ -1325,23 +1409,18 @@ impl Surfaces {
     }
 
     /// The first step of eviction over the budget (`crate::budget`):
-    /// while `over` bytes remain, built tiles that are not level-0, not
-    /// drawn or walked to, and not wanted built go compact, least recently
-    /// used first, the deepest on a tie. Takes the bytes freed off `over`
-    /// and returns how many tiles went compact.
+    /// while `over` bytes remain, built tiles that are not level-0 and not
+    /// wanted built (drawn ones are) go compact, least recently used
+    /// first, the deepest on a tie: the ancestors the walk passes through
+    /// need only their summaries. Takes the bytes freed off `over` and
+    /// returns how many tiles went compact.
     pub fn compact_over(&mut self, over: &mut u64) -> usize {
         if *over == 0 {
             return 0;
         }
-        let keep = self.drawn_and_ancestors();
         let mut items: Vec<crate::budget::Candidate<SurfaceKey>> = Vec::new();
         for (k, l) in &self.layers {
-            if k.level == 0
-                || !l.built()
-                || !l.can_compact()
-                || keep.contains(k)
-                || self.want_built.contains(k)
-            {
+            if k.level == 0 || !l.built() || !l.can_compact() || self.want_built.contains_key(k) {
                 continue;
             }
             items.push(crate::budget::Candidate {
@@ -1383,7 +1462,7 @@ impl Surfaces {
                 continue;
             }
             let l = self.layers.get(k);
-            if l.is_some_and(|l| l.built()) && self.want_built.contains(k) {
+            if l.is_some_and(|l| l.built()) && self.want_built.contains_key(k) {
                 continue;
             }
             out.push(crate::budget::Candidate {
@@ -1407,6 +1486,28 @@ impl Surfaces {
         let tiles = &self.tiles;
         self.builds.retain(|(k, _)| tiles.contains_key(k));
     }
+}
+
+/// Why the selection wants a tile built (module docs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BuiltReason {
+    /// It is drawn.
+    Drawn,
+    /// It is a child its drawn parent's split will draw.
+    Split,
+    /// It is split, beyond its split distance, and about to be drawn
+    /// again.
+    Join,
+}
+
+/// What one frame's selection walks with ([`Surfaces::select_in_frame`]).
+struct Walk {
+    cam: [f64; 3],
+    forward: [f64; 3],
+    focal: f64,
+    cone: f64,
+    occluder: f64,
+    anchor: Anchor,
 }
 
 /// One non-empty base surface of a tile: its section, kept to build it
@@ -1637,6 +1738,13 @@ impl Surfaces {
                 bytes += own.values().sum::<u64>() + own_shapes.values().sum::<u64>();
                 m.built += 1;
                 m.built_bytes += bytes;
+                match (key.level, self.want_built.get(key)) {
+                    (_, Some(BuiltReason::Drawn)) => m.built_drawn += 1,
+                    (_, Some(BuiltReason::Split)) => m.built_for_split += 1,
+                    (_, Some(BuiltReason::Join)) => m.built_for_join += 1,
+                    (0, None) => m.built_level_0 += 1,
+                    (_, None) => m.built_in_grace += 1,
+                }
             } else {
                 m.compact += 1;
                 m.compact_bytes += bytes;
@@ -2359,13 +2467,16 @@ mod tests {
                 assert_eq!(t.morph, want[k].morph);
             }
             levels.extend(got.keys().map(|k| k.level));
-            // Built: the drawn tiles and the children of the tiles within
-            // their split distance (wanted built), and the roots.
+            // Built: the roots, the tiles wanted built (drawn, waiting for
+            // a split, about to join), and ancestors the walk just split
+            // through, within the grace time.
             let built = built_keys(&s);
-            let roots = built.iter().filter(|k| k.level == 0).count();
-            assert!(built.len() <= drawn.len() + s.want_built.len() + roots);
             for k in &built {
-                assert!(k.level == 0 || s.want_built.contains(k), "{k} built");
+                let in_grace = now - s.layers[k].wanted_at < BUILT_GRACE_SECONDS;
+                assert!(
+                    k.level == 0 || s.want_built.contains_key(k) || in_grace,
+                    "{k} built"
+                );
             }
             // Far more arrived than are built.
             if height < 1.0e5 {
@@ -2405,6 +2516,172 @@ mod tests {
         );
         for (k, t) in &before {
             assert_eq!(t.geometry, after[k].geometry, "{k}");
+        }
+    }
+
+    /// [`compact_round`] with builds that take time: requests are answered
+    /// at once, but only `per_round` builds of `queue` finish each round,
+    /// largest first, the rest waiting in `queue` as a fetcher holds them.
+    fn slow_round(
+        s: &mut Surfaces,
+        queue: &mut Vec<BuildRequest>,
+        cam: [f64; 3],
+        forward: [f64; 3],
+        now: f64,
+        per_round: usize,
+    ) -> Vec<TileDrawInfo> {
+        s.now = now;
+        for key in s.take_requests() {
+            let bytes = gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
+            let outcome = if key.level <= 11 {
+                decode_tile(&key, &[bytes], &[0], &BTreeSet::new())
+            } else {
+                Ok(DecodedTile::default())
+            };
+            s.complete_layers(key, outcome, false);
+        }
+        queue.extend(s.take_builds());
+        sort_builds(queue);
+        for req in queue.drain(..per_round.min(queue.len())) {
+            let outcome = build_tile(&req);
+            s.complete_build(req.key, outcome);
+        }
+        s.want_built.clear();
+        let mut drawn = Vec::new();
+        s.select_in_frame(
+            4,
+            cam,
+            forward,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            0.9,
+            &mut drawn,
+        );
+        s.compact_unwanted();
+        drawn
+    }
+
+    /// Every vertex of every tile in `reference` that is well inside the
+    /// view (a narrower cone than the selection's) and above the horizon
+    /// lies in a tile of `drawn`: no point of the view is open.
+    fn covered(drawn: &[TileDrawInfo], reference: &[TileDrawInfo], cam: [f64; 3], fwd: [f64; 3]) {
+        let occluder = reference
+            .iter()
+            .map(|t| t.geometry.occluder)
+            .fold(f64::INFINITY, f64::min);
+        for t in reference {
+            for (v, p) in t.geometry.positions.iter().enumerate() {
+                if v % 7 != 0
+                    || !in_cone(cam, fwd, (*p, *p), 0.5)
+                    || below_horizon(cam, (*p, *p), occluder)
+                {
+                    continue;
+                }
+                assert!(
+                    locate_drawn(drawn, *p, usize::MAX).is_some(),
+                    "vertex {v} of {} is open",
+                    t.geometry.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ascending_camera_never_opens_the_view() {
+        // Zooming out across several levels faster than tiles are built:
+        // every round covers the view, and the end is what a camera that
+        // started there draws.
+        let mut s = Surfaces::new();
+        let (cam, forward) = low_camera(3000.0);
+        settle_compact(&mut s, cam, forward, 11, 0.0);
+        let mut queue = Vec::new();
+        let mut now = 10.0;
+        let mut joined = 0;
+        for height in [1.0e4, 6.0e4, 4.0e5, 2.0e6] {
+            let (cam, forward) = low_camera(height);
+            let mut reference = Surfaces::new();
+            let expected = settle(&mut reference, cam, forward, 11);
+            for _ in 0..3 {
+                now += 0.1;
+                let drawn = slow_round(&mut s, &mut queue, cam, forward, now, 1);
+                covered(&drawn, &expected, cam, forward);
+                joined += s
+                    .want_built
+                    .values()
+                    .filter(|r| **r == BuiltReason::Join)
+                    .count();
+            }
+        }
+        assert!(joined > 0, "no split tile waited to join");
+        let (cam, forward) = low_camera(2.0e6);
+        let mut drawn = Vec::new();
+        for _ in 0..64 {
+            now += 0.1;
+            drawn = slow_round(&mut s, &mut queue, cam, forward, now, 4);
+            covered(&drawn, &drawn.clone(), cam, forward);
+            if s.requests.is_empty() && s.builds.is_empty() && queue.is_empty() {
+                break;
+            }
+        }
+        let mut fresh = Surfaces::new();
+        let want = by_key(&settle_compact(&mut fresh, cam, forward, 11, 0.0));
+        let got = by_key(&drawn);
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>()
+        );
+        for (k, t) in &got {
+            assert_eq!(t.geometry, want[k].geometry, "{k}");
+            assert_eq!(t.morph, want[k].morph, "{k}");
+        }
+    }
+
+    #[test]
+    fn a_still_camera_holds_built_only_what_it_draws_or_will_split_to() {
+        let focal = focal_px(720.0, FIELD_OF_VIEW_Y);
+        for height in [1.8e4, 3000.0] {
+            let mut s = Surfaces::new();
+            let (cam, forward) = low_camera(height);
+            settle_compact(&mut s, cam, forward, 11, 0.0);
+            let drawn = compact_round(&mut s, cam, forward, 11, 1.0 + BUILT_GRACE_SECONDS);
+            let drawn = by_key(&drawn);
+            let splitting = |k: &SurfaceKey| {
+                drawn.get(k).is_some_and(|t| {
+                    let g = &t.geometry;
+                    box_distance(cam, g.bounds) < range(g.edge, g.max_edge, focal)
+                })
+            };
+            let built = built_keys(&s);
+            for k in &built {
+                assert!(
+                    k.level == 0
+                        || drawn.contains_key(k)
+                        || k.parent().is_some_and(|p| splitting(&p)),
+                    "{k} built at {height} m"
+                );
+            }
+            // The memory report counts each built tile under one reason.
+            #[cfg(feature = "memory-report")]
+            {
+                let m = s.memory();
+                assert_eq!(m.built, built.len());
+                assert_eq!(
+                    m.built_drawn
+                        + m.built_for_split
+                        + m.built_for_join
+                        + m.built_level_0
+                        + m.built_in_grace,
+                    m.built
+                );
+                assert_eq!(m.built_drawn, drawn.len());
+                assert_eq!(m.built_in_grace, 0, "{height} m");
+            }
+            let arrived = s.layers.len();
+            println!(
+                "{height} m: {} built, {} drawn, {arrived} arrived",
+                built.len(),
+                drawn.len()
+            );
+            assert!(built.len() < arrived);
         }
     }
 

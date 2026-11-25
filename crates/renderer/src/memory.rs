@@ -180,6 +180,17 @@ pub struct SurfaceMemory {
     /// Bytes of the built tiles: section bytes, summary, overlays, and
     /// geometry (material and shape).
     pub built_bytes: u64,
+    /// Of the built tiles, those drawn.
+    pub built_drawn: usize,
+    /// Of the built tiles, children a drawn tile's split is waiting for.
+    pub built_for_split: usize,
+    /// Of the built tiles, split tiles about to join (drawn again).
+    pub built_for_join: usize,
+    /// Of the built tiles, level-0 tiles held for no other reason.
+    pub built_level_0: usize,
+    /// Of the built tiles, those wanted built for no reason now, held
+    /// within [`crate::tiles::BUILT_GRACE_SECONDS`].
+    pub built_in_grace: usize,
     /// Entries known empty (or with every base hidden).
     pub empty: usize,
     /// Entries whose sections were invalid.
