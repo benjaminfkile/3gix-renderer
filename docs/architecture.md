@@ -219,9 +219,22 @@ While over it, in this order:
    (then by key, so the order is the same on every run).
 
 What the current frame draws, the ancestors the selection walks to reach
-it, level-0 tiles, the cell target, and pinned cells are never evicted,
-even over the budget. The selection's `used` set protects nothing past the
-budget.
+it, level-0 tiles, the tiles the latest selection wants built (drawn,
+children a split waits on, split tiles about to join) or asked for, the
+cell target, and pinned cells are never evicted, even over the budget.
+The rest of the selection's `used` set protects nothing past the budget.
+
+When what the view wants at full detail does not fit, detail yields to
+the budget instead (`budget::Detail`): after a surface pass that leaves
+held bytes over the budget, once the previous step has taken effect (no
+build or request outstanding) or 2 s have passed, every split distance
+is scaled down one more step of 0.8 (`budget::DETAIL_STEP`, at most 16
+steps), so the view draws fewer, coarser tiles; joins wait for the parent
+to be built as always, so the view is never open. The factor goes up a
+step only after held bytes stay below `RESUME_FRACTION` of the budget for
+2 s, and never back to a step found over the budget since the camera,
+the view size, or the budget last changed, so a still view settles. Under
+the budget the factor stays 1 and nothing changes.
 
 While held bytes exceed the budget, the selection asks only for what it
 needs at the current view: children of tiles within their split distance
@@ -257,7 +270,9 @@ unchanged. With it:
   is counted once, by pointer.
   - `allocator`: `live` and `peak`.
   - `budget`: the `budget`, the bytes it counts (`held`), whether asking
-    ahead is held, and what the latest pass and all passes evicted
+    ahead is held, the `detail` factor the surface selection scales split
+    distances by (1 unless the view's full detail did not fit), and what
+    the latest pass and all passes evicted
     (`compacted`, `tiles`, `cells`, `meshes`).
   - `surfaces`: entries `requested`, `ready` (built or compact),
     `empty`, `gone`; `compact` and `compact_bytes` (section bytes,

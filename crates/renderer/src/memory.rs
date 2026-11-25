@@ -261,6 +261,10 @@ pub struct BudgetMemory {
     pub held: u64,
     /// Whether asking ahead is held.
     pub holding_ahead: bool,
+    /// The detail factor the surface selection scales split distances by
+    /// ([`crate::budget::Detail`]): 1 unless the view's full detail did
+    /// not fit the budget.
+    pub detail: f64,
     /// What the latest pass evicted.
     pub last: crate::budget::Evicted,
     /// What every pass evicted, summed.

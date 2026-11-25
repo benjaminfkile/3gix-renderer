@@ -51,6 +51,13 @@
 //! built keeps drawing its built children until it is, then joins, so
 //! the view is briefly finer than needed. Where a part of the view cannot
 //! be covered yet with built tiles, the nearest built ancestor is drawn.
+//!
+//! Over the memory budget (`rendering.md` 8 item 7, `crate::budget`)
+//! every [`range`] is scaled by the detail factor
+//! ([`crate::budget::Detail`], [`Surfaces::set_detail_step`]): the view
+//! draws fewer, coarser tiles, joining as above, and eviction never drops
+//! or compacts a tile the selection wants. Under the budget the factor is
+//! 1 and nothing changes.
 
 use crate::camera::Camera;
 use crate::farfield::focal_px;
@@ -716,6 +723,13 @@ pub struct Surfaces {
     /// Over the memory budget: children are asked for only within the
     /// split distance, not out to [`PREFETCH`] times it (`crate::budget`).
     hold_ahead: bool,
+    /// Steps of the detail factor below full detail
+    /// ([`crate::budget::Detail`]): every split distance is scaled by
+    /// [`crate::budget::DETAIL_STEP`] to this power.
+    detail_step: u8,
+    /// Every tile the latest selection asked for (arrived or not):
+    /// eviction keeps them.
+    asked: std::collections::HashSet<SurfaceKey>,
 }
 
 impl Surfaces {
@@ -757,6 +771,7 @@ impl Surfaces {
     /// it to the wanted set with `priority` (projected size, pixels)
     /// unless it has arrived.
     fn want(&mut self, key: SurfaceKey, priority: f64) {
+        self.asked.insert(key);
         match self.tiles.entry(key) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(State::Requested);
@@ -1097,6 +1112,7 @@ impl Surfaces {
         let cone = (half_x.tan().hypot(half_y.tan())).atan() * 1.2;
         let mut drawn = Vec::new();
         self.used.clear();
+        self.asked.clear();
         self.want_built.clear();
         self.wanted = Some(Vec::new());
         for &frame in frames {
@@ -1233,7 +1249,7 @@ impl Surfaces {
             return true;
         }
         let d = box_distance(walk.cam, s.bounds);
-        let r = range(s.edge, s.max_edge, walk.focal);
+        let r = range(s.edge, s.max_edge, walk.focal) * self.detail_factor();
         let children = key.children();
         // A child's projected edge: half the parent's.
         let px = 0.5 * s.edge * walk.focal / d.max(f64::MIN_POSITIVE);
@@ -1378,6 +1394,21 @@ impl Surfaces {
         self.hold_ahead = hold;
     }
 
+    /// Sets the detail factor's step ([`crate::budget::Detail`]): from
+    /// the next selection every split distance is scaled by
+    /// [`crate::budget::DETAIL_STEP`] to the power `step`, so the view
+    /// draws fewer, coarser tiles; 0 is full detail. Joining waits for
+    /// the parent to be built, as for any join, so the view is never open
+    /// (`rendering.md` 3.3).
+    pub fn set_detail_step(&mut self, step: u8) {
+        self.detail_step = step;
+    }
+
+    /// The detail factor the selection scales split distances by.
+    pub fn detail_factor(&self) -> f64 {
+        crate::budget::DETAIL_STEP.powi(i32::from(self.detail_step))
+    }
+
     /// Bytes every held tile counts against the memory budget
     /// (`crate::budget`): each entry's key and state, and each arrived
     /// tile's sections, overlays, and geometry.
@@ -1451,8 +1482,12 @@ impl Surfaces {
     }
 
     /// The tiles eviction over the budget may drop (`crate::budget`):
-    /// every entry that is not level-0, not asked for, not drawn or walked
-    /// to, and not built and wanted built, with its last use and bytes.
+    /// every entry that is not level-0, not asked for by the latest
+    /// selection (arrived or not), not drawn or walked to, and not wanted
+    /// built (drawn, a child a split waits on, or about to join), with
+    /// its last use and bytes. What the selection wants is never dropped:
+    /// when it does not fit, the detail factor goes down instead
+    /// ([`crate::budget::Detail`]).
     pub fn eviction_candidates(&self) -> Vec<crate::budget::Candidate<SurfaceKey>> {
         let keep = self.drawn_and_ancestors();
         let entry = std::mem::size_of::<(SurfaceKey, State)>() as u64;
@@ -1461,10 +1496,10 @@ impl Surfaces {
             if k.level == 0 || matches!(s, State::Requested) || keep.contains(k) {
                 continue;
             }
-            let l = self.layers.get(k);
-            if l.is_some_and(|l| l.built()) && self.want_built.contains_key(k) {
+            if self.want_built.contains_key(k) || self.asked.contains(k) {
                 continue;
             }
+            let l = self.layers.get(k);
             out.push(crate::budget::Candidate {
                 last_used: l.map_or(f64::NEG_INFINITY, |l| l.used_at),
                 level: k.level,
@@ -1834,7 +1869,7 @@ fn in_cone(cam: [f64; 3], forward: [f64; 3], (lo, hi): ([f64; 3], [f64; 3]), con
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::camera::FIELD_OF_VIEW_Y;
     use gx_core::surface::{HEIGHT_SIDE, PARENT_SIDE};
@@ -2142,7 +2177,8 @@ mod tests {
     /// A tile whose heights are a smooth function of the vertex direction,
     /// with parent heights the same function at the parent's level (the
     /// same direction, so the same values at shared vertices).
-    fn tile(key: SurfaceKey) -> SurfaceTile {
+    /// A rough tile of `key` over the reference ellipsoid.
+    pub(crate) fn tile(key: SurfaceKey) -> SurfaceTile {
         tile_with_floor(key, -400.0)
     }
 
@@ -2196,6 +2232,21 @@ mod tests {
         let keys =
             |d: &[TileDrawInfo]| -> Vec<SurfaceKey> { d.iter().map(|t| t.geometry.key).collect() };
         let want = keys(&first);
+        // Over the budget asking ahead is held: the children asked for
+        // only ahead are no longer wanted and may go.
+        s.set_hold_ahead(true);
+        s.asked.clear();
+        s.want_built.clear();
+        let mut again = Vec::new();
+        s.select_in_frame(
+            4,
+            cam,
+            up_tangent,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            0.9,
+            &mut again,
+        );
+        assert_eq!(keys(&again), want);
         let full = s.held_bytes();
         let budget = full / 2;
         let mut over = full - budget;
@@ -2563,7 +2614,12 @@ mod tests {
     /// Every vertex of every tile in `reference` that is well inside the
     /// view (a narrower cone than the selection's) and above the horizon
     /// lies in a tile of `drawn`: no point of the view is open.
-    fn covered(drawn: &[TileDrawInfo], reference: &[TileDrawInfo], cam: [f64; 3], fwd: [f64; 3]) {
+    pub(crate) fn covered(
+        drawn: &[TileDrawInfo],
+        reference: &[TileDrawInfo],
+        cam: [f64; 3],
+        fwd: [f64; 3],
+    ) {
         let occluder = reference
             .iter()
             .map(|t| t.geometry.occluder)
