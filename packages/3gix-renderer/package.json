@@ -1,6 +1,6 @@
 {
   "name": "3gix-renderer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "The renderer as a JS package and a React component (docs/api.md section 9).",
   "type": "module",
