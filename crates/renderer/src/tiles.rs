@@ -54,9 +54,12 @@
 //! draw them, and for each child that cannot, the tile draws the matching
 //! quarter of itself ([`quarter_indices`], [`TileDrawInfo::indices`]); a
 //! tile that is not built leaves that part to its nearest built ancestor,
-//! which draws the part of itself holding it ([`part_indices`]). The
-//! parent of every drawn tile stays built, so a missing child usually
-//! falls back one level, for its quarter only. A split tile beyond its
+//! which draws the part of itself holding it ([`part_indices`]). Every
+//! ancestor of a drawn tile stays built (about a third more tiles than
+//! are drawn), so a missing child falls back to its nearest built
+//! ancestor, usually its parent, and only for its own part: a tile that
+//! turns into the view under split ancestors never takes a large area
+//! back to level 0. A split tile beyond its
 //! [`range`] that is not built keeps drawing its built children until it
 //! is, then joins, so the view is briefly finer than needed.
 //!
@@ -1454,7 +1457,7 @@ impl Surfaces {
     }
 
     /// Pushes the `indices` range of the built `key` onto `drawn`, and
-    /// wants its parent kept built as the fallback for it (module docs).
+    /// wants its ancestors kept built as the fallback for it (module docs).
     fn draw(
         &mut self,
         key: SurfaceKey,
@@ -1475,8 +1478,10 @@ impl Surfaces {
             [(MORPH_START * parent_range) as f32, parent_range as f32]
         };
         self.want_built(key, f64::INFINITY, BuiltReason::Drawn);
-        if let Some(p) = key.parent() {
+        let mut up = key.parent();
+        while let Some(p) = up {
             self.want_built(p, geo.edge * walk.focal / d, BuiltReason::Fallback);
+            up = p.parent();
         }
         drawn.push(TileDrawInfo {
             geometry: geo,
@@ -1696,8 +1701,9 @@ enum BuiltReason {
     /// It is split, beyond its split distance, and about to be drawn
     /// again.
     Join,
-    /// It is the parent of a drawn tile: kept built so a child that
-    /// cannot cover its part falls back one level, for its quarter only.
+    /// It is an ancestor of a drawn tile: kept built so a child that
+    /// cannot cover its part falls back to its nearest built ancestor,
+    /// for its own part only.
     Fallback,
 }
 
@@ -2925,7 +2931,13 @@ pub(crate) mod tests {
                 assert!(
                     k.level == 0
                         || drawn.contains_key(k)
-                        || drawn.keys().any(|d| d.parent() == Some(*k))
+                        || drawn.keys().any(|d| d.level > k.level && {
+                            let mut a = d.parent();
+                            while let Some(p) = a.filter(|p| p.level > k.level) {
+                                a = p.parent();
+                            }
+                            a == Some(*k)
+                        })
                         || k.parent().is_some_and(|p| splitting(&p)),
                     "{k} built at {height} m"
                 );
@@ -3111,7 +3123,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_still_camera_holds_built_only_what_it_draws_their_parents_and_level_0() {
+    fn a_still_camera_holds_built_only_what_it_draws_their_ancestors_and_level_0() {
         for height in [1.8e4, 3000.0] {
             let mut s = Surfaces::new();
             let (cam, forward) = low_camera(height);
@@ -3119,11 +3131,18 @@ pub(crate) mod tests {
             let drawn = compact_round(&mut s, cam, forward, 11, 1.0 + BUILT_GRACE_SECONDS);
             assert!(drawn.iter().all(|t| t.quarter().is_none()));
             let drawn = by_key(&drawn);
-            let parents: BTreeSet<SurfaceKey> = drawn.keys().filter_map(|k| k.parent()).collect();
+            let mut parents: BTreeSet<SurfaceKey> = BTreeSet::new();
+            for k in drawn.keys() {
+                let mut a = k.parent();
+                while let Some(p) = a {
+                    parents.insert(p);
+                    a = p.parent();
+                }
+            }
             let built = built_keys(&s);
             let mut fallback = 0;
             for k in &built {
-                let parent = parents.contains(k) && !drawn.contains_key(k);
+                let parent = parents.contains(k) && !drawn.contains_key(k); // an ancestor
                 fallback += usize::from(parent && k.level > 0);
                 assert!(
                     k.level == 0 || drawn.contains_key(k) || parent,
@@ -3135,7 +3154,7 @@ pub(crate) mod tests {
                 .map(|(k, l)| l.bytes(&s.tiles[k]))
                 .sum();
             println!(
-                "still at {height} m: {} built ({fallback} as fallback parents), {} drawn, {bytes} built bytes, {} held",
+                "still at {height} m: {} built ({fallback} as fallback ancestors), {} drawn, {bytes} built bytes, {} held",
                 built.len(),
                 drawn.len(),
                 s.held_bytes()

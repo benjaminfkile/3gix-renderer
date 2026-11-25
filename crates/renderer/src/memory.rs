@@ -186,9 +186,9 @@ pub struct SurfaceMemory {
     pub built_for_split: usize,
     /// Of the built tiles, split tiles about to join (drawn again).
     pub built_for_join: usize,
-    /// Of the built tiles, parents of drawn tiles kept built as their
-    /// fallback (a child that cannot cover its part falls back one level,
-    /// for its quarter).
+    /// Of the built tiles, ancestors of drawn tiles kept built as their
+    /// fallback (a child that cannot cover its part falls back to its
+    /// nearest built ancestor, for its own part).
     pub built_fallback: usize,
     /// Of the built tiles, level-0 tiles held for no other reason.
     pub built_level_0: usize,
