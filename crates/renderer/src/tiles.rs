@@ -36,8 +36,9 @@
 //! only a tile pushed to be drawn needs its geometry. A tile is wanted
 //! built while it is drawn; while it is a child, in the view cone and
 //! not below the horizon, of a drawn tile within its [`range`] (the
-//! children that tile's split will draw); and while it is split, beyond
-//! its [`range`], and not built (it is about to be drawn again). Level-0
+//! children that tile's split will draw); while it is split, beyond
+//! its [`range`], and not built (it is about to be drawn again); and
+//! while it is the parent of a drawn tile (its fallback). Level-0
 //! tiles stay built; every other arrived tile, the split ancestors the
 //! walk only passes through among them, goes back to compact
 //! [`BUILT_GRACE_SECONDS`] after it was last wanted built, or, while the
@@ -48,12 +49,16 @@
 //! which builds it off the frame thread ([`build_tile`]) and hands the
 //! geometry back ([`Surfaces::complete_build`]).
 //!
-//! The view is never open (`rendering.md` 3.3): a tile splits only when
-//! the tiles its children will draw are built, so its parent keeps
-//! drawing until then; a split tile beyond its [`range`] that is not
-//! built keeps drawing its built children until it is, then joins, so
-//! the view is briefly finer than needed. Where a part of the view cannot
-//! be covered yet with built tiles, the nearest built ancestor is drawn.
+//! The view is never open (`rendering.md` 3.3, 3.5): a tile falls back
+//! per quarter. Its children that can cover their parts with built tiles
+//! draw them, and for each child that cannot, the tile draws the matching
+//! quarter of itself ([`quarter_indices`], [`TileDrawInfo::indices`]); a
+//! tile that is not built leaves that part to its nearest built ancestor,
+//! which draws the part of itself holding it ([`part_indices`]). The
+//! parent of every drawn tile stays built, so a missing child usually
+//! falls back one level, for its quarter only. A split tile beyond its
+//! [`range`] that is not built keeps drawing its built children until it
+//! is, then joins, so the view is briefly finer than needed.
 //!
 //! Over the memory budget (`rendering.md` 8 item 7, `crate::budget`)
 //! every [`range`] is scaled by the detail factor
@@ -330,18 +335,76 @@ impl TileGeometry {
     }
 
     /// The index list shared by every tile: two triangles per quad, split
-    /// from `(i, j)` to `(i + 1, j + 1)`, counterclockwise seen from outside.
+    /// from `(i, j)` to `(i + 1, j + 1)`, counterclockwise seen from outside,
+    /// ordered by quarter, and within each quarter by its quarters, down to
+    /// single quads (Z order, [`part_indices`]): the quads of quarter `q`
+    /// (the area of child `q` of [`SurfaceKey::children`]) are one
+    /// contiguous range ([`quarter_indices`]), the four ranges in order are
+    /// the whole list, and so for the area of any descendant.
     pub fn indices() -> Vec<u32> {
         let n = TILE_VERTICES as u32;
         let mut out = Vec::with_capacity(TILE_QUADS * TILE_QUADS * 6);
-        for j in 0..TILE_QUADS as u32 {
-            for i in 0..TILE_QUADS as u32 {
-                let v = |di: u32, dj: u32| (i + di) + n * (j + dj);
-                out.extend_from_slice(&[v(0, 0), v(1, 0), v(1, 1), v(0, 0), v(1, 1), v(0, 1)]);
-            }
+        for z in 0..(TILE_QUADS * TILE_QUADS) as u32 {
+            let (i, j) = unzip(z);
+            let v = |di: u32, dj: u32| (i + di) + n * (j + dj);
+            out.extend_from_slice(&[v(0, 0), v(1, 0), v(1, 1), v(0, 0), v(1, 1), v(0, 1)]);
         }
         out
     }
+}
+
+/// The quad `(i, j)` at Z order position `z`: bit `2b` of `z` is bit `b`
+/// of `i`, bit `2b + 1` bit `b` of `j`.
+fn unzip(z: u32) -> (u32, u32) {
+    let (mut i, mut j) = (0, 0);
+    for b in 0..16 {
+        i |= ((z >> (2 * b)) & 1) << b;
+        j |= ((z >> (2 * b + 1)) & 1) << b;
+    }
+    (i, j)
+}
+
+/// The Z order position of block `(i, j)` ([`unzip`]).
+fn zip(i: u32, j: u32) -> u32 {
+    (0..16).fold(0, |z, b| {
+        z | ((i >> b) & 1) << (2 * b) | ((j >> b) & 1) << (2 * b + 1)
+    })
+}
+
+/// The whole of [`TileGeometry::indices`]: a tile drawn whole.
+pub const WHOLE_INDICES: std::ops::Range<u32> = 0..(TILE_QUADS * TILE_QUADS * 6) as u32;
+
+/// The levels below a tile whose areas are whole blocks of its quads:
+/// down to single quads.
+pub const PART_LEVELS: u8 = TILE_QUADS.trailing_zeros() as u8;
+
+/// The range of [`TileGeometry::indices`] holding quarter `q` (0 to 3) of
+/// a tile: the 32 by 32 quads child `q` of [`SurfaceKey::children`]
+/// covers (`rendering.md` 3.3, a tile falling back for one child).
+pub fn quarter_indices(q: usize) -> std::ops::Range<u32> {
+    let len = WHOLE_INDICES.end / 4;
+    (q as u32 * len)..((q as u32 + 1) * len)
+}
+
+/// The range of `tile`'s [`TileGeometry::indices`] holding the area of
+/// its descendant `part` (the area of `part`'s ancestor [`PART_LEVELS`]
+/// below `tile` when `part` is deeper): one quarter for a child, a
+/// quarter of a quarter for a grandchild, and so on. `None` when `part`
+/// is not `tile` or below it.
+pub fn part_indices(tile: SurfaceKey, part: SurfaceKey) -> Option<std::ops::Range<u32>> {
+    if part.frame_id != tile.frame_id || part.face != tile.face || part.level < tile.level {
+        return None;
+    }
+    let m = (part.level - tile.level).min(PART_LEVELS);
+    let shift = part.level - tile.level - m;
+    let (x, y) = (part.x >> shift, part.y >> shift);
+    if (x >> m) != tile.x || (y >> m) != tile.y {
+        return None;
+    }
+    let mask = (1u32 << m) - 1;
+    let len = WHOLE_INDICES.end >> (2 * u32::from(m));
+    let z = zip(x & mask, y & mask);
+    Some(z * len..(z + 1) * len)
 }
 
 /// What the selection needs of a tile without its geometry: taken from
@@ -674,6 +737,33 @@ pub struct TileDrawInfo {
     /// Camera distances, meters, where the morph begins and where it is
     /// complete; both infinite at level 0.
     pub morph: [f32; 2],
+    /// The range of [`TileGeometry::indices`] to draw: [`WHOLE_INDICES`],
+    /// or one quarter's range ([`quarter_indices`]) where the tile falls
+    /// back for a child that cannot cover its part (module docs).
+    pub indices: std::ops::Range<u32>,
+}
+
+impl TileDrawInfo {
+    /// The quarter drawn (0 to 3, as [`SurfaceKey::children`]), or `None`
+    /// when the tile is drawn whole or a smaller part of it.
+    pub fn quarter(&self) -> Option<usize> {
+        (0..4).find(|&q| quarter_indices(q) == self.indices)
+    }
+
+    /// Whether only a part of the tile is drawn (a quarter or smaller).
+    pub fn is_part(&self) -> bool {
+        self.indices != WHOLE_INDICES
+    }
+
+    /// The quads drawn, `(i, j)` ranges over the tile's grid: the whole
+    /// grid, or the drawn part's block ([`part_indices`]).
+    pub fn quads(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let quads = (self.indices.len() / 6).max(1);
+        let side = (quads as f64).sqrt().round() as u32;
+        let (bi, bj) = unzip(self.indices.start / 6 / quads as u32);
+        let (i0, j0) = ((bi * side) as usize, (bj * side) as usize);
+        (i0..i0 + side as usize, j0..j0 + side as usize)
+    }
 }
 
 /// How long, seconds, a tile waits on an overlay that is not `required`
@@ -907,7 +997,12 @@ impl Surfaces {
     /// Marks `key` wanted built by this selection and asks for its build
     /// when it is compact (module docs).
     fn want_built(&mut self, key: SurfaceKey, priority: f64, reason: BuiltReason) {
-        self.want_built.entry(key).or_insert(reason);
+        // A drawn tile counts as drawn whatever else it is wanted for.
+        if reason == BuiltReason::Drawn {
+            self.want_built.insert(key, reason);
+        } else {
+            self.want_built.entry(key).or_insert(reason);
+        }
         if let Some(l) = self.layers.get_mut(&key) {
             l.wanted_at = self.now;
         }
@@ -1200,7 +1295,7 @@ impl Surfaces {
             anchor,
         };
         for key in roots.into_iter().rev() {
-            self.cover(key, &walk, drawn);
+            self.cover(key, None, &walk, drawn);
         }
     }
 
@@ -1245,13 +1340,22 @@ impl Surfaces {
     /// Covers the part of the view `key` holds (module docs), pushing
     /// what it draws onto `drawn` in walk order. The walk reads only
     /// summaries; geometry is needed only for a tile drawn. A tile within
-    /// its split distance splits when its children cover their parts; a
+    /// its split distance splits where its children cover their parts; a
     /// tile beyond it is drawn when built, and covered by its children
-    /// until it is (it is about to join). Returns `false`, pushing
-    /// nothing, when the part cannot be covered yet with built tiles, so
-    /// the caller draws a coarser tile instead and the view is never open
-    /// (`rendering.md` 3.3).
-    fn cover(&mut self, key: SurfaceKey, walk: &Walk, drawn: &mut Vec<TileDrawInfo>) -> bool {
+    /// until it is (it is about to join). Where a child cannot cover its
+    /// part, the tile draws its own quarter for it when built, and
+    /// otherwise `up`, the nearest built ancestor, draws that part of
+    /// itself ([`part_indices`]), so one missing tile changes only its own
+    /// part (falling back per quarter). Returns `false`, pushing nothing,
+    /// when the part cannot be covered yet with built tiles and there is
+    /// no `up`, so the view is never open (`rendering.md` 3.3).
+    fn cover(
+        &mut self,
+        key: SurfaceKey,
+        up: Option<SurfaceKey>,
+        walk: &Walk,
+        drawn: &mut Vec<TileDrawInfo>,
+    ) -> bool {
         self.used.insert(key);
         let Some(s) = self.summary(&key) else {
             // Empty: nothing to draw. Not arrived: nothing to draw with.
@@ -1274,72 +1378,112 @@ impl Surfaces {
             }
         }
         let built = matches!(self.tiles.get(&key), Some(State::Ready(_)));
-        if d < r {
-            if let Some(ch) = children {
-                // Every child arrived with the overlays it waits for
-                // (`rendering.md` 7.6), and at least one has a surface:
-                // deeper keys a module leaves empty end the refinement at
-                // this tile.
-                let arrived = ch.iter().all(|c| self.arrived_for_split(c))
-                    && ch.iter().any(|c| self.summary(c).is_some());
-                if arrived && self.cover_by(ch, walk, drawn) {
-                    return true;
-                }
-                // Not split yet: the children the split will draw are
-                // wanted built (module docs).
-                for c in ch {
-                    if self.summary(&c).is_some_and(|cs| Self::visible(walk, &cs)) {
-                        self.want_built(c, px, BuiltReason::Split);
-                    }
-                }
-            }
+        // At least one child has a surface: deeper keys a module leaves
+        // empty end the refinement at this tile.
+        let split =
+            d < r && children.is_some_and(|ch| ch.iter().any(|c| self.summary(c).is_some()));
+        if !split && d < r || d >= r && built {
             if !built {
                 return false;
             }
-        } else if !built {
-            // Beyond its split distance and not built: its built children
-            // keep drawing until it is, then it joins.
-            self.want_built(key, 2.0 * px, BuiltReason::Join);
-            let covered = children.is_some_and(|ch| {
-                ch.iter().all(|c| self.arrived_for_split(c)) && self.cover_by(ch, walk, drawn)
-            });
-            return covered;
+            self.draw(key, WHOLE_INDICES, walk, drawn);
+            return true;
         }
-        let Some(State::Ready(geo)) = self.tiles.get(&key) else {
+        if !built {
+            if d >= r {
+                // Beyond its split distance and not built: its built
+                // children keep drawing until it is, then it joins.
+                self.want_built(key, 2.0 * px, BuiltReason::Join);
+            }
+            if children.is_none() {
+                return false;
+            }
+        }
+        let Some(ch) = children else {
             return false;
         };
+        // Each child that arrived with the overlays it waits for
+        // (`rendering.md` 7.6) covers its part if it can.
+        let below = if built { Some(key) } else { up };
+        let mut parts: [Option<Vec<TileDrawInfo>>; 4] = Default::default();
+        for q in (0..4).rev() {
+            let mut part = Vec::new();
+            if self.arrived_for_split(&ch[q]) && self.cover(ch[q], below, walk, &mut part) {
+                parts[q] = Some(part);
+            }
+        }
+        if d < r {
+            // The children that cannot cover their parts yet are wanted
+            // built (module docs).
+            for q in 0..4 {
+                let c = ch[q];
+                if parts[q].is_none() && self.summary(&c).is_some_and(|cs| Self::visible(walk, &cs))
+                {
+                    self.want_built(c, px, BuiltReason::Split);
+                }
+            }
+        }
+        if parts.iter().all(Option::is_some) {
+            for part in parts.into_iter().rev().flatten() {
+                drawn.extend(part);
+            }
+            return true;
+        }
+        let Some(from) = below else {
+            return false;
+        };
+        // A part deeper than single quads of `from` cannot be drawn
+        // alone: a coarser part holding this tile is drawn instead.
+        if ch[0].level - from.level > PART_LEVELS {
+            return false;
+        }
+        if from == key && parts.iter().all(Option::is_none) {
+            self.draw(key, WHOLE_INDICES, walk, drawn);
+            return true;
+        }
+        for q in (0..4).rev() {
+            match parts[q].take() {
+                Some(part) => drawn.extend(part),
+                None => {
+                    let indices = part_indices(from, ch[q]).unwrap_or(WHOLE_INDICES);
+                    self.draw(from, indices, walk, drawn);
+                }
+            }
+        }
+        true
+    }
+
+    /// Pushes the `indices` range of the built `key` onto `drawn`, and
+    /// wants its parent kept built as the fallback for it (module docs).
+    fn draw(
+        &mut self,
+        key: SurfaceKey,
+        indices: std::ops::Range<u32>,
+        walk: &Walk,
+        drawn: &mut Vec<TileDrawInfo>,
+    ) {
+        let Some(State::Ready(geo)) = self.tiles.get(&key) else {
+            return;
+        };
         let geo = Arc::clone(geo);
+        let d = box_distance(walk.cam, geo.bounds).max(f64::MIN_POSITIVE);
         let morph = if key.level == 0 {
             [f32::INFINITY; 2]
         } else {
+            let r = range(geo.edge, geo.max_edge, walk.focal) * self.detail_factor();
             let parent_range = r * 2.0;
             [(MORPH_START * parent_range) as f32, parent_range as f32]
         };
         self.want_built(key, f64::INFINITY, BuiltReason::Drawn);
+        if let Some(p) = key.parent() {
+            self.want_built(p, geo.edge * walk.focal / d, BuiltReason::Fallback);
+        }
         drawn.push(TileDrawInfo {
             geometry: geo,
             anchor: walk.anchor,
             morph,
+            indices,
         });
-        true
-    }
-
-    /// Covers each of `children`, last first (the walk's order), and
-    /// pushes what they draw onto `drawn` only when every one is covered.
-    fn cover_by(
-        &mut self,
-        children: [SurfaceKey; 4],
-        walk: &Walk,
-        drawn: &mut Vec<TileDrawInfo>,
-    ) -> bool {
-        let mut part = Vec::new();
-        for c in children.into_iter().rev() {
-            if !self.cover(c, walk, &mut part) {
-                return false;
-            }
-        }
-        drawn.append(&mut part);
-        true
     }
 
     /// The tiles of the latest selection.
@@ -1552,6 +1696,9 @@ enum BuiltReason {
     /// It is split, beyond its split distance, and about to be drawn
     /// again.
     Join,
+    /// It is the parent of a drawn tile: kept built so a child that
+    /// cannot cover its part falls back one level, for its quarter only.
+    Fallback,
 }
 
 /// What one frame's selection walks with ([`Surfaces::select_in_frame`]).
@@ -1730,6 +1877,7 @@ impl Surfaces {
         let mut m = crate::memory::SurfaceMemory {
             used: self.used.len(),
             drawn: self.drawn.len(),
+            drawn_quarters: self.drawn.iter().filter(|t| t.is_part()).count(),
             ..Default::default()
         };
         let ptr = |g: &Arc<TileGeometry>| Arc::as_ptr(g) as usize;
@@ -1796,6 +1944,7 @@ impl Surfaces {
                     (_, Some(BuiltReason::Drawn)) => m.built_drawn += 1,
                     (_, Some(BuiltReason::Split)) => m.built_for_split += 1,
                     (_, Some(BuiltReason::Join)) => m.built_for_join += 1,
+                    (_, Some(BuiltReason::Fallback)) => m.built_fallback += 1,
                     (0, None) => m.built_level_0 += 1,
                     (_, None) => m.built_in_grace += 1,
                 }
@@ -2776,6 +2925,7 @@ pub(crate) mod tests {
                 assert!(
                     k.level == 0
                         || drawn.contains_key(k)
+                        || drawn.keys().any(|d| d.parent() == Some(*k))
                         || k.parent().is_some_and(|p| splitting(&p)),
                     "{k} built at {height} m"
                 );
@@ -2789,6 +2939,7 @@ pub(crate) mod tests {
                     m.built_drawn
                         + m.built_for_split
                         + m.built_for_join
+                        + m.built_fallback
                         + m.built_level_0
                         + m.built_in_grace,
                     m.built
@@ -2846,7 +2997,13 @@ pub(crate) mod tests {
             let side = (1u64 << k.level) as f64;
             let x = ((sc + 1.0) / 2.0 * side).floor();
             let y = ((tc + 1.0) / 2.0 * side).floor();
-            x == f64::from(k.x) && y == f64::from(k.y)
+            // A drawn part holds only its block of quads.
+            let (qi, qj) = t.quads();
+            let fi = ((sc + 1.0) / 2.0 * side - x) * TILE_QUADS as f64;
+            let fj = ((tc + 1.0) / 2.0 * side - y) * TILE_QUADS as f64;
+            let in_quarter = (qi.start as f64..qi.end as f64).contains(&fi)
+                && (qj.start as f64..qj.end as f64).contains(&fj);
+            x == f64::from(k.x) && y == f64::from(k.y) && in_quarter
         })
     }
 
@@ -2951,6 +3108,171 @@ pub(crate) mod tests {
         }
         assert!(checked > 10_000, "{checked} boundary vertices checked");
         assert!(levels.len() >= 5, "levels {levels:?}");
+    }
+
+    #[test]
+    fn a_still_camera_holds_built_only_what_it_draws_their_parents_and_level_0() {
+        for height in [1.8e4, 3000.0] {
+            let mut s = Surfaces::new();
+            let (cam, forward) = low_camera(height);
+            settle_compact(&mut s, cam, forward, 11, 0.0);
+            let drawn = compact_round(&mut s, cam, forward, 11, 1.0 + BUILT_GRACE_SECONDS);
+            assert!(drawn.iter().all(|t| t.quarter().is_none()));
+            let drawn = by_key(&drawn);
+            let parents: BTreeSet<SurfaceKey> = drawn.keys().filter_map(|k| k.parent()).collect();
+            let built = built_keys(&s);
+            let mut fallback = 0;
+            for k in &built {
+                let parent = parents.contains(k) && !drawn.contains_key(k);
+                fallback += usize::from(parent && k.level > 0);
+                assert!(
+                    k.level == 0 || drawn.contains_key(k) || parent,
+                    "{k} built at {height} m"
+                );
+            }
+            let bytes: u64 = (s.layers.iter())
+                .filter(|(_, l)| l.built())
+                .map(|(k, l)| l.bytes(&s.tiles[k]))
+                .sum();
+            println!(
+                "still at {height} m: {} built ({fallback} as fallback parents), {} drawn, {bytes} built bytes, {} held",
+                built.len(),
+                drawn.len(),
+                s.held_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn quarter_ranges_split_the_index_list_by_child() {
+        let idx = TileGeometry::indices();
+        let n = TILE_VERTICES;
+        let half = TILE_QUADS / 2;
+        let mut whole = Vec::new();
+        for q in 0..4 {
+            let r = quarter_indices(q);
+            let tri = &idx[r.start as usize..r.end as usize];
+            whole.extend_from_slice(tri);
+            // Exactly the quads of child q's area, each once.
+            let (i0, j0) = ((q & 1) * half, (q >> 1) * half);
+            let mut quads = BTreeSet::new();
+            for t in tri.chunks(6) {
+                let first = t[0] as usize;
+                let (i, j) = (first % n, first / n);
+                assert!((i0..i0 + half).contains(&i) && (j0..j0 + half).contains(&j));
+                for &v in t {
+                    let (vi, vj) = (v as usize % n, v as usize / n);
+                    assert!((i0..=i0 + half).contains(&vi) && (j0..=j0 + half).contains(&vj));
+                }
+                assert!(quads.insert((i, j)), "quad ({i}, {j}) twice");
+            }
+            assert_eq!(quads.len(), half * half);
+            // The child's own grid covers the same part of the face.
+            let parent = SurfaceKey::new(4, 4, 3, 5, 2).unwrap();
+            let child = parent.children().unwrap()[q];
+            for (ci, pi) in [(0, i0), (TILE_QUADS, i0 + half)] {
+                let a = gx_core::surface::face_coord(child.level, child.x, ci as i64);
+                let b = gx_core::surface::face_coord(parent.level, parent.x, pi as i64);
+                assert!((a - b).abs() < 1e-12);
+            }
+            for (cj, pj) in [(0, j0), (TILE_QUADS, j0 + half)] {
+                let a = gx_core::surface::face_coord(child.level, child.y, cj as i64);
+                let b = gx_core::surface::face_coord(parent.level, parent.y, pj as i64);
+                assert!((a - b).abs() < 1e-12);
+            }
+        }
+        assert_eq!(whole, idx);
+        assert_eq!(quarter_indices(3).end, WHOLE_INDICES.end);
+    }
+
+    /// The drawn entries whose area holds the direction `dir`.
+    pub(crate) fn drawn_at(drawn: &[TileDrawInfo], dir: [f64; 3]) -> Vec<usize> {
+        (0..drawn.len())
+            .filter(|&i| locate_drawn(&drawn[i..=i], dir, usize::MAX).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn a_drawn_quarter_meets_its_finer_neighbors_without_a_gap() {
+        let (cam, forward) = low_camera(3000.0);
+        let mut s = Surfaces::new();
+        let first = settle(&mut s, cam, forward, 11);
+        let keys: BTreeSet<SurfaceKey> = first.iter().map(|t| t.geometry.key).collect();
+        // A drawn tile whose three siblings are drawn too: its parent is
+        // built (the fallback parent), and the tile goes missing.
+        let gone = *keys
+            .iter()
+            .rev()
+            .find(|k| {
+                k.level > 2
+                    && k.parent()
+                        .and_then(|p| p.children())
+                        .is_some_and(|ch| ch.iter().all(|c| keys.contains(c)))
+            })
+            .expect("a drawn tile with drawn siblings");
+        let parent = gone.parent().unwrap();
+        assert!(s.ready(&parent).is_some(), "the fallback parent is built");
+        s.tiles.insert(gone, State::Requested);
+        let mut drawn = Vec::new();
+        s.select_in_frame(
+            4,
+            cam,
+            forward,
+            focal_px(720.0, FIELD_OF_VIEW_Y),
+            0.9,
+            &mut drawn,
+        );
+        let q = parent
+            .children()
+            .unwrap()
+            .iter()
+            .position(|c| *c == gone)
+            .unwrap();
+        let quarters: Vec<&TileDrawInfo> = drawn.iter().filter(|t| t.quarter().is_some()).collect();
+        assert_eq!(quarters.len(), 1, "one quarter drawn");
+        assert_eq!(quarters[0].geometry.key, parent);
+        assert_eq!(quarters[0].quarter(), Some(q));
+        // Everything else drawn as before.
+        let others: BTreeSet<SurfaceKey> = (drawn.iter())
+            .filter(|t| t.quarter().is_none())
+            .map(|t| t.geometry.key)
+            .collect();
+        let mut want = keys.clone();
+        want.remove(&gone);
+        assert_eq!(others, want);
+        // Every point of the quarter's edges and just outside them is
+        // drawn by exactly one entry: no gap and no overlap in coverage.
+        let half = (TILE_QUADS / 2) as i64;
+        let (i0, j0) = ((q & 1) as i64 * half, (q >> 1) as i64 * half);
+        let (fnm, fu, fv) = gx_core::surface::face_axes(parent.face);
+        let mut checked = 0;
+        for t in 0..=half {
+            for (vi, vj, di, dj) in [
+                (i0 + t, j0, 0.0, -1.0),
+                (i0 + t, j0 + half, 0.0, 1.0),
+                (i0, j0 + t, -1.0, 0.0),
+                (i0 + half, j0 + t, 1.0, 0.0),
+            ] {
+                for side in [-1.0, 1.0] {
+                    let eps = 1e-7 * side;
+                    let sc = gx_core::surface::face_coord(parent.level, parent.x, vi) + di * eps;
+                    let tc = gx_core::surface::face_coord(parent.level, parent.y, vj) + dj * eps;
+                    if sc.abs() >= 1.0 || tc.abs() >= 1.0 {
+                        continue;
+                    }
+                    let dir: [f64; 3] = core::array::from_fn(|k| fnm[k] + sc * fu[k] + tc * fv[k]);
+                    let at = drawn_at(&drawn, dir);
+                    assert!(at.len() <= 1, "({vi}, {vj}) drawn {} times", at.len());
+                    if at.is_empty() {
+                        // Outside the drawn region (out of the view).
+                        continue;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 4 * half as usize, "{checked} points checked");
+        view_covered(&drawn, cam, forward, 6_356_752.3 - 1_000.0);
     }
 
     #[test]

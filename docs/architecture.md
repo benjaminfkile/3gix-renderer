@@ -298,8 +298,11 @@ unchanged. With it:
     geometries), and the built tiles by reason: `built_drawn`,
     `built_for_split` (children a drawn tile's split waits for),
     `built_for_join` (split tiles about to be drawn again),
+    `built_fallback` (parents of drawn tiles, kept built so a child that
+    cannot cover its part falls back one level for its quarter),
     `built_level_0`, and `built_in_grace` (within the grace time); the
-    selection's `used` set and `drawn` count; `geometries` and
+    selection's `used` set, `drawn` count, and `drawn_quarters` (drawn
+    entries that are one quarter of a tile); `geometries` and
     `geometry_bytes`, every distinct `TileGeometry` held (tile states,
     bases, the drawn list): each one's material plus each distinct
     `TileShape` once (`shapes`, `shape_bytes`), since a base and its

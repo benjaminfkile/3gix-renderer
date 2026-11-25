@@ -186,6 +186,10 @@ pub struct SurfaceMemory {
     pub built_for_split: usize,
     /// Of the built tiles, split tiles about to join (drawn again).
     pub built_for_join: usize,
+    /// Of the built tiles, parents of drawn tiles kept built as their
+    /// fallback (a child that cannot cover its part falls back one level,
+    /// for its quarter).
+    pub built_fallback: usize,
     /// Of the built tiles, level-0 tiles held for no other reason.
     pub built_level_0: usize,
     /// Of the built tiles, those wanted built for no reason now, held
@@ -197,8 +201,11 @@ pub struct SurfaceMemory {
     pub gone: usize,
     /// Tiles in the latest selection's `used` set, which eviction keeps.
     pub used: usize,
-    /// Tiles drawn by the latest selection.
+    /// Tiles drawn by the latest selection, each drawn quarter counted.
     pub drawn: usize,
+    /// Of those, quarters: a tile drawn for one child that cannot cover
+    /// its part (`crate::tiles` module docs).
+    pub drawn_quarters: usize,
     /// Distinct tile geometries held, each `Arc` once.
     pub geometries: usize,
     /// Distinct tile shapes held, each `Arc` once: one per tile, shared

@@ -166,7 +166,11 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
             .iter()
             .map(|d| d.mesh.triangle_count())
             .sum::<usize>()
-            + scene.tiles.len() * gx_core::surface::TILE_QUADS * gx_core::surface::TILE_QUADS * 2,
+            + scene
+                .tiles
+                .iter()
+                .map(|d| d.tile.indices.len() / 3)
+                .sum::<usize>(),
         volumes_drawn: scene.volumes.len(),
         sprites_drawn: scene.sprites.len(),
         lights_active: scene.lights.len(),

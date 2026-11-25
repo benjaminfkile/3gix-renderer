@@ -200,11 +200,13 @@ fn tile_hits(tile: &TileDrawInfo, o: [f64; 3], d: [f64; 3], camera: [f64; 3], ou
         return;
     }
     let side = TILE_QUADS + 1;
+    // The quads drawn: the whole grid, or one quarter's.
+    let (qi, qj) = tile.quads();
     // Blocks of 8 x 8 quads, each tested against the box of its positions
     // and targets first.
     const BLOCK: usize = 8;
-    for bj in (0..TILE_QUADS).step_by(BLOCK) {
-        for bi in (0..TILE_QUADS).step_by(BLOCK) {
+    for bj in qj.step_by(BLOCK) {
+        for bi in qi.clone().step_by(BLOCK) {
             let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
             for j in bj..=bj + BLOCK {
                 for i in bi..=bi + BLOCK {
