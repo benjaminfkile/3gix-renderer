@@ -186,6 +186,11 @@ pub struct SurfaceMemory {
     pub built_for_split: usize,
     /// Of the built tiles, split tiles about to join (drawn again).
     pub built_for_join: usize,
+    /// Of the built tiles, parents of drawn tiles: one level of fallback.
+    pub built_fallback: usize,
+    /// Of the built tiles, those the look-ahead outside the view cone
+    /// would draw.
+    pub built_look_ahead: usize,
     /// Of the built tiles, level-0 tiles held for no other reason.
     pub built_level_0: usize,
     /// Of the built tiles, those wanted built for no reason now, held
