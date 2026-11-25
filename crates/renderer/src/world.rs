@@ -527,10 +527,10 @@ impl World {
             .map(|f| f.frame_id)
             .collect();
         let pose = Pose::of(camera, view_px);
-        if self.surface_pose != Some(pose) {
-            self.detail.forget();
-            self.surface_pose = Some(pose);
-        }
+        let moved = self.surface_pose != Some(pose);
+        self.surface_pose = Some(pose);
+        self.detail.observe(moved, now);
+        self.surfaces.set_keep_built(self.detail.moving());
         self.surfaces.select(system, camera, view_px, &frames, now);
         self.enforce_budget(false);
         let settled = self.surfaces.settled();
@@ -567,6 +567,12 @@ impl World {
         self.held
     }
 
+    /// Whether the camera counts as moving for the detail factor
+    /// ([`crate::budget::Detail::moving`]).
+    pub fn memory_moving(&self) -> bool {
+        self.detail.moving()
+    }
+
     /// Whether asking ahead is held by the budget (`crate::budget`).
     pub fn holding_ahead(&self) -> bool {
         self.holding_ahead
@@ -599,22 +605,25 @@ impl World {
     }
 
     /// Evicts against the memory budget (`crate::budget`, `docs/architecture.md`,
-    /// "Memory budget"). While over it: built tiles not drawn and not
+    /// "Memory budget"). The limit is the budget while the camera moves
+    /// and [`crate::budget::SETTLE_FRACTION`] of it while it is still
+    /// ([`crate::budget::Detail::limit`]). While over it: built tiles not drawn and not
     /// wanted built go compact; then compact tiles, cells, and meshes not
     /// drawn and not in the current target go, least recently used first,
     /// the deepest first on a tie. The drawn tiles, the ancestors the
     /// selection walks to reach them, level-0 tiles, the tiles wanted
     /// built or asked for by the latest selection, the cell target, and
-    /// pinned cells stay, even over the budget: after a surface pass that
+    /// pinned cells stay, even over the limit: after a surface pass that
     /// leaves the bytes over it, the detail factor goes down instead
     /// ([`crate::budget::Detail`]). Then holds asking ahead
-    /// while held bytes exceed the budget, until they fall below
+    /// while held bytes exceed the limit, until they fall below
     /// [`crate::budget::RESUME_FRACTION`] of it.
     fn enforce_budget(&mut self, cells: bool) {
         let mut held = self.count_held(cells);
         let mut ev = crate::budget::Evicted::default();
-        if held > self.budget {
-            let mut over = held - self.budget;
+        let limit = self.detail.limit(self.budget);
+        if held > limit {
+            let mut over = held - limit;
             ev.compacted = self.surfaces.compact_over(&mut over);
             if over > 0 {
                 let mut items: Vec<crate::budget::Candidate<Held>> = Vec::new();
@@ -680,7 +689,7 @@ impl World {
             }
             held = self.count_held(true);
         }
-        self.holding_ahead = crate::budget::hold_ahead(held, self.budget, self.holding_ahead);
+        self.holding_ahead = crate::budget::hold_ahead(held, limit, self.holding_ahead);
         self.surfaces.set_hold_ahead(self.holding_ahead);
         self.cache.set_hold_ahead(self.holding_ahead);
         self.held = held;
@@ -1469,6 +1478,7 @@ impl World {
                 held: self.held,
                 holding_ahead: self.holding_ahead,
                 detail: self.detail.factor(),
+                moving: self.detail.moving(),
                 last: self.last_evicted,
                 total: self.total_evicted,
             },
@@ -1787,5 +1797,189 @@ mod tests {
         settle_surfaces(&mut world, &rig, &mut now);
         assert_eq!(world.detail_factor(), 1.0);
         assert_eq!(drawn_keys(&world), full);
+    }
+
+    /// `rig` with the camera moved `offset` meters along the surface
+    /// ahead of its view (straight, so its height grows by under a
+    /// kilometer over tens of kilometers).
+    fn rig_moved(rig: &SurfaceRig, offset: f64) -> (Camera, [f64; 3]) {
+        let c = rig.cam;
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let up: [f64; 3] = std::array::from_fn(|k| c[k] / l);
+        let f = rig.forward;
+        let along = f[0] * up[0] + f[1] * up[1] + f[2] * up[2];
+        let ahead: [f64; 3] = std::array::from_fn(|k| f[k] - along * up[k]);
+        let al = (ahead[0] * ahead[0] + ahead[1] * ahead[1] + ahead[2] * ahead[2]).sqrt();
+        let cam: [f64; 3] = std::array::from_fn(|k| c[k] + offset * ahead[k] / al);
+        let mut camera = rig.camera;
+        camera.position = Vec3::new(cam[0], cam[1], cam[2]);
+        (camera, cam)
+    }
+
+    /// Below the lowest point of the synthetic tiles: rays that meet it
+    /// look at the surface.
+    const BELOW_SURFACE: f64 = 6_356_752.3 - 1_000.0;
+
+    /// A world settled at the rig's still camera with a budget of about 70
+    /// percent of what the view needs at full detail. Returns the world,
+    /// the budget, and the clock.
+    fn settled_at_seventy_percent(rig: &SurfaceRig) -> (World, u64, f64) {
+        let mut world = World::new(0);
+        let mut now = 0.0;
+        settle_surfaces(&mut world, rig, &mut now);
+        let budget = world.held_bytes() * 7 / 10;
+        world.set_memory_budget(budget);
+        settle_surfaces(&mut world, rig, &mut now);
+        (world, budget, now)
+    }
+
+    /// One frame as [`surface_frame`] from `camera`, returning the keys
+    /// built.
+    fn surface_frame_keys(
+        world: &mut World,
+        rig: &SurfaceRig,
+        camera: &Camera,
+        now: f64,
+    ) -> Vec<gx_core::key::SurfaceKey> {
+        world.select_surfaces(&rig.system, camera, SURFACE_VIEW, now);
+        for key in world.take_surface_requests() {
+            let sections = if key.level <= 12 {
+                vec![gx_core::surface::encode(
+                    &crate::tiles::tests::tile(key),
+                    gx_core::matter::Compression::None,
+                )]
+            } else {
+                Vec::new()
+            };
+            let decoded = crate::tiles::decode_tile(&key, &sections, &[0], &Default::default());
+            world.complete_surface(key, decoded, false);
+        }
+        let builds = world.take_surface_builds();
+        let keys = builds.iter().map(|r| r.key).collect();
+        for req in builds {
+            let outcome = crate::tiles::build_tile(&req);
+            world.complete_surface_build(req.key, outcome);
+        }
+        keys
+    }
+
+    #[test]
+    fn a_still_view_settles_with_room_to_move() {
+        let rig = surface_rig();
+        let (mut world, budget, mut now) = settled_at_seventy_percent(&rig);
+        let settle = (crate::budget::SETTLE_FRACTION * budget as f64) as u64;
+        let held = world.held_bytes();
+        assert!(held <= settle, "{held} bytes over {settle}");
+        assert!(!world.memory_moving());
+        let factor = world.detail_factor();
+        let drawn = drawn_keys(&world);
+        let evicted = world.total_evicted();
+        let mut built = 0;
+        for i in 0..300 {
+            now += 1.0 / 60.0;
+            built += surface_frame(&mut world, &rig, now);
+            assert_eq!(world.total_evicted(), evicted, "frame {i}: evicted again");
+            assert_eq!(drawn_keys(&world), drawn, "frame {i}: drawn tiles changed");
+            assert_eq!(world.detail_factor(), factor, "frame {i}: detail changed");
+            let held = world.held_bytes();
+            assert!(held <= settle, "frame {i}: {held} bytes over {settle}");
+        }
+        assert_eq!(built, 0, "tiles built again at a still camera");
+        println!(
+            "settle: budget {budget}, held {} ({:.3} of it), factor {factor}, {} tiles drawn",
+            world.held_bytes(),
+            world.held_bytes() as f64 / budget as f64,
+            drawn.len()
+        );
+    }
+
+    #[test]
+    fn a_steady_pan_keeps_detail_and_the_view_covered() {
+        let rig = surface_rig();
+        let (mut world, budget, mut now) = settled_at_seventy_percent(&rig);
+        let start = world.total_evicted();
+        let mut factors = vec![world.detail_factor()];
+        let (mut built, mut peak) = (0, 0);
+        // 120 km at 3 km/s: several tiles of the levels drawn near the
+        // camera, and far enough that held bytes reach the budget.
+        for i in 1..=2400 {
+            now += 1.0 / 60.0;
+            let (camera, cam) = rig_moved(&rig, 50.0 * f64::from(i));
+            built += surface_frame_keys(&mut world, &rig, &camera, now).len();
+            assert!(
+                world.memory_moving(),
+                "frame {i}: the camera counts as still"
+            );
+            let f = world.detail_factor();
+            if factors.last() != Some(&f) {
+                factors.push(f);
+            }
+            let held = world.held_bytes();
+            peak = peak.max(held);
+            assert!(held <= budget, "frame {i}: {held} bytes over {budget}");
+            crate::tiles::tests::view_covered(
+                world.surfaces().drawn(),
+                cam,
+                rig.forward,
+                BELOW_SURFACE,
+            );
+        }
+        let end = world.total_evicted();
+        println!(
+            "pan: detail {factors:?}, peak held {peak} of {budget}, compacted {}, tiles dropped {}, geometry builds {built}",
+            end.compacted - start.compacted,
+            end.tiles - start.tiles
+        );
+        assert!(
+            factors.len() <= 2,
+            "the detail factor changed more than once: {factors:?}"
+        );
+    }
+
+    #[test]
+    fn a_pan_away_and_back_builds_nothing_drawn_before_again() {
+        let rig = surface_rig();
+        let (mut world, budget, mut now) = settled_at_seventy_percent(&rig);
+        let before: std::collections::BTreeSet<_> = drawn_keys(&world).into_iter().collect();
+        let start = world.total_evicted();
+        let mut factors = vec![world.detail_factor()];
+        let (mut built, mut peak, mut again) = (0, 0, Vec::new());
+        // 15 km away at 3 km/s and straight back over the same places.
+        let n = 300;
+        for i in 1..=2 * n {
+            now += 1.0 / 60.0;
+            let step = if i <= n { i } else { 2 * n - i };
+            let (camera, cam) = rig_moved(&rig, 50.0 * f64::from(step));
+            let keys = surface_frame_keys(&mut world, &rig, &camera, now);
+            built += keys.len();
+            if i > n {
+                again.extend(keys.into_iter().filter(|k| before.contains(k)));
+            }
+            let f = world.detail_factor();
+            if factors.last() != Some(&f) {
+                factors.push(f);
+            }
+            peak = peak.max(world.held_bytes());
+            crate::tiles::tests::view_covered(
+                world.surfaces().drawn(),
+                cam,
+                rig.forward,
+                BELOW_SURFACE,
+            );
+        }
+        let end = world.total_evicted();
+        let reached = peak >= budget;
+        println!(
+            "pan back: detail {factors:?}, peak held {peak} of {budget} (reached the budget: {reached}), compacted {}, tiles dropped {}, geometry builds {built}, drawn before and built again on the way back {}",
+            end.compacted - start.compacted,
+            end.tiles - start.tiles,
+            again.len()
+        );
+        if !reached {
+            assert!(
+                again.is_empty(),
+                "under the budget, tiles drawn before the pan were built again: {again:?}"
+            );
+        }
     }
 }

@@ -3,6 +3,11 @@
 //! compact surface tiles with their overlays, cached cells' decoded
 //! samples, and extracted meshes, against one limit chosen once at start
 //! by the platform layer. No API option sets it; the caches stay inside.
+//!
+//! A still view settles at most at [`SETTLE_FRACTION`] of the budget, so
+//! a pan or a zoom has room for the tiles it brings in; while the camera
+//! moves the held bytes may rise to the budget ([`Detail`]). The browser's
+//! budget follows the device's memory ([`browser_budget`]).
 
 /// The native default: 2 GiB. A desktop has memory to spare and freed
 /// memory goes back to the system, so the budget only keeps the caches
@@ -14,17 +19,20 @@ pub const NATIVE_BUDGET_BYTES: u64 = 2 << 30;
 /// this keeps it well inside what a desktop browser tab is given.
 pub const BROWSER_BUDGET_BYTES: u64 = 512 << 20;
 
-/// The browser default on a touch-first or small-memory device: 192 MiB.
-/// Phones and small tablets end a tab that holds much more, and their
-/// views are small enough that the drawn tiles and cells fit well inside.
+/// The browser default on a small-memory device, or a touch-first one
+/// that reports less than 8 GB of memory or nothing: 192 MiB. Such phones
+/// and small tablets end a tab that holds much more, and their views are
+/// small enough that the drawn tiles and cells fit well inside.
 pub const SMALL_DEVICE_BUDGET_BYTES: u64 = 192 << 20;
 
 /// Asking ahead resumes once the held bytes fall below this fraction of
-/// the budget (`docs/architecture.md`, "Memory budget").
+/// the eviction limit ([`Detail::limit`], `docs/architecture.md`,
+/// "Memory budget").
 pub const RESUME_FRACTION: f64 = 0.9;
 
 /// Whether asking ahead is held after a pass that left `held` bytes, given
-/// whether it was held before: held while over `budget`, and held until
+/// whether it was held before: held while over `budget` (the eviction
+/// limit, [`Detail::limit`]), and held until
 /// the bytes fall below [`RESUME_FRACTION`] of it.
 pub fn hold_ahead(held: u64, budget: u64, was: bool) -> bool {
     if held > budget {
@@ -47,10 +55,16 @@ pub const DETAIL_STEP: f64 = 0.8;
 /// leaves the level-0 tiles and few more, the least the view draws.
 pub const DETAIL_STEPS: u8 = 16;
 
-/// Seconds held bytes stay below [`RESUME_FRACTION`] of the budget before
-/// the detail factor goes up a step, and the longest a step down waits
-/// for the step before it to take effect.
+/// Seconds the camera stays still before it stops counting as moving for
+/// the detail factor, and before the factor goes up a step; also the
+/// longest a step down waits for the step before it to take effect.
 pub const DETAIL_WAIT_SECONDS: f64 = 2.0;
+
+/// At a still camera the held bytes settle at most at this fraction of
+/// the budget, so about 30 percent stays free for the tiles a pan or a
+/// zoom brings in ([`Detail`]). While the camera moves they may rise to
+/// the budget.
+pub const SETTLE_FRACTION: f64 = 0.7;
 
 /// The detail factor (`rendering.md` 3.5, 8 item 7): a number no greater
 /// than 1 that scales every surface tile's split distance, so when the
@@ -58,24 +72,36 @@ pub const DETAIL_WAIT_SECONDS: f64 = 2.0;
 /// selection draws fewer, coarser tiles instead of eviction dropping what
 /// the selection asks for again.
 ///
-/// It goes down a step after an eviction pass that left the held bytes
-/// over the budget, once the step before has taken effect (the
-/// selection's builds are done) or [`DETAIL_WAIT_SECONDS`] have passed.
-/// It goes up a step only after the held bytes stay below
-/// [`RESUME_FRACTION`] of the budget for [`DETAIL_WAIT_SECONDS`], and
-/// never back to a step found over the budget for the same camera and
-/// budget, so a still view settles instead of swinging between two.
+/// The camera counts as moving until it has been still for
+/// [`DETAIL_WAIT_SECONDS`]. The bytes eviction keeps to
+/// ([`Detail::limit`]) are the budget while it moves and
+/// [`SETTLE_FRACTION`] of it while it is still, so a still view leaves
+/// room to move. The factor goes down a step after an eviction pass that
+/// left the held bytes over that limit, once the step before has taken
+/// effect (the selection's builds are done) or [`DETAIL_WAIT_SECONDS`]
+/// have passed: while moving, only when eviction could not get under the
+/// budget without dropping what the selection wants. It goes up a step
+/// only at a still camera, once the held bytes expected after the step
+/// (the drawn bytes go up by about `1 / DETAIL_STEP^2`) have stayed under
+/// [`SETTLE_FRACTION`] of the budget for [`DETAIL_WAIT_SECONDS`], and
+/// never back to a step found over the limit for the same camera and
+/// budget, so a view settles instead of swinging between two.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Detail {
     step: u8,
-    /// The finest step found over the budget since the camera or the
+    /// The finest step found over the limit since the camera or the
     /// budget last changed.
     ceiling: Option<u8>,
-    /// Since when held bytes have been below [`RESUME_FRACTION`] of the
-    /// budget.
-    below_since: Option<f64>,
+    /// Since when the held bytes expected after a step up have been
+    /// under [`SETTLE_FRACTION`] of the budget.
+    fits_since: Option<f64>,
     /// When the step last changed, on the selection's clock.
     changed_at: f64,
+    /// When the camera last moved, on the selection's clock; `None` if it
+    /// never has.
+    moved_at: Option<f64>,
+    /// Whether the camera counted as moving at the latest pass.
+    moving: bool,
 }
 
 impl Detail {
@@ -89,10 +115,36 @@ impl Detail {
         self.step
     }
 
-    /// Forgets the steps found over the budget: the camera or the budget
+    /// Forgets the steps found over the limit: the camera or the budget
     /// changed, so what fits may have changed.
     pub fn forget(&mut self) {
         self.ceiling = None;
+    }
+
+    /// Takes the camera's state at the start of a pass at `now`, seconds:
+    /// whether it moved since the pass before. It counts as moving until
+    /// it has been still for [`DETAIL_WAIT_SECONDS`].
+    pub fn observe(&mut self, moved: bool, now: f64) {
+        if moved {
+            self.moved_at = Some(now);
+            self.forget();
+        }
+        self.moving = self.moved_at.is_some_and(|t| now - t < DETAIL_WAIT_SECONDS);
+    }
+
+    /// Whether the camera counted as moving at the latest pass.
+    pub fn moving(&self) -> bool {
+        self.moving
+    }
+
+    /// The bytes eviction keeps to under `budget`: all of it while the
+    /// camera moves, [`SETTLE_FRACTION`] of it while it is still.
+    pub fn limit(&self, budget: u64) -> u64 {
+        if self.moving {
+            budget
+        } else {
+            (SETTLE_FRACTION * budget as f64) as u64
+        }
     }
 
     /// Takes the result of one eviction pass at `now`, seconds: `held`
@@ -100,8 +152,9 @@ impl Detail {
     /// requests are all done (`settled`). Returns whether the step
     /// changed.
     pub fn after_pass(&mut self, held: u64, budget: u64, settled: bool, now: f64) -> bool {
-        if held > budget {
-            self.below_since = None;
+        let up = DETAIL_STEP * DETAIL_STEP;
+        if held > self.limit(budget) {
+            self.fits_since = None;
             let due = settled || now - self.changed_at >= DETAIL_WAIT_SECONDS;
             if due && self.step < DETAIL_STEPS {
                 self.ceiling = Some(self.ceiling.map_or(self.step, |c| c.max(self.step)));
@@ -109,29 +162,46 @@ impl Detail {
                 self.changed_at = now;
                 return true;
             }
-        } else if (held as f64) < RESUME_FRACTION * budget as f64 {
-            let since = *self.below_since.get_or_insert(now);
+        } else if !self.moving && (held as f64) / up < SETTLE_FRACTION * budget as f64 {
+            let since = *self.fits_since.get_or_insert(now);
             let allowed = self.ceiling.is_none_or(|c| self.step > c + 1);
-            if self.step > 0 && allowed && now - since >= DETAIL_WAIT_SECONDS {
+            let waited =
+                now - since >= DETAIL_WAIT_SECONDS && now - self.changed_at >= DETAIL_WAIT_SECONDS;
+            if self.step > 0 && allowed && waited {
                 self.step -= 1;
                 self.changed_at = now;
-                self.below_since = Some(now);
+                self.fits_since = Some(now);
                 return true;
             }
         } else {
-            self.below_since = None;
+            self.fits_since = None;
         }
         false
     }
 }
 
+/// The browser default on a touch-first device that reports 8 GB of
+/// memory or more: 384 MiB. A large phone or tablet keeps a tab this size
+/// and its view has room to move in it.
+pub const LARGE_TOUCH_BUDGET_BYTES: u64 = 384 << 20;
+
 /// The browser's budget from the two device facts: whether the primary
 /// pointer is coarse (`matchMedia("(pointer: coarse)")` matches) and the
 /// device memory in gigabytes (`navigator.deviceMemory`, `None` where the
-/// browser does not say).
+/// browser does not say). A device that reports 4 or less gets
+/// [`SMALL_DEVICE_BUDGET_BYTES`]; a touch-first one gets
+/// [`LARGE_TOUCH_BUDGET_BYTES`] if it reports 8 or more and
+/// [`SMALL_DEVICE_BUDGET_BYTES`] otherwise; any other gets
+/// [`BROWSER_BUDGET_BYTES`].
 pub fn browser_budget(coarse_pointer: bool, device_memory_gb: Option<f64>) -> u64 {
-    if coarse_pointer || device_memory_gb.is_some_and(|gb| gb <= 4.0) {
+    if device_memory_gb.is_some_and(|gb| gb <= 4.0) {
         SMALL_DEVICE_BUDGET_BYTES
+    } else if coarse_pointer {
+        if device_memory_gb.is_some_and(|gb| gb >= 8.0) {
+            LARGE_TOUCH_BUDGET_BYTES
+        } else {
+            SMALL_DEVICE_BUDGET_BYTES
+        }
     } else {
         BROWSER_BUDGET_BYTES
     }
@@ -222,16 +292,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_defaults_are_two_gib_native_and_512_or_192_mib_in_the_browser() {
+    fn the_defaults_are_two_gib_native_and_512_384_or_192_mib_in_the_browser() {
         assert_eq!(NATIVE_BUDGET_BYTES, 2 * 1024 * 1024 * 1024);
         #[cfg(not(target_arch = "wasm32"))]
         assert_eq!(platform_budget(), NATIVE_BUDGET_BYTES);
-        assert_eq!(browser_budget(false, None), 512 * 1024 * 1024);
-        assert_eq!(browser_budget(false, Some(8.0)), 512 * 1024 * 1024);
-        assert_eq!(browser_budget(true, None), 192 * 1024 * 1024);
-        assert_eq!(browser_budget(true, Some(16.0)), 192 * 1024 * 1024);
-        assert_eq!(browser_budget(false, Some(4.0)), 192 * 1024 * 1024);
-        assert_eq!(browser_budget(false, Some(2.0)), 192 * 1024 * 1024);
+        let mib = 1024 * 1024;
+        assert_eq!(browser_budget(false, None), 512 * mib);
+        assert_eq!(browser_budget(false, Some(8.0)), 512 * mib);
+        assert_eq!(browser_budget(false, Some(6.0)), 512 * mib);
+        assert_eq!(browser_budget(true, Some(8.0)), 384 * mib);
+        assert_eq!(browser_budget(true, Some(16.0)), 384 * mib);
+        assert_eq!(browser_budget(true, Some(6.0)), 192 * mib);
+        assert_eq!(browser_budget(true, None), 192 * mib);
+        assert_eq!(browser_budget(true, Some(4.0)), 192 * mib);
+        assert_eq!(browser_budget(false, Some(4.0)), 192 * mib);
+        assert_eq!(browser_budget(false, Some(2.0)), 192 * mib);
     }
 
     #[test]
@@ -249,36 +324,59 @@ mod tests {
     }
 
     #[test]
-    fn detail_goes_down_over_the_budget_and_up_only_below_resume_for_a_while() {
+    fn detail_settles_with_room_to_move_and_goes_up_only_when_still() {
         let b = 1000;
         let mut d = Detail::default();
         assert_eq!(d.factor(), 1.0);
-        assert!(
-            !d.after_pass(1000, b, true, 0.0),
-            "at the budget: no change"
-        );
-        assert!(d.after_pass(1001, b, true, 0.1));
+        // Still: the limit is 70 percent of the budget.
+        d.observe(false, 0.0);
+        assert!(!d.moving());
+        assert_eq!(d.limit(b), 700);
+        assert!(!d.after_pass(700, b, true, 0.0), "at the limit: no change");
+        assert!(d.after_pass(701, b, true, 0.1));
         assert_eq!(d.step(), 1);
         assert!(
-            !d.after_pass(1001, b, false, 0.2),
+            !d.after_pass(701, b, false, 0.2),
             "waits for the step to take effect"
         );
-        assert!(d.after_pass(1001, b, false, 0.1 + DETAIL_WAIT_SECONDS));
+        assert!(d.after_pass(701, b, false, 0.1 + DETAIL_WAIT_SECONDS));
         assert_eq!(d.step(), 2);
-        // Below the resume fraction: up only after the wait, and never
-        // back to a step found over the budget.
-        assert!(!d.after_pass(800, b, true, 3.0));
-        assert!(!d.after_pass(800, b, true, 3.0 + DETAIL_WAIT_SECONDS));
-        assert_eq!(d.step(), 2);
+        // Moving: up to the budget without a step, down only over it, and
+        // never up.
+        d.observe(true, 3.0);
+        assert!(d.moving());
+        assert_eq!(d.limit(b), b);
+        assert!(!d.after_pass(1000, b, true, 3.0));
+        assert!(!d.after_pass(100, b, true, 4.0));
+        d.observe(false, 4.9);
+        assert!(d.moving(), "still for less than the wait");
+        assert!(!d.after_pass(100, b, true, 4.9));
+        assert!(d.after_pass(1001, b, true, 4.95));
+        assert_eq!(d.step(), 3);
+        // Still again: up only once still for the wait and the bytes
+        // expected after the step have fit for the wait.
+        d.observe(false, 5.0 + DETAIL_WAIT_SECONDS);
+        assert!(!d.moving());
+        assert!(
+            !d.after_pass(500, b, true, 5.0 + DETAIL_WAIT_SECONDS),
+            "500 / 0.64 is over 700"
+        );
+        assert!(!d.after_pass(400, b, true, 8.0));
+        d.observe(false, 9.0);
+        assert!(!d.after_pass(400, b, true, 9.0));
+        d.observe(false, 10.0);
+        assert!(
+            !d.after_pass(400, b, true, 10.0),
+            "never back to a step found over the limit for this camera"
+        );
+        assert_eq!(d.step(), 3);
         d.forget();
-        assert!(d.after_pass(800, b, true, 6.0), "below since 3 s");
+        assert!(d.after_pass(400, b, true, 10.0), "fit since 8 s");
+        assert_eq!(d.step(), 2);
+        // The next step waits again.
+        assert!(!d.after_pass(400, b, true, 11.0));
+        assert!(d.after_pass(400, b, true, 10.0 + DETAIL_WAIT_SECONDS));
         assert_eq!(d.step(), 1);
-        // Between the resume fraction and the budget: the wait restarts.
-        assert!(!d.after_pass(950, b, true, 20.0));
-        assert!(!d.after_pass(800, b, true, 21.0));
-        assert!(!d.after_pass(800, b, true, 22.0));
-        assert!(d.after_pass(800, b, true, 21.0 + DETAIL_WAIT_SECONDS));
-        assert_eq!(d.factor(), 1.0);
     }
 
     #[test]
