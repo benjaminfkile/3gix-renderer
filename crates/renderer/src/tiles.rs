@@ -40,7 +40,10 @@
 //! its [`range`], and not built (it is about to be drawn again). Level-0
 //! tiles stay built; every other arrived tile, the split ancestors the
 //! walk only passes through among them, goes back to compact
-//! [`BUILT_GRACE_SECONDS`] after it was last wanted built. A compact tile
+//! [`BUILT_GRACE_SECONDS`] after it was last wanted built, or, while the
+//! camera moves ([`Surfaces::set_keep_built`]), once it is still again or
+//! eviction over the budget compacts it, so a view coming back finds the
+//! tiles it just left built. A compact tile
 //! wanted built is handed to the fetcher ([`Surfaces::take_builds`]),
 //! which builds it off the frame thread ([`build_tile`]) and hands the
 //! geometry back ([`Surfaces::complete_build`]).
@@ -723,6 +726,11 @@ pub struct Surfaces {
     /// Over the memory budget: children are asked for only within the
     /// split distance, not out to [`PREFETCH`] times it (`crate::budget`).
     hold_ahead: bool,
+    /// While the camera moves (`crate::budget::Detail::moving`): built
+    /// tiles stay built after [`BUILT_GRACE_SECONDS`], so the view finds
+    /// them built when it comes back; eviction compacts them over the
+    /// budget.
+    keep_built: bool,
     /// Steps of the detail factor below full detail
     /// ([`crate::budget::Detail`]): every split distance is scaled by
     /// [`crate::budget::DETAIL_STEP`] to this power.
@@ -909,8 +917,12 @@ impl Surfaces {
     }
 
     /// Returns every built tile that is not a level-0 tile and has not
-    /// been wanted built for [`BUILT_GRACE_SECONDS`] to compact.
+    /// been wanted built for [`BUILT_GRACE_SECONDS`] to compact, unless
+    /// built tiles are kept while the camera moves.
     fn compact_unwanted(&mut self) {
+        if self.keep_built {
+            return;
+        }
         let now = self.now;
         for (key, l) in &mut self.layers {
             if key.level == 0 || !l.built() || !l.can_compact() {
@@ -1386,6 +1398,13 @@ impl Surfaces {
         } else {
             a
         }
+    }
+
+    /// Keeps built tiles built past [`BUILT_GRACE_SECONDS`] while `keep`
+    /// is `true`: the camera moves, and the room the budget leaves holds
+    /// what the view just left (`crate::budget::SETTLE_FRACTION`).
+    pub fn set_keep_built(&mut self, keep: bool) {
+        self.keep_built = keep;
     }
 
     /// Holds asking ahead ([`PREFETCH`]) while `hold` is `true`: the
@@ -2636,6 +2655,52 @@ pub(crate) mod tests {
                     locate_drawn(drawn, *p, usize::MAX).is_some(),
                     "vertex {v} of {} is open",
                     t.geometry.key
+                );
+            }
+        }
+    }
+
+    /// Every direction of a grid over the middle of the view from `cam`
+    /// looking along `fwd` that reaches radius `r` from the center (below the
+    /// surface) lies in a tile of `drawn`: no point of the view is open,
+    /// with no reference selection needed (for a moving camera).
+    pub(crate) fn view_covered(drawn: &[TileDrawInfo], cam: [f64; 3], fwd: [f64; 3], r: f64) {
+        let norm = |a: [f64; 3]| {
+            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            [a[0] / l, a[1] / l, a[2] / l]
+        };
+        let cross = |a: [f64; 3], b: [f64; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let u = norm(cross(fwd, norm(cam)));
+        let v = cross(u, fwd);
+        let n = 8;
+        for i in 0..=n {
+            for j in 0..=n {
+                let (a, b) = (
+                    0.4 * (2.0 * f64::from(i) / f64::from(n) - 1.0),
+                    0.3 * (2.0 * f64::from(j) / f64::from(n) - 1.0),
+                );
+                let d = norm(std::array::from_fn(|k| fwd[k] + a * u[k] + b * v[k]));
+                // The nearer point of cam + t d at radius r.
+                let (bh, c) = (dot(cam, d), dot(cam, cam) - r * r);
+                let disc = bh * bh - c;
+                if disc < 0.0 {
+                    continue;
+                }
+                let t = -bh - disc.sqrt();
+                if t <= 0.0 {
+                    continue;
+                }
+                let p: [f64; 3] = std::array::from_fn(|k| cam[k] + t * d[k]);
+                assert!(
+                    locate_drawn(drawn, norm(p), usize::MAX).is_some(),
+                    "the view is open at ({a}, {b})"
                 );
             }
         }

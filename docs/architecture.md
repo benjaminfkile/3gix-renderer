@@ -202,14 +202,19 @@ The budget is chosen once at start by the platform layer
 |---|---|---|
 | native | 2 GiB | memory to spare, and freed memory goes back to the system |
 | browser | 512 MiB | WebAssembly memory never shrinks: the highest point while loading is what the page keeps |
-| browser, `matchMedia("(pointer: coarse)")` matches or `navigator.deviceMemory` is at most 4 | 192 MiB | phones and small tablets end tabs that hold much more |
+| browser, `matchMedia("(pointer: coarse)")` matches and `navigator.deviceMemory` is 8 or more | 384 MiB | large phones and tablets keep a tab this size, with room to move |
+| browser, `matchMedia("(pointer: coarse)")` matches and `navigator.deviceMemory` is under 8 or not reported (Safari), or `navigator.deviceMemory` is at most 4 | 192 MiB | other phones and small tablets end tabs that hold much more |
 
 Eviction runs where it ran before: after each surface selection and every
 `EVICT_INTERVAL_SECONDS` for cells (`World::enforce_budget`); the pass
 after a surface selection takes the cells' and meshes' bytes from the
-latest cell pass instead of counting every cell again. Under the
-budget nothing is evicted for size (cells still age out after 60 s).
-While over it, in this order:
+latest cell pass instead of counting every cell again. Eviction keeps
+to a limit (`budget::Detail::limit`): the budget while the camera moves,
+and 70 percent of it (`budget::SETTLE_FRACTION`) once the camera has
+been still for 2 s (`budget::DETAIL_WAIT_SECONDS`), so a still view
+leaves about 30 percent free for the tiles a pan or a zoom brings in.
+Under the limit nothing is evicted for size (cells still age out after
+60 s). While over it, in this order:
 
 1. Built tiles not level-0 and not wanted built (drawn tiles are) go
    compact, least recently looked at first; the ancestors the selection
@@ -221,26 +226,37 @@ While over it, in this order:
 What the current frame draws, the ancestors the selection walks to reach
 it, level-0 tiles, the tiles the latest selection wants built (drawn,
 children a split waits on, split tiles about to join) or asked for, the
-cell target, and pinned cells are never evicted, even over the budget.
+cell target, and pinned cells are never evicted, even over the limit.
 The rest of the selection's `used` set protects nothing past the budget.
 
 When what the view wants at full detail does not fit, detail yields to
 the budget instead (`budget::Detail`): after a surface pass that leaves
-held bytes over the budget, once the previous step has taken effect (no
+held bytes over the limit, once the previous step has taken effect (no
 build or request outstanding) or 2 s have passed, every split distance
 is scaled down one more step of 0.8 (`budget::DETAIL_STEP`, at most 16
 steps), so the view draws fewer, coarser tiles; joins wait for the parent
-to be built as always, so the view is never open. The factor goes up a
-step only after held bytes stay below `RESUME_FRACTION` of the budget for
-2 s, and never back to a step found over the budget since the camera,
-the view size, or the budget last changed, so a still view settles. Under
-the budget the factor stays 1 and nothing changes.
+to be built as always, so the view is never open. While the camera
+moves the limit is the budget, so the factor steps down only when
+eviction cannot get under the budget without dropping what the
+selection wants. The factor goes up a step only at a camera still for
+2 s, once the held bytes expected after the step (held bytes over
+`DETAIL_STEP^2`) have stayed under `SETTLE_FRACTION` of the budget for
+2 s, never while the camera moves, and never back to a step found over
+the limit since the camera, the view size, or the budget last changed,
+so the factor does not swing. Under `SETTLE_FRACTION` of the budget the
+factor stays 1 and the drawn tiles do not change.
 
-While held bytes exceed the budget, the selection asks only for what it
+While the camera moves, built tiles that are no longer wanted built stay
+built past `tiles::BUILT_GRACE_SECONDS` (`Surfaces::set_keep_built`): the
+free room holds what the view just left, so a pan back draws them at
+once. Over the budget eviction compacts them first; once the camera has
+been still for 2 s they go compact as before.
+
+While held bytes exceed the limit, the selection asks only for what it
 needs at the current view: children of tiles within their split distance
 (not out to `PREFETCH` times it) and cells of the drawn target (no cell
 whose parent has not arrived, the `AHEAD_DEPTHS` prediction). Asking ahead
-resumes once held bytes fall below 90 percent of the budget
+resumes once held bytes fall below 90 percent of the limit
 (`budget::RESUME_FRACTION`). This keeps the highest point near the budget.
 
 A compact tile is built off the frame thread (`tiles::build_tile`, on a
@@ -271,7 +287,9 @@ unchanged. With it:
   - `allocator`: `live` and `peak`.
   - `budget`: the `budget`, the bytes it counts (`held`), whether asking
     ahead is held, the `detail` factor the surface selection scales split
-    distances by (1 unless the view's full detail did not fit), and what
+    distances by (1 unless the view's full detail did not fit), whether
+    the camera counts as `moving` for it (the limit is the budget while
+    it moves, `SETTLE_FRACTION` of it while still), and what
     the latest pass and all passes evicted
     (`compacted`, `tiles`, `cells`, `meshes`).
   - `surfaces`: entries `requested`, `ready` (built or compact),

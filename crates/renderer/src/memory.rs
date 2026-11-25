@@ -265,6 +265,10 @@ pub struct BudgetMemory {
     /// ([`crate::budget::Detail`]): 1 unless the view's full detail did
     /// not fit the budget.
     pub detail: f64,
+    /// Whether the camera counts as moving for the detail factor: held
+    /// bytes may rise to the budget while it moves and settle at most at
+    /// [`crate::budget::SETTLE_FRACTION`] of it while it is still.
+    pub moving: bool,
     /// What the latest pass evicted.
     pub last: crate::budget::Evicted,
     /// What every pass evicted, summed.
