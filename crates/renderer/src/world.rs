@@ -252,6 +252,11 @@ pub struct World {
     last_evicted: crate::budget::Evicted,
     /// What every eviction pass over the budget did, summed.
     total_evicted: crate::budget::Evicted,
+    /// The detail factor the surface selection scales split distances by
+    /// over the budget ([`crate::budget::Detail`]).
+    detail: crate::budget::Detail,
+    /// The camera and view of the latest surface selection.
+    surface_pose: Option<Pose>,
 }
 
 impl World {
@@ -291,6 +296,8 @@ impl World {
             holding_ahead: false,
             last_evicted: crate::budget::Evicted::default(),
             total_evicted: crate::budget::Evicted::default(),
+            detail: crate::budget::Detail::default(),
+            surface_pose: None,
         }
     }
 
@@ -519,8 +526,24 @@ impl World {
             })
             .map(|f| f.frame_id)
             .collect();
+        let pose = Pose::of(camera, view_px);
+        if self.surface_pose != Some(pose) {
+            self.detail.forget();
+            self.surface_pose = Some(pose);
+        }
         self.surfaces.select(system, camera, view_px, &frames, now);
         self.enforce_budget(false);
+        let settled = self.surfaces.settled();
+        if self.detail.after_pass(self.held, self.budget, settled, now) {
+            self.surfaces.set_detail_step(self.detail.step());
+        }
+    }
+
+    /// The detail factor the surface selection scales split distances by
+    /// ([`crate::budget::Detail`]): 1 unless the view's full detail did
+    /// not fit the memory budget.
+    pub fn detail_factor(&self) -> f64 {
+        self.detail.factor()
     }
 
     /// The memory budget, bytes (`crate::budget`): the platform's default
@@ -532,6 +555,9 @@ impl World {
     /// Sets the memory budget, bytes: for tests and tools that force a
     /// small one. No API option reaches it (`crate::budget`).
     pub fn set_memory_budget(&mut self, bytes: u64) {
+        if bytes != self.budget {
+            self.detail.forget();
+        }
         self.budget = bytes;
     }
 
@@ -577,8 +603,11 @@ impl World {
     /// wanted built go compact; then compact tiles, cells, and meshes not
     /// drawn and not in the current target go, least recently used first,
     /// the deepest first on a tie. The drawn tiles, the ancestors the
-    /// selection walks to reach them, level-0 tiles, the cell target, and
-    /// pinned cells stay, even over the budget. Then holds asking ahead
+    /// selection walks to reach them, level-0 tiles, the tiles wanted
+    /// built or asked for by the latest selection, the cell target, and
+    /// pinned cells stay, even over the budget: after a surface pass that
+    /// leaves the bytes over it, the detail factor goes down instead
+    /// ([`crate::budget::Detail`]). Then holds asking ahead
     /// while held bytes exceed the budget, until they fall below
     /// [`crate::budget::RESUME_FRACTION`] of it.
     fn enforce_budget(&mut self, cells: bool) {
@@ -1439,6 +1468,7 @@ impl World {
                 budget: self.budget,
                 held: self.held,
                 holding_ahead: self.holding_ahead,
+                detail: self.detail.factor(),
                 last: self.last_evicted,
                 total: self.total_evicted,
             },
@@ -1600,5 +1630,162 @@ mod tests {
         world.pump();
         assert_eq!(world.counts().extracting, 0);
         assert!(Arc::ptr_eq(world.mesh(&a).unwrap(), &mesh));
+    }
+
+    /// One frame of a body with surface tiles to level 12 whose root is
+    /// frame 4 (the tiles' frame), and a camera 20 km over face 4 looking
+    /// 45 degrees down.
+    struct SurfaceRig {
+        system: FrameSystem,
+        camera: Camera,
+        cam: [f64; 3],
+        forward: [f64; 3],
+    }
+
+    const SURFACE_VIEW: (u32, u32) = (1280, 720);
+
+    fn surface_rig() -> SurfaceRig {
+        use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
+        use gx_core::units::{Kilograms, Quat, Seconds};
+        let frame = Frame {
+            frame_id: 4,
+            parent_frame_id: ROOT_PARENT,
+            root_extent: Meters::new(1.6e7),
+            max_depth: 4,
+            mass: Kilograms::new(6.0e24),
+            position: Vec3::zero(),
+            velocity: Vec3::zero(),
+            orientation: Quat::identity(),
+            angular_velocity: Vec3::zero(),
+            j2: 0.0,
+            reference_radius: Meters::new(0.0),
+            principal_moments: Vec3::zero(),
+        };
+        let reg = Registry::new(Seconds::new(0.0), vec![frame]).unwrap();
+        let system = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
+        let key = gx_core::key::SurfaceKey::new(4, 4, 0, 0, 0).unwrap();
+        let d = gx_core::surface::vertex_direction(&key, 20, 9);
+        let (p, n) = gx_core::surface::ellipsoid_point(d, 6_378_137.0, 6_356_752.3);
+        let cam: [f64; 3] = std::array::from_fn(|k| p[k] + 20_000.0 * n[k]);
+        let side = Vec3::new(0.0, 0.0, 1.0).cross(Vec3::new(n[0], n[1], n[2]));
+        let side = side.scale(1.0 / side.length());
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let forward: [f64; 3] = std::array::from_fn(|k| h * [side.x, side.y, side.z][k] - h * n[k]);
+        let camera = Camera {
+            frame_id: 4,
+            position: Vec3::new(cam[0], cam[1], cam[2]),
+            orientation: crate::camera::look_rotation(
+                Vec3::new(forward[0], forward[1], forward[2]),
+                Vec3::new(n[0], n[1], n[2]),
+            ),
+            speed: 1.0,
+            cruise: 1.0,
+            fov_y: crate::camera::FIELD_OF_VIEW_Y,
+        };
+        SurfaceRig {
+            system,
+            camera,
+            cam,
+            forward,
+        }
+    }
+
+    /// One frame at `now`: the surface selection, every request answered
+    /// and every build done at once. Returns how many tiles were built.
+    fn surface_frame(world: &mut World, rig: &SurfaceRig, now: f64) -> usize {
+        world.select_surfaces(&rig.system, &rig.camera, SURFACE_VIEW, now);
+        for key in world.take_surface_requests() {
+            let sections = if key.level <= 12 {
+                vec![gx_core::surface::encode(
+                    &crate::tiles::tests::tile(key),
+                    gx_core::matter::Compression::None,
+                )]
+            } else {
+                Vec::new()
+            };
+            let decoded = crate::tiles::decode_tile(&key, &sections, &[0], &Default::default());
+            world.complete_surface(key, decoded, false);
+        }
+        let builds = world.take_surface_builds();
+        let n = builds.len();
+        for req in builds {
+            let outcome = crate::tiles::build_tile(&req);
+            world.complete_surface_build(req.key, outcome);
+        }
+        n
+    }
+
+    fn drawn_keys(world: &World) -> Vec<gx_core::key::SurfaceKey> {
+        let mut k: Vec<_> = (world.surfaces().drawn().iter())
+            .map(|t| t.geometry.key)
+            .collect();
+        k.sort();
+        k
+    }
+
+    /// Frames at a still camera from `now` until the detail factor, the
+    /// drawn tiles, and the builds have not changed for 300 frames.
+    fn settle_surfaces(world: &mut World, rig: &SurfaceRig, now: &mut f64) {
+        let mut last = (Vec::new(), f64::NAN);
+        let mut still = 0;
+        for _ in 0..20_000 {
+            *now += 1.0 / 60.0;
+            let built = surface_frame(world, rig, *now);
+            let state = (drawn_keys(world), world.detail_factor());
+            if built == 0 && state == last {
+                still += 1;
+                if still == 300 {
+                    return;
+                }
+            } else {
+                still = 0;
+            }
+            last = state;
+        }
+        panic!("the surface selection never settled");
+    }
+
+    #[test]
+    fn over_the_budget_detail_yields_and_the_view_settles() {
+        let rig = surface_rig();
+        let mut world = World::new(0);
+        let default = world.memory_budget();
+        let mut now = 0.0;
+        settle_surfaces(&mut world, &rig, &mut now);
+        assert_eq!(world.detail_factor(), 1.0);
+        let full = drawn_keys(&world);
+        let reference = world.surfaces().drawn().to_vec();
+        let needed = world.held_bytes();
+        // Room for about 70 percent of what the view needs at full detail.
+        let budget = needed * 7 / 10;
+        world.set_memory_budget(budget);
+        settle_surfaces(&mut world, &rig, &mut now);
+        let factor = world.detail_factor();
+        assert!(factor < 1.0, "detail did not yield");
+        let drawn = drawn_keys(&world);
+        let evicted = world.total_evicted();
+        let mut built = 0;
+        for i in 0..300 {
+            now += 1.0 / 60.0;
+            built += surface_frame(&mut world, &rig, now);
+            assert_eq!(world.total_evicted(), evicted, "frame {i}: evicted again");
+            assert_eq!(drawn_keys(&world), drawn, "frame {i}: drawn tiles changed");
+            assert_eq!(world.detail_factor(), factor, "frame {i}: detail changed");
+            let held = world.held_bytes();
+            assert!(held <= budget, "frame {i}: {held} bytes over {budget}");
+        }
+        assert_eq!(built, 0, "tiles built again at a still camera");
+        crate::tiles::tests::covered(world.surfaces().drawn(), &reference, rig.cam, rig.forward);
+        println!(
+            "detail: full detail {} tiles in {needed} bytes; budget {budget}: factor {factor}, {} tiles drawn, held {}, evicted in all {evicted:?}, built over 300 settled frames {built}",
+            full.len(),
+            drawn.len(),
+            world.held_bytes()
+        );
+        // The default budget again: the unconstrained run's tiles.
+        world.set_memory_budget(default);
+        settle_surfaces(&mut world, &rig, &mut now);
+        assert_eq!(world.detail_factor(), 1.0);
+        assert_eq!(drawn_keys(&world), full);
     }
 }

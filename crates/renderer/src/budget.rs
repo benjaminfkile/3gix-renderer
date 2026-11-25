@@ -36,6 +36,95 @@ pub fn hold_ahead(held: u64, budget: u64, was: bool) -> bool {
     }
 }
 
+/// One step of the detail factor ([`Detail`]): each step down scales
+/// every split distance by this. Chosen so a step changes the drawn
+/// bytes by about a third (the drawn area at each level goes with the
+/// square of the split distance), small enough to end near the budget
+/// and large enough to settle in a few passes.
+pub const DETAIL_STEP: f64 = 0.8;
+
+/// The most steps the detail factor goes down: `0.8^16`, about 1/35,
+/// leaves the level-0 tiles and few more, the least the view draws.
+pub const DETAIL_STEPS: u8 = 16;
+
+/// Seconds held bytes stay below [`RESUME_FRACTION`] of the budget before
+/// the detail factor goes up a step, and the longest a step down waits
+/// for the step before it to take effect.
+pub const DETAIL_WAIT_SECONDS: f64 = 2.0;
+
+/// The detail factor (`rendering.md` 3.5, 8 item 7): a number no greater
+/// than 1 that scales every surface tile's split distance, so when the
+/// tiles the view wants at full detail do not fit the memory budget the
+/// selection draws fewer, coarser tiles instead of eviction dropping what
+/// the selection asks for again.
+///
+/// It goes down a step after an eviction pass that left the held bytes
+/// over the budget, once the step before has taken effect (the
+/// selection's builds are done) or [`DETAIL_WAIT_SECONDS`] have passed.
+/// It goes up a step only after the held bytes stay below
+/// [`RESUME_FRACTION`] of the budget for [`DETAIL_WAIT_SECONDS`], and
+/// never back to a step found over the budget for the same camera and
+/// budget, so a still view settles instead of swinging between two.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct Detail {
+    step: u8,
+    /// The finest step found over the budget since the camera or the
+    /// budget last changed.
+    ceiling: Option<u8>,
+    /// Since when held bytes have been below [`RESUME_FRACTION`] of the
+    /// budget.
+    below_since: Option<f64>,
+    /// When the step last changed, on the selection's clock.
+    changed_at: f64,
+}
+
+impl Detail {
+    /// The factor, `DETAIL_STEP^step`: 1 at full detail.
+    pub fn factor(&self) -> f64 {
+        DETAIL_STEP.powi(i32::from(self.step))
+    }
+
+    /// Steps below full detail.
+    pub fn step(&self) -> u8 {
+        self.step
+    }
+
+    /// Forgets the steps found over the budget: the camera or the budget
+    /// changed, so what fits may have changed.
+    pub fn forget(&mut self) {
+        self.ceiling = None;
+    }
+
+    /// Takes the result of one eviction pass at `now`, seconds: `held`
+    /// bytes against `budget`, and whether the selection's builds and
+    /// requests are all done (`settled`). Returns whether the step
+    /// changed.
+    pub fn after_pass(&mut self, held: u64, budget: u64, settled: bool, now: f64) -> bool {
+        if held > budget {
+            self.below_since = None;
+            let due = settled || now - self.changed_at >= DETAIL_WAIT_SECONDS;
+            if due && self.step < DETAIL_STEPS {
+                self.ceiling = Some(self.ceiling.map_or(self.step, |c| c.max(self.step)));
+                self.step += 1;
+                self.changed_at = now;
+                return true;
+            }
+        } else if (held as f64) < RESUME_FRACTION * budget as f64 {
+            let since = *self.below_since.get_or_insert(now);
+            let allowed = self.ceiling.is_none_or(|c| self.step > c + 1);
+            if self.step > 0 && allowed && now - since >= DETAIL_WAIT_SECONDS {
+                self.step -= 1;
+                self.changed_at = now;
+                self.below_since = Some(now);
+                return true;
+            }
+        } else {
+            self.below_since = None;
+        }
+        false
+    }
+}
+
 /// The browser's budget from the two device facts: whether the primary
 /// pointer is coarse (`matchMedia("(pointer: coarse)")` matches) and the
 /// device memory in gigabytes (`navigator.deviceMemory`, `None` where the
@@ -157,6 +246,39 @@ mod tests {
         assert!(hold_ahead(900, b, true), "still held at 90 percent");
         assert!(!hold_ahead(899, b, true));
         assert!(!hold_ahead(950, b, false));
+    }
+
+    #[test]
+    fn detail_goes_down_over_the_budget_and_up_only_below_resume_for_a_while() {
+        let b = 1000;
+        let mut d = Detail::default();
+        assert_eq!(d.factor(), 1.0);
+        assert!(
+            !d.after_pass(1000, b, true, 0.0),
+            "at the budget: no change"
+        );
+        assert!(d.after_pass(1001, b, true, 0.1));
+        assert_eq!(d.step(), 1);
+        assert!(
+            !d.after_pass(1001, b, false, 0.2),
+            "waits for the step to take effect"
+        );
+        assert!(d.after_pass(1001, b, false, 0.1 + DETAIL_WAIT_SECONDS));
+        assert_eq!(d.step(), 2);
+        // Below the resume fraction: up only after the wait, and never
+        // back to a step found over the budget.
+        assert!(!d.after_pass(800, b, true, 3.0));
+        assert!(!d.after_pass(800, b, true, 3.0 + DETAIL_WAIT_SECONDS));
+        assert_eq!(d.step(), 2);
+        d.forget();
+        assert!(d.after_pass(800, b, true, 6.0), "below since 3 s");
+        assert_eq!(d.step(), 1);
+        // Between the resume fraction and the budget: the wait restarts.
+        assert!(!d.after_pass(950, b, true, 20.0));
+        assert!(!d.after_pass(800, b, true, 21.0));
+        assert!(!d.after_pass(800, b, true, 22.0));
+        assert!(d.after_pass(800, b, true, 21.0 + DETAIL_WAIT_SECONDS));
+        assert_eq!(d.factor(), 1.0);
     }
 
     #[test]
