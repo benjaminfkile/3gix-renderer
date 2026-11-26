@@ -844,7 +844,7 @@ mod tests {
     fn numeric_flags() {
         let flags = parse_flags([
             "--time-scale",
-            "86400",
+            "51200",
             "--start-offset-seconds",
             "-3.5e6",
             "--start",
@@ -857,7 +857,7 @@ mod tests {
         ])
         .unwrap();
         let c = Config::resolve(&base_env(), &flags).unwrap();
-        assert_eq!(c.options.time_scale, 86400.0);
+        assert_eq!(c.options.time_scale, 51200.0);
         assert_eq!(c.options.start_offset_seconds, -3.5e6);
         assert_eq!(c.options.start, Start::Origin);
         assert_eq!(Start::Origin.to_string(), "origin");

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Full local CI: toolchain versions, format, lint, tests (including the
 # headless renders and the volume comparison on whatever wgpu adapter is
-# present, a software Vulkan driver is enough), the vocabulary lint, the
+# present, a software Vulkan driver is enough), the vocabulary lint
+# (banned words and banned numbers) and its own test, the
 # browser worker's module runner under Node (V8, standing in for the
 # browser) against the example module's conformance hashes, the browser's
 # view options from config.js and the query string, the
@@ -45,11 +46,15 @@ cargo clippy -p renderer --target wasm32-unknown-unknown --features web,memory-r
 step "4b. budget test (release, rendering.md section 5.3)"
 cargo test --release -p renderer --test budget
 
-step "5. vocab-lint"
+step "5. vocab-lint, banned words and banned numbers"
 sh scripts/vocab-lint.sh
+
+step "5a. vocab-lint finds a banned number and honors only a measured reference in tests/"
+sh scripts/vocab-lint-test.sh
 if [ -n "${GX_CORE_DIR:-}" ]; then
     diff "$GX_CORE_DIR/scripts/vocab-lint.sh" scripts/vocab-lint.sh
     diff "$GX_CORE_DIR/scripts/vocab-banned.txt" scripts/vocab-banned.txt
+    diff "$GX_CORE_DIR/scripts/vocab-numbers.txt" scripts/vocab-numbers.txt
     echo "vocab-lint files match the core library"
 fi
 

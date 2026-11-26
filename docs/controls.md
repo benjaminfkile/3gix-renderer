@@ -160,7 +160,7 @@ Time never goes past now: playing forward into now, or stepping forward
 past it, locks the clock to now again at rate 1. Going back stops at the
 origin. `N` returns to now from anywhere.
 
-Every jump costs at most one checkpoint interval (86 400 simulated seconds) of
+Every jump costs at most one checkpoint interval (65 536 simulated seconds) of
 integration, from the nearest checkpoint the renderer keeps.
 
 The overlay's first line shows the simulation time as a UTC date and time,

@@ -7,7 +7,9 @@
 # non-zero on any breach.
 #
 # The hub comes from the environment like the renderer's own settings:
-# GX_HUB_URL, GX_API_KEY, GX_SPACE_ID (and GX_BUILD_ID if set).
+# GX_HUB_URL, GX_API_KEY, GX_SPACE_ID (and GX_BUILD_ID if set). The views'
+# frame and direction come from GX_BENCH_ON, "<frame>:<x>,<y>,<z>" with a
+# unit direction in that frame's axes, so the script names no place.
 #
 # Usage: sh scripts/perf-budget.sh [--keep <dir>] [--baseline <file>]
 #   --keep <dir>      write the statistics and screenshots there and keep them
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
 done
 
 : "${GX_HUB_URL:?set GX_HUB_URL}" "${GX_API_KEY:?set GX_API_KEY}" "${GX_SPACE_ID:?set GX_SPACE_ID}"
+: "${GX_BENCH_ON:?set GX_BENCH_ON to <frame>:<x>,<y>,<z>}"
 
 cargo build --release --bin gx-renderer -p renderer
 cargo build --release -p perf-budget
@@ -41,9 +44,9 @@ else
     trap 'rm -rf "$out"' EXIT HUP INT TERM
 fi
 
-# rendering.md section 5.1. The direction is a unit vector in frame 4's axes;
-# @+<m> is a height above whatever surface is drawn on that line.
-dir='4:-0.278984895,-0.626786973,0.727533861'
+# rendering.md section 5.1. GX_BENCH_ON is a frame and a unit vector in its
+# axes; @+<m> is a height above whatever surface is drawn on that line.
+dir=$GX_BENCH_ON
 view_args() {
     case "$1" in
         B1) echo "--start-on $dir@+10000^20" ;;

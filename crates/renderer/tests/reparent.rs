@@ -18,7 +18,7 @@ fn tree_system() -> FrameSystem {
 fn same_point_from_two_frames() {
     let mut system = tree_system();
     // Some time later, so every frame has moved and turned.
-    let to = system.time() + Seconds::new(5.0 * 86_400.0);
+    let to = system.time() + Seconds::new(400_000.0);
     advance(&mut system, to, Seconds::new(600.0), Scheme::Yoshida4);
     // A camera 3000 km from frame 31, parented to its parent frame 30.
     let near31 = Vec3::new(1.0e6, -2.0e6, 2.0e6);

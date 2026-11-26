@@ -90,7 +90,7 @@ percent of the image while the component count fell from 15 to 9. The same
 faces were about half of them. What remains visible: the concentric ripples
 on the surface, which are the sample quantization of the compiled density
 and were there before; and a small notch, about 10 px, at the lower end of
-the lit edge near (320, 245), near the frame's pole. It was not traced to a
+the lit edge near (320, 245), near where the frame's z axis meets the surface. It was not traced to a
 single cell; the likely cause is a depth transition there, where neighbors at
 another depth clamp instead of padding with their samples (the accepted step
 of the padding rule).

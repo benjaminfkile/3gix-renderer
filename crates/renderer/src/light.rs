@@ -379,8 +379,8 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(summarize(&ball(288.0), Kelvin::new(0.0)).is_some());
-        assert_eq!(cell_emitter(&ball(288.0)), None);
+        assert!(summarize(&ball(305.0), Kelvin::new(0.0)).is_some());
+        assert_eq!(cell_emitter(&ball(305.0)), None);
         assert!(cell_emitter(&ball(1500.0)).is_some());
     }
 

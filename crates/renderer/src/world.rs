@@ -1646,7 +1646,8 @@ mod tests {
     }
 
     /// One frame of a body with surface tiles to level 12 whose root is
-    /// frame 4 (the tiles' frame), and a camera 20 km over face 4 looking
+    /// the synthetic tiles' frame ([`crate::tiles::tests::FRAME`]), and a
+    /// camera 20 km over face 4 looking
     /// 45 degrees down.
     struct SurfaceRig {
         system: FrameSystem,
@@ -1658,14 +1659,15 @@ mod tests {
     const SURFACE_VIEW: (u32, u32) = (1280, 720);
 
     fn surface_rig() -> SurfaceRig {
+        use crate::tiles::tests::{FRAME, RADIUS_XY, RADIUS_Z};
         use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
         use gx_core::units::{Kilograms, Quat, Seconds};
         let frame = Frame {
-            frame_id: 4,
+            frame_id: FRAME,
             parent_frame_id: ROOT_PARENT,
             root_extent: Meters::new(1.6e7),
             max_depth: 4,
-            mass: Kilograms::new(6.0e24),
+            mass: Kilograms::new(4.3e24),
             position: Vec3::zero(),
             velocity: Vec3::zero(),
             orientation: Quat::identity(),
@@ -1676,16 +1678,16 @@ mod tests {
         };
         let reg = Registry::new(Seconds::new(0.0), vec![frame]).unwrap();
         let system = FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap());
-        let key = gx_core::key::SurfaceKey::new(4, 4, 0, 0, 0).unwrap();
+        let key = gx_core::key::SurfaceKey::new(FRAME, 4, 0, 0, 0).unwrap();
         let d = gx_core::surface::vertex_direction(&key, 20, 9);
-        let (p, n) = gx_core::surface::ellipsoid_point(d, 6_378_137.0, 6_356_752.3);
+        let (p, n) = gx_core::surface::ellipsoid_point(d, RADIUS_XY, RADIUS_Z);
         let cam: [f64; 3] = std::array::from_fn(|k| p[k] + 20_000.0 * n[k]);
         let side = Vec3::new(0.0, 0.0, 1.0).cross(Vec3::new(n[0], n[1], n[2]));
         let side = side.scale(1.0 / side.length());
         let h = std::f64::consts::FRAC_1_SQRT_2;
         let forward: [f64; 3] = std::array::from_fn(|k| h * [side.x, side.y, side.z][k] - h * n[k]);
         let camera = Camera {
-            frame_id: 4,
+            frame_id: FRAME,
             position: Vec3::new(cam[0], cam[1], cam[2]),
             orientation: crate::camera::look_rotation(
                 Vec3::new(forward[0], forward[1], forward[2]),
@@ -1821,7 +1823,7 @@ mod tests {
 
     /// Below the lowest point of the synthetic tiles: rays that meet it
     /// look at the surface.
-    const BELOW_SURFACE: f64 = 6_356_752.3 - 1_000.0;
+    const BELOW_SURFACE: f64 = crate::tiles::tests::RADIUS_Z - 1_000.0;
 
     /// A world settled at the rig's still camera with a budget of about 70
     /// percent of what the view needs at full detail. Returns the world,

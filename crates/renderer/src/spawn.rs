@@ -229,8 +229,8 @@ impl Spawner {
 }
 
 /// Puts the camera in the spawn's frame, its height beyond `r` along its
-/// direction, looking its pitch below level toward the frame's `+z` (or
-/// `+x` at a pole).
+/// direction, looking its pitch below level toward the frame's `+z` axis,
+/// or `+x` when the camera is on the z axis.
 fn place(camera: &mut Camera, spawn: &Spawn, r: f64) {
     camera.frame_id = spawn.frame_id;
     camera.position = spawn.direction.scale(r + spawn.height);

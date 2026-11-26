@@ -2171,8 +2171,8 @@ mod tile_vertex_tests {
     fn surface(key: SurfaceKey) -> SurfaceTile {
         SurfaceTile {
             key,
-            radius_xy: 6.0e6,
-            radius_z: 5.9e6,
+            radius_xy: 4.6e6,
+            radius_z: 4.5e6,
             height_floor: -500.0,
             heights: (0..HEIGHT_SIDE * HEIGHT_SIDE)
                 .map(|n| (n % 97) as f32 * 3.0)
@@ -2244,7 +2244,7 @@ mod tile_vertex_tests {
         let draw = |g: TileGeometry| TileDrawInfo {
             geometry: Arc::new(g),
             anchor: Anchor {
-                position: [4096.0, -8192.0, 5.9e6],
+                position: [4096.0, -8192.0, 4.5e6],
                 generation: 3,
             },
             morph: [1.0e5, 2.0e5],
