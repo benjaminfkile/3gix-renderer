@@ -142,7 +142,7 @@ files. The browser build is not run in CI; it is verified by hand
 ### Performance budget on a real stack
 
 ```sh
-GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=... sh scripts/perf-budget.sh [--keep DIR]
+GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=... GX_BENCH_ON=<frame>:<x>,<y>,<z> sh scripts/perf-budget.sh [--keep DIR]
 ```
 
 Runs the benchmark views B1 to B4 of `rendering.md` section 5.1 headless,

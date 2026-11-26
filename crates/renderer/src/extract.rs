@@ -820,11 +820,11 @@ mod tests {
             Sample {
                 density: Density::new(2700.0 * occ),
                 state: State::Solid,
-                temperature: Kelvin::new(288.0),
+                temperature: Kelvin::new(305.0),
                 albedo: [Ratio::new(0.3); 3],
                 roughness: Ratio::new(0.9),
                 attenuation: Attenuation::new(0.0),
-                radiating_temperature: Kelvin::new(288.0),
+                radiating_temperature: Kelvin::new(305.0),
                 occupancy: Ratio::new(occ),
             }
         });

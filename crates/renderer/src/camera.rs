@@ -122,7 +122,7 @@ pub fn axis_angle(axis: Vec3, angle: f64) -> Quat {
 
 /// The orientation of a camera on the line `up` (unit, frame axes) from a
 /// frame's origin, looking `pitch_deg` degrees below level, level being
-/// toward the frame's `+z` heading (or `+x` at a pole), as in
+/// toward the frame's `+z` axis, or `+x` when the camera is on the z axis, as in
 /// [`Camera::over_pitched`].
 pub fn pitched_look(up: Vec3, pitch_deg: f64) -> Quat {
     let z = Vec3::new(0.0, 0.0, 1.0);
@@ -402,7 +402,8 @@ impl Camera {
     }
 
     /// [`Camera::over`], looking `pitch_deg` degrees below level (level:
-    /// toward the frame's `+z` heading, or `+x` at a pole) when given.
+    /// toward the frame's `+z` axis, or `+x` when the camera is on the z
+    /// axis) when given.
     pub fn over_pitched(
         system: &FrameSystem,
         frame_id: u64,
@@ -737,7 +738,7 @@ pub(crate) mod tests {
     fn flight_is_a_straight_line_at_the_set_speed_through_matter() {
         let mut root = frame(1, ROOT_PARENT, 2.0e13, Vec3::zero(), Quat::identity());
         root.max_depth = 0;
-        let body_radius = 6.957e8;
+        let body_radius = 4.21e8;
         let mut heavy = frame(
             2,
             1,

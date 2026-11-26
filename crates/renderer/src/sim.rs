@@ -71,11 +71,11 @@ pub const MAX_STEP_SECONDS: f64 = 600.0;
 pub const STEPS_PER_DYNAMICAL_TIME: f64 = 256.0;
 
 /// Simulated seconds between two checkpoints of the coarse history:
-/// 86 400 s.
-pub const CHECKPOINT_SECONDS: f64 = 86_400.0;
+/// 65 536 s.
+pub const CHECKPOINT_SECONDS: f64 = 65_536.0;
 
 /// The most checkpoints the coarse history holds before it thins itself
-/// (doubling its interval): 1024 intervals of 86 400 s.
+/// (doubling its interval): 1024 intervals of 65 536 s.
 pub const CHECKPOINT_CAPACITY: usize = 1024;
 
 /// The most checkpoints the fine history holds.
@@ -596,7 +596,7 @@ pub(crate) mod tests {
             parent_frame_id: ROOT_PARENT,
             root_extent: Meters::new(1.0e12),
             max_depth: 4,
-            mass: Kilograms::new(2.0e30),
+            mass: Kilograms::new(3.1e30),
             position: Vec3::zero(),
             velocity: Vec3::zero(),
             orientation: Quat::identity(),
@@ -609,13 +609,13 @@ pub(crate) mod tests {
             frame_id: 2,
             parent_frame_id: 1,
             root_extent: Meters::new(1.0e7),
-            mass: Kilograms::new(6.0e24),
-            position: Vec3::new(1.5e11, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 2.98e4, 0.0),
-            angular_velocity: Vec3::new(0.0, 0.0, 7.3e-5),
-            j2: 1.08e-3,
-            reference_radius: Meters::new(6.4e6),
-            principal_moments: Vec3::new(8.0e37, 8.0e37, 8.03e37),
+            mass: Kilograms::new(4.3e24),
+            position: Vec3::new(2.3e11, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 3.0e4, 0.0),
+            angular_velocity: Vec3::new(0.0, 0.0, 5.1e-5),
+            j2: 2.4e-3,
+            reference_radius: Meters::new(5.2e6),
+            principal_moments: Vec3::new(3.8e37, 3.8e37, 3.81e37),
             ..root
         };
         let reg = Registry::new(Seconds::new(EPOCH), vec![root, child]).unwrap();
@@ -735,7 +735,7 @@ pub(crate) mod tests {
         // Wide pair: the cap.
         assert_eq!(max_step(&system()), MAX_STEP_SECONDS);
         // A one-hour orbit: far more steps than the cap would give.
-        let gm = gx_core::gravity::G * 6.0e24;
+        let gm = gx_core::gravity::G * 4.3e24;
         let d = (gm * (3600.0 / (2.0 * std::f64::consts::PI)).powi(2)).cbrt();
         let mut tree = system().tree().frames().to_vec();
         let mut close = tree[1];

@@ -147,7 +147,7 @@ pub struct TileShape {
     /// target, frame coordinates.
     pub bounds: ([f64; 3], [f64; 3]),
     /// Length of the tile's edge along the reference shape, meters
-    /// (approximately: a quarter of the equator over `2^level`).
+    /// (approximately: a quarter of the x-y plane's circumference over `2^level`).
     pub edge: f64,
     /// The longest a tile edge of this level can be, meters: at a face's
     /// center, where the cube's face coordinate is stretched least, on the
@@ -2048,6 +2048,20 @@ pub(crate) mod tests {
     use crate::camera::FIELD_OF_VIEW_Y;
     use gx_core::surface::{HEIGHT_SIDE, PARENT_SIDE};
 
+    /// The frame the synthetic surface tiles live on: an id no other
+    /// fixture uses.
+    pub(crate) const FRAME: u64 = 61;
+
+    /// The x-y radius of the synthetic tiles' reference ellipsoid, meters:
+    /// a made-up body.
+    pub(crate) const RADIUS_XY: f64 = 4_183_000.0;
+
+    /// The z radius of the synthetic tiles' reference ellipsoid, meters.
+    pub(crate) const RADIUS_Z: f64 = 4_169_500.0;
+
+    /// The synthetic tiles' surface temperature, kelvin: a made-up value.
+    const SURFACE_KELVIN: f32 = 305.0;
+
     fn overlay_tile(key: SurfaceKey, coverage: u8, albedo: u8, roughness: u8) -> OverlayTile {
         let mut c = vec![coverage; VERTEX_COUNT];
         // Partial coverage: the first row is not covered.
@@ -2068,7 +2082,7 @@ pub(crate) mod tests {
     #[cfg(feature = "memory-report")]
     #[test]
     fn the_memory_report_counts_each_shape_once_and_each_material_apart() {
-        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let key = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         let g = Arc::new(TileGeometry::new(&tile(key)));
         // Material: one f32 triple and one f32 per vertex. Shape: two f64
         // triples, two f32 triples, and one f32 per vertex.
@@ -2084,7 +2098,7 @@ pub(crate) mod tests {
         // tile's: counted once.
         let mut s = Surfaces::new();
         s.complete(key, Ok(Some(Arc::clone(&g))));
-        let other = SurfaceKey::new(4, 1, 0, 0, 0).unwrap();
+        let other = SurfaceKey::new(FRAME, 1, 0, 0, 0).unwrap();
         s.complete(other, Ok(Some(Arc::clone(&g))));
         let m = s.memory();
         assert_eq!(
@@ -2095,7 +2109,7 @@ pub(crate) mod tests {
 
         // A shown overlay adds the composited material, sharing the base's
         // shape, and the overlay tile.
-        let third = SurfaceKey::new(4, 2, 0, 0, 0).unwrap();
+        let third = SurfaceKey::new(FRAME, 2, 0, 0, 0).unwrap();
         let o = overlay_tile(third, 255, 128, 64);
         let o_bytes = (std::mem::size_of::<OverlayTile>()
             + VERTEX_COUNT * 5
@@ -2141,7 +2155,7 @@ pub(crate) mod tests {
 
     #[test]
     fn overlays_composite_in_layer_order_and_hide() {
-        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let key = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         let base = gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
         let first = overlay_tile(key, 255, 255, 255);
         let second = overlay_tile(key, 128, 0, 0);
@@ -2192,7 +2206,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_stale_partial_completion_never_replaces_a_fuller_tile() {
-        let key = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let key = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         let base = gx_core::surface::encode(&tile(key), gx_core::matter::Compression::None);
         let first = overlay_tile(key, 255, 255, 255);
         let second = overlay_tile(key, 128, 0, 0);
@@ -2237,10 +2251,10 @@ pub(crate) mod tests {
         s.set_required_layers(required);
         s.set_hidden_layers(hidden);
         for face in 0..SURFACE_FACES {
-            let key = SurfaceKey::new(4, face, 0, 0, 0).unwrap();
+            let key = SurfaceKey::new(FRAME, face, 0, 0, 0).unwrap();
             s.complete(key, Ok(Some(Arc::new(TileGeometry::new(&tile(key))))));
         }
-        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let root = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         for c in root.children().unwrap() {
             s.complete_layers(c, Ok(waiting_child(c, None)), true);
         }
@@ -2261,14 +2275,14 @@ pub(crate) mod tests {
     /// The levels drawn from the face-0 root's box center at time `now`.
     fn levels_at(s: &mut Surfaces, now: f64) -> BTreeSet<u8> {
         s.now = now;
-        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let root = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         let (lo, hi) = s.drawn_geometry(&root).unwrap().bounds;
         let cam: [f64; 3] = core::array::from_fn(|n| 0.5 * (lo[n] + hi[n]));
         let len = (cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2]).sqrt();
         let forward = cam.map(|v| v / len);
         let mut drawn = Vec::new();
         s.select_in_frame(
-            4,
+            FRAME,
             cam,
             forward,
             focal_px(720.0, FIELD_OF_VIEW_Y),
@@ -2290,7 +2304,7 @@ pub(crate) mod tests {
             [0].into(),
             "required: no time limit"
         );
-        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let root = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         for c in root.children().unwrap() {
             let d = DecodedTile {
                 bases: vec![(0, Arc::new(TileGeometry::new(&tile(c))))],
@@ -2314,7 +2328,7 @@ pub(crate) mod tests {
     fn a_failed_required_overlay_releases_the_split() {
         let mut s = waiting_children([1].into(), BTreeSet::new());
         assert_eq!(levels_at(&mut s, 0.0), [0].into());
-        let root = SurfaceKey::new(4, 0, 0, 0, 0).unwrap();
+        let root = SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap();
         for c in root.children().unwrap() {
             // Layer 1's section is invalid; layer 2, not required, is
             // still to come and has waited long enough.
@@ -2336,7 +2350,7 @@ pub(crate) mod tests {
         let mut s = Surfaces::new();
         s.set_required_layers([1].into());
         for face in 0..SURFACE_FACES {
-            let key = SurfaceKey::new(4, face, 0, 0, 0).unwrap();
+            let key = SurfaceKey::new(FRAME, face, 0, 0, 0).unwrap();
             let d = DecodedTile {
                 bases: vec![(0, Arc::new(TileGeometry::new(&tile(key))))],
                 waiting: vec![1],
@@ -2344,7 +2358,7 @@ pub(crate) mod tests {
             };
             s.complete_layers(key, Ok(d), true);
         }
-        assert!(s.has_surface(4));
+        assert!(s.has_surface(FRAME));
         assert_eq!(levels_at(&mut s, 0.0), [0].into());
     }
 
@@ -2377,14 +2391,14 @@ pub(crate) mod tests {
         }
         SurfaceTile {
             key,
-            radius_xy: 6_378_137.0,
-            radius_z: 6_356_752.3,
+            radius_xy: RADIUS_XY,
+            radius_z: RADIUS_Z,
             height_floor: floor,
             heights,
             parent_heights,
             albedo: vec![[76, 71, 64]; VERTEX_COUNT],
             roughness: vec![230; VERTEX_COUNT],
-            temperature: vec![288.0; VERTEX_COUNT],
+            temperature: vec![SURFACE_KELVIN; VERTEX_COUNT],
         }
     }
 
@@ -2394,9 +2408,12 @@ pub(crate) mod tests {
         // after each eviction pass the held bytes are at or under the
         // budget, or only what is drawn, walked to, and level-0 remains,
         // and every drawn tile stays.
-        let (a, c) = (6_378_137.0, 6_356_752.3);
-        let d =
-            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (a, c) = (RADIUS_XY, RADIUS_Z);
+        let d = gx_core::surface::vertex_direction(
+            &SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap(),
+            32,
+            32,
+        );
         let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
         let up_tangent =
@@ -2413,7 +2430,7 @@ pub(crate) mod tests {
         s.want_built.clear();
         let mut again = Vec::new();
         s.select_in_frame(
-            4,
+            FRAME,
             cam,
             up_tangent,
             focal_px(720.0, FIELD_OF_VIEW_Y),
@@ -2456,9 +2473,12 @@ pub(crate) mod tests {
 
     #[test]
     fn asking_ahead_is_held_over_the_budget() {
-        let (a, c) = (6_378_137.0, 6_356_752.3);
-        let d =
-            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (a, c) = (RADIUS_XY, RADIUS_Z);
+        let d = gx_core::surface::vertex_direction(
+            &SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap(),
+            32,
+            32,
+        );
         let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
         let up_tangent =
@@ -2479,9 +2499,12 @@ pub(crate) mod tests {
         // compiler declares (just under the heights) tiles past the horizon
         // are hidden; declared far deeper, the occluding ball shrinks and
         // they are not. Nothing but the declared value differs.
-        let (a, c) = (6_378_137.0, 6_356_752.3);
-        let d =
-            gx_core::surface::vertex_direction(&SurfaceKey::new(4, 0, 0, 0, 0).unwrap(), 32, 32);
+        let (a, c) = (RADIUS_XY, RADIUS_Z);
+        let d = gx_core::surface::vertex_direction(
+            &SurfaceKey::new(FRAME, 0, 0, 0, 0).unwrap(),
+            32,
+            32,
+        );
         let (p, nrm) = gx_core::surface::ellipsoid_point(d, a, c);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + 2000.0 * nrm[k]);
         let up_tangent =
@@ -2498,8 +2521,8 @@ pub(crate) mod tests {
 
     #[test]
     fn neighbors_share_edge_positions_and_targets() {
-        let l = TileGeometry::new(&tile(SurfaceKey::new(4, 2, 7, 40, 90).unwrap()));
-        let r = TileGeometry::new(&tile(SurfaceKey::new(4, 2, 7, 41, 90).unwrap()));
+        let l = TileGeometry::new(&tile(SurfaceKey::new(FRAME, 2, 7, 40, 90).unwrap()));
+        let r = TileGeometry::new(&tile(SurfaceKey::new(FRAME, 2, 7, 41, 90).unwrap()));
         let n = TILE_VERTICES;
         for j in 0..n {
             assert_eq!(l.positions[(n - 1) + n * j], r.positions[n * j]);
@@ -2512,7 +2535,7 @@ pub(crate) mod tests {
         // A child's edge, morphed completely, lies on its parent's edge:
         // even vertices are the parent's vertices, odd ones the middle of
         // the parent's edge between them.
-        let parent_key = SurfaceKey::new(4, 2, 7, 40, 90).unwrap();
+        let parent_key = SurfaceKey::new(FRAME, 2, 7, 40, 90).unwrap();
         let child_key = parent_key.children().unwrap()[0];
         let p = TileGeometry::new(&tile(parent_key));
         let c = TileGeometry::new(&tile(child_key));
@@ -2530,7 +2553,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Fills `s` with synthetic tiles (the [`tile`] surface, frame 4, levels
+    /// Fills `s` with synthetic tiles (the [`tile`] surface, frame [`FRAME`], levels
     /// up to `max_level`) until a selection from `cam` looking along
     /// `forward` asks for nothing more.
     fn settle(
@@ -2569,7 +2592,7 @@ pub(crate) mod tests {
     ) -> Vec<TileDrawInfo> {
         let cone = 0.9;
         for face in 0..SURFACE_FACES {
-            s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap(), 1.0);
+            s.want(SurfaceKey::new(FRAME, face, 0, 0, 0).unwrap(), 1.0);
         }
         for _ in 0..64 {
             for key in s.take_requests() {
@@ -2583,7 +2606,7 @@ pub(crate) mod tests {
                 s.complete(key, outcome);
             }
             let mut drawn = Vec::new();
-            s.select_in_frame(4, cam, forward, focal, cone, &mut drawn);
+            s.select_in_frame(FRAME, cam, forward, focal, cone, &mut drawn);
             if s.requests.is_empty() {
                 return drawn;
             }
@@ -2616,7 +2639,7 @@ pub(crate) mod tests {
         s.want_built.clear();
         let mut drawn = Vec::new();
         s.select_in_frame(
-            4,
+            FRAME,
             cam,
             forward,
             focal_px(720.0, FIELD_OF_VIEW_Y),
@@ -2636,7 +2659,7 @@ pub(crate) mod tests {
         now: f64,
     ) -> Vec<TileDrawInfo> {
         for face in 0..SURFACE_FACES {
-            s.want(SurfaceKey::new(4, face, 0, 0, 0).unwrap(), 1.0);
+            s.want(SurfaceKey::new(FRAME, face, 0, 0, 0).unwrap(), 1.0);
         }
         for _ in 0..64 {
             let drawn = compact_round(s, cam, forward, max_level, now);
@@ -2650,8 +2673,9 @@ pub(crate) mod tests {
     /// The camera `height` meters over a fixed point of face 4, looking
     /// down 25 degrees.
     fn low_camera(height: f64) -> ([f64; 3], [f64; 3]) {
-        let d = gx_core::surface::vertex_direction(&SurfaceKey::new(4, 4, 0, 0, 0).unwrap(), 20, 9);
-        let (p, nrm) = gx_core::surface::ellipsoid_point(d, 6_378_137.0, 6_356_752.3);
+        let d =
+            gx_core::surface::vertex_direction(&SurfaceKey::new(FRAME, 4, 0, 0, 0).unwrap(), 20, 9);
+        let (p, nrm) = gx_core::surface::ellipsoid_point(d, RADIUS_XY, RADIUS_Z);
         let cam: [f64; 3] = core::array::from_fn(|k| p[k] + height * nrm[k]);
         let tangent = unit_cross([0.0, 0.0, 1.0], nrm).map(f64::from);
         let forward: [f64; 3] = core::array::from_fn(|k| 0.9 * tangent[k] - 0.42 * nrm[k]);
@@ -2774,7 +2798,7 @@ pub(crate) mod tests {
         s.want_built.clear();
         let mut drawn = Vec::new();
         s.select_in_frame(
-            4,
+            FRAME,
             cam,
             forward,
             focal_px(720.0, FIELD_OF_VIEW_Y),
@@ -3040,7 +3064,7 @@ pub(crate) mod tests {
     }
 
     fn meet_without_gaps(focal: f64, face: u8, i0: i64, j0: i64) {
-        let (a, c) = (6_378_137.0, 6_356_752.3);
+        let (a, c) = (RADIUS_XY, RADIUS_Z);
         let n = TILE_VERTICES;
         let boundary: Vec<usize> = (0..n)
             .flat_map(|i| [i, i + n * (n - 1), n * i, n * i + n - 1])
@@ -3051,7 +3075,7 @@ pub(crate) mod tests {
             let mut s = Surfaces::new();
             // 3 km up, moving along the surface, looking down 25 degrees.
             let d = gx_core::surface::vertex_direction(
-                &SurfaceKey::new(4, face, 0, 0, 0).unwrap(),
+                &SurfaceKey::new(FRAME, face, 0, 0, 0).unwrap(),
                 i0 + step,
                 j0,
             );
@@ -3187,7 +3211,7 @@ pub(crate) mod tests {
             }
             assert_eq!(quads.len(), half * half);
             // The child's own grid covers the same part of the face.
-            let parent = SurfaceKey::new(4, 4, 3, 5, 2).unwrap();
+            let parent = SurfaceKey::new(FRAME, 4, 3, 5, 2).unwrap();
             let child = parent.children().unwrap()[q];
             for (ci, pi) in [(0, i0), (TILE_QUADS, i0 + half)] {
                 let a = gx_core::surface::face_coord(child.level, child.x, ci as i64);
@@ -3234,7 +3258,7 @@ pub(crate) mod tests {
         s.tiles.insert(gone, State::Requested);
         let mut drawn = Vec::new();
         s.select_in_frame(
-            4,
+            FRAME,
             cam,
             forward,
             focal_px(720.0, FIELD_OF_VIEW_Y),
@@ -3291,7 +3315,7 @@ pub(crate) mod tests {
             }
         }
         assert!(checked > 4 * half as usize, "{checked} points checked");
-        view_covered(&drawn, cam, forward, 6_356_752.3 - 1_000.0);
+        view_covered(&drawn, cam, forward, RADIUS_Z - 1_000.0);
     }
 
     #[test]

@@ -485,13 +485,13 @@ fn directions_are_batched_and_empty_cells_need_nothing() {
 
 #[test]
 fn headless_render_at_now_and_at_the_origin() {
-    // A space whose origin is two days ago, with the registry at epoch 0,
+    // A space whose origin is 200 000 s ago, with the registry at epoch 0,
     // the origin, as every registry is (`matter-format.md` section 5).
     let origin_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        - 2 * 86_400_000;
+        - 200_000_000;
     let epoch = Seconds::new(0.0);
     let registry = common::registry_bytes();
     let mut options = space_with_registry(registry);
@@ -521,7 +521,7 @@ fn headless_render_at_now_and_at_the_origin() {
             assert_eq!(sim.time(), epoch);
         } else {
             assert!(sim.clock().is_at_now());
-            assert!(sim.time() >= epoch + Seconds::new(2.0 * 86_400.0 - 60.0));
+            assert!(sim.time() >= epoch + Seconds::new(200_000.0 - 60.0));
         }
         let frame = render_headless_view(&mut sim, Some(&mut c.fetcher), &run)
             .expect("a wgpu adapter, software is fine");

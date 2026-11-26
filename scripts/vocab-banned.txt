@@ -145,3 +145,9 @@ landscape
 landform
 landforms
 relief
+equator
+equators
+equatorial
+pole
+poles
+polar

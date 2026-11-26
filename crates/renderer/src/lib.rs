@@ -4,7 +4,7 @@
 //! near the camera (`space-model.md` section 2, "The renderer runs the
 //! laws"). The one rule: the renderer may know physics, never objects. No
 //! module, identifier, string, or comment here names anything in the
-//! universe; frames are integers, and a frame is "frame 4".
+//! universe; frames are integers, and a frame is "frame 7".
 //!
 //! This crate is the engine as a library, so the desktop binary, the
 //! headless tests, and the later browser build share one code path:

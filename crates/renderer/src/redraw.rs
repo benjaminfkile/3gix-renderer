@@ -408,7 +408,7 @@ mod tests {
         Scene {
             mesh_mode: MeshMode::Surfaces,
             markers: vec![Marker {
-                frame_id: 4,
+                frame_id: 67,
                 position: at,
                 size_px: 6.0,
                 color: [1.0; 4],

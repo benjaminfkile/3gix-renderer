@@ -354,8 +354,8 @@ mod tests {
             rate: 1.0,
             rewinding: false,
             paused: false,
-            crosshair: Some((3, 499.0123)),
-            camera_frame: 4,
+            crosshair: Some((5, 731.2468)),
+            camera_frame: 7,
             camera_distance: 1.5e8,
             camera_speed: 2.5e4,
             frame_count: 6,
@@ -417,8 +417,8 @@ mod tests {
         let l = info().lines();
         assert_eq!(l[0], "2026-11-15 12:34:56.789 UTC  now");
         assert_eq!(l[1], "rate 1x");
-        assert_eq!(l[2], "light time frame 3 499.012 s");
-        assert_eq!(l[3], "camera frame 4  |p| 1.5000e8 m  speed 2.500e4 m/s");
+        assert_eq!(l[2], "light time frame 5 731.247 s");
+        assert_eq!(l[3], "camera frame 7  |p| 1.5000e8 m  speed 2.500e4 m/s");
         assert_eq!(l[4], "frames 6");
         assert_eq!(l[5], "fps 59.9");
         let mut stepped = info();

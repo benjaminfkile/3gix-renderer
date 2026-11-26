@@ -398,7 +398,7 @@ mod tests {
     fn a_start_and_offset_reach_the_same_wall_clock_instant() {
         use crate::sim::tests::system;
         let origin_ms = 1_234_567_890_123;
-        let now_ms = origin_ms + 86_400_000;
+        let now_ms = origin_ms + 100_000_000;
         for (start, offset, want_ms) in [
             (Start::Origin, 3_600.0, origin_ms + 3_600_000),
             (Start::Now, -3_600.0, now_ms - 3_600_000),
@@ -439,7 +439,7 @@ mod tests {
         for (n, v) in [
             ("start", "origin"),
             ("start-offset-seconds", "-3.5e6"),
-            ("time-scale", "86400"),
+            ("time-scale", "51200"),
             ("start-on", "3:0,0,1@+10"),
             ("view", "3"),
             ("view-distance-scale", "0.5"),
@@ -451,7 +451,7 @@ mod tests {
         }
         assert_eq!(o.start, Start::Origin);
         assert_eq!(o.start_offset_seconds, -3.5e6);
-        assert_eq!(o.time_scale, 86400.0);
+        assert_eq!(o.time_scale, 51200.0);
         let s = o.start_on.unwrap();
         assert_eq!((s.frame_id, s.height, s.distance), (3, Some(10.0), None));
         assert_eq!(o.view, View::Key(2));

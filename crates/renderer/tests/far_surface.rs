@@ -28,7 +28,7 @@ const BODY: u64 = 2;
 /// The body's root extent, meters: its cube holds the reference ellipsoid.
 const EXTENT: f64 = 1.6e7;
 /// The x-y and z radii of the tiles' reference ellipsoid, meters.
-const RADII: (f64, f64) = (6.0e6, 5.98e6);
+const RADII: (f64, f64) = (4.6e6, 4.58e6);
 
 fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: Vec3) -> Frame {
     Frame {
@@ -52,7 +52,7 @@ fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: Vec3) -> Frame 
 fn system(distance: f64) -> FrameSystem {
     let frames = vec![
         frame(ROOT, ROOT_PARENT, 1.0e12, 0.0, Vec3::zero()),
-        frame(BODY, ROOT, EXTENT, 6.0e24, Vec3::new(0.0, distance, 0.0)),
+        frame(BODY, ROOT, EXTENT, 4.3e24, Vec3::new(0.0, distance, 0.0)),
     ];
     let reg = Registry::new(Seconds::new(0.0), frames).unwrap();
     FrameSystem::from_tree(FrameTree::from_registries(&[reg]).unwrap())

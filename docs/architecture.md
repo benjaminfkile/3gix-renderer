@@ -11,10 +11,16 @@ draws. The specification is `space-model.md` (v2), `client-compute.md`, and
 The renderer may know physics, never objects.
 
 No module, identifier, string, comment, or file in this repository names
-anything in the universe. A frame is an integer: "frame 4". The enforcement is
+anything in the universe. A frame is an integer: "frame 7". The enforcement is
 the core library's vocabulary lint, `scripts/vocab-lint.sh` with
-`scripts/vocab-banned.txt`, copied here unchanged and run by `scripts/ci.sh`.
-A banned word anywhere in a tracked file or file name fails the build.
+`scripts/vocab-banned.txt` and `scripts/vocab-numbers.txt`, copied here
+unchanged and run by `scripts/ci.sh` (with its own test,
+`scripts/vocab-lint-test.sh`). A banned word anywhere in a tracked file or
+file name, or a banned number (one body's size, mass, spin, orbit, day, or
+temperature) in a tracked file, fails the build. Test fixtures use made-up
+values. The lint's one exception, a file under `tests/` whose first comment
+block carries a `measured-reference:` line, is for a test of a law against a
+real measurement; no renderer test uses it.
 
 ## Module map
 
@@ -44,7 +50,7 @@ bytes, and depends on `gx-core` (and natively `gx-module-host`) only.
 | `hub` | The native hub client v2: clock, active build, build, directions, edge reads (sections by address and `sha256`), uploads with the section 2.5 headers | `client-compute.md` 2.3 to 2.5 |
 | `directions` | The client loop as a state machine without I/O: batches of at most 512 keys, deduplication in flight, `ready`/`missing`/`local`/`empty` per layer, retries with backoff | `client-compute.md` 1, 2.4 |
 | `mock_hub` | A small v2 hub for tests and `gx-mock-hub` | `client-compute.md` 2 |
-| `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every 86 400 simulated seconds, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
+| `sim` | `SimClock` between the origin and now, the relativistic integration of every frame with checkpoints (a coarse history every 65 536 simulated seconds, a fine one around the simulation time for light time) | `space-model.md` 6.1, 6.2, 7 |
 | `seen` | Every frame at its retarded state for the camera (position and orientation), the camera re-expressed among them, the emitter shift per lit frame, the frame nearest the crosshair | `space-model.md` 6.4 |
 | `camera` | Free camera that floats in root coordinates (or follows a frame), parented to its nearest frame for precision, re-parenting | `space-model.md` 5 |
 | `stream` | Cell selection (a target that asks up to three depths ahead from arrived occupancy, and the drawn selection pruned from it, `rendering.md` 3), the cell cache keyed by hash map, decode and composite, the depth transition rule, the native fetcher driving `directions`, the local cache, and the worker pool | `space-model.md` 2, 5, 7, 8; `matter-format.md` 3.5, 6 |
@@ -126,7 +132,7 @@ visibly from the last one drawn (`redraw`, `rendering.md` section 4).
    1/256 of the shortest dynamical time `sqrt(d^3 / (G (m1 + m2)))` of two
    frames (`sim::max_step`), read from a
    fine `gx_core::history::History` that is rebuilt from a coarse one
-   (checkpoints every 86 400 simulated seconds from the origin) whenever the time
+   (checkpoints every 65 536 simulated seconds from the origin) whenever the time
    leaves it. A jump anywhere costs at most one coarse interval.
 3. The camera moves (`camera::advance`): it keeps its place and view
    direction in root coordinates through the integration, free flight
