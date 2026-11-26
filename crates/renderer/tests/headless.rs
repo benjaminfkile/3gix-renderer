@@ -42,6 +42,7 @@ fn home_view_renders_markers_and_overlay_deterministically() {
     let scene = build_scene(&system, &camera, f64::from(WIDTH) / f64::from(HEIGHT));
     let overlay = OverlayInfo {
         sim_time: system.time(),
+        origin_ms: 0,
         offset_from_now: gx_core::units::Seconds::new(0.0),
         at_now: true,
         rate: 1.0,

@@ -27,7 +27,7 @@ const ROOT: u64 = 1;
 const BODY: u64 = 2;
 /// The body's root extent, meters: its cube holds the reference ellipsoid.
 const EXTENT: f64 = 1.6e7;
-/// Equatorial and polar radii of the tiles' reference ellipsoid, meters.
+/// The x-y and z radii of the tiles' reference ellipsoid, meters.
 const RADII: (f64, f64) = (6.0e6, 5.98e6);
 
 fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: Vec3) -> Frame {
@@ -100,8 +100,8 @@ fn depth_zero() -> Section {
 fn tile(key: &SurfaceKey) -> Vec<u8> {
     let tile = SurfaceTile {
         key: *key,
-        radius_equatorial: RADII.0,
-        radius_polar: RADII.1,
+        radius_xy: RADII.0,
+        radius_z: RADII.1,
         height_floor: -500.0,
         heights: vec![0.0; HEIGHT_SIDE * HEIGHT_SIDE],
         parent_heights: vec![0.0; PARENT_SIDE * PARENT_SIDE],

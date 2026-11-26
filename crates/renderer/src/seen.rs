@@ -194,7 +194,10 @@ impl<'a> Seen<'a> {
                 record
             })
             .collect();
-        let registry = Registry::new(t, records)
+        // A registry's epoch is always 0 (`matter-format.md` section 5): the
+        // drawn system only carries the retarded states, and the time they
+        // are seen at is `Seen::time`.
+        let registry = Registry::new(Seconds::new(0.0), records)
             .expect("retarded states of a valid tree are a valid registry");
         let drawn = FrameSystem::from_tree(
             FrameTree::from_registries(&[registry]).expect("the same tree as the registry's"),
@@ -217,7 +220,8 @@ impl<'a> Seen<'a> {
         }
     }
 
-    /// Every frame at its retarded state: what is drawn.
+    /// Every frame at its retarded state: what is drawn. Its own time is
+    /// not the time seen; that is [`Seen::time`].
     pub fn system(&self) -> &FrameSystem {
         &self.system
     }
@@ -228,8 +232,7 @@ impl<'a> Seen<'a> {
         &self.camera
     }
 
-    /// The simulation time the frames are seen at, seconds of TDB since
-    /// J2000.
+    /// The simulation time the frames are seen at, universe seconds.
     pub fn time(&self) -> Seconds {
         self.time
     }

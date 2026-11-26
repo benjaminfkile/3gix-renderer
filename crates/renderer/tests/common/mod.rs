@@ -52,18 +52,18 @@ fn frame(id: u64, parent: u64, extent: f64, mass: f64, position: [f64; 3]) -> Fr
     }
 }
 
-/// The registry: the root (mass 0) and the child, at J2000.
+/// The registry: the root (mass 0) and the child, at epoch 0, the origin.
 pub fn registry() -> Registry {
-    registry_at(Seconds::new(0.0))
+    registry_with_child_mass(1.0e3)
 }
 
-/// The registry with its epoch at `epoch`, seconds of TDB since J2000.
-pub fn registry_at(epoch: Seconds) -> Registry {
+/// The registry with the child's mass `mass`, kilograms.
+pub fn registry_with_child_mass(mass: f64) -> Registry {
     Registry::new(
-        epoch,
+        Seconds::new(0.0),
         vec![
             frame(ROOT, ROOT_PARENT, ROOT_EXTENT, 0.0, [0.0; 3]),
-            frame(CHILD, ROOT, CHILD_EXTENT, 1.0e3, CHILD_OFFSET),
+            frame(CHILD, ROOT, CHILD_EXTENT, mass, CHILD_OFFSET),
         ],
     )
     .expect("a valid registry")

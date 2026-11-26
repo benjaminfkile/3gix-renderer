@@ -26,8 +26,7 @@ pub use crate::tiles::SurfaceShape as Surface;
 use crate::world::World;
 use gx_core::frames::FrameSystem;
 use gx_core::registry::FrameTree;
-use gx_core::timescale::{tdb_seconds_to_utc_ms, utc_ms_to_tdb_seconds};
-use gx_core::units::{Quat, Seconds, Vec3};
+use gx_core::units::{Quat, Vec3};
 pub use query::{Hit, HitKind, Picture, Projected, SurfaceHeight};
 use std::collections::{BTreeSet, VecDeque};
 
@@ -219,9 +218,9 @@ impl Time {
             clock.rate()
         };
         Time {
-            utc_ms: tdb_seconds_to_utc_ms(clock.time().value()),
-            origin_utc_ms: tdb_seconds_to_utc_ms(clock.origin().value()),
-            now_utc_ms: tdb_seconds_to_utc_ms(clock.now().value()),
+            utc_ms: clock.wall_ms(clock.time()),
+            origin_utc_ms: clock.wall_ms(clock.origin()),
+            now_utc_ms: clock.wall_ms(clock.now()),
             time_scale: rate,
         }
     }
@@ -954,10 +953,11 @@ impl Api {
                 Command::SetFov(deg) => camera.fov_y = deg.to_radians(),
                 Command::SetTime(utc_ms) => {
                     let c = *sim.clock();
-                    let time = Seconds::new(utc_ms_to_tdb_seconds(utc_ms));
+                    let time = c.universe_seconds(utc_ms);
                     let rate = Time::of(&c).time_scale;
                     let rate = if rate == 0.0 { 1.0 } else { rate };
-                    let mut next = SimClock::starting_at(c.origin(), c.now(), time, rate);
+                    let mut next = SimClock::starting_at(c.origin(), c.now(), time, rate)
+                        .with_origin_ms(c.origin_ms());
                     if c.paused() && !next.is_at_now() {
                         next.apply(crate::sim::ClockAction::TogglePause);
                     }
@@ -1039,7 +1039,7 @@ impl Api {
 mod tests {
     use super::*;
     use crate::sim::tests::{system, EPOCH};
-    use gx_core::timescale::tdb_seconds_to_utc_ms;
+    use gx_core::units::Seconds;
 
     /// A clock jump moves the child frame along its orbit. A camera whose
     /// `placeOver` is still pending stays over that frame; it would
@@ -1064,7 +1064,8 @@ mod tests {
         tick(&mut api, &mut sim, &mut camera);
         assert_eq!(camera.frame_id, 2);
         let before = camera.position;
-        api.set_time(tdb_seconds_to_utc_ms(EPOCH + 0.5e6)).unwrap();
+        api.set_time(sim.clock().wall_ms(Seconds::new(EPOCH + 0.5e6)))
+            .unwrap();
         tick(&mut api, &mut sim, &mut camera);
         assert_eq!(camera.frame_id, 2);
         assert!(
@@ -1101,7 +1102,8 @@ mod tests {
             };
             api.set_camera(pose, ride).unwrap();
             tick(&mut api, &mut sim, &mut camera);
-            api.set_time(tdb_seconds_to_utc_ms(EPOCH + 0.5e6)).unwrap();
+            api.set_time(sim.clock().wall_ms(Seconds::new(EPOCH + 0.5e6)))
+                .unwrap();
             tick(&mut api, &mut sim, &mut camera);
             let moved = (camera.position - Vec3::new(7.0e6, 0.0, 0.0)).length();
             if ride {

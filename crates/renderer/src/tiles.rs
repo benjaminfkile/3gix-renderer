@@ -159,7 +159,7 @@ pub struct TileShape {
     /// tile's `height_floor` (`matter-format.md` 10.3), the lowest height
     /// its compiler declares for the frame's whole surface.
     pub occluder: f64,
-    /// The reference ellipsoid's equatorial and polar radii and the
+    /// The reference ellipsoid's radii `radius_xy` and `radius_z` and the
     /// frame's `height_floor`, meters (`matter-format.md` section 10), as
     /// the tile declares them.
     pub shape: SurfaceShape,
@@ -178,10 +178,10 @@ impl std::ops::Deref for TileGeometry {
 /// 10): the reference ellipsoid and the lowest height above it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SurfaceShape {
-    /// Equatorial radius of the reference ellipsoid, meters.
-    pub radius_equatorial: f64,
-    /// Polar radius of the reference ellipsoid, meters.
-    pub radius_polar: f64,
+    /// Radius of the reference ellipsoid in the frame's x-y plane, meters.
+    pub radius_xy: f64,
+    /// Radius of the reference ellipsoid along the frame's z axis, meters.
+    pub radius_z: f64,
     /// The lowest height above the ellipsoid the compiler declares for
     /// the whole surface, meters.
     pub height_floor: f64,
@@ -224,7 +224,7 @@ impl TileGeometry {
     /// Builds a tile's geometry (off the frame thread: about `5 * 67^2`
     /// square roots).
     pub fn new(t: &SurfaceTile) -> TileGeometry {
-        let (a, c) = (t.radius_equatorial, t.radius_polar);
+        let (a, c) = (t.radius_xy, t.radius_z);
         let key = t.key;
         let q = TILE_QUADS as i64;
         let at = |i: i64, j: i64| vertex_position(&key, i, j, f64::from(t.height(i, j)), a, c);
@@ -325,8 +325,8 @@ impl TileGeometry {
             max_edge: 2.0 * a.max(c) / (1u64 << key.level) as f64,
             occluder: a.min(c) + t.height_floor,
             shape: SurfaceShape {
-                radius_equatorial: a,
-                radius_polar: c,
+                radius_xy: a,
+                radius_z: c,
                 height_floor: t.height_floor,
             },
         });
@@ -2377,8 +2377,8 @@ pub(crate) mod tests {
         }
         SurfaceTile {
             key,
-            radius_equatorial: 6_378_137.0,
-            radius_polar: 6_356_752.3,
+            radius_xy: 6_378_137.0,
+            radius_z: 6_356_752.3,
             height_floor: floor,
             heights,
             parent_heights,

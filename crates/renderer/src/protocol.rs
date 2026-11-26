@@ -1277,4 +1277,40 @@ mod tests {
             .to_string();
         assert!(e.starts_with("registry is invalid: code"), "{e}");
     }
+
+    /// Every registry's epoch is 0, the origin (`matter-format.md` section
+    /// 5): a build whose registry has any other epoch is refused with the
+    /// core's code.
+    #[test]
+    fn a_registry_epoch_other_than_zero_is_refused() {
+        let b = BuildDescription {
+            build_id: "b".into(),
+            layers: Vec::new(),
+            frame_records: BTreeMap::new(),
+        };
+        let root = gx_core::registry::Frame {
+            frame_id: 1,
+            parent_frame_id: gx_core::registry::ROOT_PARENT,
+            root_extent: gx_core::units::Meters::new(1.0e3),
+            max_depth: 0,
+            mass: gx_core::units::Kilograms::new(0.0),
+            position: gx_core::units::Vec3::zero(),
+            velocity: gx_core::units::Vec3::zero(),
+            orientation: gx_core::units::Quat::identity(),
+            angular_velocity: gx_core::units::Vec3::zero(),
+            j2: 0.0,
+            reference_radius: gx_core::units::Meters::new(0.0),
+            principal_moments: gx_core::units::Vec3::zero(),
+        };
+        let r = Registry::new(gx_core::units::Seconds::new(0.0), vec![root]).unwrap();
+        let mut bytes = registry::encode(&r);
+        assert!(frame_system_from_registries(&[Arc::from(&bytes[..])], &b).is_ok());
+        // The epoch is the f64 at byte 8.
+        bytes[8..16].copy_from_slice(&1.0f64.to_le_bytes());
+        let e = frame_system_from_registries(&[Arc::from(&bytes[..])], &b)
+            .unwrap_err()
+            .to_string();
+        let code = gx_core::error::codes::REGISTRY_EPOCH_NONZERO;
+        assert!(e.contains(&format!("code {code}:")), "{e}");
+    }
 }

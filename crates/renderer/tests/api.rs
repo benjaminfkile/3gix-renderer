@@ -21,7 +21,7 @@ use renderer::mock_hub::{
 };
 use renderer::protocol::Routes;
 use renderer::seen::Seen;
-use renderer::sim::Simulation;
+use renderer::sim::{SimClock, Simulation};
 use renderer::spawn::Spawner;
 use renderer::stream::{Fetcher, FetcherOptions};
 use renderer::world::World;
@@ -31,6 +31,9 @@ use winit::keyboard::KeyCode;
 
 /// Seconds per test tick.
 const DT: f64 = 1.0 / 60.0;
+
+/// A made-up origin, wall-clock milliseconds, as the hub would report it.
+const ORIGIN_MS: i64 = 1_234_567_890_123;
 
 /// The view, pixels.
 const VIEW: (u32, u32) = (320, 180);
@@ -110,7 +113,10 @@ impl Loop {
             api: Api::new(system.tree(), &camera)
                 .with_build(&build)
                 .with_compute_budget(fetcher.max_compute_budget(), None),
-            sim: Simulation::at_now(system, now),
+            sim: Simulation::new(
+                system,
+                SimClock::at_now(Seconds::new(0.0), now).with_origin_ms(ORIGIN_MS),
+            ),
             camera,
             spawner: Spawner::default(),
             keys: Keys::new(None),
@@ -505,6 +511,28 @@ fn time_reads_in_utc_and_set_time_clamps_as_the_start_options() {
     assert!(l.sim.clock().is_at_now(), "past now follows now");
 }
 
+/// `setTime(x)` then `getTime().utcMs == x` for x at the origin, the
+/// origin plus one millisecond, and now, while the loop is paused so the
+/// clock does not play between the two. Universe time is
+/// `(x - origin) / 1000` exactly (`gx_core::clock`).
+#[test]
+fn set_time_then_get_time_round_trips_to_the_millisecond() {
+    let mut l = Loop::new();
+    l.tick();
+    let t = l.api.get_time().unwrap();
+    assert_eq!(t.origin_utc_ms, ORIGIN_MS);
+    assert_eq!(t.now_utc_ms, ORIGIN_MS + 1_000_000_000, "now is 1e6 s on");
+    l.api.pause().unwrap();
+    for x in [t.origin_utc_ms, t.origin_utc_ms + 1, t.now_utc_ms] {
+        l.api.set_time(x).unwrap();
+        l.tick();
+        assert_eq!(l.api.get_time().unwrap().utc_ms, x);
+        assert_eq!(l.sim.time(), gx_core::clock::universe_seconds(x, ORIGIN_MS));
+    }
+    assert_eq!(l.sim.time().value(), 1.0e6);
+    assert!(l.sim.clock().is_at_now());
+}
+
 #[test]
 fn set_time_scale_runs_back_and_clamps() {
     let mut l = Loop::new();
@@ -558,8 +586,8 @@ fn frames_list_the_registry_and_surfaces_once_arrived() {
         };
         let tile = SurfaceTile {
             key,
-            radius_equatorial: 4.0,
-            radius_polar: 3.9,
+            radius_xy: 4.0,
+            radius_z: 3.9,
             height_floor: -0.25,
             heights: vec![0.0; HEIGHT_SIDE * HEIGHT_SIDE],
             parent_heights: vec![0.0; PARENT_SIDE * PARENT_SIDE],
@@ -582,10 +610,7 @@ fn frames_list_the_registry_and_surfaces_once_arrived() {
         .unwrap();
     assert!(child.has_surface);
     let s = child.surface.expect("the surface once arrived");
-    assert_eq!(
-        (s.radius_equatorial, s.radius_polar, s.height_floor),
-        (4.0, 3.9, -0.25)
-    );
+    assert_eq!((s.radius_xy, s.radius_z, s.height_floor), (4.0, 3.9, -0.25));
 }
 
 fn close(a: [f64; 3], b: [f64; 3]) -> bool {
@@ -938,8 +963,8 @@ mod queries {
         let h = |n: usize| 200.0 + 50.0 * ((n % 13) as f32) + 7.0 * ((n / 11 % 5) as f32);
         SurfaceTile {
             key,
-            radius_equatorial: a,
-            radius_polar: c,
+            radius_xy: a,
+            radius_z: c,
             height_floor: 0.0,
             heights: (0..HEIGHT_SIDE * HEIGHT_SIDE).map(h).collect(),
             parent_heights: (0..PARENT_SIDE * PARENT_SIDE)
@@ -1267,8 +1292,8 @@ mod queries {
     fn served(key: &SurfaceKey) -> Vec<u8> {
         let t = SurfaceTile {
             key: *key,
-            radius_equatorial: SERVED_RADIUS,
-            radius_polar: SERVED_RADIUS,
+            radius_xy: SERVED_RADIUS,
+            radius_z: SERVED_RADIUS,
             height_floor: 0.0,
             heights: vec![0.1; HEIGHT_SIDE * HEIGHT_SIDE],
             parent_heights: vec![0.1; PARENT_SIDE * PARENT_SIDE],

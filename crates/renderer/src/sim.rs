@@ -7,11 +7,15 @@
 //!
 //! # Time
 //!
-//! The universe begins at the origin, the registry epoch (the hub's origin
-//! converted to TDB, `matter-format.md` section 5.2), and "now" is the
-//! hub's now, kept by [`crate::protocol::ClockSync`] and converted with
-//! [`gx_core::timescale`]. The [`SimClock`] holds the simulation time,
-//! always between the origin and now:
+//! Simulation time is universe time (`space-model.md` section 7 item 5):
+//! seconds since the origin, which is 0 and the epoch of every registry
+//! (`matter-format.md` section 5). The hub reports the origin and its now
+//! as wall-clock milliseconds; "now" is the hub's now, kept by
+//! [`crate::protocol::ClockSync`]. The [`SimClock`] holds the origin's
+//! wall-clock milliseconds and converts both ways with
+//! [`gx_core::clock::universe_seconds`] and [`gx_core::clock::wall_ms`]
+//! ([`SimClock::universe_seconds`], [`SimClock::wall_ms`]). It holds the
+//! simulation time, always between the origin and now:
 //!
 //! - It starts at now and, while at now, follows now at one second per
 //!   second.
@@ -170,6 +174,7 @@ pub enum ClockAction {
 pub struct SimClock {
     time: Seconds,
     origin: Seconds,
+    origin_ms: i64,
     now: Seconds,
     rate: f64,
     rewinding: bool,
@@ -178,13 +183,16 @@ pub struct SimClock {
 }
 
 impl SimClock {
-    /// A clock at now, following it. Times are seconds of TDB since J2000;
-    /// a `now` before the origin is taken as the origin.
+    /// A clock at now, following it. Times are universe seconds; a `now`
+    /// before the origin is taken as the origin. The origin's wall-clock
+    /// instant is 0 milliseconds until [`SimClock::with_origin_ms`] sets
+    /// it.
     pub fn at_now(origin: Seconds, now: Seconds) -> SimClock {
         let now = if now < origin { origin } else { now };
         SimClock {
             time: now,
             origin,
+            origin_ms: 0,
             now,
             rate: 1.0,
             rewinding: false,
@@ -213,17 +221,40 @@ impl SimClock {
         c
     }
 
-    /// The simulation time, seconds of TDB since J2000.
+    /// This clock with the origin at the wall-clock instant `origin_ms`,
+    /// milliseconds, as the hub reports it. Universe times are unchanged.
+    pub fn with_origin_ms(self, origin_ms: i64) -> SimClock {
+        SimClock { origin_ms, ..self }
+    }
+
+    /// The origin's wall-clock instant, milliseconds.
+    pub fn origin_ms(&self) -> i64 {
+        self.origin_ms
+    }
+
+    /// The universe time of the wall-clock instant `wall_ms`, milliseconds
+    /// ([`gx_core::clock::universe_seconds`] from this clock's origin).
+    pub fn universe_seconds(&self, wall_ms: i64) -> Seconds {
+        gx_core::clock::universe_seconds(wall_ms, self.origin_ms)
+    }
+
+    /// The wall-clock instant, milliseconds, of universe time `t`
+    /// ([`gx_core::clock::wall_ms`] from this clock's origin).
+    pub fn wall_ms(&self, t: Seconds) -> i64 {
+        gx_core::clock::wall_ms(t, self.origin_ms)
+    }
+
+    /// The simulation time, universe seconds.
     pub fn time(&self) -> Seconds {
         self.time
     }
 
-    /// The origin, seconds of TDB since J2000.
+    /// The origin, universe seconds: the registry epoch, 0.
     pub fn origin(&self) -> Seconds {
         self.origin
     }
 
-    /// The latest now the clock was given, seconds of TDB since J2000.
+    /// The latest now the clock was given, universe seconds.
     pub fn now(&self) -> Seconds {
         self.now
     }
@@ -406,7 +437,7 @@ impl Simulation {
     }
 
     /// The simulation of `system` (at its epoch, the origin) entered at
-    /// `now`, seconds of TDB since J2000, following now.
+    /// `now`, universe seconds, following now.
     pub fn at_now(system: FrameSystem, now: Seconds) -> Simulation {
         let clock = SimClock::at_now(system.tree().epoch(), now);
         Simulation::new(system, clock)
@@ -422,12 +453,12 @@ impl Simulation {
         &self.system
     }
 
-    /// The simulation time, seconds of TDB since J2000.
+    /// The simulation time, universe seconds.
     pub fn time(&self) -> Seconds {
         self.system.time()
     }
 
-    /// The origin, seconds of TDB since J2000.
+    /// The origin, universe seconds: 0.
     pub fn origin(&self) -> Seconds {
         self.clock.origin()
     }
@@ -437,8 +468,8 @@ impl Simulation {
         &self.history
     }
 
-    /// Ticks the clock by `wall_dt` with the hub's `now` (seconds of TDB
-    /// since J2000) and integrates every frame to the new time.
+    /// Ticks the clock by `wall_dt` with the hub's `now` (universe
+    /// seconds) and integrates every frame to the new time.
     pub fn update(&mut self, wall_dt: Seconds, now: Seconds) {
         self.clock.tick(wall_dt, now);
         self.sync();
@@ -555,7 +586,8 @@ pub(crate) mod tests {
     use gx_core::registry::{Frame, FrameTree, Registry, ROOT_PARENT};
     use gx_core::units::{Kilograms, Meters, Quat};
 
-    pub(crate) const EPOCH: f64 = 1000.0;
+    /// The registry epoch: 0, the origin.
+    pub(crate) const EPOCH: f64 = 0.0;
 
     /// A heavy root frame and a spinning child frame in orbit around it.
     pub(crate) fn system() -> FrameSystem {
@@ -607,7 +639,7 @@ pub(crate) mod tests {
         assert_eq!(c.rate(), 1.0);
         assert!(c.is_at_now());
         // A now before the origin is the origin.
-        assert_eq!(SimClock::at_now(s(EPOCH), s(0.0)).time(), s(EPOCH));
+        assert_eq!(SimClock::at_now(s(EPOCH), s(EPOCH - 1.0)).time(), s(EPOCH));
     }
 
     #[test]

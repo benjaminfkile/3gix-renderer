@@ -20,7 +20,7 @@ Approved 2026-11-22. This file holds the API's items; the rules they follow are 
 - A **pose** is `{ frameId, position: [x, y, z], orientation: [x, y, z, w], speed }`: position relative to the frame origin in the frame's own axes, orientation the camera axes relative to the frame axes (unit quaternion), speed the set flight speed. These are the fields of `camera::Camera`.
 - Positions in a frame's axes stay put as the frame spins, so placing or reading a fixed point needs no time.
 - Frame ids are integers. In JS they are numbers; an id at or above 2^53 is an error.
-- Time in the API is UTC milliseconds (`utcMs`) for instants; the renderer's internal TDB seconds stay internal.
+- Time in the API is wall-clock milliseconds (`utcMs`) for instants, as the hub's clock counts them; the renderer's universe time (seconds since the origin, `gx_core::clock`) stays internal.
 - Errors: Rust items return `Result`; JS methods throw `Error` with the same message.
 
 ## 3. Lifecycle
@@ -51,7 +51,7 @@ Approved 2026-11-22. This file holds the API's items; the rules they follow are 
 | `getTime()` | `{ utcMs, originUtcMs, nowUtcMs, timeScale }`: the instant drawn, the universe's origin, real now, the playback rate. |
 | `setTime(utcMs)` | Jumps to that instant, clamped between origin and now as the start options are. |
 | `setTimeScale(x)` | Playback rate; negative runs back. Same clamps as now. |
-| `frames()` | Every frame of the registry: `{ id, parentId, mass, angularVelocity: [x, y, z], hasSurface, surface }`, `surface` null or `{ radiusEquatorial, radiusPolar, heightFloor }` from the frame's level-0 surface tiles once they have arrived (`matter-format.md` section 10). |
+| `frames()` | Every frame of the registry: `{ id, parentId, mass, angularVelocity: [x, y, z], hasSurface, surface }`, `surface` null or `{ radiusXy, radiusZ, heightFloor }` from the frame's level-0 surface tiles once they have arrived (`matter-format.md` section 10). |
 | `transform(point, fromFrame, toFrame, kind)` | A point (`kind: "point"`) or direction (`"direction"`) from one frame's axes into another's at the instant drawn. |
 
 ## 6. Queries

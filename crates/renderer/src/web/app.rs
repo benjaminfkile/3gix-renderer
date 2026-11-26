@@ -26,7 +26,6 @@ use crate::sim::Simulation;
 use crate::stream::FetchEvent;
 use crate::world::{DrawList, World, COMPOSITE_SLICE_SECONDS};
 use anyhow::{anyhow, Context, Result};
-use gx_core::units::Seconds;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -127,9 +126,7 @@ fn matter_step(
     now: f64,
 ) -> DrawList {
     let started = crate::clock::now_seconds();
-    fetcher.set_time_utc_ms(gx_core::timescale::tdb_seconds_to_utc_ms(
-        sim.time().value(),
-    ));
+    fetcher.set_time_utc_ms(sim.clock().wall_ms(sim.time()));
     let mut cells = Vec::new();
     for e in fetcher.drain_until(started + COMPOSITE_SLICE_SECONDS) {
         match e {
@@ -324,7 +321,7 @@ impl WebApp {
             }
         }
 
-        let hub_now = gx_core::timescale::utc_ms_to_tdb_seconds(self.fetcher.now_utc_ms());
+        let hub_now = self.sim.clock().universe_seconds(self.fetcher.now_utc_ms());
         let shared = self.shared.clone();
         let mut api = shared.api.borrow_mut();
         api.begin_tick(crate::api::Target {
@@ -359,7 +356,7 @@ impl WebApp {
             &mut self.sim,
             &mut self.camera,
             dt,
-            Seconds::new(hub_now),
+            hub_now,
             &input,
             self.controls.attached,
         );
@@ -456,6 +453,7 @@ impl WebApp {
         let clock = self.sim.clock();
         let mut text = OverlayInfo {
             sim_time: self.sim.time(),
+            origin_ms: clock.origin_ms(),
             offset_from_now: clock.offset_from_now(),
             at_now: clock.is_at_now(),
             rate: clock.rate(),

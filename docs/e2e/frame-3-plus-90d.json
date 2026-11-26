@@ -16,7 +16,7 @@
   "ready": true,
   "requests": 942,
   "sim_lag": false,
-  "sim_time_seconds_since_j2000": 7776000.0,
+  "sim_time_seconds": 7776000.0,
   "sprites": [
     {
       "frame_id": 1,

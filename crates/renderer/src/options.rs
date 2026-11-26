@@ -268,10 +268,29 @@ pub struct Launch {
     pub pending_spawn: Option<StartOn>,
 }
 
-/// The clock of a simulation of `system` (at its epoch, the origin) whose
-/// now is `now`, seconds of TDB since J2000, started as `options` say.
-pub fn launch_clock(system: &FrameSystem, options: &ViewOptions, now: Seconds) -> SimClock {
+/// The origin's wall-clock instant, milliseconds: the hub's, or the hub's
+/// now `now_ms` while the hub has reported none. The hub sets the origin
+/// at the first directions request, which a renderer started at now asks
+/// for at now.
+pub fn origin_ms_or_now(origin_utc_ms: Option<i64>, now_ms: i64) -> i64 {
+    origin_utc_ms.unwrap_or_else(|| {
+        tracing::info!("the hub has no origin yet; universe time starts at its now");
+        now_ms
+    })
+}
+
+/// The clock of a simulation of `system` (at its epoch, the origin, 0)
+/// started as `options` say, with the hub's origin at the wall-clock
+/// instant `origin_ms` and its now at `now_ms`, milliseconds. Now becomes
+/// universe time with [`gx_core::clock::universe_seconds`].
+pub fn launch_clock(
+    system: &FrameSystem,
+    options: &ViewOptions,
+    origin_ms: i64,
+    now_ms: i64,
+) -> SimClock {
     let origin = system.tree().epoch();
+    let now = gx_core::clock::universe_seconds(now_ms, origin_ms);
     let from = match options.start {
         Start::Now => now,
         Start::Origin => origin,
@@ -282,6 +301,7 @@ pub fn launch_clock(system: &FrameSystem, options: &ViewOptions, now: Seconds) -
         from + Seconds::new(options.start_offset_seconds),
         options.time_scale,
     )
+    .with_origin_ms(origin_ms)
 }
 
 /// The camera `options` start with: over the `start-on` frame (looking at
@@ -309,9 +329,10 @@ pub fn launch_camera_at(system: &FrameSystem, s: StartOn) -> Option<Camera> {
 }
 
 /// Applies `options` to the clock and the camera at start, for both
-/// builds.
-pub fn launch(system: FrameSystem, options: &ViewOptions, now: Seconds) -> Launch {
-    let clock = launch_clock(&system, options, now);
+/// builds, with the hub's origin and now at the wall-clock instants
+/// `origin_ms` and `now_ms` ([`launch_clock`]).
+pub fn launch(system: FrameSystem, options: &ViewOptions, origin_ms: i64, now_ms: i64) -> Launch {
+    let clock = launch_clock(&system, options, origin_ms, now_ms);
     let camera = launch_camera(&system, options);
     Launch {
         sim: Simulation::new(system, clock),
@@ -367,6 +388,49 @@ mod tests {
         let none = ViewOptions::from_camel_pairs([("hideLayers", "")]).unwrap();
         let (hidden, _) = hidden_layer_indices(&ids, none.hide_layers.as_deref(), [2].into());
         assert!(hidden.is_empty());
+    }
+
+    /// `start` and `startOffsetSeconds` reach the same wall-clock instant
+    /// as before, `origin_ms` or now plus the offset, and the frames stand
+    /// where the registry integrated over the same seconds since the
+    /// origin puts them.
+    #[test]
+    fn a_start_and_offset_reach_the_same_wall_clock_instant() {
+        use crate::sim::tests::system;
+        let origin_ms = 1_234_567_890_123;
+        let now_ms = origin_ms + 86_400_000;
+        for (start, offset, want_ms) in [
+            (Start::Origin, 3_600.0, origin_ms + 3_600_000),
+            (Start::Now, -3_600.0, now_ms - 3_600_000),
+            (Start::Now, 0.0, now_ms),
+            (Start::Origin, -10.0, origin_ms),
+        ] {
+            let options = ViewOptions {
+                start,
+                start_offset_seconds: offset,
+                ..ViewOptions::default()
+            };
+            let l = launch(system(), &options, origin_ms, now_ms);
+            let clock = l.sim.clock();
+            assert_eq!(clock.wall_ms(l.sim.time()), want_ms, "{start:?} {offset}");
+            assert_eq!(clock.wall_ms(clock.now()), now_ms);
+            assert_eq!(clock.wall_ms(clock.origin()), origin_ms);
+            let t = gx_core::clock::universe_seconds(want_ms, origin_ms);
+            assert_eq!(l.sim.time(), t);
+            let mut direct = system();
+            let step = Seconds::new(crate::sim::max_step(&direct));
+            gx_core::integrate::advance(&mut direct, t, step, crate::sim::SCHEME);
+            for f in direct.tree().frames() {
+                let d = (l.sim.system().root_position(f.frame_id)
+                    - direct.root_position(f.frame_id))
+                .length();
+                assert!(
+                    d < 1e-3,
+                    "{start:?} {offset}: frame {} off by {d} m",
+                    f.frame_id
+                );
+            }
+        }
     }
 
     #[test]
@@ -451,9 +515,14 @@ mod tests {
         assert_eq!(native.api_key, ApiKey::new("k"));
         let web = ViewOptions::from_camel_pairs([("startOn", place), ("timeScale", "-2")]).unwrap();
         assert_eq!(native.options, web);
-        let now = Seconds::new(1e6);
-        let a = launch(crate::camera::tests::system(), &native.options, now);
-        let b = launch(crate::camera::tests::system(), &web, now);
+        let (origin_ms, now_ms) = (5_000, 1_000_005_000);
+        let a = launch(
+            crate::camera::tests::system(),
+            &native.options,
+            origin_ms,
+            now_ms,
+        );
+        let b = launch(crate::camera::tests::system(), &web, origin_ms, now_ms);
         assert_eq!(a.camera, b.camera);
         assert_eq!(a.camera.frame_id, 5);
         assert!((a.camera.position.length() - 300.0).abs() < 1e-9);

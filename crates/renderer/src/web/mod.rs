@@ -167,8 +167,9 @@ async fn start(
         .load_registry()
         .await
         .map_err(|e| value::js_error(format!("{e:#}")))?;
-    let now = gx_core::timescale::utc_ms_to_tdb_seconds(fetcher.now_utc_ms());
-    let launch = crate::options::launch(system, &options, gx_core::units::Seconds::new(now));
+    let now_ms = fetcher.now_utc_ms();
+    let origin_ms = crate::options::origin_ms_or_now(fetcher.origin_utc_ms(), now_ms);
+    let launch = crate::options::launch(system, &options, origin_ms, now_ms);
     let api = crate::api::Api::new(launch.sim.system().tree(), &launch.camera)
         .with_build(fetcher.hub().build())
         .with_compute_budget(fetch::WEB_WORKERS, options.compute_budget);
