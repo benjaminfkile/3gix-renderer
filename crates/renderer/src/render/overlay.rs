@@ -5,14 +5,14 @@
 //! `epaint_default_fonts` (see `docs/architecture.md` for why). This module
 //! only formats the text so it can be tested without a GPU.
 //!
-//! Simulation time is shown as a UTC date and time (converted from TDB with
-//! [`gx_core::timescale`]), with its offset from now in seconds, or "now"
+//! Simulation time is shown as the wall-clock date and time in UTC
+//! (universe seconds converted from the origin's wall-clock instant with
+//! [`gx_core::clock::wall_ms`]), with its offset from now in seconds, or "now"
 //! when the clock follows now (`space-model.md` section 7). One line gives
 //! the light-travel time to the frame nearest the crosshair
 //! (`space-model.md` section 6.4).
 
 use crate::stream::FetcherStats;
-use gx_core::timescale::tdb_seconds_to_utc_ms;
 use gx_core::units::Seconds;
 
 /// Left and top margin of the overlay, pixels.
@@ -137,8 +137,11 @@ impl MatterStats {
 /// The values the overlay reports.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct OverlayInfo {
-    /// Simulation time, seconds of TDB since J2000.
+    /// Simulation time, universe seconds.
     pub sim_time: Seconds,
+    /// The origin's wall-clock instant, milliseconds: what the simulation
+    /// time is shown from.
+    pub origin_ms: i64,
     /// Simulation time minus now, seconds: 0 at now.
     pub offset_from_now: Seconds,
     /// `true` while the clock follows now.
@@ -171,7 +174,7 @@ pub struct OverlayInfo {
 impl OverlayInfo {
     /// The overlay lines, top to bottom.
     pub fn lines(&self) -> Vec<String> {
-        let utc = format_utc(tdb_seconds_to_utc_ms(self.sim_time.value()));
+        let utc = format_utc(gx_core::clock::wall_ms(self.sim_time, self.origin_ms));
         let mut lines = vec![
             if self.at_now {
                 format!("{utc}  now")
@@ -334,14 +337,18 @@ fn format_scale(scale: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gx_core::timescale::utc_ms_to_tdb_seconds;
+    use gx_core::clock::universe_seconds;
 
     /// 2026-11-15 12:34:56.789 UTC.
     const UTC_MS: i64 = 1_794_746_096_789;
 
+    /// A made-up origin, wall-clock milliseconds.
+    const ORIGIN_MS: i64 = 1_700_000_000_000;
+
     fn info() -> OverlayInfo {
         OverlayInfo {
-            sim_time: Seconds::new(utc_ms_to_tdb_seconds(UTC_MS)),
+            sim_time: universe_seconds(UTC_MS, ORIGIN_MS),
+            origin_ms: ORIGIN_MS,
             offset_from_now: Seconds::new(0.0),
             at_now: true,
             rate: 1.0,
@@ -431,7 +438,8 @@ mod tests {
     #[test]
     fn past_paused_backwards_and_fractions() {
         let l = OverlayInfo {
-            sim_time: Seconds::new(utc_ms_to_tdb_seconds(UTC_MS - 3_600_000)),
+            sim_time: universe_seconds(UTC_MS - 3_600_000, ORIGIN_MS),
+            origin_ms: ORIGIN_MS,
             offset_from_now: Seconds::new(-3600.0),
             at_now: false,
             rate: 0.25,

@@ -67,10 +67,10 @@ export interface TimeState {
 
 /** A frame's surface shape from its level-0 tiles (section 5), meters. */
 export interface SurfaceShape {
-    /** Equatorial radius of the reference ellipsoid. */
-    radiusEquatorial: number;
-    /** Polar radius of the reference ellipsoid. */
-    radiusPolar: number;
+    /** Radius of the reference ellipsoid in the frame's x-y plane. */
+    radiusXy: number;
+    /** Radius of the reference ellipsoid along the frame's z axis. */
+    radiusZ: number;
     /** The lowest height a tile may hold. */
     heightFloor: number;
 }

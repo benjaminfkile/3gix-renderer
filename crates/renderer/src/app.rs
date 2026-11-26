@@ -54,7 +54,6 @@ use crate::stream::{FetchEvent, Fetcher};
 use crate::world::{DrawList, World};
 use anyhow::{anyhow, Context, Result};
 use gx_core::frames::FrameSystem;
-use gx_core::units::Seconds;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -187,49 +186,25 @@ pub fn matter_stats(world: &World, fetcher: Option<&Fetcher>, scene: &Scene) -> 
 }
 
 /// Tells the fetcher which moment is drawn, so directions are asked for it
-/// (`client-compute.md` section 2.4): the simulation time converted from
-/// TDB to UTC milliseconds.
+/// (`client-compute.md` section 2.4): the simulation time as a wall-clock
+/// instant in milliseconds ([`SimClock::wall_ms`]).
 pub fn set_fetch_time(fetcher: &mut Fetcher, sim: &Simulation) {
-    let t = gx_core::timescale::tdb_seconds_to_utc_ms(sim.time().value());
-    fetcher.set_time_utc_ms(t);
+    fetcher.set_time_utc_ms(sim.clock().wall_ms(sim.time()));
 }
 
-/// A UTC time in milliseconds as seconds of TDB since J2000.
-pub fn tdb_of_utc_ms(utc_ms: i64) -> Seconds {
-    Seconds::new(gx_core::timescale::utc_ms_to_tdb_seconds(utc_ms))
-}
-
-/// Seconds the registry epoch may differ from the hub's origin before
-/// [`check_origin`] warns.
-pub const ORIGIN_TOLERANCE_SECONDS: f64 = 2.0;
-
-/// Logs a warning when the registry epoch, which the renderer takes as the
-/// origin, is not the hub's origin converted to TDB (`matter-format.md`
-/// section 5.2 requires them to be equal). Returns whether they agree, or
-/// `true` while the hub has not reported an origin.
-pub fn check_origin(system: &FrameSystem, origin_utc_ms: Option<i64>) -> bool {
-    let Some(origin) = origin_utc_ms else {
-        return true;
-    };
-    let epoch = system.tree().epoch().value();
-    let hub = tdb_of_utc_ms(origin).value();
-    let agree = (epoch - hub).abs() <= ORIGIN_TOLERANCE_SECONDS;
-    if !agree {
-        tracing::warn!(
-            registry_epoch_tdb_s = epoch,
-            hub_origin_tdb_s = hub,
-            "the registry epoch is not the hub's origin; time runs from the registry epoch"
-        );
-    }
-    agree
-}
+pub use crate::options::origin_ms_or_now;
 
 /// The configured start (`--start`, `--start-offset-seconds`,
 /// `--time-scale`) of a simulation of `system` (at its epoch, the origin)
-/// whose now is `now`, seconds of TDB since J2000: at now by default
-/// ([`crate::options::launch_clock`]).
-pub fn launch_simulation(system: FrameSystem, config: &Config, now: Seconds) -> Simulation {
-    let clock = crate::options::launch_clock(&system, &config.options, now);
+/// with the hub's origin and now at the wall-clock instants `origin_ms`
+/// and `now_ms`: at now by default ([`crate::options::launch_clock`]).
+pub fn launch_simulation(
+    system: FrameSystem,
+    config: &Config,
+    origin_ms: i64,
+    now_ms: i64,
+) -> Simulation {
+    let clock = crate::options::launch_clock(&system, &config.options, origin_ms, now_ms);
     Simulation::new(system, clock)
 }
 
@@ -246,6 +221,7 @@ pub fn overlay_info(
     let clock = sim.clock();
     OverlayInfo {
         sim_time: sim.time(),
+        origin_ms: clock.origin_ms(),
         offset_from_now: clock.offset_from_now(),
         at_now: clock.is_at_now(),
         rate: clock.rate(),
@@ -417,7 +393,7 @@ impl HeadlessStats {
         let m = &o.matter;
         let mut out = serde_json::json!({
             "view": self.view.to_string(),
-            "sim_time_seconds_since_j2000": o.sim_time.value(),
+            "sim_time_seconds": o.sim_time.value(),
             "camera_frame": o.camera_frame,
             "camera_distance_m": o.camera_distance,
             "frames": o.frame_count,
@@ -459,7 +435,7 @@ impl HeadlessStats {
             })).collect::<Vec<_>>(),
         });
         let time = serde_json::json!({
-            "sim_time_utc_ms": gx_core::timescale::tdb_seconds_to_utc_ms(o.sim_time.value()),
+            "sim_time_utc_ms": gx_core::clock::wall_ms(o.sim_time, o.origin_ms),
             "offset_from_now_seconds": o.offset_from_now.value(),
             "at_now": o.at_now,
             "crosshair_frame": o.crosshair.map(|(f, _)| f),
@@ -689,9 +665,9 @@ pub fn render_headless_view(
 /// path. Cells come through `fetcher`. With `--wait-ready-seconds`, fails
 /// after writing both when the selection was not ready in time.
 pub fn run_headless(config: &Config, system: FrameSystem, mut fetcher: Fetcher) -> Result<()> {
-    check_origin(&system, fetcher.origin_utc_ms());
-    let now = tdb_of_utc_ms(fetcher.now_utc_ms());
-    let mut sim = launch_simulation(system, config, now);
+    let now_ms = fetcher.now_utc_ms();
+    let origin_ms = origin_ms_or_now(fetcher.origin_utc_ms(), now_ms);
+    let mut sim = launch_simulation(system, config, origin_ms, now_ms);
     let run = HeadlessRun::from_config(config);
     let frame = render_headless_view(&mut sim, Some(&mut fetcher), &run)?;
     match &config.screenshot {
@@ -733,9 +709,9 @@ pub fn run_windowed(
     // still runs continuously, but paced by the surface's present mode (one
     // frame per display refresh) and the optional cap instead of spinning.
     event_loop.set_control_flow(ControlFlow::Wait);
-    check_origin(&system, fetcher.origin_utc_ms());
-    let now = tdb_of_utc_ms(fetcher.now_utc_ms());
-    let launch = crate::options::launch(system, &config.options, now);
+    let now_ms = fetcher.now_utc_ms();
+    let origin_ms = origin_ms_or_now(fetcher.origin_utc_ms(), now_ms);
+    let launch = crate::options::launch(system, &config.options, origin_ms, now_ms);
     let mut app = App {
         api: Api::new(launch.sim.system().tree(), &launch.camera)
             .with_build(fetcher.client().build())
@@ -970,7 +946,7 @@ impl App {
             .map_or(0.0, |t| (now - t).as_secs_f64().min(MAX_FRAME_SECONDS));
         self.last_tick = Some(now);
 
-        let hub_now = tdb_of_utc_ms(self.fetcher.now_utc_ms());
+        let hub_now = self.sim.clock().universe_seconds(self.fetcher.now_utc_ms());
         self.consumer.tick(&mut self.api);
         self.api.begin_tick(api::Target {
             sim: &mut self.sim,

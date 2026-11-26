@@ -247,7 +247,8 @@ fn mesh_hits(mesh: &SurfaceMesh, o: [f64; 3], d: [f64; 3], out: &mut Vec<f64>) {
 }
 
 /// The height of `p` (frame coordinates) above the ellipsoid of radii `a`
-/// (equatorial) and `c` (polar), along the ellipsoid's normal.
+/// (in the x-y plane, `radius_xy`) and `c` (along z, `radius_z`), along the
+/// ellipsoid's normal.
 pub fn ellipsoid_height(p: [f64; 3], a: f64, c: f64) -> f64 {
     if a == c {
         return length(p) - a;
@@ -255,8 +256,8 @@ pub fn ellipsoid_height(p: [f64; 3], a: f64, c: f64) -> f64 {
     let rho = (p[0] * p[0] + p[1] * p[1]).sqrt();
     let z = p[2];
     let e2 = 1.0 - (c * c) / (a * a);
-    // The angle of the normal from the equatorial plane by fixed point
-    // iteration, then the height in the form that holds at the poles too.
+    // The angle of the normal from the x-y plane by fixed point
+    // iteration, then the height in the form that holds on the z axis too.
     let mut phi = z.atan2(rho * (1.0 - e2));
     let mut h = 0.0;
     for _ in 0..16 {
@@ -428,7 +429,7 @@ impl Picture {
         let p = d.map(|c| c * t);
         let key = tile.geometry.key;
         Some(SurfaceHeight {
-            height: ellipsoid_height(p, s.radius_equatorial, s.radius_polar),
+            height: ellipsoid_height(p, s.radius_xy, s.radius_z),
             level: key.level,
             finer: self.coarse.contains(&key),
         })

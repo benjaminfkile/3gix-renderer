@@ -35,10 +35,9 @@ mod common;
 
 use gx_core::frames::FrameSystem;
 use gx_core::key::CellKey;
-use gx_core::timescale::utc_ms_to_tdb_seconds;
 use gx_core::units::Seconds;
 use gx_worker::MAX_UPLOADS_IN_FLIGHT;
-use renderer::app::{check_origin, matter_step, render_headless_view, HeadlessRun};
+use renderer::app::{matter_step, render_headless_view, HeadlessRun};
 use renderer::camera::Camera;
 use renderer::config::{ApiKey, View};
 use renderer::extract::default_threads;
@@ -341,7 +340,7 @@ fn a_stale_cached_copy_is_discarded_on_a_hash_change() {
         &gx_core::key::ChunkKey::Registry,
     ));
     assert!(hub.sections().contains_key(&address));
-    let replaced = gx_core::registry::encode(&common::registry_at(Seconds::new(1.0)));
+    let replaced = gx_core::registry::encode(&common::registry_with_child_mass(2.0e3));
     assert_ne!(replaced, registry);
     hub.replace_section(&address, replaced.clone());
     let b = connect(&rt, &hub, Some(&dir));
@@ -486,15 +485,15 @@ fn directions_are_batched_and_empty_cells_need_nothing() {
 
 #[test]
 fn headless_render_at_now_and_at_the_origin() {
-    // A space whose origin is two days ago, with the registry at the
-    // origin, as the system module emits it (`matter-format.md` 5.2).
+    // A space whose origin is two days ago, with the registry at epoch 0,
+    // the origin, as every registry is (`matter-format.md` section 5).
     let origin_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
         - 2 * 86_400_000;
-    let epoch = Seconds::new(utc_ms_to_tdb_seconds(origin_ms));
-    let registry = gx_core::registry::encode(&common::registry_at(epoch));
+    let epoch = Seconds::new(0.0);
+    let registry = common::registry_bytes();
     let mut options = space_with_registry(registry);
     options.origin_utc_ms = Some(origin_ms);
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -503,8 +502,6 @@ fn headless_render_at_now_and_at_the_origin() {
     let mut c = connect(&rt, &hub, Some(&dir));
     assert_eq!(c.system.tree().epoch(), epoch);
     assert_eq!(c.fetcher.origin_utc_ms(), Some(origin_ms));
-    assert!(check_origin(&c.system, c.fetcher.origin_utc_ms()));
-    assert!(!check_origin(&c.system, Some(origin_ms + 60_000)));
     let run = HeadlessRun {
         overlay: false,
         wait_ready_seconds: Some(90.0),
@@ -512,12 +509,13 @@ fn headless_render_at_now_and_at_the_origin() {
         ..HeadlessRun::home(WIDTH, HEIGHT)
     };
     for (name, at_origin) in [("now", false), ("origin", true)] {
-        let now = Seconds::new(utc_ms_to_tdb_seconds(c.fetcher.now_utc_ms()));
+        let now = gx_core::clock::universe_seconds(c.fetcher.now_utc_ms(), origin_ms);
         let clock = if at_origin {
             SimClock::starting_at(epoch, now, epoch, 1.0)
         } else {
             SimClock::at_now(epoch, now)
-        };
+        }
+        .with_origin_ms(origin_ms);
         let mut sim = Simulation::new(c.system.clone(), clock);
         if at_origin {
             assert_eq!(sim.time(), epoch);

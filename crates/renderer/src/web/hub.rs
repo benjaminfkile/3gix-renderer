@@ -135,6 +135,12 @@ impl WebHub {
         self.clock.get().now_utc_ms(now_seconds())
     }
 
+    /// The origin, wall-clock milliseconds, once the hub's clock has
+    /// reported one ([`ClockSync::origin_utc_ms`]).
+    pub fn origin_utc_ms(&self) -> Option<i64> {
+        self.clock.get().origin_utc_ms()
+    }
+
     /// Measures the offset from the hub's clock again with `GET
     /// /space/{s}/clock`. Done at connect time and, by
     /// [`WebHub::keep_clock`], every

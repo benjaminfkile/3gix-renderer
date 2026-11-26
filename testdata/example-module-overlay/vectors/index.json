@@ -12,7 +12,7 @@
       "key": "7-1-0-1-0",
       "sha256": "477d4dc43837c9052bb00570edd1b2139ad5b539a67499c8e00cb4e20a948c1a"
     },
-    "04-equator": {
+    "04-xy-plane": {
       "key": "s-7-0-0-0-0",
       "sha256": "59eed624cfbdc3aa0aac27196e9ae9e9ad89f2ca7daf77a06a820e355d1bc639"
     },
@@ -20,7 +20,7 @@
       "key": "s-7-0-2-1-2",
       "sha256": "89fa423ffd3f2f5f74a70b1ea380f47e5c6abc30f54e1327fc797b0f134c2cb2"
     },
-    "06-pole": {
+    "06-z-axis": {
       "key": "s-7-4-1-0-1",
       "sha256": "7f764d85d994421eed7913a3a86fc3184e9c18120d685fcd5953b022ba664cb1"
     },

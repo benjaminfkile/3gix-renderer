@@ -5,7 +5,7 @@
 //! [`crate::api::Api`]'s.
 
 use crate::api::{Exposure, FlightInput, FrameInfo, Hit, HitKind, Layer, Pose, Projected};
-use crate::api::{Kind, MeshMode, Stats, SurfaceHeight, Time};
+use crate::api::{Kind, MeshMode, Stats, Surface, SurfaceHeight, Time};
 use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
@@ -191,18 +191,18 @@ pub fn frame_to_js(f: &FrameInfo) -> Result<JsValue, JsValue> {
     set(&o, "mass", f.mass);
     set(&o, "angularVelocity", array(&f.angular_velocity));
     set(&o, "hasSurface", f.has_surface);
-    let surface = match f.surface {
-        Some(s) => {
-            let so = Object::new();
-            set(&so, "radiusEquatorial", s.radius_equatorial);
-            set(&so, "radiusPolar", s.radius_polar);
-            set(&so, "heightFloor", s.height_floor);
-            so.into()
-        }
-        None => JsValue::NULL,
-    };
+    let surface = f.surface.as_ref().map_or(JsValue::NULL, surface_to_js);
     set(&o, "surface", surface);
     Ok(o.into())
+}
+
+/// A frame's surface shape as `{ radiusXy, radiusZ, heightFloor }`.
+pub fn surface_to_js(s: &Surface) -> JsValue {
+    let o = Object::new();
+    set(&o, "radiusXy", s.radius_xy);
+    set(&o, "radiusZ", s.radius_z);
+    set(&o, "heightFloor", s.height_floor);
+    o.into()
 }
 
 /// A layer as `{ id, overlay, exclusive, shown }`.
@@ -277,6 +277,18 @@ pub fn stats_to_js(s: &Stats) -> JsValue {
 #[wasm_bindgen(js_name = checkPose)]
 pub fn check_pose(value: JsValue) -> Result<JsValue, JsValue> {
     pose_to_js(&pose(&value)?)
+}
+
+/// A surface shape of radii `radius_xy` and `radius_z` and floor
+/// `height_floor`, meters, as `frames()` hands it out. Exported for the
+/// Node checks.
+#[wasm_bindgen(js_name = checkSurface)]
+pub fn check_surface(radius_xy: f64, radius_z: f64, height_floor: f64) -> JsValue {
+    surface_to_js(&Surface {
+        radius_xy,
+        radius_z,
+        height_floor,
+    })
 }
 
 /// Checks a frame id as every method taking one converts it: a whole

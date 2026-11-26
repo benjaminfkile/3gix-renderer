@@ -28,8 +28,8 @@ use renderer::sim::Simulation;
 use renderer::stream::{decode_cell, FetchOutcome};
 use renderer::world::World;
 
-/// The registry epoch, seconds of TDB since J2000.
-const EPOCH: f64 = 8.0e8;
+/// The registry epoch: 0, the origin (`matter-format.md` section 5).
+const EPOCH: f64 = 0.0;
 /// One light-hour, meters.
 const LIGHT_HOUR: f64 = C * 3600.0;
 /// The far frame's speed, meters per second.

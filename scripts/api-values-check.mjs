@@ -1,9 +1,10 @@
 // Checks the web binding's value conversions under Node, without a GPU or
 // a hub (docs/api.md section 2): loads web/pkg (built by web/build.sh) and
-// calls its checkPose and checkFrameId, which convert exactly as the
-// Renderer methods do. A pose round-trips as a plain object; a frame id
-// that is not a whole number from 0 to below 2^53, and a pose with a
-// missing or misshapen field, throw an Error.
+// calls its checkPose, checkFrameId, and checkSurface, which convert
+// exactly as the Renderer methods do. A pose round-trips as a plain
+// object; a frame id that is not a whole number from 0 to below 2^53, and
+// a pose with a missing or misshapen field, throw an Error. A surface
+// shape in frames() has exactly the fields radiusXy, radiusZ, heightFloor.
 //
 // Usage: node scripts/api-values-check.mjs
 
@@ -15,7 +16,7 @@ import assert from "node:assert/strict";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = await import(join(root, "web/pkg/renderer.js"));
 pkg.initSync({ module: readFileSync(join(root, "web/pkg/renderer_bg.wasm")) });
-const { checkPose, checkFrameId } = pkg;
+const { checkPose, checkFrameId, checkSurface } = pkg;
 
 const throws = (f, pattern, what) => {
     assert.throws(f, (e) => e instanceof Error && pattern.test(e.message), what);
@@ -47,5 +48,8 @@ throws(() => checkPose({ ...pose, orientation: [0, 0, "0", 1] }), /orientation i
 throws(() => checkPose({ ...pose, speed: null }), /speed is not a number/, "no speed");
 throws(() => checkPose(null), /expected an object/, "null");
 throws(() => checkPose(5), /expected an object/, "number");
+
+// Surface shapes (frames(), docs/api.md section 5).
+assert.deepEqual(checkSurface(4, 3.9, -0.5), { radiusXy: 4, radiusZ: 3.9, heightFloor: -0.5 });
 
 console.log("api values ok");

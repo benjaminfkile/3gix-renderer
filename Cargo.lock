@@ -808,7 +808,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1119,7 +1119,7 @@ dependencies = [
 [[package]]
 name = "gx-core"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#7d3889ef08786fa900e4b2f7871af959b14c740d"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#b254266d562bf05c49323d0f8a680c6d998a8a42"
 dependencies = [
  "wasm-bindgen",
  "zstd",
@@ -1128,7 +1128,7 @@ dependencies = [
 [[package]]
 name = "gx-module-host"
 version = "0.1.0"
-source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#7d3889ef08786fa900e4b2f7871af959b14c740d"
+source = "git+https://github.com/benjaminfkile/3gix-core?branch=grunt#b254266d562bf05c49323d0f8a680c6d998a8a42"
 dependencies = [
  "gx-core",
  "wasmparser 0.261.0",
@@ -2418,7 +2418,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2708,7 +2708,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2765,7 +2765,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4149,7 +4149,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

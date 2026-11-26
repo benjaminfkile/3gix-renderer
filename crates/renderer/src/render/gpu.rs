@@ -2171,8 +2171,8 @@ mod tile_vertex_tests {
     fn surface(key: SurfaceKey) -> SurfaceTile {
         SurfaceTile {
             key,
-            radius_equatorial: 6.0e6,
-            radius_polar: 5.9e6,
+            radius_xy: 6.0e6,
+            radius_z: 5.9e6,
             height_floor: -500.0,
             heights: (0..HEIGHT_SIDE * HEIGHT_SIDE)
                 .map(|n| (n % 97) as f32 * 3.0)

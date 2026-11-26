@@ -113,8 +113,13 @@ second otherwise. A tick builds the scene and draws it only when it differs
 visibly from the last one drawn (`redraw`, `rendering.md` section 4).
 
 1. The `SimClock` takes the hub's now (`protocol::ClockSync`, measured at
-   start and every minute) and advances by the wall-clock delta times the
-   rate, clamped between the origin and now; at now it follows now.
+   start and every minute) as universe time, seconds since the origin
+   (`gx_core::clock::universe_seconds` from the hub's `originUtcMs`, or
+   from the hub's now at start while the hub has no origin yet; the
+   registry epoch is 0, the origin), and advances by the wall-clock delta
+   times the rate, clamped between the origin and now; at now it follows
+   now. Instants leave the renderer (`getTime`, the HUD, directions) as
+   wall-clock milliseconds through `gx_core::clock::wall_ms`.
 2. Every frame is integrated to the clock's time with
    `gx_core::integrate::Scheme::Relativistic` (first post-Newtonian gravity,
    oblateness, rotation with torques) in steps of at most 600 s and at most

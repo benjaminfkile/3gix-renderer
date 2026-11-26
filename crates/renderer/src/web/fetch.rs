@@ -206,6 +206,14 @@ impl WebFetcher {
         self.hub.now_utc_ms()
     }
 
+    /// The space's origin, wall-clock milliseconds, once a directions
+    /// answer or the hub's clock has reported it.
+    pub fn origin_utc_ms(&self) -> Option<i64> {
+        self.coordinator
+            .origin_utc_ms()
+            .or_else(|| self.hub.origin_utc_ms())
+    }
+
     /// Asks for directions at `t` (UTC milliseconds) from now on, clamped
     /// to the hub's now and the space's origin.
     pub fn set_time_utc_ms(&mut self, t: i64) {

@@ -1,7 +1,7 @@
 {
   "epoch": {
-    "bits": "0x41c823cf40000000",
-    "decimal": "8.1e8"
+    "bits": "0x0000000000000000",
+    "decimal": "0e0"
   },
   "frame_count": 1,
   "frames": [
@@ -16,18 +16,18 @@
           "decimal": "0e0"
         },
         {
-          "bits": "0x3ec8088a682354ef",
-          "decimal": "2.865e-6"
+          "bits": "0x3ecc9aeb534aaac9",
+          "decimal": "3.41e-6"
         }
       ],
       "frame_id": 1,
       "j2": {
-        "bits": "0x3e8ad7f29abcaf48",
-        "decimal": "2e-7"
+        "bits": "0x3e96255b5942109c",
+        "decimal": "3.3e-7"
       },
       "mass": {
-        "bits": "0x46391ace3d05aef4",
-        "decimal": "1.989e30"
+        "bits": "0x46410a15d3b2c584",
+        "decimal": "2.7e30"
       },
       "max_depth": 14,
       "orientation": [
@@ -65,21 +65,21 @@
       ],
       "principal_moments": [
         {
-          "bits": "0x49a3f7efd1fbfe7d",
-          "decimal": "5.7e46"
+          "bits": "0x49b5b85a30c141b9",
+          "decimal": "1.24e47"
         },
         {
-          "bits": "0x49a3f7efd1fbfe7d",
-          "decimal": "5.7e46"
+          "bits": "0x49b5b85a30c141b9",
+          "decimal": "1.24e47"
         },
         {
-          "bits": "0x49a4519eb1bd0bf0",
-          "decimal": "5.8e46"
+          "bits": "0x49b6120910824f2c",
+          "decimal": "1.26e47"
         }
       ],
       "reference_radius": {
-        "bits": "0x41c4bbc510000000",
-        "decimal": "6.957e8"
+        "bits": "0x41c83ab2a0000000",
+        "decimal": "8.13e8"
       },
       "root_extent": {
         "bits": "0x42a5d3ef79800000",

@@ -4,7 +4,7 @@
 
 use super::{Api, ApiError, ApiResult, Consumer, Target};
 use crate::app::{
-    api_picture, api_stats, check_origin, matter_step, set_fetch_time, tdb_of_utc_ms, view_settled,
+    api_picture, api_stats, matter_step, origin_ms_or_now, set_fetch_time, view_settled,
 };
 use crate::config::Config;
 use crate::controls::Controls as Keys;
@@ -141,9 +141,9 @@ fn run_headless_loop(
     size: (u32, u32),
     mut consumer: Box<dyn Consumer>,
 ) {
-    check_origin(&system, fetcher.origin_utc_ms());
-    let now = tdb_of_utc_ms(fetcher.now_utc_ms());
-    let launch = crate::options::launch(system, &config.options, now);
+    let now_ms = fetcher.now_utc_ms();
+    let origin_ms = origin_ms_or_now(fetcher.origin_utc_ms(), now_ms);
+    let launch = crate::options::launch(system, &config.options, origin_ms, now_ms);
     let (mut sim, mut camera) = (launch.sim, launch.camera);
     let mut api = Api::new(sim.system().tree(), &camera)
         .with_build(fetcher.client().build())
@@ -166,7 +166,7 @@ fn run_headless_loop(
         let tick = Instant::now();
         let dt = last.map_or(0.0, |t| (tick - t).as_secs_f64());
         last = Some(tick);
-        let hub_now = tdb_of_utc_ms(fetcher.now_utc_ms());
+        let hub_now = sim.clock().universe_seconds(fetcher.now_utc_ms());
         consumer.tick(&mut api);
         if api.destroyed() {
             break;

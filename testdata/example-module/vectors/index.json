@@ -21,21 +21,21 @@
     },
     "04-depth-two": {
       "key": "7-2-3-1-2",
-      "sha256": "5286ded991cd90de9f7a3bcd475476a70b4ed9f28a34074852430f14758a182c",
+      "sha256": "08d846001488d4e0b0906c32e93b2487c0b0ba5c4dc7792920dbcd4f828fbeb9",
       "sources": [
         "226"
       ]
     },
     "05-span": {
       "key": "42-5-17-3-30",
-      "sha256": "5f406c8beb0f937446748a2315e95cbb83aa03a8416c7ebcd9da7497439320f7",
+      "sha256": "fb1563539c95839c4415082fc0d41915b24f1e176514c95e391578e42b93e56e",
       "sources": [
         "1349"
       ]
     },
     "06-origin": {
       "key": "3-10-1023-0-512",
-      "sha256": "c017adf00a8e561ffab56410e7775f0d0f7f2d93b09cb42f26a932dbad999410",
+      "sha256": "65623ac470319c38601ac477a1c6c12a429c3f8e75e187f1c761af53d6a162a7",
       "sources": [
         "106"
       ]
@@ -49,7 +49,7 @@
     },
     "08-cold": {
       "key": "1000-12-4095-4095-4095",
-      "sha256": "ed1ba68aeb57d9fd06ab4d09c7c3d8022025605ccd773cd0601816f46014fb0e",
+      "sha256": "13f1b57248b17cb3ce69fcf0a0602fcb01c8d4d90d53bd36a4926e9f71a63b48",
       "sources": [
         "32012"
       ]

@@ -41,8 +41,8 @@ const PAINTED: u64 = 7;
 fn base_tile(key: &SurfaceKey) -> Vec<u8> {
     let tile = SurfaceTile {
         key: *key,
-        radius_equatorial: 6.0e6,
-        radius_polar: 6.0e6,
+        radius_xy: 6.0e6,
+        radius_z: 6.0e6,
         height_floor: 0.0,
         heights: vec![0.0; HEIGHT_SIDE * HEIGHT_SIDE],
         parent_heights: vec![0.0; PARENT_SIDE * PARENT_SIDE],
