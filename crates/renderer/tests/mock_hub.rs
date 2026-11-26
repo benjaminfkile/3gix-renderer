@@ -638,13 +638,16 @@ fn a_lying_section_is_replaced_by_the_computed_one_and_disputed() {
 
     hub.set_check_rate(Some(1.0));
     let mut b = connect(&rt, &hub, None);
-    stream_home(&mut b);
+    // One world for the client's whole run, as the renderer has: a fresh
+    // world on a fetcher another world used is not supported (known
+    // issues: the fetcher keeps a finished key wanted until the next
+    // wanted set, so a new world asking for it again waits forever).
+    let mut world = stream_home(&mut b);
     wait_for_checks(&mut b);
     let s = b.fetcher.stats();
     assert_eq!(s.worker.checks_disputed, 1, "{s:?}");
     assert_eq!(hub.counts().checks_disputed, 1);
     // The replaced key completes again with the computed section.
-    let mut world = settle_home(&mut b);
     let start = Instant::now();
     while matter(&world) != truth {
         assert!(
