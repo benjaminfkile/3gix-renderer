@@ -35,8 +35,44 @@ const QUERY_TOLERANCE: f64 = 1e-3;
 const QUERY_TOLERANCE_RADIUS: f64 = 1e-9;
 /// The drawn height agrees with the height function to this part of its
 /// amplitude: the function is smooth and the mesh interpolates it linearly
-/// between vertices.
+/// between vertices. A flat quad also sits below the curved shape by its
+/// [`sagitta`], so the tile under the camera must have refined to a level
+/// where that is under this part of the amplitude too.
 const HEIGHT_TOLERANCE: f64 = 0.02;
+
+/// How far the flat triangles of the quad holding unit direction `d` in a
+/// tile at `level` sit below the ellipsoid of radii `a`, `c`, meters: the
+/// depth of the midpoints of the quad's diagonals (the deepest point of a
+/// right triangle under a curved shape is its hypotenuse's midpoint),
+/// the larger of the two. The quad edge `s` and the local radius of
+/// curvature `R` give about `s^2 / (8 R)`.
+fn sagitta(d: [f64; 3], level: u8, a: f64, c: f64) -> f64 {
+    let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let face = (0..6u8)
+        .max_by(|&f, &g| {
+            let n = |f| dot(gx_core::surface::face_axes(f).0, d);
+            n(f).total_cmp(&n(g))
+        })
+        .unwrap();
+    let (n, u, v) = gx_core::surface::face_axes(face);
+    let quads = (gx_core::surface::TILE_QUADS as f64) * f64::from(1u32 << level);
+    // The face coordinates of the quad's corners, -1 to 1.
+    let corner = |x: f64| {
+        let g = ((x + 1.0) * 0.5 * quads).floor().clamp(0.0, quads - 1.0);
+        (2.0 * g / quads - 1.0, 2.0 * (g + 1.0) / quads - 1.0)
+    };
+    let (s0, s1) = corner(dot(d, u) / dot(d, n));
+    let (t0, t1) = corner(dot(d, v) / dot(d, n));
+    let at = |s: f64, t: f64| {
+        let p: [f64; 3] = std::array::from_fn(|k| n[k] + s * u[k] + t * v[k]);
+        gx_core::surface::ellipsoid_point(unit(p), a, c).0
+    };
+    let depth = |p: [f64; 3], q: [f64; 3]| {
+        let mid: [f64; 3] = std::array::from_fn(|k| 0.5 * (p[k] + q[k]));
+        -ellipsoid_height(mid, a, c)
+    };
+    depth(at(s0, t0), at(s1, t1)).max(depth(at(s1, t0), at(s0, t1)))
+}
 
 fn surface(a: f64, c: f64, amplitude: f64, max_level: u8) -> SurfaceSpec {
     SurfaceSpec {
@@ -57,6 +93,15 @@ fn one_body(extent: f64, body_extent: f64, s: SurfaceSpec) -> Vec<Body> {
     body.matter = Matter::Solid(0.5 * r);
     body.surface = Some(s);
     vec![Body::new(ROOT, ROOT_PARENT, extent, 0.0, [0.0; 3]), body]
+}
+
+/// A light: frame `id` under `parent` at `at`, a hot plasma ball of
+/// radius `r` filling its depth-0 cell. A body at the tests' 250 K emits
+/// next to nothing in the visible bands, so a picture of one needs this.
+fn light(id: u64, parent: u64, at: [f64; 3], r: f64) -> Body {
+    let mut b = Body::new(id, parent, 4.0 * r, 1.0, at);
+    b.matter = Matter::Hot(r, 7000.0);
+    b
 }
 
 /// Puts the camera in `frame` `height` meters above the surface of body
@@ -177,6 +222,8 @@ fn check(u: &mut Universe, body: u64, name: &str) -> Checked {
         .transform([p.x, p.y, p.z], u.camera.frame_id, body, Kind::Point)
         .unwrap();
     let mut hits = 0;
+    let mut worst = 0.0f64;
+    let mut levels = (u8::MAX, 0u8);
     let (nx, ny) = (16, 9);
     for j in 0..ny {
         for i in 0..nx {
@@ -204,10 +251,17 @@ fn check(u: &mut Universe, body: u64, name: &str) -> Checked {
                         sh.height
                     );
                     let want = (s.height)(normal_under(q, a, c));
+                    let diff = (mesh - want).abs();
                     assert!(
-                        (mesh - want).abs() < HEIGHT_TOLERANCE * s.max_height + tol,
-                        "{name} ({x}, {y}): drawn {mesh} vs height function {want}"
+                        diff < HEIGHT_TOLERANCE * s.max_height + tol,
+                        "{name} ({x}, {y}): drawn {mesh} vs height function {want}, \
+                         level {}, sagitta {}",
+                        sh.level,
+                        sagitta(unit(q), sh.level, a, c)
                     );
+                    worst = worst.max(diff);
+                    levels.0 = levels.0.min(sh.level);
+                    levels.1 = levels.1.max(sh.level);
                 }
                 _ => assert!(
                     !through,
@@ -216,6 +270,18 @@ fn check(u: &mut Universe, body: u64, name: &str) -> Checked {
             }
         }
     }
+    // The tile under the camera refined until its quads' sagitta is under
+    // the tolerance.
+    let under = unit(cam);
+    let below = picture
+        .surface_height(body, under)
+        .unwrap_or_else(|| panic!("{name}: surfaceHeight under the camera"));
+    let sag = sagitta(under, below.level, a, c);
+    assert!(
+        sag < HEIGHT_TOLERANCE * s.max_height,
+        "{name}: the tile under the camera is level {}, sagitta {sag} m",
+        below.level
+    );
     let mut headless = Headless::new(VIEW.0, VIEW.1, None).expect("a wgpu adapter");
     // Radiance before exposure: a body lit by no light still has its own
     // thermal emission, far below what the display shows.
@@ -227,9 +293,22 @@ fn check(u: &mut Universe, body: u64, name: &str) -> Checked {
             lit += usize::from(radiance.pixel(x, y)[..3].iter().any(|v| *v > 0.0));
         }
     }
+    let drawn: Vec<u8> = scene
+        .tiles
+        .iter()
+        .filter(|t| t.tile.geometry.key.frame_id == body)
+        .map(|t| t.tile.geometry.key.level)
+        .collect();
     println!(
-        "{name}: {hits} hits, {lit} lit pixels, {} tiles",
-        scene.tiles.len()
+        "{name}: {hits} hits, {lit} lit pixels, {} tiles, levels drawn {}..{}, \
+         levels hit {}..{}, level under the camera {} (sagitta {sag:.3} m), \
+         largest height difference {worst:.3} m",
+        scene.tiles.len(),
+        drawn.iter().min().unwrap(),
+        drawn.iter().max().unwrap(),
+        levels.0,
+        levels.1,
+        below.level
     );
     assert!(lit > 0, "{name}: the picture is empty");
     Checked { hits, lit }
@@ -238,7 +317,15 @@ fn check(u: &mut Universe, body: u64, name: &str) -> Checked {
 #[test]
 fn a_small_body() {
     let s = surface(1500.0, 1500.0, 400.0, 3);
-    let mut u = Universe::start(one_body(1.0e6, 8000.0, s));
+    let mut bodies = one_body(1.0e6, 8000.0, s);
+    // Behind the camera of both views.
+    bodies.push(light(
+        3,
+        ROOT,
+        unit([0.3, -0.5, 0.4]).map(|v| v * 3.0e5),
+        1.0e4,
+    ));
+    let mut u = Universe::start(bodies);
     over(&mut u, 2, unit([0.3, -0.5, 0.4]), 100.0);
     let near = check(&mut u, 2, "small, 100 m above");
     assert!(near.hits > 0);
@@ -251,7 +338,15 @@ fn a_small_body() {
 fn a_very_flattened_body() {
     let (a, c) = (9.0e7, 5.4e7);
     let s = surface(a, c, 5000.0, 4);
-    let mut u = Universe::start(one_body(1.0e12, 2.5 * a, s));
+    let mut bodies = one_body(1.0e12, 2.5 * a, s);
+    // Between the two views' normals: it lights both.
+    bodies.push(light(
+        3,
+        ROOT,
+        unit([1.0, 0.0, 2.0]).map(|v| v * 1.0e11),
+        1.0e9,
+    ));
+    let mut u = Universe::start(bodies);
     // The point whose normal is 45 degrees from the x-y plane.
     let t = (a / c).powi(2);
     let d45 = unit([1.0, 0.0, 1.0 / t]);
@@ -268,6 +363,9 @@ fn a_fast_spinner_keeps_the_camera_over_its_point() {
     let s = surface(3000.0, 2900.0, 200.0, 3);
     let mut bodies = one_body(1.0e6, 1.6e4, s);
     bodies[1].spin = [0.0, 0.0, 2.0 * std::f64::consts::PI / 200.0];
+    // Over the spin axis: it lights the camera's side however far the
+    // body has turned.
+    bodies.push(light(3, ROOT, [0.0, 0.0, 3.0e5], 1.0e4));
     let mut u = Universe::start(bodies);
     u.tick();
     u.api.place_over(2, [1.0, 0.5, 0.2], 100.0, 30.0).unwrap();
@@ -374,6 +472,9 @@ fn a_deep_tree_with_ids_out_of_order() {
     bodies[0].surface = Some(spec(5.0e4));
     bodies[0].matter = Matter::Solid(2.5e4);
     bodies[1].position = [0.0, 0.0, 3.0e7];
+    // Far out along the cameras' direction: behind each of them.
+    let far = unit([0.4, -0.7, 0.3]).map(|v| v * 1.0e8);
+    bodies.push(light(64, 11, [far[0], far[1], far[2] + 3.0e7], 1.0e6));
     let ids = [11u64, 40, 7, 93];
     let mut u = Universe::start(bodies);
     for id in [40u64, 7, 93] {
@@ -421,8 +522,11 @@ fn a_deep_tree_with_ids_out_of_order() {
 fn a_very_large_body() {
     let r = 7.0e8;
     let s = surface(r, r, 3000.0, 6);
-    let mut u = Universe::start(one_body(1.0e13, 2.5 * r, s));
     let d = unit([0.2, 0.9, -0.3]);
+    let mut bodies = one_body(1.0e13, 2.5 * r, s);
+    // Behind the camera.
+    bodies.push(light(3, ROOT, d.map(|v| v * 1.0e11), 1.0e9));
+    let mut u = Universe::start(bodies);
     over(&mut u, 2, d, 1000.0);
     let near = check(&mut u, 2, "large, 1 km above");
     assert!(near.hits > 0);

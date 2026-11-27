@@ -249,7 +249,7 @@ pub fn cell_bytes(body: &Body, key: &CellKey) -> Vec<u8> {
 
 /// The mock hub's layers for `bodies`: the registry, one stored layer of
 /// every frame's cells and surface tiles (empty for a frame without a
-/// surface).
+/// surface), filled to each frame's [`SurfaceSpec::max_level`].
 pub fn layers_of(bodies: &[Body]) -> Vec<MockLayer> {
     let reg = registry::encode(&registry_of(bodies));
     let mut layers = vec![registry_layer("frames", &reg)];
@@ -276,6 +276,15 @@ pub fn layers_of(bodies: &[Body]) -> Vec<MockLayer> {
             None => gx_core::surface::encode_empty(key),
         }
     })));
+    // The hub applies a layer's maximum depth to surface levels too: each
+    // frame's is its deepest surface level (its cells are empty past 0).
+    layer.max_depth = bodies
+        .iter()
+        .map(|b| {
+            let levels = b.surface.as_ref().map_or(0, |s| s.max_level);
+            (b.id.to_string(), levels)
+        })
+        .collect();
     layers.push(layer);
     layers
 }
@@ -379,6 +388,18 @@ impl Universe {
             keys: &mut self.keys,
         });
         let input = self.api.flight(self.keys.take_flight());
+        // The window's order: the spawner after the flight input, before
+        // the camera advances, at the loop's session time.
+        self.spawner.frame(
+            self.sim.system(),
+            &self.world,
+            &mut self.camera,
+            &mut self.keys,
+            &input,
+            self.t,
+        );
+        // The hub's clock runs with the loop's, as the window's does.
+        self.now = self.now + Seconds::new(self.dt);
         renderer::camera::advance(
             &mut self.sim,
             &mut self.camera,
