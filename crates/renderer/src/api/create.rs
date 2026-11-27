@@ -52,13 +52,15 @@ pub enum CreateTarget {
 pub type Connection = Config;
 
 /// The fetcher, the registry, and the runtime they run on.
-struct Connected {
-    system: FrameSystem,
-    fetcher: Fetcher,
+pub(crate) struct Connected {
+    pub(crate) system: FrameSystem,
+    pub(crate) fetcher: Fetcher,
     _runtime: tokio::runtime::Runtime,
 }
 
-fn connect(config: &Config) -> anyhow::Result<Connected> {
+/// Connects to the hub of `config`, opens its cache, starts the fetcher,
+/// and loads the registry, waiting for it up to `registry_deadline`.
+pub(crate) fn connect(config: &Config, registry_deadline: Duration) -> anyhow::Result<Connected> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -92,7 +94,7 @@ fn connect(config: &Config) -> anyhow::Result<Connected> {
     if let Some(n) = config.options.compute_budget {
         fetcher.set_compute_budget(n);
     }
-    let system = fetcher.load_registry(REGISTRY_DEADLINE)?;
+    let system = fetcher.load_registry(registry_deadline)?;
     Ok(Connected {
         system,
         fetcher,
@@ -117,7 +119,7 @@ pub fn create(
         ..connection.clone()
     };
     let run = || -> anyhow::Result<()> {
-        let c = connect(&config)?;
+        let c = connect(&config, REGISTRY_DEADLINE)?;
         match target {
             CreateTarget::Window => {
                 crate::app::run_windowed(&config, c.system, c.fetcher, consumer)

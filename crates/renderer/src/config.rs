@@ -135,6 +135,8 @@ FLAGS:
                                    least one)
     --max-fps <u32>                cap the window frame rate below the display refresh
                                    (default 0: one frame per refresh)
+    --print-benchmark-start        print the benchmark views' start, <frame>:<x>,<y>,<z>, picked
+                                   by rule from the hub's universe, and exit (rendering.md 5.1)
     --help                         print this text
 ";
 
@@ -409,6 +411,8 @@ pub struct Flags {
     pub no_cache: bool,
     /// `--workers`.
     pub workers: Option<u32>,
+    /// `--print-benchmark-start`.
+    pub print_benchmark_start: bool,
     /// `--help`.
     pub help: bool,
 }
@@ -489,6 +493,7 @@ where
             }
             "--no-cache" => flags.no_cache = true,
             "--workers" => flags.workers = Some(parse_u32(&name, &value(&name)?)?),
+            "--print-benchmark-start" => flags.print_benchmark_start = true,
             "--help" | "-h" => flags.help = true,
             other => return Err(err(format!("unknown argument {other:?}, see --help"))),
         }

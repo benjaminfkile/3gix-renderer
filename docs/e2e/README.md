@@ -180,21 +180,15 @@ What each check means:
   1.7 levels over a range of 112.8.
 
 Where each frame projects in `home.png`, from the registry the hub served
-(positions at the epoch, a child's added to its parent's), as the script
-prints it:
+(positions at the epoch, a child's added to its parent's), the script prints
+one line per frame:
 
 ```
-home: frame 1 projects to (-0.04, +0.01) px from the image center, 0.04 px away
-home: frame 2 projects to (-0.68, +2.00) px from the image center, 2.11 px away
-home: frame 3 projects to (-3.61, +0.24) px from the image center, 3.62 px away
-home: frame 4 projects to (-0.92, -4.43) px from the image center, 4.53 px away
-home: frame 5 projects to (+6.89, +0.01) px from the image center, 6.89 px away
-home: frame 6 projects to (+20.24, -13.85) px from the image center, 24.53 px away
-home: frame 7 projects to (+33.07, -31.90) px from the image center, 45.95 px away
-home: frame 8 projects to (+65.86, +57.11) px from the image center, 87.17 px away
-home: frame 9 projects to (+72.34, +98.93) px from the image center, 122.56 px away
-home: frame 10 projects to (-0.93, -4.42) px from the image center, 4.52 px away
+home: frame <id> projects to (<dx>, <dy>) px from the image center, <d> px away
 ```
+
+In the recorded run the ten frames all projected within 123 px of the image
+center.
 
 ## Statistics
 
