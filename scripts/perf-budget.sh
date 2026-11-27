@@ -8,8 +8,11 @@
 #
 # The hub comes from the environment like the renderer's own settings:
 # GX_HUB_URL, GX_API_KEY, GX_SPACE_ID (and GX_BUILD_ID if set). The views'
-# frame and direction come from GX_BENCH_ON, "<frame>:<x>,<y>,<z>" with a
-# unit direction in that frame's axes, so the script names no place.
+# frame and direction are picked by rule from whatever universe the hub
+# serves (rendering.md section 5.1): `gx-renderer --print-benchmark-start`
+# runs first, untimed, with its own fresh cache, and prints
+# "<frame>:<x>,<y>,<z>"; the first line of the output names it so the run
+# can be reproduced. The script names no frame or place.
 #
 # Usage: sh scripts/perf-budget.sh [--keep <dir>] [--baseline <file>]
 #   --keep <dir>      write the statistics and screenshots there and keep them
@@ -24,14 +27,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --keep) keep=$2; shift ;;
         --baseline) baseline=$2; shift ;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "perf-budget: unknown argument $1" >&2; exit 2 ;;
     esac
     shift
 done
 
 : "${GX_HUB_URL:?set GX_HUB_URL}" "${GX_API_KEY:?set GX_API_KEY}" "${GX_SPACE_ID:?set GX_SPACE_ID}"
-: "${GX_BENCH_ON:?set GX_BENCH_ON to <frame>:<x>,<y>,<z>}"
 
 cargo build --release --bin gx-renderer -p renderer
 cargo build --release -p perf-budget
@@ -44,9 +46,19 @@ else
     trap 'rm -rf "$out"' EXIT HUP INT TERM
 fi
 
-# rendering.md section 5.1. GX_BENCH_ON is a frame and a unit vector in its
-# axes; @+<m> is a height above whatever surface is drawn on that line.
-dir=$GX_BENCH_ON
+# rendering.md section 5.1: the start picked by rule, not timed, from its
+# own fresh cache. It is a frame and a unit vector in its axes; @+<m> is a
+# height above whatever surface is drawn on that line.
+rm -rf "$out/cache-pick"
+mkdir -p "$out/cache-pick"
+if ! dir=$(./target/release/gx-renderer --print-benchmark-start \
+    --cache-dir "$out/cache-pick" 2>"$out/pick.log"); then
+    cat "$out/pick.log" >&2
+    echo "perf-budget: picking the benchmark start failed" >&2
+    exit 1
+fi
+rm -rf "$out/cache-pick"
+echo "perf-budget: start $dir"
 view_args() {
     case "$1" in
         B1) echo "--start-on $dir@+10000^20" ;;

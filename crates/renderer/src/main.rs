@@ -9,7 +9,8 @@
 //! renders one headless frame ([`renderer::app`]), streaming and
 //! computing matter on the same runtime. Exits with a clear error and a
 //! non-zero status when the configuration is incomplete or the registry is
-//! invalid or never arrives.
+//! invalid or never arrives. `--print-benchmark-start` prints the
+//! benchmark start instead ([`renderer::benchmark`]) and exits.
 //!
 //! Native only: the browser build starts from `web/index.html` instead, so
 //! on `wasm32` this binary is an empty stub that lets the whole package
@@ -46,6 +47,10 @@ mod native {
             return Ok(());
         }
         let config = Config::resolve(&load_env()?, &flags)?;
+        if flags.print_benchmark_start {
+            println!("{}", renderer::benchmark::print_benchmark_start(&config)?);
+            return Ok(());
+        }
         let target = if config.headless {
             CreateTarget::Snapshot
         } else {

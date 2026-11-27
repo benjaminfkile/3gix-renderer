@@ -142,11 +142,13 @@ files. The browser build is not run in CI; it is verified by hand
 ### Performance budget on a real stack
 
 ```sh
-GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=... GX_BENCH_ON=<frame>:<x>,<y>,<z> sh scripts/perf-budget.sh [--keep DIR]
+GX_HUB_URL=... GX_API_KEY=... GX_SPACE_ID=... sh scripts/perf-budget.sh [--keep DIR]
 ```
 
-Runs the benchmark views B1 to B4 of `rendering.md` section 5.1 headless,
-each with a fresh cache, and checks them against section 5.2 and
+Picks the benchmark start by rule from the hub's universe
+(`gx-renderer --print-benchmark-start`, `rendering.md` section 5.1, printed
+in the first line), then runs the benchmark views B1 to B4 headless, each
+with a fresh cache, and checks them against section 5.2 and
 `perf/baseline.json` (`tools/perf-budget`). Exits non-zero on any breach.
 Every change that can affect what is drawn or how fast puts its overall line
 in the commit message (`rendering.md` section 6).

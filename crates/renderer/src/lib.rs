@@ -49,6 +49,8 @@
 //!   and the headless offscreen target.
 //! - [`app`]: the desktop window loop and the headless screenshot run
 //!   (native only).
+//! - [`benchmark`]: the benchmark start picked by rule
+//!   (`rendering.md` section 5.1, native only).
 //! - `web`: the browser build on a canvas with WebGPU (`wasm32` with the
 //!   `web` feature; see `docs/web.md`).
 //!
@@ -108,6 +110,8 @@ pub mod world;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod app;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod benchmark;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hub;
 #[cfg(not(target_arch = "wasm32"))]
